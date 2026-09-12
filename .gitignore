@@ -1,0 +1,40 @@
+# Local credentials (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Environments and generated Python files
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# External repositories: distributed separately, not vendored core
+/RoboSynChallenge/
+/RoboSynChallenge_eval_clean/
+/RoboTwin/
+/EmbodiChain/
+
+# Assets, datasets, experimental outputs, historical local plans
+/embodichain_data/
+/autoresearch_runs/
+/autoresearch_cache/
+/output/
+/plan/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.hdf5
+*.h5
+*.parquet
+*.mp4
+*.zip
+*.tar
+*.tar.gz
+*.log

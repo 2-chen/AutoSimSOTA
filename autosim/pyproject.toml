@@ -1,0 +1,31 @@
+[project]
+name = "autosim"
+version = "0.2.0"
+description = "AutoSOTA-style automated research for embodied AI robotics tasks"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.5",
+]
+
+[project.scripts]
+autosim = "autosim.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["autosim*"]
+exclude = ["tests*", "output*", "demo*", "task*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["output", ".git", ".venv"]

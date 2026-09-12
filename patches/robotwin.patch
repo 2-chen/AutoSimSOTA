@@ -1,0 +1,233 @@
+diff --git a/XPolicyLab b/XPolicyLab
+--- a/XPolicyLab
++++ b/XPolicyLab
+@@ -1 +1 @@
+-Subproject commit c37109c500be67d0dea6b36bf7337bbd26e763cd
++Subproject commit c37109c500be67d0dea6b36bf7337bbd26e763cd-dirty
+diff --git a/scripts/collect_data.py b/scripts/collect_data.py
+index 5c529f1..c72bace 100644
+--- a/scripts/collect_data.py
++++ b/scripts/collect_data.py
+@@ -150,7 +150,9 @@ def main(task_name=None, task_config=None):
+ 
+ 
+ def run(TASK_ENV, args):
+-    epid, suc_num, fail_num, seed_list = 0, 0, 0, []
++    epid, suc_num, fail_num, seed_list = int(args.get("seed_start", 0)), 0, 0, []
++    attempts_this_run = 0
++    max_seed_attempts = args.get("max_seed_attempts")
+ 
+     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
+ 
+@@ -171,6 +173,10 @@ def run(TASK_ENV, args):
+             print(f"Exist seed file, Start from: {epid} / {suc_num}")
+ 
+         while suc_num < args["episode_num"]:
++            if max_seed_attempts is not None and attempts_this_run >= int(max_seed_attempts):
++                raise RuntimeError(
++                    f"bounded collection exhausted {max_seed_attempts} seed attempts "
++                    f"with {suc_num}/{args['episode_num']} successes")
+             try:
+                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
+                 TASK_ENV.play_once()
+@@ -213,6 +219,7 @@ def run(TASK_ENV, args):
+                 time.sleep(1)
+ 
+             epid += 1
++            attempts_this_run += 1
+ 
+             with open(os.path.join(args["save_path"], "seed.txt"), "w") as file:
+                 for sed in seed_list:
+diff --git a/scripts/eval_policy_xpolicylab.py b/scripts/eval_policy_xpolicylab.py
+index 745cc30..a0c8a2d 100644
+--- a/scripts/eval_policy_xpolicylab.py
++++ b/scripts/eval_policy_xpolicylab.py
+@@ -4,6 +4,7 @@ import argparse
+ import ast
+ import copy
+ import importlib
++import json
+ import multiprocessing as mp
+ import os
+ import queue
+@@ -40,6 +41,16 @@ CAMERA_NAME_MAP = {
+ }
+ 
+ 
++def append_evaluation_trace(path: str | os.PathLike[str] | None, row: Mapping[str, Any]) -> None:
++    """Append audit-only seed/outcome evidence without changing evaluation semantics."""
++    if path is None:
++        return
++    output = Path(path)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with output.open("a", encoding="utf-8") as stream:
++        stream.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
++
++
+ def add_xpolicylab_paths(xpolicylab_root: str | os.PathLike[str] | None) -> None:
+     if not xpolicylab_root:
+         return
+@@ -287,6 +298,7 @@ def main(usr_args: dict[str, Any]) -> None:
+         task_name, policy_name, task_config, ckpt_setting, current_time
+     )
+     save_dir.mkdir(parents=True, exist_ok=True)
++    usr_args["evaluation_trace_path"] = str(save_dir / "episode_results.jsonl")
+     video_size = None
+ 
+     if args["eval_video_log"]:
+@@ -437,11 +449,22 @@ def main_batch(usr_args: dict[str, Any]) -> None:
+             msg_type = message.get("type")
+             if msg_type == "seed_skipped":
+                 skipped += 1
++                append_evaluation_trace(
++                    save_dir / "episode_results.jsonl",
++                    {"status": "seed_skipped", "worker_id": message.get("worker_id"),
++                     "seed": message.get("seed"), "reason": message.get("reason")},
++                )
+                 continue
+             if msg_type == "episode_done":
+                 if completed < test_num:
+                     completed += 1
+                     success_num += int(bool(message.get("success")))
++                    append_evaluation_trace(
++                        save_dir / "episode_results.jsonl",
++                        {"status": "episode_counted", "episode_index": completed - 1,
++                         "worker_id": message.get("worker_id"), "seed": message.get("seed"),
++                         "success": bool(message.get("success"))},
++                    )
+                     print(
+                         f"\033[93m{task_name}\033[0m | episode={message.get('episode_id')} | "
+                         f"worker={message.get('worker_id')} | seed={message.get('seed')} | "
+@@ -784,6 +807,23 @@ def eval_remote_policy(
+     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
+ 
+     expert_check = parse_bool(usr_args.get("expert_check", True))
++    seed_bank_path = usr_args.get("seed_bank_file")
++    explicit_seed_bank: list[int] | None = None
++    if seed_bank_path:
++        seed_bank_data = json.loads(Path(seed_bank_path).read_text(encoding="utf-8"))
++        explicit_seed_bank = seed_bank_data.get("seeds") if isinstance(seed_bank_data, dict) else seed_bank_data
++        if not isinstance(explicit_seed_bank, list) or not explicit_seed_bank:
++            raise ValueError("explicit evaluation seed bank must be a non-empty JSON list")
++        if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in explicit_seed_bank):
++            raise ValueError("explicit evaluation seed bank must contain integers only")
++        if len(explicit_seed_bank) != test_num:
++            raise ValueError(
++                f"explicit seed bank size {len(explicit_seed_bank)} differs from test_num {test_num}"
++            )
++        if len(set(explicit_seed_bank)) != len(explicit_seed_bank):
++            raise ValueError("explicit evaluation seed bank contains duplicate seeds")
++        if expert_check:
++            raise ValueError("explicit seed bank replay requires expert_check=false")
+     frequency = int(usr_args.get("frequency", usr_args.get("ctrl_freq", 30)))
+     action_type = str(usr_args.get("action_type", "joint"))
+ 
+@@ -796,8 +836,19 @@ def eval_remote_policy(
+     clear_cache_freq = args["clear_cache_freq"]
+     args["eval_mode"] = True
+     consecutive_env_errors = 0
++    max_seed_attempts = int(usr_args.get("max_seed_attempts") or max(test_num * 50, 20))
++    attempted_seeds = 0
++    trace_path = usr_args.get("evaluation_trace_path")
+ 
+     while succ_seed < test_num:
++        if attempted_seeds >= max_seed_attempts:
++            raise RuntimeError(
++                f"bounded evaluation seed budget exhausted: completed={succ_seed}/{test_num}, "
++                f"attempted={attempted_seeds}, max_seed_attempts={max_seed_attempts}"
++            )
++        attempted_seeds += 1
++        if explicit_seed_bank is not None:
++            now_seed = explicit_seed_bank[succ_seed]
+         render_freq = args["render_freq"]
+         args["render_freq"] = 0
+         episode_info = {"info": {}}
+@@ -809,18 +860,25 @@ def eval_remote_policy(
+                 task_env.close_env()
+             except UnStableError:
+                 safe_close_env(task_env)
++                append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                     "reason": "expert_unstable"})
+                 print(f"skip unstable seed={now_seed} (expert check)")
+                 now_seed += 1
+                 args["render_freq"] = render_freq
+                 continue
+             except Exception as e:
+                 safe_close_env(task_env)
++                append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                     "reason": "expert_error",
++                                                     "error_type": type(e).__name__})
+                 now_seed += 1
+                 args["render_freq"] = render_freq
+                 print(f"error occurs during expert check! seed={now_seed - 1} err={type(e).__name__}: {e}")
+                 continue
+ 
+         if expert_check and not (task_env.plan_success and task_env.check_success()):
++            append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                 "reason": "expert_failed"})
+             now_seed += 1
+             args["render_freq"] = render_freq
+             continue
+@@ -830,11 +888,22 @@ def eval_remote_policy(
+             task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+         except UnStableError:
+             safe_close_env(task_env)
++            if explicit_seed_bank is not None:
++                raise RuntimeError(f"explicit evaluation seed became unstable: {now_seed}")
++            append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                 "reason": "eval_unstable"})
+             print(f"skip unstable seed={now_seed} (eval setup)")
+             now_seed += 1
+             continue
+         except Exception as e:
+             safe_close_env(task_env)
++            if explicit_seed_bank is not None:
++                raise RuntimeError(
++                    f"explicit evaluation seed setup failed: {now_seed}: {type(e).__name__}: {e}"
++                ) from e
++            append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                 "reason": "eval_setup_error",
++                                                 "error_type": type(e).__name__})
+             print(f"skip seed={now_seed} setup error: {type(e).__name__}: {e}")
+             now_seed += 1
+             continue
+@@ -936,6 +1005,10 @@ def eval_remote_policy(
+             consecutive_env_errors += 1
+             succ_seed -= 1
+             safe_close_env(task_env, clear_cache=True)
++            if explicit_seed_bank is not None:
++                raise RuntimeError(f"explicit evaluation seed failed before policy action: {now_seed}")
++            append_evaluation_trace(trace_path, {"status": "seed_skipped", "seed": now_seed,
++                                                 "reason": "environment_error_before_action"})
+             print(
+                 f"env error before first action at seed={now_seed}; episode not counted "
+                 f"(consecutive={consecutive_env_errors})"
+@@ -962,6 +1035,11 @@ def eval_remote_policy(
+             task_env.viewer.close()
+ 
+         task_env.test_num += 1
++        append_evaluation_trace(
++            trace_path,
++            {"status": "episode_counted", "episode_index": task_env.test_num - 1,
++             "seed": now_seed, "success": bool(succ), "action_steps": rollout_steps},
++        )
+         print(
+             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | "
+             f"\033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
+@@ -1347,6 +1425,7 @@ def parse_args() -> dict[str, Any]:
+     parser.add_argument("--frequency", type=int, default=None)
+     parser.add_argument("--num_workers", type=int, default=None)
+     parser.add_argument("--max_seed_attempts", type=int, default=None)
++    parser.add_argument("--seed_bank_file")
+     args = parser.parse_args()
+ 
+     usr_args: dict[str, Any] = {
+@@ -1376,6 +1455,8 @@ def parse_args() -> dict[str, Any]:
+         usr_args["num_workers"] = args.num_workers
+     if args.max_seed_attempts is not None:
+         usr_args["max_seed_attempts"] = args.max_seed_attempts
++    if args.seed_bank_file is not None:
++        usr_args["seed_bank_file"] = args.seed_bank_file
+ 
+     usr_args.update(parse_additional_info(args.additional_info))
+     usr_args.setdefault("ckpt_setting", usr_args.get("ckpt_name"))

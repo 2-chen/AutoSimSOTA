@@ -1,0 +1,17 @@
+# AutoSim: Embodied Intelligence Auto-Research System
+#
+# Core dependencies for the optimization framework.
+# Isaac Sim-specific dependencies are provided by the Isaac Sim environment.
+
+numpy>=1.26
+pyyaml>=6.0
+requests>=2.31
+scipy>=1.10
+
+# For visualization (optional)
+matplotlib>=3.5.0
+
+# For connecting to real Isaac Sim (provided by Isaac Sim environment):
+# - omni.isaac.core
+# - omni.usd
+# - pxr
