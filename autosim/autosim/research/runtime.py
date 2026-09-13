@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -68,6 +69,32 @@ def startup_receipt(directory: Path) -> dict:
         receipt["startup_phase"] = read_json(startup).get("phase")
     receipt["initializations_recorded"] = (directory / "initializations.jsonl").is_file()
     return receipt
+
+
+def startup_census(directory: Path) -> list:
+    """Every phase receipt an evaluation wrote, in order, with its own-process census.
+
+    ``startup.json`` keeps only the latest phase, and the latest phase is never the answer
+    to "when did card 0 gain its 525 MiB": memory already held before the engine is
+    constructed belongs to a library import, the same memory appearing while it is
+    constructed belongs to the engine.  The two findings have opposite fixes, so the ladder
+    carries the whole timeline rather than one number.  Unreadable or malformed lines are
+    skipped -- a diagnostic that raises would turn a measurement into a crash.
+    """
+    rows: list = []
+    try:
+        text = (directory / "startup_census.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return rows
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
 
 
 @dataclass

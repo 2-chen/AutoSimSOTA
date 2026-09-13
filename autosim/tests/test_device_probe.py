@@ -182,6 +182,200 @@ class EnvironmentMeasurementTests(unittest.TestCase):
         self.assertEqual(row["renderer_auto_returncode"], 0)
 
 
+class NodeIsolationTests(unittest.TestCase):
+    """The free measurement that decides whether the deeper mechanism is available.
+
+    Every identity arm on a card other than 0 leaves ~525 MiB on card 0, and it is neither
+    torch's nor warp's default device (both are aligned and the receipt shows it).  Hiding
+    the other cards' device nodes would make "device 0" mean the leased card for *every*
+    subsystem at once, including the unnamed one -- so whether this container permits it is
+    worth seconds of measurement rather than an assumption either way.
+    """
+
+    DEVICES = [{"index": i, "uuid": f"GPU-{i}"} for i in range(4)]
+
+    def setUp(self):
+        self.calls = []
+
+    def measure(self, results):
+        def merged(command, **kwargs):
+            self.calls.append(list(command))
+            for needle, payload in results:
+                if needle in " ".join(command):
+                    return payload if isinstance(payload, dict) else {"returncode": 0, "text": payload}
+            return {"returncode": 0, "text": ""}
+        with mock.patch.object(device_probe, "run_merged", merged):
+            return device_probe.node_isolation_measurement(
+                Path("/usr/bin/python"), {"PATH": "/usr/bin"}, self.DEVICES, dri=Path("/nonexistent-dri"))
+
+    def test_the_namespace_is_tried_three_ways_because_each_can_fail_alone(self):
+        measurement = self.measure([])
+        self.assertEqual(sorted(measurement["runs"]), ["namespace_only", "user_namespace",
+                                                       "with_cuda_visible_0"])
+        self.assertEqual(len(self.calls), 3)
+        self.assertIn("unshare", self.calls[0][0])
+
+    def test_it_hides_every_card_but_the_one_it_is_testing(self):
+        measurement = self.measure([])
+        self.assertEqual(measurement["target_index"], 3)
+        self.assertEqual(measurement["hidden_nodes"],
+                         ["/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2"])
+        self.assertNotIn("/dev/nvidia3", " ".join(self.calls[0]))
+
+    def test_a_surviving_card_that_renumbers_to_zero_is_the_feasible_answer(self):
+        measurement = self.measure([("unshare", {"returncode": 0, "text": "RESULT_MARKER " + json.dumps(
+            {"nvidia_smi": "0, GPU-3", "torch_count": 1, "torch_rows": [{"i": 0}]})})])
+        self.assertTrue(measurement["runs"]["namespace_only"]["feasible"])
+        self.assertTrue(measurement["feasible"])
+
+    def test_a_survivor_that_keeps_its_own_index_is_infeasible_and_says_so(self):
+        """Hiding a node is not the same as renumbering it: the minor can survive."""
+        measurement = self.measure([("unshare", {"returncode": 0, "text": "RESULT_MARKER " + json.dumps(
+            {"nvidia_smi": "3, GPU-3", "torch_count": 1, "torch_rows": [{"i": 0}]})})])
+        row = measurement["runs"]["namespace_only"]
+        self.assertEqual(row["survivor_index"], "3")
+        self.assertFalse(row["feasible"])
+        self.assertIn("output", row)
+
+    def test_a_refused_unshare_is_recorded_with_its_own_output(self):
+        measurement = self.measure([("unshare", {"returncode": 1,
+                                             "text": "unshare: unshare failed: Operation not permitted"})])
+        row = measurement["runs"]["namespace_only"]
+        self.assertIsNone(row["survivor_index"])
+        self.assertFalse(row["feasible"])
+        self.assertIn("Operation not permitted", row["output"])
+
+    def test_a_bind_that_failed_disqualifies_the_run_even_if_one_card_remains(self):
+        """A partially hidden node set looks like a one-card node and is not one."""
+        measurement = self.measure([("unshare", {"returncode": 0, "text":
+                                             "BIND_FAILED /dev/nvidia1\nRESULT_MARKER " + json.dumps(
+                                                 {"nvidia_smi": "0, GPU-3", "torch_count": 1})})])
+        row = measurement["runs"]["namespace_only"]
+        self.assertEqual(row["bind_failures"], ["/dev/nvidia1"])
+        self.assertFalse(row["feasible"])
+
+    def test_every_variant_must_work_because_production_uses_the_cvd_spelling(self):
+        measurement = self.measure([("--map-root-user", {"returncode": 1, "text": "denied"})])
+        self.assertFalse(measurement["feasible"])
+        self.assertEqual(measurement["runs"]["user_namespace"]["returncode"], 1)
+
+    def test_an_unreadable_dri_directory_is_not_an_exception(self):
+        measurement = self.measure([])
+        self.assertIn("unreadable", str(measurement["dri_nodes"]))
+
+    def test_feasibility_is_never_a_verification(self):
+        """It must not be able to reach the verdict: only a real episode can verify a mode."""
+        source = Path(device_probe.__file__).read_text(encoding="utf-8")
+        block = source.split("def probe_verdict(")[1].split("\ndef ")[0]
+        self.assertNotIn("node_isolation", block)
+
+
+class StartupCensusTests(unittest.TestCase):
+    """The timeline, not the number: which phase put memory on a card nobody leased.
+
+    ``startup.json`` keeps only the latest phase, and the latest phase is never the answer
+    -- memory already held before the engine is constructed is a library import, the same
+    memory appearing during construction is the engine.  Opposite fixes, one number.
+    """
+
+    def test_this_process_and_its_children_are_attributed_separately(self):
+        mine, child = os.getpid(), os.getpid() + 1
+        apps = (f"GPU-aaa, {mine}, 500\n"
+                f"GPU-aaa, {child}, 40\n"
+                f"GPU-bbb, {mine}, 10\n"
+                "GPU-ccc, 999999, 999\n")
+        with mock.patch("autosim.research.devices.run_text", lambda command, **kw: apps), \
+             mock.patch("autosim.research.accounting.describe_process",
+                        lambda pid, **kw: {"parent": mine if pid == child else 999}):
+            census = evaluation._own_memory_mib()
+        self.assertEqual(census["own"], {"GPU-aaa": 500, "GPU-bbb": 10})
+        self.assertEqual(census["children"], {"GPU-aaa": 40})
+
+    def test_a_failing_query_is_recorded_rather_than_raised(self):
+        with mock.patch("autosim.research.devices.run_text", lambda command, **kw: "__error__: rc=9"):
+            self.assertIn("error", evaluation._own_memory_mib())
+
+    def test_the_census_is_appended_so_the_timeline_survives(self):
+        from autosim.research.runtime import startup_census
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            with mock.patch.object(evaluation, "_own_memory_mib",
+                                  lambda: {"own": {"GPU-aaa": 7}, "children": {}}):
+                evaluation._ALIGNMENT.clear()
+                evaluation.startup_phase(output, "environment_constructing", policy_has_acted=False)
+                evaluation.startup_phase(output, "environment_ready", policy_has_acted=False)
+            rows = startup_census(Path(tmp))
+            self.assertEqual([row["phase"] for row in rows],
+                             ["environment_constructing", "environment_ready"])
+            self.assertEqual(rows[0]["memory"]["own"], {"GPU-aaa": 7})
+            self.assertEqual(json.loads((Path(tmp) / "startup.json").read_text())["phase"],
+                             "environment_ready")
+
+    def test_a_malformed_census_line_is_skipped_rather_than_raised(self):
+        from autosim.research.runtime import startup_census
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "startup_census.jsonl").write_text('{"phase": "a"}\nnot json\n\n{"phase": "b"}\n')
+            self.assertEqual([row["phase"] for row in startup_census(Path(tmp))], ["a", "b"])
+
+    def test_a_missing_census_is_an_empty_timeline(self):
+        from autosim.research.runtime import startup_census
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(startup_census(Path(tmp)), [])
+
+    def test_the_alignment_phase_is_written_before_the_engine_is_built(self):
+        """The pre-environment census is what separates an import from the engine."""
+        source = Path(evaluation.__file__).read_text(encoding="utf-8")
+        align = source.split("def _select_cuda(")[1].split("\ndef ")[0]
+        self.assertIn('startup_phase(output, "devices_aligned"', align)
+
+
+class ConcurrentSamplerTests(unittest.TestCase):
+    """The 2026-09-13 ladder's concurrent arms reported zero growth on every card.
+
+    That is not what a failed overlap looks like -- it is what *no sampling* looks like: the
+    two episodes completed, the shared sampler was created and read once for its baseline,
+    and it was never entered, so "peak" after the join was the baseline again.  The check
+    then said two devices never ran at the same time, which the evidence did not support.
+    """
+
+    def test_a_sampler_that_is_never_entered_reports_the_baseline_back(self):
+        from autosim.research.accounting import UtilizationSampler
+
+        readings = iter(["GPU-aaa, 0, 1\n", "GPU-aaa, 0, 4096\n"])
+        sampler = UtilizationSampler(interval_seconds=0.01,
+                                     runner=lambda command, **kw: next(readings, "GPU-aaa, 0, 4096\n"))
+        sampler._sample_once()
+        baseline = sampler.summary()
+        self.assertEqual(baseline["GPU-aaa"]["peak_memory_mib"], 1)
+        self.assertEqual(sampler.summary()["GPU-aaa"]["peak_memory_mib"], 1)
+
+    def test_entering_the_sampler_is_what_makes_the_overlap_visible(self):
+        import time as clock
+
+        from autosim.research.accounting import UtilizationSampler
+
+        state = {"mib": 1}
+        sampler = UtilizationSampler(interval_seconds=0.01,
+                                     runner=lambda command, **kw: f"GPU-aaa, 0, {state['mib']}\n")
+        sampler._sample_once()
+        baseline = sampler.summary()["GPU-aaa"]["peak_memory_mib"]
+        with sampler:
+            state["mib"] = 4096
+            clock.sleep(0.2)
+        self.assertEqual(baseline, 1)
+        self.assertGreater(sampler.summary()["GPU-aaa"]["peak_memory_mib"], 1)
+
+    def test_the_ladder_enters_the_shared_sampler_around_the_overlap_window(self):
+        source = Path(device_probe.__file__).read_text(encoding="utf-8")
+        block = source.split('if "concurrent" in wanted:')[1].split("# The two diagnostic arms")[0]
+        self.assertIn("with sampler:", block)
+        self.assertLess(block.index("with sampler:"), block.index("thread.start()"))
+        self.assertLess(block.index("thread.join()"), block.index("peak = sampler.summary()"))
+
+
 class RuntimeDeviceBindingTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory()

@@ -58,7 +58,7 @@ def _seeded_numpy(offset: int):
 _ALIGNMENT: dict = {}
 
 
-def _select_cuda(index: int) -> None:
+def _select_cuda(index: int, output: Path) -> None:
     """Align torch -- and warp, under a device plan -- with the leased card.
 
     ``index`` is the leased card's *CUDA* ordinal, not the engine's physical index (see
@@ -67,15 +67,53 @@ def _select_cuda(index: int) -> None:
     child are built, so it is also the last point at which a library's *default* device can
     still be pointed at the leased card instead of at card zero.
 
-    What it did is recorded in ``startup.json``: the second multi-GPU probe left 1030 MiB on
-    card 0 with no owner it could name, and the alignment record is the first thing that
-    either rules this process out or names its default device as the cause.
+    Measured on 2026-09-13 (4-GPU ladder, cards 1-3): the alignment takes effect -- every
+    arm's ``startup.json`` records ``torch_default``/``warp_default`` on its own card -- and
+    it removes about half of the leak the second probe saw (1030 MiB on card 0 before, 525
+    MiB after).  The remainder is therefore *not* torch's and not warp's default device, and
+    the census written here is what tells the two candidate phases apart.
     """
     from .devices import align_process_defaults, default_device_index
 
     record = align_process_defaults(int(index), warp=default_device_index() is not None)
     _ALIGNMENT.clear()
     _ALIGNMENT.update(record)
+    startup_phase(output, "devices_aligned", policy_has_acted=False)
+
+
+def _own_memory_mib() -> dict:
+    """How much memory *this* process -- and its children -- hold on each card, right now.
+
+    The 2026-09-13 4-GPU ladder could say "525 MiB appeared on card 0 while the arm ran on
+    card 1, held by that arm's own pid" and still not say *when*, which is the difference
+    between two opposite fixes: memory present before the engine is constructed belongs to a
+    library import, memory that appears while it is constructed belongs to the engine.  Read
+    at every phase, this turns one number into a timeline.
+
+    Never raises: a diagnostic that can fail would turn a measurement into a crash.
+    """
+    try:
+        from .accounting import describe_process
+        from .devices import parse_compute_apps, run_text
+
+        text = run_text(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
+                         "--format=csv,noheader,nounits"], timeout=20)
+        if text.strip().startswith("__error__"):
+            return {"error": text.strip()[:120]}
+        mine = os.getpid()
+        own: dict = {}
+        children: dict = {}
+        for app in parse_compute_apps(text):
+            pid, uuid = app.get("pid"), app.get("gpu_uuid")
+            if uuid is None or pid is None:
+                continue
+            if pid == mine:
+                own[uuid] = max(own.get(uuid, 0), app.get("used_memory_mib") or 0)
+            elif describe_process(int(pid)).get("parent") == mine:
+                children[uuid] = max(children.get(uuid, 0), app.get("used_memory_mib") or 0)
+        return {"own": own, "children": children}
+    except Exception as exc:                          # noqa: BLE001 -- diagnostics are free
+        return {"error": f"{type(exc).__name__}: {exc}"[:120]}
 
 
 def startup_phase(output: Path, phase: str, **extra) -> None:
@@ -85,9 +123,17 @@ def startup_phase(output: Path, phase: str, **extra) -> None:
     first reset".  The pid and the device alignment are here because the cross-card residual
     is a *process* question -- ``1030 MiB on card 0, owner unknown`` was the one finding two
     probes could not act on.
+
+    The per-card census is appended to ``startup_census.jsonl`` as well, because
+    ``startup.json`` keeps only the latest phase and the timeline is what names a phase.
     """
+    census = _own_memory_mib()
     atomic_json(output / "startup.json", {"phase": phase, "pid": os.getpid(),
-                                          "default_device": dict(_ALIGNMENT), **extra})
+                                          "default_device": dict(_ALIGNMENT),
+                                          "own_memory_mib": census, **extra})
+    event(output / "startup_census.jsonl", "startup_phase", phase=phase, pid=os.getpid(),
+          default_device=dict(_ALIGNMENT), memory=census)
+
 
 
 def certification_fields(spec, purpose: str) -> dict:
@@ -234,7 +280,7 @@ def main() -> None:
     official.parse_args_and_config = lambda: config
     official.load_policy_adapter = lambda unused: adapter
     official.create_eval_run_dir = lambda unused: output
-    official.select_cuda_device = lambda unused: _select_cuda(args.device_torch_index)
+    official.select_cuda_device = lambda unused: _select_cuda(args.device_torch_index, output)
     make_env = official.make_env_from_configs
 
     def wrapped_factory(*factory_args, **factory_kwargs):

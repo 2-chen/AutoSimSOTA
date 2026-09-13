@@ -15,9 +15,11 @@ C and D are falsification points: if C does not abort, or if D resolves the GPU 
 successfully, the model is missing something and the winning arm cannot be trusted.  A, by
 contrast, is the fallback production form and is expected to pass as well -- it is only
 rejected for being dangerous under concurrency (any ``cuda``/``cuda:0`` default lands on
-card 0).  Passing arms are folded into a probe receipt keyed by node+driver+device set; a
-multi-device run without a matching receipt refuses to start (unknown capability is never
-assumed available).
+card 0).  The 2026-09-13 ladder measured that caveat more precisely: A completes a real
+episode on every card, and the torch/warp default device is aligned to the leased card, but
+each arm still leaves ~525 MiB on card 0.  Passing arms are folded into a probe receipt
+keyed by node+driver+device set; a multi-device run without a matching receipt refuses to
+start (unknown capability is never assumed available).
 
     python -m autosim.research.device_probe --workspace <platform_root> --output <dir>
 """
@@ -28,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -40,7 +43,7 @@ from .common import atomic_json, digest, now
 from .devices import (SimDeviceSelection, discover, probe_receipt_key, run_text, select,
                       write_probe_receipt)
 from .registry import load_task
-from .runtime import Runtime, startup_receipt
+from .runtime import Runtime, startup_census, startup_receipt
 
 DEFAULT_VULKAN_PROBE = Path("/data/AutoResearch/AutoSimSOTA/probe_vulkan_devices.py")
 VULKAN_COUNT = re.compile(r"vulkan_physical_device_count=(\d+)")
@@ -57,6 +60,16 @@ TORCH_SNIPPET = (
 RENDERER_SNIPPET = (
     "import sys; from embodichain.lab.sim.utility.render_utils import select_default_renderer;"
     " print('RESULT_MARKER', select_default_renderer(int(sys.argv[1])))")
+NODE_ISOLATION_SNIPPET = """
+import json, subprocess, torch
+listed = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                        capture_output=True, text=True).stdout.strip()
+rows = [{"i": i, "uuid": str(torch.cuda.get_device_properties(i).uuid)}
+        for i in range(torch.cuda.device_count())]
+print("RESULT_MARKER", json.dumps({"nvidia_smi": listed,
+                                   "torch_count": torch.cuda.device_count(),
+                                   "torch_rows": rows}))
+"""
 
 
 def run_merged(command: Sequence[str], *, env: Mapping[str, str], timeout: int) -> dict:
@@ -176,6 +189,71 @@ def environment_measurements(python: Path, base_env: dict, devices: list[dict], 
     return table
 
 
+def node_isolation_measurement(python: Path, base_env: Mapping[str, str], devices: Sequence[dict],
+                               *, timeout: int = 240, dri: Path = Path("/dev/dri")) -> dict:
+    """Can this container hide the other cards' device nodes -- and does the survivor renumber?
+
+    Every ``identity`` arm on a card other than 0 leaves ~525 MiB on card 0 (measured
+    2026-09-13), and it is not torch's default device and not warp's: both are aligned to the
+    leased card and the receipt shows it.  Whatever resolves "device 0" for itself, the
+    mechanism that neutralises it *without having to name it first* is to make card 0 **be**
+    the leased card: ``unshare --mount`` with the other ``/dev/nvidiaN`` nodes bound to
+    ``/dev/null``, which is what ``devices.select(..., "node_isolated")`` already models.
+    Whether that is available is a property of this container's privileges, and it costs
+    seconds, so it is measured rather than assumed.
+
+    Two things fail independently, so both are reported: the namespace (``unshare`` needs
+    ``CAP_SYS_ADMIN``; ``--user`` is tried as the fallback spelling) and the renumbering (a
+    node that disappears may keep its own minor, in which case the survivor is still index 3
+    and hiding nodes is not by itself the answer).  ``/dev/dri`` is listed because Vulkan
+    enumerates render nodes rather than ``nvidia*`` nodes: if this proves out, hiding the
+    card from the engine's Vulkan side needs those too, which is a follow-up this
+    measurement does not claim.
+
+    Feasibility only, never verification: nothing here writes a receipt and no arm is called
+    passed on the strength of it.
+    """
+    target = devices[-1]
+    hidden = [f"/dev/nvidia{device['index']}" for device in devices
+              if device["index"] != target["index"]]
+    script = ("for node in " + " ".join(hidden) + '; do mount --bind /dev/null "$node" || '
+              "echo BIND_FAILED $node; done; exec " + str(python) + " -c "
+              + shlex.quote(NODE_ISOLATION_SNIPPET))
+    measurement: dict = {"target_index": target["index"], "target_uuid": target["uuid"],
+                         "hidden_nodes": hidden, "runs": {}}
+    variants = (("namespace_only", [], {}),
+                ("with_cuda_visible_0", [], {"CUDA_VISIBLE_DEVICES": "0"}),
+                ("user_namespace", ["--user", "--map-root-user"], {}))
+    for label, prefix, overrides in variants:
+        captured = run_merged(["unshare", *prefix, "--mount", "--propagation", "private",
+                               "sh", "-c", script],
+                              env={**base_env, **overrides}, timeout=timeout)
+        text = captured["text"]
+        found = re.search(r"RESULT_MARKER\s+(\{.*\})", text)
+        row: dict = {"returncode": captured["returncode"]}
+        if found:
+            try:
+                row.update(json.loads(found.group(1)))
+            except ValueError:
+                row["parse_error"] = found.group(1)[:160]
+        row["bind_failures"] = re.findall(r"BIND_FAILED (\S+)", text)
+        visible = [line for line in str(row.get("nvidia_smi") or "").splitlines() if line.strip()]
+        row["visible_devices"] = len(visible)
+        row["survivor_index"] = visible[0].split(",")[0].strip() if len(visible) == 1 else None
+        row["feasible"] = bool(row["returncode"] == 0 and not row["bind_failures"]
+                               and row["visible_devices"] == 1 and row["survivor_index"] == "0"
+                               and row.get("torch_count") == 1)
+        if not row["feasible"]:
+            row["output"] = text[-300:]
+        measurement["runs"][label] = row
+    measurement["feasible"] = all(row.get("feasible") for row in measurement["runs"].values())
+    try:
+        measurement["dri_nodes"] = sorted(node.name for node in dri.iterdir())
+    except OSError as exc:
+        measurement["dri_nodes"] = f"unreadable: {exc.strerror or exc}"
+    return measurement
+
+
 def judge(arm: dict, *, own_uuid: str, allocation: list[str], baseline: dict, peak: dict,
           idle_uuids: list[str] | None = None) -> dict:
     """The leased device must have run it -- and no device that should be idle may move.
@@ -275,6 +353,9 @@ def run_arm(*, name: str, runtime: Runtime, spec, checkpoint: Path, output: Path
     arm["worker_failure"] = (json.loads(failure.read_text(encoding="utf-8"))
                              if failure.is_file() else None)
     arm["memory"] = {uuid: _growth(local.summary(), baseline, uuid) for uuid in local.summary()}
+    # Per-card memory of this arm's own process at each phase it reached: the number says a
+    # card leaked, the timeline says which phase did it.
+    arm["startup_census"] = startup_census(output)
     # Which process ran this arm, so a foreign holder on another card can be compared against
     # it.  A context the arm's *own* process left on card 0 and a stranger's process is the
     # difference between "this library defaults to device 0" and "another job is sharing my
@@ -479,6 +560,13 @@ def main() -> int:                                # noqa: C901 -- a linear ladde
         base_runtime.python, base_env, allocation, vulkan_probe=args.vulkan_probe,
         loader_select=f"0x10de:0x{loader}" if loader else None)
     print(json.dumps(receipt["environments"], indent=1)[:5000], flush=True)
+    # Free, and it decides which repair is even available: if this container can hide the
+    # other cards' device nodes, a mode exists that makes "device 0" mean the leased card for
+    # every subsystem at once -- including whichever one the 525 MiB on card 0 belongs to.
+    receipt["node_isolation"] = node_isolation_measurement(base_runtime.python, base_env,
+                                                           allocation)
+    print(f"[P0-node] feasible={receipt['node_isolation']['feasible']} "
+          f"{json.dumps(receipt['node_isolation']['runs'])[:900]}", flush=True)
 
     spec = load_task(bench, args.task)
     primary = allocation[-1]
@@ -576,10 +664,18 @@ def main() -> int:                                # noqa: C901 -- a linear ladde
 
             threads = [threading.Thread(target=one, args=(label, device))
                        for label, device in (("concurrent_a", first), ("concurrent_b", second))]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
+            # The sampler only samples inside ``with``: it is entered here, around the whole
+            # overlap window, because ``run_arm`` deliberately skips its own sampling when a
+            # shared sampler is passed in.  Without this the "peak" after the join is the
+            # baseline again and both concurrent arms report zero growth on every card --
+            # which reads as "two devices never ran an episode at the same time" when the
+            # episodes did run and only the measurement was missing.  That is exactly what
+            # the 2026-09-13 ladder recorded, so this enter/exit pair is load-bearing.
+            with sampler:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
             peak = sampler.summary()
             uninvolved = [g["uuid"] for g in allocation if g not in (first, second)]
             for label, device in (("concurrent_a", first), ("concurrent_b", second)):
