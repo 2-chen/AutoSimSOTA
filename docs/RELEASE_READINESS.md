@@ -11,7 +11,7 @@
 1. RoboSyn已移到外部，但`repository_autoresearch.py`的真实运行仍检查benchmark/evaluator必须位于项目内部；不能承诺外部输入已能长跑。应改为明确登记的外部benchmark依赖，而非隐式扫描父项目；保留核心代码、凭据和输出边界。
 2. `research/runtime.py`的项目根目录判断依赖内置RoboSyn目录存在，移动后可能误判；EmbodiChain和资产位置也仍使用约定目录。需以明确根目录与外部依赖配置替代存在性猜测。
 3. `research/runtime.py`与`research/robotwin_jobs.py`仍包含开发机conda路径。需显式配置runtime Python、库路径和资产位置，并用清洁工作目录验证。
-4. 部分兼容逻辑位于外部benchmark。`patches/`仅保存已跟踪文件的当前Git差异，不代表所有未跟踪脚本、资产或RoboSyn历史修改已经归档。正式一键安装前需补齐逐backend版本锁、补丁清单与应用校验。
+4. 部分兼容逻辑位于外部benchmark。RoboSyn的5个已跟踪插桩文件现已归档到`patches/robosyn.patch`并登记基线提交；补丁不包含未跟踪脚本、资产或完整上游仓库。正式一键安装前仍需把补丁应用步骤自动化，并补齐其他backend的版本锁与未跟踪兼容文件审计。
 5. 源码包含历史开发路径、旧实验入口和说明；这些不是密钥，但不等于通用可运行配置。暂不删除，避免破坏历史复现。
 6. 自动多卡、跨设备兼容、完整预算恢复仍在规划中；不要在发布说明中写成已有能力。
 

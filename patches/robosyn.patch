@@ -1,0 +1,2103 @@
+diff --git a/policy/act/deploy_policy.py b/policy/act/deploy_policy.py
+index 1d97e35..4ebb26f 100644
+--- a/policy/act/deploy_policy.py
++++ b/policy/act/deploy_policy.py
+@@ -37,6 +37,19 @@ def get_model(usr_args):
+         policy = ACTPolicy.from_pretrained(checkpoint_path, config=config)
+     policy.eval()
+ 
++    n_action_steps_override = usr_args.get("act_n_action_steps_override")
++    if n_action_steps_override is not None:
++        n_action_steps_override = int(n_action_steps_override)
++        if not 1 <= n_action_steps_override <= int(policy.config.chunk_size):
++            raise ValueError(
++                "act_n_action_steps_override must be in [1, chunk_size], got "
++                f"{n_action_steps_override} for chunk_size={policy.config.chunk_size}"
++            )
++        policy.config.n_action_steps = n_action_steps_override
++        # Rebuild the queue with the new length. The override changes only how
++        # often the frozen model is queried; weights and predicted chunks stay fixed.
++        policy.reset()
++
+     image_key_map = {
+         "observation.images.cam_high": "cam_high",
+         "observation.images.cam_right_wrist": "cam_right_wrist",
+@@ -54,6 +67,7 @@ def get_model(usr_args):
+     policy.act_step = int(usr_args.get("act_step", 8))
+     policy.state_obs_path = usr_args.get("state_obs_path", "robot/qpos")
+     policy.strict_action_dim = bool(usr_args.get("strict_action_dim", True))
++    policy.act_n_action_steps_override = n_action_steps_override
+     policy.act_image_keys = image_keys
+     policy.image_key_map = image_key_map
+ 
+diff --git a/policy/act/scripts/train.py b/policy/act/scripts/train.py
+index 8919a57..fc9b375 100644
+--- a/policy/act/scripts/train.py
++++ b/policy/act/scripts/train.py
+@@ -3,11 +3,16 @@
+ 
+ import argparse
+ import copy
++import json
+ import os
+ import shutil
++import sys
++from datetime import datetime, timezone
+ from pathlib import Path
+ 
++import numpy as np
+ import torch
++import torch.nn.functional as F
+ 
+ 
+ LEGACY_FEATURE_ALIASES = {
+@@ -17,9 +22,23 @@ LEGACY_FEATURE_ALIASES = {
+     "observation.images.cam_left_wrist": "cam_left_wrist.color",
+ }
+ 
++ACT_REQUIRED_FEATURES = {
++    "observation.state",
++    "observation.images.cam_high",
++    "observation.images.cam_right_wrist",
++    "observation.images.cam_left_wrist",
++    "action",
++}
++
+ 
+ class _AliasedDatasetMetadata:
+-    def __init__(self, base_meta, aliases):
++    def __init__(
++        self,
++        base_meta,
++        aliases,
++        required_features=None,
++        stats_override=None,
++    ):
+         self._base_meta = base_meta
+         self._aliases = aliases
+         alias_sources = set(aliases.values())
+@@ -27,15 +46,28 @@ class _AliasedDatasetMetadata:
+         self._features = {
+             key: value
+             for key, value in base_meta.features.items()
+-            if key not in alias_sources and value.get("dtype") not in {"image", "video"}
++            if key not in alias_sources
+         }
+         for alias_key, source_key in aliases.items():
+             self._features[alias_key] = copy.deepcopy(base_meta.features[source_key])
++        if required_features is not None:
++            missing = set(required_features) - set(self._features)
++            if missing:
++                raise ValueError(f"ACT dataset is missing required features: {sorted(missing)}")
++            self._features = {
++                key: value
++                for key, value in self._features.items()
++                if key in required_features
++            }
+ 
+-        self._stats = dict(base_meta.stats)
+-        for alias_key, source_key in aliases.items():
+-            if source_key in base_meta.stats:
+-                self._stats[alias_key] = base_meta.stats[source_key]
++        self._stats = dict(base_meta.stats if stats_override is None else stats_override)
++        if stats_override is None:
++            for alias_key, source_key in aliases.items():
++                if source_key in base_meta.stats:
++                    self._stats[alias_key] = base_meta.stats[source_key]
++        self._stats = {
++            key: value for key, value in self._stats.items() if key in self._features
++        }
+ 
+     def __getattr__(self, name):
+         return getattr(self._base_meta, name)
+@@ -62,10 +94,20 @@ class _AliasedDatasetMetadata:
+ 
+ 
+ class _AliasedLeRobotDataset(torch.utils.data.Dataset):
+-    def __init__(self, base_dataset, aliases):
++    def __init__(
++        self,
++        base_dataset,
++        aliases,
++        targeted_image_transform=None,
++        required_features=None,
++    ):
+         self._base_dataset = base_dataset
+         self._aliases = aliases
+-        self.meta = _AliasedDatasetMetadata(base_dataset.meta, aliases)
++        self._targeted_image_transform = targeted_image_transform
++        self.meta = _AliasedDatasetMetadata(
++            base_dataset.meta, aliases, required_features=required_features
++        )
++        self._required_features = set(required_features or self.meta.features)
+ 
+     def __getattr__(self, name):
+         return getattr(self._base_dataset, name)
+@@ -75,6 +117,18 @@ class _AliasedLeRobotDataset(torch.utils.data.Dataset):
+ 
+     def __getitem__(self, idx):
+         item = self._base_dataset[idx]
++        if self._targeted_image_transform is not None:
++            image_keys = {
++                key
++                for key in set(self._aliases.values()) | self._required_features
++                if key.endswith(".color") or key.startswith("observation.images.")
++            }
++            if hasattr(self._targeted_image_transform, "apply_item"):
++                self._targeted_image_transform.apply_item(item, image_keys, idx)
++            else:
++                for source_key in image_keys:
++                    if source_key in item:
++                        item[source_key] = self._targeted_image_transform(item[source_key])
+         for alias_key, source_key in self._aliases.items():
+             if source_key not in item:
+                 continue
+@@ -85,7 +139,454 @@ class _AliasedLeRobotDataset(torch.utils.data.Dataset):
+             if source_pad_key in item:
+                 item[f"{alias_key}_is_pad"] = item[source_pad_key]
+ 
+-        return item
++        allowed = self._required_features | {
++            f"{key}_is_pad" for key in self._required_features
++        }
++        return {key: value for key, value in item.items() if key in allowed}
++
++
++class _BenchmarkAlignedImageTransform:
++    """Apply one mild, 10-frame-consistent perturbation to every camera view."""
++
++    def __init__(self, profile):
++        self.profile = str(profile)
++
++    def apply_item(self, item, image_keys, idx):
++        from torchvision.transforms import InterpolationMode
++        from torchvision.transforms import functional as tvf
++
++        keys = sorted(key for key in image_keys if key in item)
++        if not keys:
++            return
++        generator = torch.Generator(device="cpu")
++        # LeRobot workers have independent initial seeds. Grouping by ten frames
++        # mirrors the benchmark's interval randomizers without making every
++        # adjacent observation an unrelated color/geometry domain.
++        block = int(idx) // 10
++        generator.manual_seed((int(torch.initial_seed()) + 1_000_003 * block) % (2**63 - 1))
++
++        def uniform(low, high):
++            value = torch.rand((), generator=generator).item()
++            return float(low + (high - low) * value)
++
++        if self.profile == "camera_geometry_mild":
++            scale = uniform(0.96, 1.04)
++            shift_x = uniform(-0.025, 0.025)
++            shift_y = uniform(-0.025, 0.025)
++            for key in keys:
++                image = item[key]
++                height, width = image.shape[-2:]
++                item[key] = tvf.affine(
++                    image,
++                    angle=0.0,
++                    translate=[int(round(width * shift_x)), int(round(height * shift_y))],
++                    scale=scale,
++                    shear=[0.0, 0.0],
++                    interpolation=InterpolationMode.BILINEAR,
++                    fill=0,
++                )
++            return
++
++        if self.profile == "illumination_step_mild":
++            brightness = uniform(0.90, 1.10)
++            contrast = uniform(0.90, 1.10)
++            saturation = uniform(0.92, 1.08)
++            for key in keys:
++                image = tvf.adjust_brightness(item[key], brightness)
++                image = tvf.adjust_contrast(image, contrast)
++                item[key] = tvf.adjust_saturation(image, saturation)
++            return
++
++        raise ValueError(f"unknown benchmark-aligned transform: {self.profile}")
++
++
++def _masked_action_l1_loss(actions, predictions, action_is_pad, profile):
++    elementwise = F.l1_loss(actions, predictions, reduction="none")
++    valid = (~action_is_pad).unsqueeze(-1).expand_as(elementwise)
++    if profile == "legacy_mask_mean":
++        return (elementwise * valid).mean()
++    if profile == "valid_mean":
++        return (elementwise * valid).sum() / valid.sum().clamp_min(1)
++    raise ValueError(f"unknown action loss profile: {profile}")
++
++
++def _patch_act_loss_profile(profile):
++    """Patch only ACT's scalar loss reduction; model inputs/outputs stay unchanged."""
++
++    if profile == "legacy_mask_mean":
++        return
++    from lerobot.constants import ACTION, OBS_IMAGES
++    from lerobot.policies.act.modeling_act import ACTPolicy
++
++    def forward(policy, batch):
++        batch = policy.normalize_inputs(batch)
++        if policy.config.image_features:
++            batch = dict(batch)
++            batch[OBS_IMAGES] = [batch[key] for key in policy.config.image_features]
++        batch = policy.normalize_targets(batch)
++        actions_hat, (mu_hat, log_sigma_x2_hat) = policy.model(batch)
++        l1_loss = _masked_action_l1_loss(
++            batch[ACTION], actions_hat, batch["action_is_pad"], profile
++        )
++        loss_dict = {"l1_loss": l1_loss.item()}
++        if policy.config.use_vae:
++            mean_kld = (
++                -0.5
++                * (1 + log_sigma_x2_hat - mu_hat.pow(2) - log_sigma_x2_hat.exp())
++            ).sum(-1).mean()
++            loss_dict["kld_loss"] = mean_kld.item()
++            loss = l1_loss + mean_kld * policy.config.kl_weight
++        else:
++            loss = l1_loss
++        return loss, loss_dict
++
++    ACTPolicy.forward = forward
++
++
++def _as_template_type(value, template):
++    array = np.asarray(value)
++    if isinstance(template, torch.Tensor):
++        return torch.as_tensor(array, dtype=template.dtype, device=template.device)
++    if isinstance(template, np.ndarray):
++        return array.astype(template.dtype, copy=False)
++    return array
++
++
++def _merge_feature_statistics(metas):
++    """Merge per-dataset population moments using their recorded frame counts.
++
++    LeRobot stores mean/std/count for every normalized feature.  A concatenated
++    dataset must combine the first two moments; copying the first dataset's
++    metadata silently normalizes all supplemental data with official-only stats.
++    """
++
++    if not metas:
++        raise ValueError("at least one dataset metadata object is required")
++    common_features = set(metas[0].stats)
++    for meta in metas[1:]:
++        common_features &= set(meta.stats)
++
++    merged = {}
++    for feature in sorted(common_features):
++        parts = [meta.stats[feature] for meta in metas]
++        required = {"mean", "std", "count"}
++        if not all(required <= set(part) for part in parts):
++            merged[feature] = copy.deepcopy(parts[0])
++            continue
++
++        counts = np.asarray(
++            [float(np.asarray(part["count"]).reshape(-1)[0]) for part in parts],
++            dtype=np.float64,
++        )
++        if np.any(counts <= 0) or not np.isfinite(counts).all():
++            raise ValueError(f"invalid statistics counts for {feature}: {counts}")
++        means = [np.asarray(part["mean"], dtype=np.float64) for part in parts]
++        stds = [np.asarray(part["std"], dtype=np.float64) for part in parts]
++        total = float(counts.sum())
++        mean = sum(count * value for count, value in zip(counts, means)) / total
++        second_moment = sum(
++            count * (std**2 + part_mean**2)
++            for count, std, part_mean in zip(counts, stds, means)
++        ) / total
++        std = np.sqrt(np.maximum(second_moment - mean**2, 0.0))
++
++        result = copy.deepcopy(parts[0])
++        result["mean"] = _as_template_type(mean, parts[0]["mean"])
++        result["std"] = _as_template_type(std, parts[0]["std"])
++        result["count"] = _as_template_type(
++            np.asarray([total]), parts[0]["count"]
++        )
++        if all("min" in part for part in parts):
++            minimum = np.minimum.reduce(
++                [np.asarray(part["min"], dtype=np.float64) for part in parts]
++            )
++            result["min"] = _as_template_type(minimum, parts[0]["min"])
++        if all("max" in part for part in parts):
++            maximum = np.maximum.reduce(
++                [np.asarray(part["max"], dtype=np.float64) for part in parts]
++            )
++            result["max"] = _as_template_type(maximum, parts[0]["max"])
++        merged[feature] = result
++    return merged
++
++
++def _episode_progress(dataset):
++    boundaries = dataset.episode_data_index
++    starts = np.asarray(boundaries["from"], dtype=np.int64)
++    stops = np.asarray(boundaries["to"], dtype=np.int64)
++    progress = np.empty(len(dataset), dtype=np.float64)
++    for start, stop in zip(starts, stops):
++        length = int(stop - start)
++        if length <= 0:
++            raise ValueError(f"invalid episode boundary [{start}, {stop})")
++        progress[start:stop] = np.linspace(0.0, 1.0, length, dtype=np.float64)
++    return progress
++
++
++def _build_stratified_sample_weights(datasets, entries, sampling):
++    """Return per-frame weights with explicit profile mass and phase emphasis."""
++
++    if len(datasets) != len(entries):
++        raise ValueError("dataset entries and loaded datasets differ in length")
++    profile_masses = dict(sampling.get("profile_masses", {}))
++    phase_bins = sampling.get(
++        "phase_bins",
++        [
++            {"name": "early", "start": 0.0, "end": 0.45, "weight": 0.75},
++            {"name": "approach", "start": 0.45, "end": 0.75, "weight": 1.0},
++            {"name": "contact_recovery", "start": 0.75, "end": 1.01, "weight": 2.0},
++        ],
++    )
++    if profile_masses:
++        entry_profiles = [str(entry.get("profile", "unknown")) for entry in entries]
++        missing = sorted(set(entry_profiles) - set(profile_masses))
++        if missing:
++            raise ValueError(f"profile_masses missing profiles: {missing}")
++        present_profile_mass = {
++            profile: float(profile_masses[profile]) for profile in set(entry_profiles)
++        }
++        profile_total = sum(present_profile_mass.values())
++        frames_by_profile = {
++            profile: sum(
++                len(dataset)
++                for dataset, candidate in zip(datasets, entry_profiles)
++                if candidate == profile
++            )
++            for profile in set(entry_profiles)
++        }
++        # profile_masses are aggregate masses. If a role has multiple lineage
++        # shards (e.g. early + late corrections), divide its mass by frames.
++        mass_values = np.asarray(
++            [
++                present_profile_mass[profile]
++                / profile_total
++                * len(dataset)
++                / frames_by_profile[profile]
++                for dataset, profile in zip(datasets, entry_profiles)
++            ],
++            dtype=np.float64,
++        )
++    else:
++        mass_values = np.asarray([len(dataset) for dataset in datasets], dtype=np.float64)
++    if np.any(mass_values <= 0):
++        raise ValueError("all dataset/profile masses must be positive")
++    mass_values /= mass_values.sum()
++
++    all_weights = []
++    audit_parts = []
++    for dataset, entry, target_mass in zip(datasets, entries, mass_values):
++        progress = _episode_progress(dataset)
++        phase_weights = np.zeros(len(dataset), dtype=np.float64)
++        realized_phase_counts = {}
++        for phase in phase_bins:
++            name = str(phase["name"])
++            start = float(phase["start"])
++            end = float(phase["end"])
++            weight = float(phase["weight"])
++            mask = (progress >= start) & (progress < end)
++            phase_weights[mask] = weight
++            realized_phase_counts[name] = int(mask.sum())
++        if np.any(phase_weights <= 0):
++            raise ValueError("phase_bins do not cover every episode progress value")
++        horizon_config = dict(sampling.get("horizon_weighting") or {})
++        horizon_mode = str(horizon_config.get("mode", "none"))
++        horizon_weights = np.ones(len(dataset), dtype=np.float64)
++        if horizon_mode != "none":
++            if horizon_mode != "linear_floor":
++                raise ValueError(f"unknown horizon weighting mode: {horizon_mode}")
++            chunk_size = int(horizon_config.get("chunk_size", 50))
++            floor = float(horizon_config.get("floor", 0.25))
++            if chunk_size <= 0 or not 0.0 < floor <= 1.0:
++                raise ValueError("horizon weighting requires chunk_size>0 and 0<floor<=1")
++            boundaries = dataset.episode_data_index
++            for start, stop in zip(boundaries["from"], boundaries["to"]):
++                start, stop = int(start), int(stop)
++                remaining = np.arange(stop - start, 0, -1, dtype=np.float64)
++                horizon_weights[start:stop] = np.maximum(
++                    np.minimum(remaining, chunk_size) / chunk_size,
++                    floor,
++                )
++        phase_weights *= horizon_weights
++        local_weights = phase_weights / phase_weights.sum() * target_mass
++        all_weights.append(local_weights)
++        audit_parts.append(
++            {
++                "profile": str(entry.get("profile", "unknown")),
++                "root": str(entry.get("root", "")),
++                "frames": len(dataset),
++                "target_sampling_mass": float(target_mass),
++                "phase_frame_counts": realized_phase_counts,
++                "horizon_weighting": horizon_config or {"mode": "none"},
++                "mean_horizon_weight": float(horizon_weights.mean()),
++            }
++        )
++    weights = np.concatenate(all_weights)
++    weights /= weights.sum()
++    return torch.as_tensor(weights, dtype=torch.double), audit_parts
++
++
++def _jsonable_stats(stats):
++    return {
++        feature: {
++            key: np.asarray(value).tolist()
++            for key, value in values.items()
++            if key in {"min", "max", "mean", "std", "count"}
++        }
++        for feature, values in stats.items()
++    }
++
++
++class _CompatibleConcatDataset(torch.utils.data.ConcatDataset):
++    """Concat normalized datasets while exposing LeRobot's metadata contract."""
++
++    def __init__(self, datasets, entries=None, sampling=None, track_sources=False):
++        super().__init__(datasets)
++        self.entries = list(entries or [])
++        self.track_sources = bool(track_sources)
++        merged_stats = _merge_feature_statistics([dataset.meta for dataset in datasets])
++        self.meta = _AliasedDatasetMetadata(
++            datasets[0].meta,
++            {},
++            required_features=ACT_REQUIRED_FEATURES,
++            stats_override=merged_stats,
++        )
++        self.num_frames = sum(int(dataset.num_frames) for dataset in datasets)
++        self.num_episodes = sum(int(dataset.num_episodes) for dataset in datasets)
++        self.sample_weights = None
++        self.sampling_audit = None
++        if sampling and sampling.get("strategy") == "stratified_phase":
++            self.sample_weights, parts = _build_stratified_sample_weights(
++                datasets, entries or [], sampling
++            )
++            self.sampling_audit = {
++                "strategy": "stratified_phase",
++                "num_samples_per_epoch": len(self),
++                "parts": parts,
++                "phase_bins": sampling.get("phase_bins"),
++            }
++
++    def __getitem__(self, idx):
++        item = super().__getitem__(idx)
++        if not self.track_sources:
++            return item
++        import bisect
++
++        if idx < 0:
++            idx += len(self)
++        source_id = bisect.bisect_right(self.cumulative_sizes, idx)
++        tagged = dict(item)
++        tagged["__autosim_source_id__"] = source_id
++        return tagged
++
++
++class _ExposureAudit:
++    """Count source examples actually yielded by the DataLoader to training."""
++
++    def __init__(self, path, entries, lengths, expected_masses=None, flush_batches=50):
++        self.path = Path(path).expanduser().resolve()
++        self.entries = list(entries)
++        self.lengths = [int(value) for value in lengths]
++        self.expected_masses = list(expected_masses or [])
++        self.flush_batches = int(flush_batches)
++        self.batches = 0
++        self.samples = 0
++        self.counts = [0 for _ in self.entries]
++        self._write("initialized")
++
++    def observe(self, source_ids):
++        values = torch.as_tensor(source_ids).detach().cpu().reshape(-1).tolist()
++        for raw in values:
++            source_id = int(raw)
++            if not 0 <= source_id < len(self.counts):
++                raise ValueError(f"invalid exposure source id: {source_id}")
++            self.counts[source_id] += 1
++        self.batches += 1
++        self.samples += len(values)
++        if self.batches % self.flush_batches == 0:
++            self._write("running")
++
++    def close_iterator(self):
++        self._write("iterator_closed")
++
++    def _write(self, status):
++        rows = []
++        for index, (entry, frames, count) in enumerate(
++            zip(self.entries, self.lengths, self.counts)
++        ):
++            rows.append(
++                {
++                    "source_id": index,
++                    "root": str(entry.get("root", "")),
++                    "profile": str(entry.get("profile", "unknown")),
++                    "source_kind": str(entry.get("source_kind", entry.get("role", "unknown"))),
++                    "available_frames": frames,
++                    "expected_sampling_mass": (
++                        float(self.expected_masses[index])
++                        if len(self.expected_masses) == len(self.entries)
++                        else None
++                    ),
++                    "yielded_samples": count,
++                    "realized_sampling_mass": count / self.samples if self.samples else None,
++                }
++            )
++        payload = {
++            "schema_version": 1,
++            "kind": "robosyn_act_training_exposure_audit",
++            "status": status,
++            "updated_at": datetime.now(timezone.utc).isoformat(),
++            "semantics": "examples yielded by DataLoader after collation and before policy.update",
++            "batches_yielded": self.batches,
++            "samples_yielded": self.samples,
++            "parts": rows,
++            "limitations": [
++                "a process failure after a batch is yielded can prevent that batch update",
++                "profile labels do not prove within-profile scene coverage",
++            ],
++        }
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        temporary = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
++        with temporary.open("w", encoding="utf-8") as stream:
++            json.dump(payload, stream, indent=2)
++            stream.write("\n")
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, self.path)
++
++
++class _ExposureTrackingLoader:
++    def __init__(self, loader, audit):
++        self._loader = loader
++        self._audit = audit
++
++    def __getattr__(self, name):
++        return getattr(self._loader, name)
++
++    def __len__(self):
++        return len(self._loader)
++
++    def __iter__(self):
++        try:
++            for batch in self._loader:
++                if "__autosim_source_id__" not in batch:
++                    raise RuntimeError("exposure audit source marker was lost during collation")
++                self._audit.observe(batch.pop("__autosim_source_id__"))
++                yield batch
++        finally:
++            self._audit.close_iterator()
++
++
++def _normalize_act_dataset(dataset, targeted_image_transform=None):
++    aliases = _legacy_aliases_for_dataset(dataset)
++    if aliases:
++        print("[ACT train] Applying legacy dataset feature aliases:")
++        for alias_key, source_key in aliases.items():
++            print(f"  {source_key} -> {alias_key}")
++    return _AliasedLeRobotDataset(
++        dataset,
++        aliases,
++        targeted_image_transform=targeted_image_transform,
++        required_features=ACT_REQUIRED_FEATURES,
++    )
+ 
+ 
+ def _legacy_aliases_for_dataset(dataset):
+@@ -103,27 +604,106 @@ def _legacy_aliases_for_dataset(dataset):
+     return aliases
+ 
+ 
+-def _patch_lerobot_dataset_factory(distributed_context=None):
++def _patch_lerobot_dataset_factory(
++    distributed_context=None,
++    image_augmentation_profile="none",
++    action_loss_profile="legacy_mask_mean",
++    dataset_roots=None,
++    dataset_entries=None,
++    sampling_config=None,
++    data_pipeline_audit=None,
++    sampling_exposure_audit=None,
++):
+     import lerobot.scripts.train as train_module
+ 
+     original_make_dataset = train_module.make_dataset
++    targeted_image_transform = None
++    if image_augmentation_profile == "clutter_occlusion_mild":
++        from torchvision.transforms import v2
++
++        targeted_image_transform = v2.RandomErasing(
++            p=0.5,
++            scale=(0.02, 0.12),
++            ratio=(0.3, 3.3),
++            value="random",
++        )
++    elif image_augmentation_profile in {
++        "camera_geometry_mild",
++        "illumination_step_mild",
++    }:
++        targeted_image_transform = _BenchmarkAlignedImageTransform(
++            image_augmentation_profile
++        )
++    _patch_act_loss_profile(action_loss_profile)
+ 
+     def make_dataset_with_legacy_aliases(cfg):
+-        dataset = original_make_dataset(cfg)
+-        aliases = _legacy_aliases_for_dataset(dataset)
+-        if aliases:
+-            print("[ACT train] Applying legacy dataset feature aliases:")
+-            for alias_key, source_key in aliases.items():
+-                print(f"  {source_key} -> {alias_key}")
+-            dataset = _AliasedLeRobotDataset(dataset, aliases)
+-        return dataset
++        roots = [Path(value).resolve() for value in (dataset_roots or [cfg.dataset.root])]
++        normalized = []
++        for root in roots:
++            part_cfg = copy.deepcopy(cfg)
++            part_cfg.dataset.root = str(root)
++            part_cfg.dataset.repo_id = root.name
++            dataset = original_make_dataset(part_cfg)
++            normalized.append(
++                _normalize_act_dataset(
++                    dataset, targeted_image_transform=targeted_image_transform
++                )
++            )
++        if len(normalized) == 1:
++            return normalized[0]
++        print("[ACT train] Dataset mixture:")
++        for root, dataset in zip(roots, normalized):
++            print(f"  {root}: {len(dataset)} samples")
++        mixture_dataset = _CompatibleConcatDataset(
++            normalized,
++            entries=dataset_entries,
++            sampling=sampling_config,
++            track_sources=bool(sampling_exposure_audit),
++        )
++        print("[ACT train] Recomputed normalization stats across all mixture parts.")
++        if mixture_dataset.sampling_audit:
++            print("[ACT train] Stratified profile/phase sampling enabled:")
++            for part in mixture_dataset.sampling_audit["parts"]:
++                print(
++                    f"  {part['profile']}: target_mass="
++                    f"{part['target_sampling_mass']:.4f}, frames={part['frames']}"
++                )
++        if data_pipeline_audit:
++            output = Path(data_pipeline_audit).expanduser().resolve()
++            output.parent.mkdir(parents=True, exist_ok=True)
++            payload = {
++                "schema_version": 2,
++                "kind": "robosyn_act_data_pipeline_audit",
++                "created_at": datetime.now(timezone.utc).isoformat(),
++                "dataset_roots": [str(root) for root in roots],
++                "total_frames": mixture_dataset.num_frames,
++                "total_episodes": mixture_dataset.num_episodes,
++                "action_loss_profile": action_loss_profile,
++                "image_augmentation_profile": image_augmentation_profile,
++                "normalization_statistics": _jsonable_stats(mixture_dataset.meta.stats),
++                "sampling": mixture_dataset.sampling_audit or {
++                    "strategy": "proportional_to_frames"
++                },
++            }
++            output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
++        return mixture_dataset
+ 
+     train_module.make_dataset = make_dataset_with_legacy_aliases
+-    if distributed_context is not None:
+-        original_make_policy = train_module.make_policy
+-        rank, world_size, local_rank = distributed_context
+-        original_dataloader = torch.utils.data.DataLoader
+-        def make_dataloader(dataset, *args, **kwargs):
++    original_dataloader = torch.utils.data.DataLoader
++    exposure_tracker = None
++
++    def make_dataloader(dataset, *args, **kwargs):
++        nonlocal exposure_tracker
++        sample_weights = getattr(dataset, "sample_weights", None)
++        if sample_weights is not None:
++            kwargs["sampler"] = torch.utils.data.WeightedRandomSampler(
++                sample_weights,
++                num_samples=len(dataset),
++                replacement=True,
++            )
++            kwargs["shuffle"] = False
++        if distributed_context is not None:
++            rank, world_size, _ = distributed_context
+             sampler = kwargs.get("sampler")
+             if sampler is not None:
+                 kwargs["sampler"] = list(sampler)[rank::world_size]
+@@ -132,8 +712,34 @@ def _patch_lerobot_dataset_factory(distributed_context=None):
+                     dataset, world_size, rank
+                 )
+                 kwargs["shuffle"] = False
+-            return original_dataloader(dataset, *args, **kwargs)
+-        torch.utils.data.DataLoader = make_dataloader
++        loader = original_dataloader(dataset, *args, **kwargs)
++        if sampling_exposure_audit and isinstance(dataset, _CompatibleConcatDataset):
++            if exposure_tracker is None:
++                lengths = [len(part) for part in dataset.datasets]
++                if sample_weights is not None:
++                    offsets = np.cumsum([0] + lengths)
++                    expected_masses = [
++                        float(sample_weights[offsets[i] : offsets[i + 1]].sum())
++                        for i in range(len(lengths))
++                    ]
++                else:
++                    total = sum(lengths)
++                    expected_masses = [length / total for length in lengths]
++                audit_path = Path(sampling_exposure_audit)
++                if distributed_context is not None:
++                    audit_path = audit_path.with_name(
++                        audit_path.stem + f".rank{distributed_context[0]}" + audit_path.suffix
++                    )
++                exposure_tracker = _ExposureAudit(
++                    audit_path, dataset.entries, lengths, expected_masses
++                )
++            return _ExposureTrackingLoader(loader, exposure_tracker)
++        return loader
++
++    torch.utils.data.DataLoader = make_dataloader
++    if distributed_context is not None:
++        original_make_policy = train_module.make_policy
++        rank, world_size, local_rank = distributed_context
+         def make_patched_policy(*args, **kwargs):
+             policy = original_make_policy(*args, **kwargs)
+             ddp_policy = torch.nn.parallel.DistributedDataParallel(
+@@ -148,10 +754,71 @@ def _patch_lerobot_dataset_factory(distributed_context=None):
+         train_module.make_policy = make_patched_policy
+     return train_module.train
+ 
++
++def _image_transforms_config(profile):
++    from lerobot.datasets.transforms import ImageTransformConfig, ImageTransformsConfig
++
++    if profile in {
++        "none",
++        "clutter_occlusion_mild",
++        "camera_geometry_mild",
++        "illumination_step_mild",
++    }:
++        return ImageTransformsConfig(enable=False)
++    ranges = {
++        "photometric_mild": {
++            "brightness": (0.85, 1.15),
++            "contrast": (0.85, 1.15),
++            "saturation": (0.8, 1.2),
++            "hue": (-0.03, 0.03),
++            "sharpness": (0.75, 1.25),
++        },
++        "photometric_strong": {
++            "brightness": (0.6, 1.4),
++            "contrast": (0.6, 1.4),
++            "saturation": (0.5, 1.5),
++            "hue": (-0.08, 0.08),
++            "sharpness": (0.5, 1.5),
++        },
++    }
++    if profile not in ranges:
++        raise ValueError(f"unknown image augmentation profile: {profile}")
++    params = ranges[profile]
++    transforms = {
++        name: ImageTransformConfig(
++            type="SharpnessJitter" if name == "sharpness" else "ColorJitter",
++            kwargs={name: value},
++        )
++        for name, value in params.items()
++    }
++    return ImageTransformsConfig(
++        enable=True,
++        max_num_transforms=2 if profile == "photometric_mild" else 3,
++        random_order=True,
++        tfs=transforms,
++    )
++
+ def parse_args():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--dataset-root", required=True)
++    parser.add_argument("--observation-contract", default=None,
++                        help="JSON camera/state/action contract; limits learned inputs explicitly.")
+     parser.add_argument("--repo-id", default=None)
++    parser.add_argument(
++        "--dataset-mixture-manifest",
++        default=None,
++        help="JSON manifest containing ordered official + targeted dataset roots.",
++    )
++    parser.add_argument(
++        "--data-pipeline-audit",
++        default=None,
++        help="Write merged normalization and realized sampling metadata to JSON.",
++    )
++    parser.add_argument(
++        "--sampling-exposure-audit",
++        default=None,
++        help="Write cumulative source/profile counts for batches yielded to training.",
++    )
+     parser.add_argument("--output-dir", required=True)
+     parser.add_argument("--job-name", default=None)
+     parser.add_argument("--video-backend", default="pyav")
+@@ -166,11 +833,37 @@ def parse_args():
+     parser.add_argument("--n-obs-steps", type=int, default=1)
+     parser.add_argument("--chunk-size", type=int, default=16)
+     parser.add_argument("--n-action-steps", type=int, default=8)
++    parser.add_argument("--optimizer-lr", type=float, default=1e-5)
++    parser.add_argument("--optimizer-weight-decay", type=float, default=1e-4)
++    parser.add_argument("--kl-weight", type=float, default=10.0)
++    parser.add_argument("--dropout", type=float, default=0.1)
++    parser.add_argument(
++        "--image-augmentation-profile",
++        choices=[
++            "none",
++            "clutter_occlusion_mild",
++            "photometric_mild",
++            "photometric_strong",
++            "camera_geometry_mild",
++            "illumination_step_mild",
++        ],
++        default="none",
++    )
++    parser.add_argument(
++        "--action-loss-profile",
++        choices=["legacy_mask_mean", "valid_mean"],
++        default="legacy_mask_mean",
++    )
+     parser.add_argument("--use-amp", action="store_true")
+     parser.add_argument("--wandb", action="store_true")
+     parser.add_argument("--wandb-project", default="robosynchallenge")
+     parser.add_argument("--wandb-name", default=None)
+     parser.add_argument("--resume", action="store_true")
++    parser.add_argument(
++        "--pretrained-policy",
++        default=None,
++        help="Initialize a new optimizer run from this frozen policy directory.",
++    )
+     parser.add_argument("--overwrite", action="store_true")
+     parser.add_argument("--no-imagenet-stats", action="store_true")
+     parser.add_argument("--no-save-checkpoint", action="store_true")
+@@ -181,6 +874,23 @@ def parse_args():
+ 
+ def main():
+     args = parse_args()
++    if args.resume and args.pretrained_policy:
++        raise ValueError("--resume and --pretrained-policy are mutually exclusive")
++    if args.observation_contract:
++        global ACT_REQUIRED_FEATURES, LEGACY_FEATURE_ALIASES
++        contract = json.loads(Path(args.observation_contract).read_text())
++        cameras = contract["cameras"]
++        if not cameras or len(set(cameras)) != len(cameras):
++            raise ValueError("observation contract needs distinct RGB cameras")
++        ACT_REQUIRED_FEATURES = {"observation.state", "action"} | {
++            f"observation.images.{camera}" for camera in cameras
++        }
++        LEGACY_FEATURE_ALIASES = {"observation.state": "observation.qpos", **{
++            f"observation.images.{camera}": f"{camera}.color" for camera in cameras
++        }}
++    from lerobot.utils.utils import init_logging
++
++    init_logging()
+     distributed_context = None
+     if args.distributed:
+         import torch.distributed as dist
+@@ -188,7 +898,30 @@ def main():
+         torch.cuda.set_device(local_rank)
+         dist.init_process_group(backend="nccl")
+         distributed_context = (int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), local_rank)
+-    dataset_root = Path(args.dataset_root).expanduser().resolve()
++    dataset_roots = None
++    dataset_entries = None
++    sampling_config = None
++    if args.dataset_mixture_manifest:
++        mixture_path = Path(args.dataset_mixture_manifest).expanduser().resolve()
++        mixture = json.loads(mixture_path.read_text(encoding="utf-8"))
++        dataset_entries = mixture.get("datasets", [])
++        dataset_roots = [
++            Path(item["root"]).expanduser().resolve()
++            for item in dataset_entries
++        ]
++        if not dataset_roots:
++            raise ValueError(f"dataset mixture is empty: {mixture_path}")
++        raw_sampling = mixture.get("sampling", "proportional_to_frames")
++        sampling_config = (
++            {"strategy": raw_sampling}
++            if isinstance(raw_sampling, str)
++            else dict(raw_sampling)
++        )
++    dataset_root = (
++        dataset_roots[0]
++        if dataset_roots is not None
++        else Path(args.dataset_root).expanduser().resolve()
++    )
+     repo_id = args.repo_id or dataset_root.name
+     output_dir = Path(args.output_dir).expanduser().resolve()
+     if distributed_context is not None:
+@@ -201,41 +934,99 @@ def main():
+     from lerobot.configs.default import WandBConfig
+     from lerobot.configs.train import TrainPipelineConfig
+     from lerobot.policies.act.configuration_act import ACTConfig
+-    lerobot_train = _patch_lerobot_dataset_factory(distributed_context)
+-
+-    policy_kwargs = {
+-        "device": args.device,
+-        "use_amp": args.use_amp,
+-        "push_to_hub": False,
+-        "n_obs_steps": args.n_obs_steps,
+-        "chunk_size": args.chunk_size,
+-        "n_action_steps": args.n_action_steps,
+-    }
+-    policy_kwargs = {
+-        key: value for key, value in policy_kwargs.items() if value is not None
+-    }
+-
+-    cfg = TrainPipelineConfig(
+-        dataset=DatasetConfig(
+-            repo_id=repo_id,
+-            root=str(dataset_root),
+-            use_imagenet_stats=not args.no_imagenet_stats,
+-            video_backend=args.video_backend,
+-        ),
+-        policy=ACTConfig(**policy_kwargs),
+-        output_dir=output_dir,
+-        job_name=args.wandb_name or args.job_name,
+-        resume=args.resume,
+-        seed=args.seed,
+-        num_workers=args.num_workers,
+-        batch_size=args.batch_size,
+-        steps=args.steps,
+-        eval_freq=args.eval_freq,
+-        log_freq=args.log_freq,
+-        save_checkpoint=not args.no_save_checkpoint,
+-        save_freq=args.save_freq,
+-        wandb=WandBConfig(enable=args.wandb and (distributed_context is None or distributed_context[0] == 0), project=args.wandb_project),
++    lerobot_train = _patch_lerobot_dataset_factory(
++        distributed_context,
++        args.image_augmentation_profile,
++        args.action_loss_profile,
++        dataset_roots=dataset_roots,
++        dataset_entries=dataset_entries,
++        sampling_config=sampling_config,
++        data_pipeline_audit=args.data_pipeline_audit,
++        sampling_exposure_audit=args.sampling_exposure_audit,
+     )
++
++    if args.resume:
++        checkpoint_dir = (output_dir / "checkpoints" / "last").resolve()
++        train_config_path = checkpoint_dir / "pretrained_model" / "train_config.json"
++        if not train_config_path.is_file():
++            raise FileNotFoundError(
++                f"cannot resume: missing checkpoint config {train_config_path}"
++            )
++        cfg = TrainPipelineConfig.from_pretrained(train_config_path)
++        step_path = checkpoint_dir / "training_state/training_step.json"
++        saved_step = int(json.loads(step_path.read_text())["step"]) if step_path.is_file() else int(cfg.steps)
++        if args.steps <= saved_step:
++            raise ValueError(
++                f"resume target steps ({args.steps}) must exceed saved steps ({saved_step})"
++            )
++        cfg.output_dir = output_dir
++        cfg.resume = True
++        cfg.steps = args.steps
++        cfg.log_freq = args.log_freq
++        cfg.save_freq = args.save_freq
++        cfg.eval_freq = args.eval_freq
++        cfg.save_checkpoint = not args.no_save_checkpoint
++        cfg.wandb = WandBConfig(
++            enable=args.wandb
++            and (distributed_context is None or distributed_context[0] == 0),
++            project=args.wandb_project,
++        )
++        # TrainPipelineConfig.validate() uses LeRobot's global parser to locate
++        # the policy and optimizer state for a resumed programmatic run.
++        sys.argv = [sys.argv[0], f"--config_path={train_config_path}"]
++    else:
++        policy_kwargs = {
++            "device": args.device,
++            "use_amp": args.use_amp,
++            "push_to_hub": False,
++            "n_obs_steps": args.n_obs_steps,
++            "chunk_size": args.chunk_size,
++            "n_action_steps": args.n_action_steps,
++            "optimizer_lr": args.optimizer_lr,
++            "optimizer_weight_decay": args.optimizer_weight_decay,
++            "kl_weight": args.kl_weight,
++            "dropout": args.dropout,
++        }
++        policy_kwargs = {
++            key: value for key, value in policy_kwargs.items() if value is not None
++        }
++
++        cfg = TrainPipelineConfig(
++            dataset=DatasetConfig(
++                repo_id=repo_id,
++                root=str(dataset_root),
++                image_transforms=_image_transforms_config(
++                    args.image_augmentation_profile
++                ),
++                use_imagenet_stats=not args.no_imagenet_stats,
++                video_backend=args.video_backend,
++            ),
++            policy=ACTConfig(**policy_kwargs),
++            output_dir=output_dir,
++            job_name=args.wandb_name or args.job_name,
++            resume=False,
++            seed=args.seed,
++            num_workers=args.num_workers,
++            batch_size=args.batch_size,
++            steps=args.steps,
++            eval_freq=args.eval_freq,
++            log_freq=args.log_freq,
++            save_checkpoint=not args.no_save_checkpoint,
++            save_freq=args.save_freq,
++            wandb=WandBConfig(
++                enable=args.wandb
++                and (distributed_context is None or distributed_context[0] == 0),
++                project=args.wandb_project,
++            ),
++        )
++    if args.pretrained_policy:
++        pretrained = Path(args.pretrained_policy).expanduser().resolve()
++        for name in ("config.json", "model.safetensors"):
++            if not (pretrained / name).is_file():
++                raise FileNotFoundError(f"pretrained policy missing {pretrained / name}")
++        # TrainPipelineConfig.validate() reads this path to construct the policy
++        # from existing weights while creating a fresh optimizer/scheduler.
++        sys.argv = [sys.argv[0], f"--policy.path={pretrained}"]
+     lerobot_train(cfg)
+     if distributed_context is not None:
+         dist.destroy_process_group()
+diff --git a/robosynchallenge/managers/datasets.py b/robosynchallenge/managers/datasets.py
+index 99d1c58..29bffce 100755
+--- a/robosynchallenge/managers/datasets.py
++++ b/robosynchallenge/managers/datasets.py
+@@ -19,6 +19,7 @@
+ from __future__ import annotations
+ 
+ from pathlib import Path
++import inspect
+ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+ 
+ import numpy as np
+@@ -52,6 +53,26 @@ except ImportError:
+ __all__ = ["LeRobotRecorder", "install_lerobot_recorder_override"]
+ 
+ 
++class _LeRobotDatasetAPIBridge:
++    """Bridge EmbodiChain's v3 recorder calls to LeRobot 0.3.3/v2.1 APIs."""
++
++    def __init__(self, dataset):
++        self._dataset = dataset
++
++    def __getattr__(self, name):
++        return getattr(self._dataset, name)
++
++    def add_frame(self, frame: Dict) -> None:
++        payload = dict(frame)
++        task = payload.pop("task", "unknown_task")
++        self._dataset.add_frame(payload, task=task)
++
++    def finalize(self) -> None:
++        finalize = getattr(self._dataset, "finalize", None)
++        if finalize is not None:
++            finalize()
++
++
+ class LeRobotRecorder(EmbodiChainLeRobotRecorder):
+     """LeRobot recorder with save_path resolved relative to RoboSynChallenge."""
+ 
+@@ -66,6 +87,57 @@ class LeRobotRecorder(EmbodiChainLeRobotRecorder):
+ 
+         super().__init__(cfg, env)
+ 
++    def _initialize_dataset(self) -> None:
++        """Create datasets across LeRobot 0.3.3 and current recorder APIs.
++
++        ACT in this benchmark is pinned to LeRobot 0.3.3, whose writer emits
++        v2.1 directly. Newer EmbodiChain passes a v3-only
++        ``metadata_buffer_size`` argument and calls ``add_frame(frame)``;
++        this localized bridge keeps the training stack pinned and avoids a
++        second lossy conversion step.
++        """
++
++        robot_type = str(self.robot_meta.get("robot_type", "robot")).lower().replace(
++            " ", "_"
++        )
++        scene_type = self.extra.get("scene_type", "scene")
++        task_description = str(
++            self.extra.get("task_description", "task")
++        ).lower().replace(" ", "_")
++        lerobot_data_root = Path(self.lerobot_data_root)
++        base_name = f"{robot_type}_{scene_type}_{task_description}"
++        existing_dirs = list(lerobot_data_root.glob(f"{base_name}_*"))
++        max_id = -1
++        for dir_path in existing_dirs:
++            suffix = dir_path.name[len(base_name) + 1 :]
++            if suffix.isdigit():
++                max_id = max(max_id, int(suffix))
++        dataset_name = f"{base_name}_{max_id + 1:03d}"
++        self.dataset_full_path = lerobot_data_root / dataset_name
++
++        create_params = inspect.signature(LeRobotDataset.create).parameters
++        create_kwargs = {
++            "repo_id": dataset_name,
++            "fps": self.robot_meta.get("control_freq", 30),
++            "root": str(self.dataset_full_path),
++            "robot_type": robot_type,
++            "features": self._build_features(),
++            "use_videos": self.use_videos,
++            "image_writer_processes": self.image_writer_processes,
++            "image_writer_threads": self.image_writer_threads,
++        }
++        if "metadata_buffer_size" in create_params:
++            create_kwargs["metadata_buffer_size"] = 1
++        if "batch_encoding_size" in create_params:
++            create_kwargs["batch_encoding_size"] = 1
++
++        dataset = LeRobotDataset.create(**create_kwargs)
++        add_frame_params = inspect.signature(dataset.add_frame).parameters
++        if "task" in add_frame_params or not hasattr(dataset, "finalize"):
++            dataset = _LeRobotDatasetAPIBridge(dataset)
++        self.dataset = dataset
++        logger.log_info(f"Created LeRobot dataset at: {self.dataset_full_path}")
++
+ 
+ def install_lerobot_recorder_override() -> None:
+     """Make EmbodiChain config lookup resolve LeRobotRecorder to this subclass."""
+diff --git a/scripts/eval_policy.py b/scripts/eval_policy.py
+index d7021f1..ffcc387 100755
+--- a/scripts/eval_policy.py
++++ b/scripts/eval_policy.py
+@@ -118,6 +118,33 @@ def resolve_episode_max_steps(config, gym_config):
+     return max_env_steps, deploy_max_steps, gym_max_steps
+ 
+ 
++def read_button_press_depth(env):
++    """Read privileged post-hoc telemetry without exposing it to the policy."""
++    try:
++        base = getattr(env, "unwrapped", env)
++        qpos = base.sim.get_articulation("button").get_qpos()
++        value = qpos[:, 0] if getattr(qpos, "ndim", 0) > 1 else qpos[0]
++        if isinstance(value, torch.Tensor):
++            value = value.detach().max().cpu().item()
++        else:
++            value = np.asarray(value).max().item()
++        return max(0.0, -float(value))
++    except Exception:
++        return None
++
++
++def classify_press_failure(success, max_press_depth):
++    if success:
++        return "success"
++    if max_press_depth is None:
++        return "unclassified"
++    if max_press_depth >= 0.0040:
++        return "near_threshold_press"
++    if max_press_depth >= 0.0001:
++        return "contact_insufficient_press"
++    return "no_button_contact"
++
++
+ class EpisodeVideoRecorder:
+     """Record one RGB observation stream per episode through an ffmpeg pipe."""
+ 
+@@ -395,6 +422,52 @@ def find_gym_config(config):
+     with open(f"configs/{task_name}/{setting}/gym_config.json", "r") as f:
+         return json.load(f)
+ 
++
++DIAGNOSTIC_EVENT_PROFILES = {
++    "appearance": {
++        "random_light",
++        "random_material",
++        "random_robot_material",
++        "random_plane_material",
++        "random_button_material",
++    },
++    "camera": {
++        "random_camera_high_intrinsics",
++        "random_camera_high_extrinsics",
++    },
++    "robot_pose": {
++        "random_robot_init_eef_pose",
++        "random_robot_qpos",
++    },
++    "clutter": {"randomize_distractor_slots"},
++}
++DIAGNOSTIC_BASE_EVENTS = {
++    "init_button_pose",
++    "prepare_extra_attr",
++    "register_info_to_env",
++}
++
++
++def apply_diagnostic_event_profile(gym_config, profile):
++    """Create a non-ranking diagnostic slice from the frozen random config."""
++    if profile in (None, "", "full_random"):
++        return gym_config, None
++    if profile not in DIAGNOSTIC_EVENT_PROFILES:
++        choices = ", ".join(sorted(DIAGNOSTIC_EVENT_PROFILES))
++        raise ValueError(f"unknown diagnostic profile {profile!r}; choose from {choices}")
++    selected = DIAGNOSTIC_BASE_EVENTS | DIAGNOSTIC_EVENT_PROFILES[profile]
++    events = gym_config.get("env", {}).get("events", {})
++    gym_config["env"]["events"] = {
++        name: value for name, value in events.items() if name in selected
++    }
++    metadata = {
++        "profile": profile,
++        "active_events": list(gym_config["env"]["events"]),
++        "excluded_events": [name for name in events if name not in selected],
++        "ranking_eligible": False,
++    }
++    return gym_config, metadata
++
+ def find_action_config(config):
+     """Load the task action_config.json, falling back to the setting folder."""
+     task_name = config.get("task_name")
+@@ -547,6 +620,9 @@ def main():
+ 
+     # Resolve gym and action configs
+     gym_config_dict = find_gym_config(config)
++    gym_config_dict, diagnostic_metadata = apply_diagnostic_event_profile(
++        gym_config_dict, config.get("eval_diagnostic_profile")
++    )
+     action_config_dict = find_action_config(config)
+     max_env_steps, deploy_max_steps, gym_max_steps = resolve_episode_max_steps(
+         config, gym_config_dict
+@@ -584,6 +660,7 @@ def main():
+     action_steps = []
+     all_inference_times = []
+     episode_inference_totals = []
++    episode_results = []
+     print(f"\n{'='*25} Starting Evaluation {'='*25}\n")
+     print(f"  Policy: {policy_name}  |  Task: {task_name}")
+     print(f"  Episodes: {max_episodes}  |  Seed: {seed}")
+@@ -594,6 +671,11 @@ def main():
+     )
+     print(f"  Timing platform: {format_platform(platform_metadata)}")
+     print(f"  Metrics file: {result_path}")
++    if diagnostic_metadata:
++        print(
++            "  Diagnostic profile: "
++            f"{diagnostic_metadata['profile']} (NOT ranking eligible)"
++        )
+     print(f"{'='*70}\n")
+ 
+     try:
+@@ -607,11 +689,15 @@ def main():
+                 video_recorder.start_episode(episode, ep_seed)
+ 
+             episode_success = False
++            max_press_depth = 0.0
+             inference_times = []
+             env_steps = 0
+             progress_bar = None
+             try:
+                 obs, info = eval_env.reset(seed=ep_seed)
++                initial_press_depth = read_button_press_depth(env)
++                if initial_press_depth is not None:
++                    max_press_depth = max(max_press_depth, initial_press_depth)
+                 policy_pkg.reset_model(model)
+                 progress_bar = tqdm(
+                     total=max_env_steps,
+@@ -627,6 +713,9 @@ def main():
+                     )
+                     inference_times.extend(new_times)
+                     env_steps = int(info["elapsed_steps"].item())
++                    press_depth = read_button_press_depth(env)
++                    if press_depth is not None:
++                        max_press_depth = max(max_press_depth, press_depth)
+ 
+                     progress_bar.update(
+                         max(0, min(env_steps, max_env_steps) - progress_bar.n)
+@@ -656,6 +745,21 @@ def main():
+             all_inference_times.extend(inference_times)
+             episode_inference_totals.append(sum(inference_times))
+             episode_average = float(np.mean(inference_times)) if inference_times else 0
++            episode_results.append(
++                {
++                    "episode_index": episode,
++                    "episode_seed": ep_seed,
++                    "success": bool(episode_success),
++                    "action_steps": effective_steps,
++                    "inference_call_count": len(inference_times),
++                    "average_inference_time_seconds": episode_average,
++                    "total_inference_time_seconds": float(sum(inference_times)),
++                    "max_button_press_depth_m": max_press_depth,
++                    "failure_stage": classify_press_failure(
++                        episode_success, max_press_depth
++                    ),
++                }
++            )
+             status = "\033[92mSUCCESS\033[0m" if episode_success else "\033[91mFAIL\033[0m"
+             print(
+                 f"  Episode {episode+1}: {status}; action_steps="
+@@ -668,7 +772,6 @@ def main():
+     finally:
+         if video_recorder:
+             video_recorder.close_episode(success=False)
+-        env.close()
+ 
+     inference_call_count = len(all_inference_times)
+     average_action_steps = float(np.mean(action_steps))
+@@ -688,7 +791,7 @@ def main():
+         ),
+     }
+     result_payload = {
+-        "schema_version": 1,
++        "schema_version": 2,
+         "created_at": datetime.now().astimezone().isoformat(),
+         "config": {
+             "policy": policy_name,
+@@ -699,13 +802,24 @@ def main():
+             "episode_count": max_episodes,
+             "timeout_action_steps": max_env_steps,
+             "seed": seed,
++            "diagnostic_profile": (
++                diagnostic_metadata["profile"] if diagnostic_metadata else None
++            ),
++            "act_n_action_steps_override": config.get(
++                "act_n_action_steps_override"
++            ),
++            "ranking_eligible": diagnostic_metadata is None,
+         },
+         "inference_timing_scope": (
+             "raw observation preprocessing and transfer through executable action; "
+             "env.step excluded"
+         ),
+         "platform": platform_metadata,
++        "diagnostic": diagnostic_metadata,
+         "summary": summary,
++        # Per-episode telemetry makes same-seed comparisons paired and auditable.
++        # It does not alter reset seeds, stopping conditions, or aggregate metrics.
++        "episodes": episode_results,
+     }
+     with result_path.open("w", encoding="utf-8") as result_file:
+         json.dump(result_payload, result_file, indent=2, ensure_ascii=False)
+@@ -738,6 +852,11 @@ def main():
+     print(f"  Timing platform: {format_platform(platform_metadata)}")
+     print(f"  Metrics saved to: {result_path}")
+     print(f"{'='*50}")
++    # DexSim's SimulationManager.destroy() exits the process instead of
++    # returning to Python.  Persist and flush all evaluation output first.
++    sys.stdout.flush()
++    sys.stderr.flush()
++    env.close()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/run_env.py b/scripts/run_env.py
+index 6c5a9cc..fd66c82 100755
+--- a/scripts/run_env.py
++++ b/scripts/run_env.py
+@@ -14,12 +14,25 @@
+ # limitations under the License.
+ # ----------------------------------------------------------------------------
+ 
+-"""Script to run the environment."""
++"""Script to run the environment.
++
++The collection-specific options in this file deliberately live below
++``launch/run_task.sh``.  That keeps AutoResearch datasets reproducible and
++avoids the launcher's destructive v3 -> v2.1 conversion cleanup.
++"""
+ 
+ import argparse
++import hashlib
++import json
++import re
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
+ import torch
+ import numpy as np
+ import tqdm
++import yaml
+ 
+ import gymnasium as gym
+ import robosynchallenge
+@@ -41,6 +54,240 @@ gym_utils.DEFAULT_MANAGER_MODULES = gym_utils.DEFAULT_MANAGER_MODULES + [
+ ]
+ 
+ 
++_BASE_EVENT_NAMES = {
++    "init_button_pose",
++    "prepare_extra_attr",
++    "register_info_to_env",
++}
++_APPEARANCE_EVENT_NAMES = {
++    "random_light",
++    "random_material",
++    "random_robot_material",
++    "random_plane_material",
++    "random_button_material",
++}
++_CAMERA_EVENT_NAMES = {
++    "random_camera_high_intrinsics",
++    "random_camera_high_extrinsics",
++}
++_ROBOT_POSE_EVENT_NAMES = {
++    "random_robot_init_eef_pose",
++    "random_robot_qpos",
++}
++_CLUTTER_EVENT_NAMES = {"randomize_distractor_slots"}
++
++COLLECTION_PROFILE_EVENTS = {
++    # The official random config, unchanged. This is the only profile that is
++    # distribution-matched to the public simulator benchmark.
++    "full_random": None,
++    # Full benchmark factor composition under a separate lineage label.  This
++    # uses the exact benchmark ranges; it is not a weakened diagnostic slice.
++    "composite_hard": None,
++    # Targeted training-only slices. They are mixed with full_random data and
++    # must never be used as substitutes for the official ranking evaluator.
++    "targeted_clutter": _BASE_EVENT_NAMES | _CLUTTER_EVENT_NAMES,
++    "targeted_appearance": _BASE_EVENT_NAMES | _APPEARANCE_EVENT_NAMES,
++    "targeted_camera": _BASE_EVENT_NAMES | _CAMERA_EVENT_NAMES,
++    "targeted_recovery": (
++        _BASE_EVENT_NAMES | _ROBOT_POSE_EVENT_NAMES | _CLUTTER_EVENT_NAMES
++    ),
++}
++
++
++class CollectionSeedStream:
++    """Deterministic, auditable reset seeds for expert data generation."""
++
++    def __init__(self, master_seed: int):
++        self.master_seed = int(master_seed)
++        self._rng = np.random.RandomState(self.master_seed)
++        self.current_seed = None
++        self.resets = []
++        self.attempts = []
++
++    def reset(self, env, *, options=None, reason: str):
++        seed = int(self._rng.randint(0, np.iinfo(np.int32).max))
++        self.current_seed = seed
++        self.resets.append({"seed": seed, "reason": reason})
++        return env.reset(seed=seed, options=options)
++
++    def record_attempt(
++        self, seed: int, *, saved: bool, reason: str, **details
++    ) -> None:
++        row = {"seed": int(seed), "saved": bool(saved), "reason": reason}
++        row.update(details)
++        self.attempts.append(row)
++
++
++def _reset_env(env, seed_stream=None, *, options=None, reason: str):
++    if seed_stream is None:
++        return env.reset(options=options)
++    return seed_stream.reset(env, options=options, reason=reason)
++
++
++def _apply_collection_overrides(gym_config: dict, args) -> None:
++    """Apply training-only collection slices without editing benchmark files."""
++
++    profile = getattr(args, "collection_profile", "full_random")
++    if profile == "composite_hard" and gym_config.get("id") != "ClickBell":
++        raise ValueError("composite_hard is a ClickBell-only historical collection profile")
++    allowed_events = COLLECTION_PROFILE_EVENTS[profile]
++    if allowed_events is not None and gym_config.get("id") != "ClickBell":
++        # Preserve all semantic/unknown events, including placements, constraint
++        # attachment, and attribute registration. Only known nuisance factors
++        # may be removed from a training-only diagnostic slice.
++        families = {
++            "randomize_light": "appearance", "randomize_visual_material": "appearance",
++            "randomize_camera_intrinsics": "camera", "randomize_camera_extrinsics": "camera",
++            "randomize_robot_eef_pose": "robot_pose", "randomize_robot_qpos": "robot_pose",
++            "replace_distractor_slots_from_library": "clutter",
++        }
++        keep = {"targeted_clutter": {"clutter"}, "targeted_appearance": {"appearance"},
++                "targeted_camera": {"camera"}, "targeted_recovery": {"robot_pose", "clutter"}}[profile]
++        gym_config["env"]["events"] = {
++            key: value for key, value in gym_config["env"].get("events", {}).items()
++            if value.get("func") not in families or families[value["func"]] in keep
++        }
++    elif allowed_events is not None:
++        events = gym_config.get("env", {}).get("events", {})
++        missing = sorted(_BASE_EVENT_NAMES - set(events))
++        if missing:
++            raise KeyError(f"Collection config is missing base events: {missing}")
++        gym_config["env"]["events"] = {
++            key: value for key, value in events.items() if key in allowed_events
++        }
++
++    dataset_save_path = getattr(args, "dataset_save_path", None)
++    if dataset_save_path:
++        dataset_cfg = gym_config.get("env", {}).get("dataset", {})
++        if not dataset_cfg:
++            raise KeyError("Collection config has no env.dataset recorder.")
++        for recorder_cfg in dataset_cfg.values():
++            recorder_cfg.setdefault("params", {})["save_path"] = str(
++                Path(dataset_save_path).expanduser().resolve()
++            )
++
++
++def _dataset_paths(env) -> list[str]:
++    try:
++        dataset_manager = env.get_wrapper_attr("dataset_manager")
++    except AttributeError:
++        dataset_manager = getattr(
++            getattr(env, "unwrapped", env), "dataset_manager", None
++        )
++    paths = []
++    if dataset_manager is not None:
++        for mode_cfgs in getattr(dataset_manager, "_mode_functor_cfgs", {}).values():
++            for functor_cfg in mode_cfgs:
++                functor = getattr(functor_cfg, "func", None)
++                path = getattr(functor, "dataset_full_path", None)
++                if path is not None:
++                    paths.append(str(Path(path).resolve()))
++    return sorted(set(paths))
++
++
++def _sha256(path: str | None) -> str | None:
++    if not path:
++        return None
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _write_collection_manifest(
++    args,
++    *,
++    seed_stream,
++    dataset_paths,
++    status: str,
++    error: str | None,
++    started_at: str,
++) -> None:
++    manifest_path = getattr(args, "collection_manifest", None)
++    if not manifest_path:
++        return
++    output = Path(manifest_path).expanduser().resolve()
++    output.parent.mkdir(parents=True, exist_ok=True)
++    successful_seeds = [
++        row["seed"] for row in seed_stream.attempts if row["saved"]
++    ]
++    payload = {
++        "schema_version": 2,
++        "kind": "robosyn_expert_collection",
++        "status": status,
++        "error": error,
++        "started_at": started_at,
++        "finished_at": datetime.now(timezone.utc).isoformat(),
++        "task": re.sub(r"(?<!^)(?=[A-Z])", "_", json.loads(
++            Path(args.gym_config).read_text(encoding="utf-8")
++        )["id"]).lower(),
++        "profile": args.collection_profile,
++        "collection_mode": args.collection_mode,
++        "master_seed": seed_stream.master_seed,
++        "target_successful_episodes": args.max_episodes,
++        "successful_episode_seeds": successful_seeds,
++        "failed_attempt_seeds": [
++            row["seed"] for row in seed_stream.attempts if not row["saved"]
++        ],
++        "expert_attempt_count": len(seed_stream.attempts),
++        "expert_attempt_success_rate": (
++            len(successful_seeds) / len(seed_stream.attempts)
++            if seed_stream.attempts
++            else None
++        ),
++        "attempts": seed_stream.attempts,
++        "resets": seed_stream.resets,
++        "dataset_paths": dataset_paths,
++        "source_configs": {
++            "gym_config": str(Path(args.gym_config).resolve()),
++            "gym_config_sha256": _sha256(args.gym_config),
++            "action_config": (
++                str(Path(args.action_config).resolve()) if args.action_config else None
++            ),
++            "action_config_sha256": _sha256(args.action_config),
++        },
++        "lineage": {
++            "training_only": True,
++            "privileged_state_used_by_expert_only": True,
++            "policy_observation_contract": (
++                "task-specific; frozen TaskContract and source config hashes are recorded by AutoSim"
++            ),
++            "parent_checkpoint": (
++                str(Path(args.correction_checkpoint).expanduser().resolve())
++                if args.correction_checkpoint
++                else None
++            ),
++            "parent_model_sha256": _sha256(
++                str(
++                    Path(args.correction_checkpoint).expanduser().resolve()
++                    / "model.safetensors"
++                )
++                if args.correction_checkpoint
++                else None
++            ),
++            "correction_prefix_steps": (
++                [args.correction_prefix_min, args.correction_prefix_max]
++                if args.collection_mode == "policy_correction"
++                else None
++            ),
++            "correction_replan_steps": (
++                args.correction_replan_steps
++                if args.collection_mode == "policy_correction"
++                else None
++            ),
++            "safe_return_steps": (
++                args.correction_safe_return_steps
++                if args.collection_mode == "policy_correction"
++                else None
++            ),
++        },
++    }
++    temporary = output.with_suffix(output.suffix + ".tmp")
++    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
++    temporary.replace(output)
++
++
+ def _generate_function(
+     env,
+     num_traj,
+@@ -49,20 +296,42 @@ def _generate_function(
+     save_video: bool = False,
+     debug_mode: bool = False,
+     reset_first: bool = True,
++    seed_stream=None,
++    max_collection_attempts=None,
+     **kwargs,
+ ) -> bool:
+     valid = True
+     if reset_first:
+-        _, _ = env.reset()
++        _reset_env(env, seed_stream, reason="trajectory_start")
+ 
+     while True:
++        if (
++            seed_stream is not None
++            and max_collection_attempts is not None
++            and len(seed_stream.attempts) >= int(max_collection_attempts)
++        ):
++            raise RuntimeError(
++                f"Collection exceeded {max_collection_attempts} expert attempts."
++            )
+         for trajectory_idx in range(num_traj):
+             valid = generate_and_execute_action_list(
+                 env, trajectory_idx, debug_mode, **kwargs
+             )
+ 
+             if not valid:
+-                _, _ = env.reset(options={"save_data": False})
++                invalid_seed = seed_stream.current_seed if seed_stream else None
++                _reset_env(
++                    env,
++                    seed_stream,
++                    options={"save_data": False},
++                    reason="retry_after_invalid_expert_trajectory",
++                )
++                if seed_stream is not None:
++                    seed_stream.record_attempt(
++                        invalid_seed,
++                        saved=False,
++                        reason="invalid_expert_trajectory",
++                    )
+                 break
+ 
+         if valid:
+@@ -98,7 +367,9 @@ def _get_saved_episode_count(env):
+     return max(episode_counts)
+ 
+ 
+-def _generate_until_saved_episode_target(args, env, gym_config, num_traj: int) -> bool:
++def _generate_until_saved_episode_target(
++    args, env, gym_config, num_traj: int, seed_stream=None
++) -> bool:
+     target_episodes = int(gym_config.get("max_episodes", 1))
+     saved_episodes = _get_saved_episode_count(env)
+ 
+@@ -110,7 +381,7 @@ def _generate_until_saved_episode_target(args, env, gym_config, num_traj: int) -
+         color="green",
+     )
+ 
+-    _, _ = env.reset()
++    _reset_env(env, seed_stream, reason="collection_start")
+     saved_episodes = _get_saved_episode_count(env)
+     attempt = 0
+     progress = tqdm.tqdm(
+@@ -132,14 +403,34 @@ def _generate_until_saved_episode_target(args, env, gym_config, num_traj: int) -
+             save_video=getattr(args, "save_video", False),
+             debug_mode=getattr(args, "debug_mode", False),
+             reset_first=False,
++            seed_stream=seed_stream,
++            max_collection_attempts=(
++                args.collection_max_attempts
++                if args.collection_max_attempts is not None
++                else target_episodes * 10
++            ),
+             regenerate=getattr(args, "regenerate", False),
+         )
+ 
+         saved_before_reset = _get_saved_episode_count(env)
+-        _, _ = env.reset(
+-            options={"save_data": saved_before_reset < target_episodes}
++        completed_seed = seed_stream.current_seed if seed_stream else None
++        _reset_env(
++            env,
++            seed_stream,
++            options={"save_data": saved_before_reset < target_episodes},
++            reason="save_completed_trajectory",
+         )
+         saved_episodes = _get_saved_episode_count(env)
++        if seed_stream is not None:
++            seed_stream.record_attempt(
++                completed_seed,
++                saved=saved_episodes > previous_saved_episodes,
++                reason=(
++                    "saved_successful_episode"
++                    if saved_episodes > previous_saved_episodes
++                    else "trajectory_not_saved"
++                ),
++            )
+ 
+         progress.update(max(0, min(saved_episodes, target_episodes) - progress.n))
+ 
+@@ -159,7 +450,187 @@ def _generate_until_saved_episode_target(args, env, gym_config, num_traj: int) -
+     return True
+ 
+ 
+-def run_env_main(args, env, gym_config):
++def _load_correction_policy(args):
++    """Load ACT lazily so ordinary expert collection has no policy dependency."""
++
++    policy_dir = Path(__file__).resolve().parents[1] / "policy"
++    if str(policy_dir.parent) not in sys.path:
++        sys.path.insert(0, str(policy_dir.parent))
++    from policy import act as policy_adapter
++
++    config = {}
++    if args.correction_policy_config:
++        config = yaml.safe_load(
++            Path(args.correction_policy_config).read_text(encoding="utf-8")
++        )
++    config.update(
++        {
++            "checkpoint_path": str(
++                Path(args.correction_checkpoint).expanduser().resolve()
++            ),
++            "pytorch_device": args.correction_device,
++            "device": args.correction_device,
++            # One environment step per adapter call; queue length controls
++            # replanning frequency independently.
++            "act_step": 1,
++            "act_n_action_steps_override": args.correction_replan_steps,
++        }
++    )
++    model = policy_adapter.get_model(config)
++    return policy_adapter, model
++
++
++def _clear_policy_prefix_from_recorder(env) -> None:
++    """Discard policy actions while retaining the simulator's induced state."""
++
++    base = env.unwrapped
++    if base.rollout_buffer is None:
++        raise RuntimeError("policy correction requires the dataset rollout buffer")
++    base.current_rollout_step = 0
++    if hasattr(base, "episode_success_status"):
++        base.episode_success_status.zero_()
++    if hasattr(base, "_task_success"):
++        base._task_success.zero_()
++
++
++def _extract_policy_state(obs) -> np.ndarray:
++    value = obs
++    for key in ("robot", "qpos"):
++        value = value[key]
++    if isinstance(value, torch.Tensor):
++        value = value.detach().cpu().numpy()
++    value = np.asarray(value, dtype=np.float32)
++    if value.ndim == 2:
++        value = value[0]
++    if value.shape != (14,):
++        raise ValueError(f"expected 14D policy state, got {value.shape}")
++    return value.copy()
++
++
++def _execute_safe_return(env, target_state: np.ndarray, steps: int) -> None:
++    """Record a smooth recovery to the randomized episode's reset posture."""
++
++    current = _extract_policy_state(env.unwrapped.get_obs())
++    for alpha in np.linspace(0.0, 1.0, int(steps) + 1, dtype=np.float32)[1:]:
++        action = current + alpha * (target_state - current)
++        env.step(
++            torch.as_tensor(
++                action[None], device=env.unwrapped.device, dtype=torch.float32
++            )
++        )
++
++
++def _collect_policy_corrections(args, env, gym_config, seed_stream) -> bool:
++    """Collect expert suffixes from states visited by a frozen parent policy."""
++
++    target_episodes = int(gym_config.get("max_episodes", 1))
++    max_attempts = int(args.collection_max_attempts or target_episodes * 12)
++    policy_adapter, model = _load_correction_policy(args)
++    prefix_rng = np.random.RandomState(int(args.collection_seed) ^ 0x5A17C0DE)
++    saved_episodes = _get_saved_episode_count(env)
++    _reset_env(env, seed_stream, reason="policy_correction_start")
++    saved_episodes = _get_saved_episode_count(env)
++
++    progress = tqdm.tqdm(
++        total=target_episodes,
++        initial=min(saved_episodes, target_episodes),
++        desc="Saved policy-induced expert corrections",
++        unit="episode",
++    )
++    while saved_episodes < target_episodes:
++        if len(seed_stream.attempts) >= max_attempts:
++            raise RuntimeError(
++                f"Correction collection exceeded {max_attempts} attempts."
++            )
++        episode_seed = seed_stream.current_seed
++        prefix_target = int(
++            prefix_rng.randint(
++                args.correction_prefix_min, args.correction_prefix_max + 1
++            )
++        )
++        policy_adapter.reset_model(model)
++        obs = env.unwrapped.get_obs()
++        reset_policy_state = _extract_policy_state(obs)
++        prefix_steps = 0
++        policy_success = False
++        prefix_truncated = False
++        while prefix_steps < prefix_target:
++            obs, info, truncated, _ = policy_adapter.eval(env, model, obs)
++            prefix_steps = int(info["elapsed_steps"].item())
++            policy_success = bool(env.get_wrapper_attr("is_task_success")())
++            prefix_truncated = bool(
++                truncated.any().item()
++                if isinstance(truncated, torch.Tensor)
++                else np.asarray(truncated).any()
++            )
++            if policy_success or prefix_truncated:
++                break
++
++        if policy_success or prefix_truncated:
++            reason = (
++                "parent_policy_already_succeeded"
++                if policy_success
++                else "parent_policy_prefix_truncated"
++            )
++            _reset_env(
++                env,
++                seed_stream,
++                options={"save_data": False},
++                reason=f"retry_after_{reason}",
++            )
++            seed_stream.record_attempt(
++                episode_seed,
++                saved=False,
++                reason=reason,
++                policy_prefix_steps=prefix_steps,
++                requested_prefix_steps=prefix_target,
++            )
++            continue
++
++        _clear_policy_prefix_from_recorder(env)
++        valid = generate_and_execute_action_list(
++            env, 0, getattr(args, "debug_mode", False), regenerate=False
++        )
++        used_safe_return = False
++        if not valid and args.correction_safe_return_steps > 0:
++            used_safe_return = True
++            _execute_safe_return(
++                env, reset_policy_state, args.correction_safe_return_steps
++            )
++            valid = generate_and_execute_action_list(
++                env, 0, getattr(args, "debug_mode", False), regenerate=True
++            )
++        before = _get_saved_episode_count(env)
++        _reset_env(
++            env,
++            seed_stream,
++            options={"save_data": bool(valid and env.get_wrapper_attr("is_task_success")())},
++            reason="save_policy_induced_expert_correction",
++        )
++        saved_episodes = _get_saved_episode_count(env)
++        saved = bool(saved_episodes > before)
++        seed_stream.record_attempt(
++            episode_seed,
++            saved=saved,
++            reason=(
++                "saved_policy_induced_expert_correction"
++                if saved
++                else "expert_correction_failed"
++            ),
++            policy_prefix_steps=prefix_steps,
++            requested_prefix_steps=prefix_target,
++            expert_plan_valid=bool(valid),
++            safe_return_used=used_safe_return,
++            safe_return_steps=(
++                args.correction_safe_return_steps if used_safe_return else 0
++            ),
++        )
++        progress.update(max(0, min(saved_episodes, target_episodes) - progress.n))
++    progress.close()
++    return True
++
++
++def run_env_main(args, env, gym_config, seed_stream=None):
+     if getattr(args, "replay", False):
+         replay_trajectory(
+             env,
+@@ -174,10 +645,15 @@ def run_env_main(args, env, gym_config):
+         )
+         preview(env)
+ 
++    if getattr(args, "collection_mode", "expert") == "policy_correction":
++        return _collect_policy_corrections(args, env, gym_config, seed_stream)
++
+     log_info("Start offline data generation.", color="green")
+     num_traj = 1
+ 
+-    if _generate_until_saved_episode_target(args, env, gym_config, num_traj):
++    if _generate_until_saved_episode_target(
++        args, env, gym_config, num_traj, seed_stream=seed_stream
++    ):
+         return
+ 
+     log_warning(
+@@ -191,10 +667,11 @@ def run_env_main(args, env, gym_config):
+             save_path=getattr(args, "save_path", ""),
+             save_video=getattr(args, "save_video", False),
+             debug_mode=getattr(args, "debug_mode", False),
++            seed_stream=seed_stream,
+             regenerate=getattr(args, "regenerate", False),
+         )
+ 
+-    _, _ = env.reset()
++    _reset_env(env, seed_stream, reason="fallback_final_reset")
+ 
+ 
+ if __name__ == "__main__":
+@@ -222,17 +699,88 @@ if __name__ == "__main__":
+         default="kinematic",
+         help="Replay mode (default: kinematic).",
+     )
++    parser.add_argument(
++        "--collection_profile",
++        choices=sorted(COLLECTION_PROFILE_EVENTS),
++        default="full_random",
++        help="Training-data randomization slice; never changes ranking evaluation.",
++    )
++    parser.add_argument(
++        "--collection_mode",
++        choices=["expert", "policy_correction"],
++        default="expert",
++        help="Collect reset-state expert demos or expert suffixes from parent-policy states.",
++    )
++    parser.add_argument(
++        "--collection_seed",
++        type=int,
++        default=20260829,
++        help="Master seed for the deterministic per-reset collection seed stream.",
++    )
++    parser.add_argument(
++        "--dataset_save_path",
++        type=str,
++        default=None,
++        help="Override the parent directory used by the LeRobot recorder.",
++    )
++    parser.add_argument(
++        "--collection_manifest",
++        type=str,
++        default=None,
++        help="Write an auditable JSON manifest for this collection run.",
++    )
++    parser.add_argument(
++        "--collection_quiet",
++        action="store_true",
++        help="Suppress routine EmbodiChain info logs during long collection runs.",
++    )
++    parser.add_argument(
++        "--collection_max_attempts",
++        type=int,
++        default=None,
++        help="Abort after this many valid+invalid expert attempts (default: 10x target).",
++    )
++    parser.add_argument("--correction_policy_config", type=str, default=None)
++    parser.add_argument("--correction_checkpoint", type=str, default=None)
++    parser.add_argument("--correction_device", type=str, default="cuda")
++    parser.add_argument("--correction_prefix_min", type=int, default=20)
++    parser.add_argument("--correction_prefix_max", type=int, default=120)
++    parser.add_argument("--correction_replan_steps", type=int, default=10)
++    parser.add_argument("--correction_safe_return_steps", type=int, default=20)
+ 
+     args = parser.parse_args()
+ 
++    if args.collection_quiet:
++        from embodichain.utils import logger as embodichain_logger
++
++        embodichain_logger.log_info = lambda *unused_args, **unused_kwargs: None
++        original_tqdm = tqdm.tqdm
++
++        def quiet_tqdm(*tqdm_args, **tqdm_kwargs):
++            tqdm_kwargs["disable"] = True
++            return original_tqdm(*tqdm_args, **tqdm_kwargs)
++
++        tqdm.tqdm = quiet_tqdm
++
+     if args.replay and not args.replay_trajectory:
+         parser.error("--replay requires --replay_trajectory <path>.")
+     if args.replay and args.preview:
+         parser.error("--replay and --preview are mutually exclusive.")
+     if args.replay:
+         args.filter_dataset_saving = True
+-
+-    env_cfg, gym_config, action_config = build_env_cfg_from_args(args)
++    if args.collection_mode == "policy_correction" and not args.correction_checkpoint:
++        parser.error("--collection_mode policy_correction requires --correction_checkpoint")
++    if args.collection_mode == "policy_correction":
++        collection_env_id = json.loads(Path(args.gym_config).read_text())["id"]
++        if collection_env_id != "ClickBell":
++            parser.error("policy correction requires a validated task recovery plugin; "
++                         "this legacy collector only supports ClickBell")
++    if args.correction_prefix_min < 1 or args.correction_prefix_max < args.correction_prefix_min:
++        parser.error("correction prefix range must satisfy 1 <= min <= max")
++
++    env_cfg, gym_config, action_config = build_env_cfg_from_args(
++        args, gym_config_modifier=lambda config: _apply_collection_overrides(config, args)
++    )
+     physics_config = gym_config.get("physics", {})
+     if "enable_ccd" in physics_config:
+         env_cfg.sim_cfg.physics_config.enable_ccd = bool(
+@@ -246,9 +794,29 @@ if __name__ == "__main__":
+         gym_config["max_episodes"] = args.max_episodes
+ 
+     env = gym.make(id=gym_config["id"], cfg=env_cfg, **action_config)
++    seed_stream = CollectionSeedStream(args.collection_seed)
++    started_at = datetime.now(timezone.utc).isoformat()
++    status = "completed"
++    error = None
+ 
+     try:
+-        run_env_main(args, env, gym_config=gym_config)
++        run_env_main(args, env, gym_config=gym_config, seed_stream=seed_stream)
+     except Exception as e:
++        status = "failed"
++        error = f"{type(e).__name__}: {e}"
+         log_warning(f"An error occurred during environment execution: {e}")
++        raise
++    finally:
++        dataset_paths = _dataset_paths(env)
++        # DexSim's destroy() exits the process from native code, so audit data
++        # must be atomically flushed before env.close(). Episodes themselves
++        # are already committed by LeRobotDataset.save_episode().
++        _write_collection_manifest(
++            args,
++            seed_stream=seed_stream,
++            dataset_paths=dataset_paths,
++            status=status,
++            error=error,
++            started_at=started_at,
++        )
+         env.close()
