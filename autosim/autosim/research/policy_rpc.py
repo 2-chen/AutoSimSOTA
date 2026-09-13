@@ -52,6 +52,18 @@ def _worker(connection, config: dict, contract: dict) -> None:
     import importlib
     import torch
 
+    # This child is torch-only, so the engine's physical index never reaches it: under a
+    # device plan it inherits the evaluator's whole visible set and must be told which card
+    # "the default device" means, or a bare ``cuda`` in the policy stack would load onto
+    # card 0 while the evaluator simulates on the leased card.  No warp here -- this process
+    # never builds an environment.
+    from .devices import align_process_defaults, default_device_index, ordinal_of
+
+    if default_device_index() is not None:
+        index = ordinal_of(config.get("pytorch_device"))
+        if index is not None:
+            align_process_defaults(index, warp=False)
+
     try:
         adapter = importlib.import_module(f"policy.{config['policy_name']}")
         policy = adapter.get_model(config)

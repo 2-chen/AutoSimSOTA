@@ -8,25 +8,35 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from autosim.llm_client import LLMClient
 from autosim.robosyn_data import evaluation_seed_bank
 from autosim.robosyn_mvp import gpu_lock
 
 from .analysis import analyze
+from .accounting import BudgetLedger, Charge
 from .common import atomic_json, digest, immutable_json, now, object_digest, read_json, redact
 from .decision_controllers import control_proposal
 from .data_version import fingerprint_dataset
+from .device_cli import (DevicePlanRefused, DeviceReceiptMissing, devices_protocol_block,
+                         plan_summary,
+                         protocol_mismatch, resolve_plan, write_plan)
+from .devices import NoCompatibleDevice
+from .job_runner import PhaseJob, run_phase as run_phase_jobs
 from .ledger import SeedLedger, compare
 from .registry import TASK_IDS, load_task
 from .robosyn_adapter import PROFILE_FAMILIES, RoboSynAdapter
-from .runtime import Runtime, retryable_evaluation_startup
+from .runtime import (Runtime, retryable_collection_startup, retryable_evaluation_startup,
+                      startup_receipt)
 from .task_diagnostics import task_failure_analysis
 
 
@@ -102,12 +112,29 @@ class MilestoneConfig:
     allow_api_egress: bool = False
     dry_run: bool = False
     probe_only: bool = False
+    # Multi-device knobs.  All of them default to the absent value: a plain `--gpu i`
+    # invocation never builds a device plan, so its frozen protocol stays byte-identical
+    # to the runs that predate this feature.
+    gpus: str | None = None
+    device_mode: str = "auto"
+    max_parallel_jobs: int | None = None
+    gpu_hours: float | None = None
+    accept_device_plan: bool = False
+    multi_gpu_probe: bool = False
+    probe_if_needed: bool = False
+    probe_smoke_timeout: int = 900
 
     def validate(self) -> "MilestoneConfig":
         if self.task != "auto" and self.task not in TASK_IDS:
             raise ValueError(f"unknown RoboSyn task: {self.task}")
         if self.controller not in {"api", "fixed", "random", "heuristic"}:
             raise ValueError(f"unknown research controller: {self.controller}")
+        if self.device_mode not in {"auto", "pinned_index", "identity", "node_isolated"}:
+            raise ValueError(f"unknown device addressing mode: {self.device_mode}")
+        if self.max_parallel_jobs is not None and self.max_parallel_jobs < 1:
+            raise ValueError("--max-parallel-jobs must be at least 1")
+        if self.gpu_hours is not None and self.gpu_hours <= 0:
+            raise ValueError("--gpu-hours must be positive")
         if not 1 <= self.rounds <= 8:
             raise ValueError("research rounds must be in [1,8]")
         if self.attempts_per_round < 2 or self.screen_steps < 1:
@@ -119,6 +146,25 @@ class MilestoneConfig:
         if not 0 < self.hours <= 24:
             raise ValueError("run budget must be in (0,24] hours")
         return self
+
+
+def protocol_budget(config: MilestoneConfig) -> dict[str, Any]:
+    """The frozen budget block, minus the knobs that are invocation-level.
+
+    Egress authorization is a permission, not an experiment variable, so an explicitly
+    approved resume keeps the same frozen protocol.  The device knobs are invocation-level
+    in the same way: the resolved plan (``protocol["devices"]``) records what the run
+    actually executes under -- mode, device set, parallel limit, GPU-hour limit -- so
+    dropping the raw flags keeps every legacy ``--gpu i`` budget byte-identical to the runs
+    that predate the multi-device feature.
+    """
+    budget = asdict(config) | {"output_root": str(config.output_root)}
+    budget.pop("allow_api_egress", None)
+    for key in ("gpus", "device_mode", "max_parallel_jobs", "gpu_hours",
+                "accept_device_plan", "multi_gpu_probe", "probe_if_needed",
+                "probe_smoke_timeout"):
+        budget.pop(key, None)
+    return budget
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -196,9 +242,16 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
                 "development_evidence_id", "hypothesis", "primary_intervention",
                 "collection", "training", "expected_validation"}
     missing, extra = sorted(required - set(raw)), sorted(set(raw) - required)
-    extra = [field for field in extra if field != "decision"]
+    # `decision` is an optional schema field. `round` is not part of the schema at all:
+    # build_prompt() sends the request as {"round": n, "required_schema": {...}, ...}, and
+    # the model sometimes echoes that wrapper key back into its answer. It carries no
+    # information the validator does not already bind (round_index is validated against
+    # proposal_id and the evidence ids), so it must not fail an otherwise valid proposal --
+    # it is dropped below to keep the persisted proposal canonical.
+    extra = [field for field in extra if field not in {"decision", "round"}]
     if missing or extra:
         raise ValueError(f"proposal schema mismatch; missing={missing}; extra={extra}")
+    raw.pop("round", None)
     if raw["development_evidence_id"] != evidence_id:
         raise ValueError("proposal cites the wrong development evidence")
     if raw["parent_checkpoint_sha256"] != parent_checkpoint_sha256:
@@ -365,6 +418,11 @@ class RepositoryAutoResearch:
         self.spec = None
         self.assets: dict[str, Any] = {}
         self.allowed_profiles: set[str] = set()
+        self.plan: dict[str, Any] | None = None   # stays None for every legacy invocation
+        self.ledger = None                        # only a multi-device run keeps accounts
+        # Parallel jobs in one phase share this object's state file and capability index;
+        # both are read-modify-write, so every mutation goes through one lock.
+        self.lock = threading.RLock()
 
     def _master_seed(self, role: str) -> int:
         """Derive independent, reproducible banks for each research replicate.
@@ -433,22 +491,40 @@ class RepositoryAutoResearch:
                        if key in budget and budget[key] != value}
             if changed:
                 raise ValueError(f"completed run protocol differs from request: {changed}")
+            recorded_devices = budget.get("devices")
+            requested_plan = self._requested_plan_identity()
+            if recorded_devices and not requested_plan:
+                raise ValueError(
+                    "completed run was executed under a multi-device plan; re-running it "
+                    "without --gpus/--device-mode would change its protocol "
+                    f"(recorded plan: {recorded_devices.get('plan_digest')})")
+            if requested_plan and not recorded_devices:
+                raise ValueError(
+                    "completed run was executed single-device; --gpus would change its protocol")
+            if recorded_devices:
+                changed_plan = {key: {"recorded": recorded_devices.get(key), "requested": value}
+                                for key, value in requested_plan.items()
+                                if recorded_devices.get(key) != value}
+                if changed_plan:
+                    raise ValueError(f"completed run device plan differs from request: {changed_plan}")
         return self.state
 
     def save(self, **updates: Any) -> None:
-        self.state.update(updates, updated_at=now())
-        atomic_json(self.state_path, self.state)
+        with self.lock:
+            self.state.update(updates, updated_at=now())
+            atomic_json(self.state_path, self.state)
 
     def update_capability(self, capability_id: str, status: str, evidence: dict[str, Any],
                           limitation: str | None = None) -> None:
         path = self.run_root / "capabilities.json"
-        document = read_json(path)
-        matches = [row for row in document["records"] if row["capability_id"] == capability_id]
-        if len(matches) != 1:
-            raise RuntimeError(f"capability record is not unique: {capability_id}")
-        matches[0].update(status=status, evidence=evidence, limitation=limitation,
-                          verified_at=now() if status == "verified" else None)
-        atomic_json(path, document)
+        with self.lock:
+            document = read_json(path)
+            matches = [row for row in document["records"] if row["capability_id"] == capability_id]
+            if len(matches) != 1:
+                raise RuntimeError(f"capability record is not unique: {capability_id}")
+            matches[0].update(status=status, evidence=evidence, limitation=limitation,
+                              verified_at=now() if status == "verified" else None)
+            atomic_json(path, document)
 
     def start_or_resume_budget(self) -> None:
         """Use one wall-clock budget across retries and process restarts."""
@@ -465,6 +541,201 @@ class RepositoryAutoResearch:
                 f"AutoResearch wall-clock budget of {self.config.hours:g} hours is exhausted")
         assert self.runtime is not None
         self.runtime.deadline = time.monotonic() + remaining_seconds
+
+    def device_ledger(self) -> Any:
+        """The GPU-hour account.  A legacy run keeps none, so its artifacts are unchanged."""
+        if self.plan is None or self.plan["legacy_equivalence"]:
+            return None
+        if self.ledger is None:
+            self.ledger = BudgetLedger(self.run_root / "accounting.json",
+                                       wall_limit_seconds=self.config.hours * 3600.0,
+                                       gpu_hours_limit=self.plan["gpu_hours_limit"],
+                                       devices=self.plan["usable"])
+        return self.ledger
+
+    def phase_estimate(self, episodes: int) -> float:
+        """Seconds a job of this size is expected to cost: construction plus per-episode marginal."""
+        model = getattr(self.runtime, "cost_model", None) or {}
+        return (float(model.get("construction_seconds", 360.0))
+                + max(0, int(episodes)) * float(model.get("marginal_seconds", 40.0)))
+
+    def run_phase(self, phase: str, jobs: Sequence[PhaseJob]) -> dict[str, Any]:
+        """Run one phase's independent jobs: in order on one device, in parallel on several.
+
+        The order *between* phases is the research protocol and is untouched; this only
+        stops jobs that do not depend on each other from queueing.  With no multi-device
+        plan -- every legacy invocation, and every single-device run -- ``run_phase`` is a
+        plain loop over the same calls.
+        """
+        assert self.runtime is not None
+        ledger = self.device_ledger()
+        results = run_phase_jobs(phase=phase, jobs=jobs, runtime=self.runtime, plan=self.plan,
+                                 output=self.run_root / "schedule",
+                                 max_parallel_jobs=self.config.max_parallel_jobs,
+                                 ledger=ledger, run_id=self.config.run_id)
+        if ledger is not None:
+            with self.lock:
+                ledger.write()
+        return results
+
+    def _resolve_device_plan(self, workspace: Path) -> dict[str, Any] | None:
+        """Build the device plan, or refuse with the reason.  Legacy builds none.
+
+        A plan exists only when ``--gpus`` was passed; the other multi-device knobs are
+        rejected without it (see ``main``), so "no plan" is exactly "the legacy path".
+        """
+        if self.config.gpus is None:
+            return None
+        try:
+            plan = self._plan_once(workspace)
+        except DeviceReceiptMissing as exc:
+            # No receipt for *this* container.  A receipt is keyed by the node it was taken
+            # on and this cluster's container hostname is job-scoped, so a receipt from
+            # another job can never authorize this one -- measuring here is the only way a
+            # multi-device run starts without a hand-carried receipt.  Only a missing
+            # receipt is treated this way: "device busy" or "incompatible" is a fact about
+            # the node that measuring again would not change.
+            if not self.config.probe_if_needed:
+                raise RuntimeError(f"multi-device plan refused: {exc}") from exc
+            outcome = self._run_device_probe(workspace)
+            if not outcome["published"]:
+                raise RuntimeError(
+                    f"multi-device plan refused: {exc}; the in-run device probe did not "
+                    f"publish a usable receipt ({outcome['detail']})"
+                ) from exc
+            try:
+                plan = self._plan_once(workspace)
+            except (DevicePlanRefused, NoCompatibleDevice) as again:
+                raise RuntimeError(
+                    f"multi-device plan refused: {again}; measured in this container by "
+                    f"{outcome['artifact']}"
+                ) from again
+        except (DevicePlanRefused, NoCompatibleDevice) as exc:
+            raise RuntimeError(f"multi-device plan refused: {exc}") from exc
+        write_plan(self.run_root, plan)
+        if self.runtime is not None:
+            self.runtime.plan = plan
+        self.save(stage="device_plan_resolved", device_plan=plan_summary(plan),
+                  device_plan_digest=plan["plan_digest"],
+                  device_plan_legacy_equivalence=plan["legacy_equivalence"],
+                  devices=[{"index": gpu["index"], "uuid": gpu["uuid"],
+                            "class_name": gpu.get("class_name"), "renderer": gpu.get("renderer")}
+                           for gpu in plan["usable"]])
+        return plan
+
+    def _plan_once(self, workspace: Path) -> dict:
+        """One resolution attempt against whatever receipt this container already has."""
+        return resolve_plan(platform_root=workspace, requested=self.config.gpus,
+                            mode=self.config.device_mode,
+                            max_parallel_jobs=self.config.max_parallel_jobs,
+                            gpu_hours=self.config.gpu_hours, hours=self.config.hours,
+                            accept_partial=self.config.accept_device_plan,
+                            image=os.environ.get("AUTOSIM_IMAGE"),
+                            worker_spec=os.environ.get("SCO_WORKER_SPEC"))
+
+    def _run_device_probe(self, workspace: Path, *, runner: Callable[..., int] | None = None,
+                          ) -> dict[str, Any]:
+        """Measure this container's devices, the way the full run will address them.
+
+        Runs the ladder as its own process (`device_probe.main`), for the same reason the
+        launcher does: it builds and tears down real simulations, and a crash in one arm
+        must not take the research run's process with it.  It costs about an hour of wall
+        clock and one episode per device -- charged to this run's GPU-hour account, because
+        the cards were held for it whether or not it produced anything else.
+
+        The probe honours the run's own ``--device-mode``, so a run that asks for a mode
+        this node cannot do fails here, in the measurement, rather than later mid-phase.
+        """
+        output = self.run_root / "device_probe"
+        output.mkdir(parents=True, exist_ok=True)
+        mode = (self.config.device_mode if self.config.device_mode in {"pinned_index", "identity"}
+                else "pinned_index")
+        command = [sys.executable, "-m", "autosim.research.device_probe",
+                   "--workspace", str(workspace), "--output", str(output),
+                   "--task", self.task, "--gpus", self.config.gpus,
+                   "--mode", mode, "--smoke-timeout", str(int(self.config.probe_smoke_timeout))]
+        self.save(stage="device_probe_running", device_probe={
+            "command": " ".join(command), "output": str(output),
+            "note": "no device receipt for this container; measuring this node before the plan",
+        })
+        started = time.time()
+        returncode = (runner or subprocess.call)(command)
+        artifact = output / "device_probe.json"
+        receipt = read_json(artifact) if artifact.is_file() else {}
+        self.probe_charge = {
+            "job": "device_probe", "category": "probe", "wall_seconds": time.time() - started,
+            "status": "completed" if returncode == 0 else f"failed(rc={returncode})",
+            "devices": [str(uuid) for uuid in (receipt.get("verified_devices")
+                                               or [row.get("uuid") for row in
+                                                   receipt.get("allocation") or []])],
+            "detail": {"mode": receipt.get("mode"), "passed": bool(receipt.get("passed")),
+                       "verdict": receipt.get("verdict"), "returncode": returncode,
+                       "artifact": str(artifact)},
+        }
+        published = bool(receipt.get("passed"))
+        self.save(stage="device_probe_finished", device_probe={
+            "returncode": returncode, "passed": published,
+            "mode": receipt.get("mode"), "verified_devices": receipt.get("verified_devices"),
+            "verdict": receipt.get("verdict"), "artifact": str(artifact),
+        })
+        return {"published": published, "artifact": str(artifact),
+                "detail": f"rc={returncode}, passed={published}, mode={receipt.get('mode')}"}
+
+    def _charge_device_probe(self) -> None:
+        """Put the in-run probe on the same account as everything else it paid for."""
+        charge = getattr(self, "probe_charge", None)
+        ledger = self.device_ledger()
+        if not charge or ledger is None:
+            return
+        ledger.charge(Charge(job=charge["job"], category=charge["category"],
+                             status=charge["status"], devices=tuple(charge["devices"]),
+                             wall_seconds=float(charge["wall_seconds"]),
+                             detail=charge["detail"]))
+
+    def _requested_plan_identity(self) -> dict[str, Any]:
+        """What this invocation asks for, in the plan-identity vocabulary.
+
+        Only knobs the operator actually passed are compared: an omitted knob means "let the
+        node decide", which must not become a false conflict against whatever clamped value
+        the recorded plan happens to carry.
+        """
+        if self.config.gpus is None:
+            return {}
+        identity: dict[str, Any] = {"requested": self.config.gpus}
+        if self.config.device_mode != "auto":
+            identity["mode"] = self.config.device_mode
+        if self.config.max_parallel_jobs is not None:
+            identity["max_parallel_jobs"] = self.config.max_parallel_jobs
+        if self.config.gpu_hours is not None:
+            identity["gpu_hours_limit"] = self.config.gpu_hours
+        return identity
+
+    def _check_recorded_plan(self, protocol: dict[str, Any]) -> None:
+        """A resume must not silently change which devices the experiment ran on.
+
+        ``immutable_json`` would catch the difference one step later, but a bare frozen-file
+        error does not say *which* device knob changed, so the plan identity is compared
+        here and reported field by field.
+        """
+        recorded_path = self.run_root / "protocol.json"
+        if not recorded_path.is_file():
+            return
+        recorded = read_json(recorded_path)
+        recorded_devices = (recorded.get("budget") or {}).get("devices")
+        resolved = (protocol.get("budget") or {}).get("devices")
+        if recorded_devices and not resolved:
+            raise ValueError(
+                "this run was executed under a multi-device plan; resuming it without "
+                "--gpus would change its protocol. Pass the same --gpus/--device-mode/"
+                f"--max-parallel-jobs (recorded plan: {recorded_devices.get('plan_digest')})")
+        if not recorded_devices and resolved:
+            raise ValueError(
+                f"this run was executed single-device; --gpus would change its protocol "
+                f"(requested plan: {resolved.get('plan_digest')})")
+        if recorded_devices and resolved:
+            changed = protocol_mismatch(recorded_devices, resolved)
+            if changed:
+                raise ValueError(f"resume device plan differs from the recorded one: {changed}")
 
     def initialize(self) -> None:
         self.repo, source = resolve_repository(self.config.repo_input, self.run_root)
@@ -523,11 +794,13 @@ class RepositoryAutoResearch:
             "external_system_dependencies": ["GPU driver", "system shared libraries"],
             "note": "credential file is loaded from the project root; historical priors are literal protocol context, not runtime reads",
         })
-        budget = asdict(self.config) | {"output_root": str(self.config.output_root)}
-        # Egress authorization is an invocation permission, not an experiment
-        # variable.  Excluding it lets an explicitly approved resume keep the
-        # same frozen data/training/evaluation protocol.
-        budget.pop("allow_api_egress", None)
+        self.plan = self._resolve_device_plan(workspace)
+        # Open the GPU-hour account with the run's wall clock, not with the first job: the
+        # ledger is what bounds the second, third and tenth job, so it has to have been
+        # counting since the budget did.
+        self.device_ledger()
+        self._charge_device_probe()
+        budget = protocol_budget(self.config)
         protocol = {
             "schema_version": SCHEMA_VERSION, "benchmark": BENCHMARK, "task": self.task,
             "source": source, "discovery_sha256": object_digest(discovery), "assets": self.assets,
@@ -536,6 +809,12 @@ class RepositoryAutoResearch:
             "comparison_models": ["official_act", "official_data_continuation", "api_selected_candidate"],
             "success_gate_pp": 3.0, "final_feedback_forbidden": True,
         }
+        # Only a plan that is *not* legacy equivalent changes the run's identity.  A
+        # `--gpus 0` plan addresses exactly the card and the way `--gpu 0` does, so it stays
+        # out of the frozen protocol.
+        if self.plan is not None and not self.plan["legacy_equivalence"]:
+            protocol["devices"] = devices_protocol_block(self.plan)
+        self._check_recorded_plan(protocol)
         immutable_json(self.run_root / "run_request.json", {
             "schema_version": 1, "run_id": self.config.run_id,
             "repository": str(self.repo), "source_commit": source["git_commit"],
@@ -587,15 +866,22 @@ class RepositoryAutoResearch:
             raise RuntimeError(f"incompatible cached evaluation: {metrics}")
         return data
 
-    def evaluate(self, checkpoint: Path, label: str, purpose: str, master: int, count: int) -> dict[str, Any]:
+    def evaluate(self, checkpoint: Path, label: str, purpose: str, master: int, count: int,
+                 *, bound: Runtime | None = None) -> dict[str, Any]:
+        """One evaluation, on ``bound``'s device when a phase placed it on one.
+
+        ``bound`` is a per-job view; the unbound path is what every legacy invocation and
+        every single-device run takes, and it is unchanged.
+        """
         assert self.runtime is not None and self.spec is not None
+        runtime = bound or self.runtime
         path = self.run_root / "evaluations" / f"{label}_{purpose}"
         cached = self._existing_evaluation(path, purpose, count)
         if cached is not None:
             result = cached
         else:
-            result = self.runtime.evaluate(self.spec, checkpoint, path, episodes=count,
-                                           master_seed=master, purpose=purpose)
+            result = runtime.evaluate(self.spec, checkpoint, path, episodes=count,
+                                      master_seed=master, purpose=purpose)
         self.update_capability("native_evaluation", "verified", {
             "evaluation": str(path), "execution_mode": result.get("execution_mode"),
             "checkpoint_sha256": digest(checkpoint / "model.safetensors"),
@@ -755,10 +1041,12 @@ class RepositoryAutoResearch:
         return result
 
     def _collect_one(self, round_index: int, label: str, *, attempts: int, target: int,
-                     profile: str, mode: str, checkpoint: Path) -> dict[str, Any] | None:
+                     profile: str, mode: str, checkpoint: Path,
+                     bound: Runtime | None = None) -> dict[str, Any] | None:
         if attempts == 0:
             return None
         assert self.runtime is not None and self.spec is not None
+        runtime = bound or self.runtime
         base = self.run_root / "rounds" / f"round_{round_index}" / "collection" / label
         for candidate in [base, base / "startup_attempt_2", base / "startup_attempt_3"]:
             result_path = candidate / "bounded_collection_result.json"
@@ -770,11 +1058,7 @@ class RepositoryAutoResearch:
             process_path = destination / "process/process.json"
             if process_path.is_file():
                 process = read_json(process_path)
-                crash_before_reset = (process.get("status") == "failed"
-                                      and process.get("returncode") in {-11, -6}
-                                      and not (destination / "collection.json").exists()
-                                      and not (destination / "scene_resets.jsonl").exists())
-                if crash_before_reset and attempt_index < 3:
+                if retryable_collection_startup(destination) and attempt_index < 3:
                     atomic_json(base / f"startup_attempt_{attempt_index}_retry_decision.json", {
                         "reason": "native_crash_before_first_collection_reset",
                         "returncode": process.get("returncode"), "accepted_episodes": 0,
@@ -784,7 +1068,7 @@ class RepositoryAutoResearch:
                     continue
                 raise RuntimeError(f"unclassified prior collection attempt: {process_path}")
             try:
-                result = self.runtime.collect_bounded(
+                result = runtime.collect_bounded(
                     self.spec, destination, attempt_budget=attempts, target_episodes=min(target, attempts),
                     master_seed=master, profile=profile, collection_mode=mode,
                     correction_checkpoint=checkpoint if mode == "policy_correction" else None,
@@ -892,12 +1176,27 @@ class RepositoryAutoResearch:
         enabled = bool(collection["enabled"])
         acting_checkpoint = Path(context.get(
             "current_policy_checkpoint", self.assets["official_checkpoint"]))
-        target = self._collect_one(round_index, "targeted", attempts=int(collection["targeted_attempts"]) if enabled else 0,
-                                   target=int(collection["target_episodes"]), profile=collection["profile"],
-                                   mode=collection["mode"], checkpoint=acting_checkpoint)
-        original = self._collect_one(round_index, "original", attempts=int(collection["original_attempts"]) if enabled else 0,
-                                     target=int(collection["original_attempts"]), profile="full_random",
-                                     mode="expert", checkpoint=Path(self.assets["official_checkpoint"]))
+        targeted_attempts = int(collection["targeted_attempts"]) if enabled else 0
+        original_attempts = int(collection["original_attempts"]) if enabled else 0
+        # The two collections of a round share no seed bank, no output directory and no
+        # checkpoint, and neither result can change the other's -- which is what makes them
+        # the phase a second device actually buys: on one device they run in this order.
+        collected = self.run_phase(f"round_{round_index}_collection", [
+            PhaseJob("collection_targeted", "collection",
+                     lambda bound: self._collect_one(
+                         round_index, "targeted", attempts=targeted_attempts,
+                         target=int(collection["target_episodes"]), profile=collection["profile"],
+                         mode=collection["mode"], checkpoint=acting_checkpoint, bound=bound),
+                     estimate_seconds=self.phase_estimate(targeted_attempts)),
+            PhaseJob("collection_original", "collection",
+                     lambda bound: self._collect_one(
+                         round_index, "original", attempts=original_attempts,
+                         target=original_attempts, profile="full_random", mode="expert",
+                         checkpoint=Path(self.assets["official_checkpoint"]), bound=bound),
+                     estimate_seconds=self.phase_estimate(original_attempts)),
+        ])
+        target = collected["collection_targeted"]
+        original = collected["collection_original"]
         admitted = []
         excluded = []
         for profile, result in ((collection["profile"], target), ("full_random", original)):
@@ -916,12 +1215,20 @@ class RepositoryAutoResearch:
                 })
                 continue
             if result and int(result.get("accepted_episodes", 0)) > 0 and result.get("dataset_root"):
-                root = Path(result["dataset_root"])
-                self.runtime.prepare_data(self.spec, root, round_dir / "data_audit" / f"{profile}_{len(admitted)}")
-                cumulative.append((profile, root))
-                admitted.append({"profile": profile, "root": str(root),
-                                 "accepted_episodes": result["accepted_episodes"],
-                                 "attempts_consumed": result["attempts_consumed"]})
+                # A spread collection leaves one dataset per attempt block; every one of
+                # them is admitted, and each carries its own shard's yield rather than the
+                # merged total, so the mixture's parts stay per-dataset facts.
+                per_root = {row.get("dataset_root"): row for row in result.get("shards") or []}
+                for root in map(Path, result.get("dataset_roots") or [result["dataset_root"]]):
+                    shard = per_root.get(str(root)) or {}
+                    self.runtime.prepare_data(self.spec, root,
+                                              round_dir / "data_audit" / f"{profile}_{len(admitted)}")
+                    cumulative.append((profile, root))
+                    admitted.append({"profile": profile, "root": str(root),
+                                     "accepted_episodes": shard.get("accepted_episodes",
+                                                                    result["accepted_episodes"]),
+                                     "attempts_consumed": shard.get("attempts",
+                                                                    result["attempts_consumed"])})
         atomic_json(round_dir / "data_admission.json", {
             "admitted": admitted, "excluded": excluded,
             "rule": "targeted sources require verified realized-scene readback; full_random is admitted by its original-distribution contract",
@@ -1020,13 +1327,30 @@ class RepositoryAutoResearch:
                 "must_use_current_policy_feedback": prior is not None}
 
     def _select(self, baseline: dict[str, Any], rounds: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
-        official = self.evaluate(Path(self.assets["official_checkpoint"]), "official_act", "selection_validation",
-                                 self._master_seed("selection_validation"), self.config.selection_episodes)
+        """Score the baseline and every candidate on one frozen bank.
+
+        These evaluations share a seed bank and a checkpoint per row, and none of them can
+        change another's number, so they are one phase: on several devices they run at the
+        same time, and on one they run in the order they always did, official first.
+        """
+        seed = self._master_seed("selection_validation")
+        episodes = self.config.selection_episodes
+        estimate = self.phase_estimate(episodes)
+        jobs = [PhaseJob("round_1_selection_official_act", "evaluation",
+                         lambda bound, checkpoint=Path(self.assets["official_checkpoint"]): self.evaluate(
+                             checkpoint, "official_act", "selection_validation", seed, episodes,
+                             bound=bound), estimate_seconds=estimate)]
+        for row in rounds:
+            label, checkpoint = f"round_{row['round']}_candidate", Path(row["checkpoint"])
+            jobs.append(PhaseJob(f"round_{row['round']}_selection_candidate", "evaluation",
+                                 lambda bound, checkpoint=checkpoint, label=label: self.evaluate(
+                                     checkpoint, label, "selection_validation", seed, episodes,
+                                     bound=bound), estimate_seconds=estimate))
+        measured = self.run_phase("selection_validation", jobs)
+        official = measured["round_1_selection_official_act"]
         candidates = []
         for row in rounds:
-            metrics = self.evaluate(Path(row["checkpoint"]), f"round_{row['round']}_candidate",
-                                    "selection_validation", self._master_seed("selection_validation"),
-                                    self.config.selection_episodes)
+            metrics = measured[f"round_{row['round']}_selection_candidate"]
             candidates.append((row, metrics, compare(metrics, official)))
         def key(item):
             summary = item[1]["summary"]
@@ -1082,8 +1406,13 @@ class RepositoryAutoResearch:
                     "preserve it and rebuild under a new run identity"
                 )
         if not destination.exists():
+            # `.venv` is machine state, not artifact content: policy/act ships an 11 GB
+            # uv venv (torch cu128 wheels) that would be copied here and again into the
+            # short /tmp staging tree below, and the exported README tells the deployer
+            # to install the dependencies anyway. Validation runs the staged evaluator
+            # with this platform's interpreter, so it never reads that venv.
             shutil.copytree(export_base, destination, ignore=shutil.ignore_patterns(
-                ".git", "lerobot_dataset", "eval_result", "evaluation_results", "__pycache__", "*.pyc", "checkpoints"))
+                ".git", ".venv", "lerobot_dataset", "eval_result", "evaluation_results", "__pycache__", "*.pyc", "checkpoints"))
             for relative in overlay_paths:
                 source = self.repo / relative
                 target = destination / relative
@@ -1170,7 +1499,18 @@ class RepositoryAutoResearch:
                 smoke = export_runtime.evaluate(export_spec, staged_checkpoint, smoke_dir,
                                                 episodes=1, master_seed=bank["master_seed"],
                                                 purpose="smoke", startup_attempts=1,
-                                                smoke_timeout=120)
+                                                # 900 s is a real budget, not a token bound. The
+                                                # environment takes ~360 s to construct before the
+                                                # first reset in this cluster (measured on the run's
+                                                # own development evaluation: process start
+                                                # 10:21:44.96 -> first reset 10:27:44.68), while
+                                                # every real evaluation is allowed >=1800 s. At the
+                                                # previous 120 s bound the probe was killed mid-
+                                                # construction on every attempt -- ``TimeoutExpired``
+                                                # with ``startup.json: environment_constructing`` and
+                                                # no ``initializations.jsonl`` -- so it could only
+                                                # ever report a startup fault that had not occurred.
+                                                smoke_timeout=900)
                 break
             except RuntimeError as exc:
                 last_error = exc
@@ -1184,6 +1524,7 @@ class RepositoryAutoResearch:
                     "artifact_directory": str(smoke_dir),
                     "status": "failed_before_first_reset",
                     "error_type": type(exc).__name__,
+                    "startup_receipt": startup_receipt(smoke_dir),
                 })
         if smoke is None:
             # All bounded operational probes failed before reset. Loading
@@ -1211,7 +1552,12 @@ class RepositoryAutoResearch:
                     f"evaluations/round_{selected_round}_candidate_selection_validation")
             native_limitation = {
                 "status": "blocked_before_first_reset",
-                "reason": "benchmark native renderer/material startup fault on every bounded operational probe",
+                # Quote the probes rather than name a cause: each attempt carries
+                # its ``startup_receipt`` (termination, phase, whether any
+                # initialization was recorded). Saying "renderer fault" here
+                # instead would be a diagnosis these artifacts do not support.
+                "reason": ("every operational probe ended before its first reset; see "
+                           "attempts[].startup_receipt for the recorded phase and termination"),
                 "attempts": startup_failures,
                 "completed_evaluation_episodes": 0,
                 "same_checkpoint_real_simulation_evidence": True,
@@ -1271,7 +1617,12 @@ class RepositoryAutoResearch:
             else:
                 self.save(stage="control_controller_ready", decision_controller=self.config.controller)
             self.start_or_resume_budget()
-            with gpu_lock(self.config.gpu):
+            # The legacy index lock guards *this run* against a concurrent single-device
+            # run; it is the mechanism the UUID leases replace.  Taking both would be
+            # self-defeating -- the leases treat a held legacy lock as occupancy, so a
+            # multi-device run holding index 0 would block its own first lease.
+            holding_legacy = self.plan is None or self.plan["legacy_equivalence"]
+            with gpu_lock(self.config.gpu) if holding_legacy else nullcontext():
                 official_audit_path = self.run_root / "official_data_audit"
                 official_audit_file = official_audit_path / "data_audit.json"
                 if official_audit_file.is_file():
@@ -1316,16 +1667,28 @@ class RepositoryAutoResearch:
                         steps=80_000, params=selected_row["proposal"]["training"]["params"],
                         mixture=Path(selected_row["mixture"]), seed=self.config.train_seed, resume=True)
                     official_cont = self._official_continuation(80_000)
-                    official_recheck = self.evaluate(Path(self.assets["official_checkpoint"]),
-                        "official_act_80k_recheck", "selection_validation",
-                        self._master_seed("selection_validation"),
-                        self.config.selection_episodes)
-                    candidate_recheck = self.evaluate(candidate, f"{self.config.controller}_selected_candidate_80k",
-                        "selection_validation", self._master_seed("selection_validation"),
-                        self.config.selection_episodes)
-                    control_recheck = self.evaluate(official_cont, "official_data_continuation_80k",
-                        "selection_validation", self._master_seed("selection_validation"),
-                        self.config.selection_episodes)
+                    recheck_seed = self._master_seed("selection_validation")
+                    recheck_episodes = self.config.selection_episodes
+                    recheck_estimate = self.phase_estimate(recheck_episodes)
+                    rechecks = self.run_phase("full_budget_recheck", [
+                        PhaseJob("official_act_80k_recheck", "evaluation",
+                                 lambda bound, checkpoint=Path(self.assets["official_checkpoint"]): self.evaluate(
+                                     checkpoint, "official_act_80k_recheck", "selection_validation",
+                                     recheck_seed, recheck_episodes, bound=bound),
+                                 estimate_seconds=recheck_estimate),
+                        PhaseJob("selected_candidate_80k_recheck", "evaluation",
+                                 lambda bound, checkpoint=candidate: self.evaluate(
+                                     checkpoint, f"{self.config.controller}_selected_candidate_80k",
+                                     "selection_validation", recheck_seed, recheck_episodes,
+                                     bound=bound), estimate_seconds=recheck_estimate),
+                        PhaseJob("official_data_continuation_80k_recheck", "evaluation",
+                                 lambda bound, checkpoint=official_cont: self.evaluate(
+                                     checkpoint, "official_data_continuation_80k",
+                                     "selection_validation", recheck_seed, recheck_episodes,
+                                     bound=bound), estimate_seconds=recheck_estimate)])
+                    official_recheck = rechecks["official_act_80k_recheck"]
+                    candidate_recheck = rechecks["selected_candidate_80k_recheck"]
+                    control_recheck = rechecks["official_data_continuation_80k_recheck"]
                     selection["full_budget_recheck"] = {
                         "official_summary": _summary(official_recheck),
                         "candidate_summary": _summary(candidate_recheck),
@@ -1342,15 +1705,20 @@ class RepositoryAutoResearch:
                     if official_cont is None:
                         official_cont = self._official_continuation(compact_steps)
                     self.save(stage="final_confirmation", final_confirmation_opened=True)
-                    metrics = {}
-                    for key, label, checkpoint in (
-                        ("official_act", "official_act", Path(self.assets["official_checkpoint"])),
-                        ("official_data_continuation", "official_data_continuation", official_cont),
-                        ("selected_candidate", f"{self.config.controller}_selected_candidate", candidate),
-                    ):
-                        metrics[key] = self.evaluate(checkpoint, label, "final_confirmation",
-                                                     self._master_seed("final_confirmation"),
-                                                     self.config.final_episodes)
+                    final_seed = self._master_seed("final_confirmation")
+                    final_episodes = self.config.final_episodes
+                    final_estimate = self.phase_estimate(final_episodes)
+                    metrics = self.run_phase("final_confirmation", [
+                        PhaseJob(key, "evaluation",
+                                 lambda bound, checkpoint=checkpoint, label=label: self.evaluate(
+                                     checkpoint, label, "final_confirmation", final_seed,
+                                     final_episodes, bound=bound),
+                                 estimate_seconds=final_estimate)
+                        for key, label, checkpoint in (
+                            ("official_act", "official_act", Path(self.assets["official_checkpoint"])),
+                            ("official_data_continuation", "official_data_continuation", official_cont),
+                            ("selected_candidate", f"{self.config.controller}_selected_candidate", candidate),
+                        )])
                     final = {"summaries": {k: _summary(v) for k, v in metrics.items()},
                              "decision_controller": self.config.controller,
                              "candidate_vs_official": compare(metrics["selected_candidate"], metrics["official_act"]),
@@ -1412,7 +1780,34 @@ def make_parser() -> argparse.ArgumentParser:
                         help="Task to optimize; auto uses the backend's deterministic default")
     parser.add_argument("--controller", choices=["api", "fixed", "random", "heuristic"],
                         default="api", help="Research decision policy; controls share the same executor and budget")
-    parser.add_argument("--gpu", default="0")
+    parser.add_argument("--gpu", default=None,
+                        help="Single-device form: the GPU index this run uses (default 0). "
+                             "Cannot be combined with the --gpus family, which would make "
+                             "the intended device set ambiguous")
+    parser.add_argument("--gpus", default=None,
+                        help="Multi-device form: 'auto' or a comma-separated device list such "
+                             "as 0,1. Requires a passing device-probe receipt for this node "
+                             "(python -m autosim.research.device_probe)")
+    parser.add_argument("--device-mode", choices=["auto", "pinned_index", "identity", "node_isolated"],
+                        default="auto",
+                        help="Addressing scheme; 'auto' adopts the mode the device probe verified")
+    parser.add_argument("--max-parallel-jobs", type=int, default=None,
+                        help="Upper bound on heavy jobs running at the same time")
+    parser.add_argument("--gpu-hours", type=float, default=None,
+                        help="Cumulative GPU-hour budget; defaults to --hours x usable devices")
+    parser.add_argument("--accept-device-plan", action="store_true",
+                        help="Proceed on the usable subset when some requested devices are busy "
+                             "or incompatible, and record the accepted reasons")
+    parser.add_argument("--multi-gpu-probe", action="store_true",
+                        help="Run the device-alignment ladder on this node, publish its receipt, "
+                             "and exit without starting a research run")
+    parser.add_argument("--probe-if-needed", action="store_true",
+                        help="For a multi-device run: if no device receipt matches this container, "
+                             "run the ladder here (same budget) before building the plan")
+    parser.add_argument("--probe-smoke-timeout", type=int, default=900,
+                        help="Per-arm wall-clock bound for --multi-gpu-probe and --probe-if-needed; "
+                             "a real episode needs minutes because DexSim construction alone "
+                             "costs ~6 minutes")
     parser.add_argument("--hours", type=float, default=24.0)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--attempts-per-round", type=int, default=100)
@@ -1439,8 +1834,69 @@ def make_parser() -> argparse.ArgumentParser:
 ClickBellAutoResearch = RepositoryAutoResearch
 
 
+def _reject_ambiguous_devices(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`--gpu` and the `--gpus` family describe the same thing; refuse to guess.
+
+    Two device models in one invocation would let a multi-device plan be built and then
+    executed with the single-device device, which is exactly the silent mislabelling the
+    plan is supposed to prevent.
+    """
+    multi = []
+    if args.gpus is not None:
+        multi.append("--gpus")
+    if args.max_parallel_jobs is not None:
+        multi.append("--max-parallel-jobs")
+    if args.gpu_hours is not None:
+        multi.append("--gpu-hours")
+    if args.device_mode != "auto":
+        multi.append("--device-mode")
+    if args.accept_device_plan:
+        multi.append("--accept-device-plan")
+    if args.multi_gpu_probe:
+        multi.append("--multi-gpu-probe")
+    if args.probe_if_needed:
+        multi.append("--probe-if-needed")
+    if args.gpu is not None and multi:
+        parser.error(f"--gpu uses the single-device form and cannot be combined with "
+                     f"{', '.join(multi)}; pass --gpus instead of --gpu")
+    if args.multi_gpu_probe:
+        # The ladder measures the node; it schedules no jobs, so job-level budgets and
+        # acknowledgements have nothing to apply to.
+        unusable = [name for name, value in (("--max-parallel-jobs", args.max_parallel_jobs),
+                                            ("--gpu-hours", args.gpu_hours),
+                                            ("--accept-device-plan", args.accept_device_plan or None),
+                                            ("--probe-if-needed", args.probe_if_needed or None))
+                    if value is not None]
+        if unusable:
+            parser.error(f"{', '.join(unusable)} do not apply to --multi-gpu-probe, "
+                         f"which only measures this node and publishes its receipt")
+        return
+    dependent = [name for name in multi if name not in {"--gpus", "--multi-gpu-probe"}]
+    if dependent and args.gpus is None:
+        parser.error(f"{', '.join(dependent)} only applies to a multi-device plan; "
+                     f"add --gpus auto (or a device list)")
+
+
+def _probe_argv(args: argparse.Namespace) -> list[str]:
+    """The device ladder runs as its own process, exactly as the launcher runs it."""
+    return ["-m", "autosim.research.device_probe",
+            "--workspace", str(PROJECT_ROOT),
+            "--output", str(Path(args.output_root) / BENCHMARK / f"multigpu_probe_{args.run_id}"),
+            "--task", args.task,
+            "--gpus", args.gpus or "auto",
+            "--mode", args.device_mode if args.device_mode in {"pinned_index", "identity"} else "pinned_index",
+            "--smoke-timeout", str(int(args.probe_smoke_timeout))]
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = make_parser().parse_args(argv)
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    _reject_ambiguous_devices(parser, args)
+    if args.multi_gpu_probe:
+        # No research run, no plan: this invocation only measures the node and publishes the
+        # receipt a later --gpus run consumes.
+        return subprocess.call([sys.executable, *_probe_argv(args)])
+    gpu = args.gpu if args.gpu is not None else "0"
     local_repo = Path(args.repo).expanduser()
     if (local_repo / "env_cfg/task_config/demo_randomized.yml").is_file() and (
             local_repo / "collect_data.sh").is_file():
@@ -1482,7 +1938,7 @@ def main(argv: list[str] | None = None) -> int:
         from .robotwin_autoresearch import RoboTwinAutoResearch
         runner = RoboTwinAutoResearch(
             project_root=PROJECT_ROOT, repo=local_repo, output_root=args.output_root,
-            run_id=args.run_id, task=task, controller=args.controller, gpu=args.gpu,
+            run_id=args.run_id, task=task, controller=args.controller, gpu=gpu,
             hours=args.hours, train_seed=args.train_seed,
             training_epochs=args.robotwin_training_epochs,
             evaluation_episodes=args.robotwin_evaluation_episodes,
@@ -1497,7 +1953,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["status"] == "completed" else 3
     config = MilestoneConfig(repo_input=args.repo, output_root=args.output_root,
                              run_id=args.run_id, task=args.task, controller=args.controller,
-                             gpu=args.gpu, hours=args.hours,
+                             gpu=gpu, hours=args.hours,
                              rounds=args.rounds, attempts_per_round=args.attempts_per_round,
                              screen_steps=args.training_steps,
                              development_episodes=args.development_episodes,
@@ -1508,7 +1964,14 @@ def main(argv: list[str] | None = None) -> int:
                              full_budget=args.full_budget,
                              allow_api_egress=args.allow_api_egress,
                              dry_run=args.dry_run,
-                             probe_only=args.probe_only)
+                             probe_only=args.probe_only,
+                             gpus=args.gpus, device_mode=args.device_mode,
+                             max_parallel_jobs=args.max_parallel_jobs,
+                             gpu_hours=args.gpu_hours,
+                             accept_device_plan=args.accept_device_plan,
+                             multi_gpu_probe=args.multi_gpu_probe,
+                             probe_if_needed=args.probe_if_needed,
+                             probe_smoke_timeout=args.probe_smoke_timeout)
     runner = RepositoryAutoResearch(config)
     try:
         result = runner.execute()

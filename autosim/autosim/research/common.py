@@ -96,8 +96,21 @@ def assert_frozen(hashes: dict[str, str]) -> None:
 
 
 def run_command(command: list[str], *, cwd: Path, env: dict[str, str],
-                output: Path, timeout: int) -> dict[str, Any]:
-    """Never retry a partial run or infer success merely from exit code zero."""
+                output: Path, timeout: int, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Never retry a partial run or infer success merely from exit code zero.
+
+    ``metadata`` (the device binding, the job name) is stamped onto the record and onto
+    every partial write of it, but never enters ``request``/``request_hash``: the timeout
+    may shrink when a run is resumed, so the request hash already excludes it, and a job
+    re-bound to a *different* device is a different fact that must be refused rather than
+    silently overwritten.
+    """
+    metadata = dict(metadata or {})
+    collisions = set(metadata) & {"command", "cwd", "timeout", "request_hash", "status",
+                                  "started_at", "finished_at", "elapsed_seconds", "pid",
+                                  "returncode", "error"}
+    if collisions:
+        raise ValueError(f"metadata may not shadow process record fields: {sorted(collisions)}")
     output.mkdir(parents=True, exist_ok=True)
     request = {"command": command, "cwd": str(cwd), "timeout": timeout}
     request_hash = object_digest(request)
@@ -106,10 +119,15 @@ def run_command(command: list[str], *, cwd: Path, env: dict[str, str],
         previous = read_json(result_path)
         if previous["command"] != command or previous["cwd"] != str(cwd):
             raise RuntimeError(f"refusing to reuse output for a different command: {output}")
+        conflicts = {key: value for key, value in metadata.items() if previous.get(key, value) != value}
+        if conflicts:
+            raise RuntimeError(f"refusing to rebind an existing process record: {output} {conflicts}")
+        if metadata:
+            atomic_json(result_path, {**previous, **metadata})
         if previous["status"] == "completed":
-            return previous
+            return {**previous, **metadata}
         raise RuntimeError(f"prior process incomplete/failed; audit and use a new attempt directory: {output}")
-    record = {**request, "request_hash": request_hash, "started_at": now(), "status": "running"}
+    record = {**request, **metadata, "request_hash": request_hash, "started_at": now(), "status": "running"}
     atomic_json(result_path, record)
     started = time.monotonic()
     with (output / "stdout.log").open("w", encoding="utf-8") as log:

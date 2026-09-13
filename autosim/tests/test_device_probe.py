@@ -1,0 +1,581 @@
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from autosim.research import device_probe, evaluation
+from autosim.research.devices import DEFAULT_DEVICE_ENV, SimDeviceSelection
+from autosim.research.runtime import Runtime
+
+ALLOCATION = ["GPU-aaa", "GPU-bbb"]
+IDLE = {"GPU-aaa": {"peak_memory_mib": 12, "mean_utilization_pct": 0.0, "samples": 3},
+        "GPU-bbb": {"peak_memory_mib": 8, "mean_utilization_pct": 0.0, "samples": 3}}
+
+
+def arm(**overrides):
+    row = {"name": "B", "status": "completed", "execution_mode": "real_simulation",
+           "episode_count": 1, "worker_failure": None}
+    row.update(overrides)
+    return row
+
+
+def peak(**memory):
+    return {uuid: {"peak_memory_mib": value, "mean_utilization_pct": 40.0, "samples": 5}
+            for uuid, value in memory.items()}
+
+
+class JudgeTests(unittest.TestCase):
+    def verdict(self, row=None, peaks=None, baseline=None):
+        return device_probe.judge(row or arm(), own_uuid="GPU-aaa", allocation=ALLOCATION,
+                                  baseline=baseline if baseline is not None else IDLE,
+                                  peak=peaks if peaks is not None else peak(**{"GPU-aaa": 4000,
+                                                                               "GPU-bbb": 8}))
+
+    def test_the_leased_device_grew_and_every_other_stayed_idle(self):
+        result = self.verdict()
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["growth_mib"]["GPU-aaa"]["growth_mib"], 3988)
+        self.assertEqual(result["growth_mib"]["GPU-bbb"]["growth_mib"], 0)
+
+    def test_a_leaking_neighbour_fails_even_when_the_leased_device_grew(self):
+        result = self.verdict(peaks=peak(**{"GPU-aaa": 4000, "GPU-bbb": 2600}))
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["others_stayed_idle"])
+
+    def test_the_leased_device_not_growing_fails_the_arm(self):
+        result = self.verdict(peaks=peak(**{"GPU-aaa": 40, "GPU-bbb": 8}))
+        self.assertFalse(result["checks"]["own_device_grew"])
+
+    def test_growth_is_measured_against_the_pre_run_baseline(self):
+        baseline = {"GPU-aaa": {"peak_memory_mib": 3700, "samples": 1},
+                    "GPU-bbb": {"peak_memory_mib": 8, "samples": 1}}
+        result = self.verdict(peaks=peak(**{"GPU-aaa": 5000, "GPU-bbb": 8}), baseline=baseline)
+        self.assertEqual(result["growth_mib"]["GPU-aaa"]["growth_mib"], 1300)
+        self.assertTrue(result["passed"])
+
+    def test_a_crashed_arm_fails_even_when_memory_moved(self):
+        result = self.verdict(row=arm(status="failed", execution_mode=None, episode_count=None,
+                                      worker_failure={"error": "SIGABRT"}),
+                              peaks=peak(**{"GPU-aaa": 4000, "GPU-bbb": 8}))
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["no_worker_failure"])
+
+    def test_an_unreadable_memory_reading_is_not_evidence_of_growth(self):
+        result = self.verdict(peaks=peak(**{"GPU-aaa": 40, "GPU-bbb": 8}))
+        self.assertIsNotNone(result["growth_mib"]["GPU-aaa"]["growth_mib"])
+        self.assertFalse(result["checks"]["own_device_grew"])
+
+
+def negative(status="failed", **receipt):
+    row = {"name": "C", "status": status,
+           "startup_receipt": {"status": "failed", "returncode": -6,
+                               "startup_phase": "environment_constructing",
+                               "initializations_recorded": False, **receipt}}
+    return row
+
+
+class NegativeControlTests(unittest.TestCase):
+    """The negative control's claim is narrow, so failing it is not enough to satisfy it."""
+
+    def test_a_native_abort_before_the_first_reset_reproduces_it(self):
+        self.assertTrue(device_probe.reproduced_native_abort(negative()))
+        self.assertTrue(device_probe.reproduced_native_abort(negative(returncode=-11)))
+
+    def test_a_command_line_error_is_not_a_reproduced_abort(self):
+        # rc=2 in 1.8 s with no startup.json: the first probe read this as a falsification
+        # of the model when it was a defect in the probe's own command line.
+        row = negative(returncode=2, startup_phase=None)
+        self.assertFalse(device_probe.reproduced_native_abort(row))
+
+    def test_an_abort_after_the_first_reset_is_not_the_startup_abort(self):
+        self.assertFalse(device_probe.reproduced_native_abort(negative(initializations_recorded=True)))
+        self.assertFalse(device_probe.reproduced_native_abort(negative(startup_phase="running")))
+
+    def test_a_missing_process_receipt_is_not_evidence_of_anything(self):
+        self.assertFalse(device_probe.reproduced_native_abort({"name": "C", "status": "failed"}))
+        self.assertFalse(device_probe.reproduced_native_abort({"name": "C", "status": "completed"}))
+
+
+class MergedCaptureTests(unittest.TestCase):
+    def test_the_diagnostic_reads_stderr_because_that_is_where_the_engine_logs(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="[EmbodiChain WARNING]: boom\n")
+        with mock.patch.object(device_probe.subprocess, "run", return_value=completed) as run:
+            captured = device_probe.run_merged(["python", "-c", "x"], env={"A": "1"}, timeout=5)
+        self.assertEqual(captured["returncode"], 0)
+        self.assertIn("boom", captured["text"])
+        self.assertEqual(run.call_args.kwargs["env"], {"A": "1"})
+
+    def test_a_failure_to_launch_is_recorded_rather_than_raised(self):
+        with mock.patch.object(device_probe.subprocess, "run", side_effect=OSError("no python")):
+            captured = device_probe.run_merged(["python"], env={}, timeout=5)
+        self.assertIsNone(captured["returncode"])
+        self.assertIn("__error__", captured["text"])
+
+
+class EnvironmentMeasurementTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+        def runner(command, **kwargs):
+            self.calls.append(list(command))
+            index = command[-1] if command[-2] == "-c" and len(command) > 2 else None
+            if "torch" in " ".join(command) and "-c" in command:
+                return json.dumps({"count": 4, "rows": [
+                    {"i": i, "name": "NVIDIA GeForce RTX 5090", "uuid": f"u{i}"}
+                    for i in range(4)]})
+            if "select_default_renderer" in " ".join(command):
+                return f"RESULT_MARKER hybrid\n" if index else "RESULT_MARKER hybrid\n"
+            return "  vulkan_physical_device_count=4\n    [0] uuid=GPU-aaa luid=0\n"
+        self.patch = mock.patch.object(device_probe, "run_text", runner)
+        self.runner = self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.patch_merged = mock.patch.object(
+            device_probe, "run_merged",
+            lambda command, **kw: {"returncode": 0, "text": runner(command) or ""})
+        self.patch_merged.start()
+        self.addCleanup(self.patch_merged.stop)
+
+    def measure(self, devices=None):
+        devices = devices or [{"index": i, "uuid": f"GPU-{i}"} for i in range(4)]
+        return device_probe.environment_measurements(
+            Path("/usr/bin/python"), {"PATH": "/usr/bin"}, devices,
+            vulkan_probe=Path(__file__), loader_select=None)
+
+    def test_shared_environments_are_measured_once_and_each_index_separately(self):
+        table = self.measure()
+        self.assertEqual(sorted(table["shared"]), ["cvd_all", "outer_default"])
+        self.assertEqual(sorted(table["by_index"]), ["0", "1", "2", "3"])
+
+    def test_loader_select_is_recorded_only_when_asked_for(self):
+        self.assertNotIn("loader_select", self.measure()["shared"])
+        table = device_probe.environment_measurements(
+            Path("/usr/bin/python"), {}, [{"index": 0, "uuid": "GPU-0"}],
+            vulkan_probe=Path(__file__), loader_select="0x10de:0x2b85")
+        self.assertIn("loader_select", table["shared"])
+
+    def test_a_failing_query_is_recorded_rather_than_guessed(self):
+        with mock.patch.object(device_probe, "run_text", lambda command, **kw: "__error__: rc=9"):
+            table = self.measure([{"index": 0, "uuid": "GPU-0"}])
+        entry = table["by_index"]["0"]
+        self.assertIn("error", entry["torch"])
+        self.assertIsNone(entry["vulkan"]["physical_devices"])
+
+    def test_the_engine_warning_on_stderr_is_what_the_row_records(self):
+        """Six identical bare markers is what a blind measurement looks like.
+
+        The engine answers ``select_default_renderer`` through ``log_warning`` on stderr, so a
+        stdout-only capture makes every environment -- including the one predicted to fail --
+        read the same. The row has to carry the line that distinguishes them.
+        """
+        def merged(command, **kwargs):
+            if "select_default_renderer" in " ".join(command):
+                return {"returncode": 0, "text": "RESULT_MARKER hybrid\n[EmbodiChain WARNING]: "
+                                                 "Failed to query GPU name for device 3 (boom). "
+                                                 "Defaulting renderer to 'hybrid'."}
+            return {"returncode": 0, "text": ""}
+
+        with mock.patch.object(device_probe, "run_merged", merged):
+            row = self.measure([{"index": 3, "uuid": "GPU-3"}])["by_index"]["3"]
+        self.assertIn("Failed to query GPU name for device 3", row["renderer_auto"])
+        self.assertEqual(row["renderer_auto_returncode"], 0)
+
+
+class RuntimeDeviceBindingTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+        self.runtime = Runtime(self.root, self.root / "out", repo_path=self.root,
+                               eval_repo_path=self.root, python_path=Path("/usr/bin/python"))
+        self.selection = SimDeviceSelection("pinned_index", 2, "GPU-ccc", 2, 0, "2", "hybrid", {})
+
+    def test_the_legacy_path_passes_no_device_flag_at_all(self):
+        self.assertEqual(self.runtime.collector_device_flags(), [])
+        self.assertEqual(self.runtime.evaluation_device_flags(), [])
+        self.assertEqual(self.runtime.device_metadata(), {})
+        environment = self.runtime.environment()
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertNotIn(DEFAULT_DEVICE_ENV, environment,
+                         "the legacy path has nothing to align: ordinal 0 is the leased card")
+
+    def test_a_device_plan_tells_every_child_which_card_is_ordinal_zero(self):
+        """A plan is what makes "the default device" ambiguous, so a plan is what aligns it.
+
+        The evaluator, the collector and the policy child each read this variable before they
+        touch CUDA (see ``devices.align_process_defaults``); the trainer gets it through its
+        narrowed selection, where ordinal 0 means the leased card by construction.
+        """
+        identity = SimDeviceSelection("identity", 3, "GPU-ddd", 3, 3, None, "hybrid", {})
+        bound = self.runtime.for_job(identity, job="eval_1", output=self.root / "job1")
+        self.assertEqual(bound.environment()[DEFAULT_DEVICE_ENV], "3")
+        # The trainer is bound to one visible card, so its ordinal 0 -- and its variable -- is
+        # the leased card by construction rather than by alignment.
+        self.runtime.selection = identity
+        environment = self.runtime.environment(selection=self.runtime.training_selection())
+        self.assertEqual((environment[DEFAULT_DEVICE_ENV], environment["CUDA_VISIBLE_DEVICES"]),
+                         ("0", "3"))
+
+    def test_each_subprocess_gets_the_flags_its_own_cli_defines(self):
+        """The collector and the evaluator spell the engine index differently.
+
+        Asserting the strings against the two argparsers rather than against each other is
+        the point: the first multi-GPU probe died on ``--gpu_id`` reaching an evaluator that
+        only knows ``--device-gpu-id``.
+        """
+        bound = self.runtime.for_job(self.selection, job="eval_1")
+        self.assertEqual(bound.collector_device_flags(),
+                         ["--gpu_id", "2", "--renderer", "hybrid"])
+        self.assertEqual(bound.evaluation_device_flags(),
+                         ["--device-gpu-id", "2", "--renderer", "hybrid",
+                          "--device-torch-index", "0"])
+        # And against the CLIs themselves, read from source: a unit test that only compares
+        # our two spellings to each other would have passed the day the probe died.
+        evaluator_source = (Path(__file__).parents[1] / "autosim/research/evaluation.py").read_text()
+        for flag in bound.evaluation_device_flags()[::2]:
+            self.assertIn(f'"{flag}"', evaluator_source)
+        # Both accepted layouts: next to the platform (outer) or inside it (inner root).
+        candidates = [root / "EmbodiChain/embodichain/lab/gym/utils/gym_utils.py"
+                      for root in (Path(__file__).parents[2], Path(__file__).parents[3])]
+        collector_source = next((path for path in candidates if path.is_file()), None)
+        if collector_source is None:
+            self.skipTest("the EmbodiChain checkout defining the collector CLI is absent")
+        for flag in bound.collector_device_flags()[::2]:
+            self.assertIn(f'"{flag}"', collector_source.read_text())
+        metadata = bound.device_metadata()
+        self.assertEqual((metadata["device_uuid"], metadata["device_index"],
+                          metadata["device_torch_index"], metadata["job"]),
+                         ("GPU-ccc", 2, 0, "eval_1"))
+        self.assertNotIn("renderer", metadata["device_mode"])
+
+    def test_binding_a_job_never_mutates_the_shared_runtime(self):
+        self.runtime.selection = self.selection
+        bound = self.runtime.for_job(self.selection, job="eval_1", output=self.root / "job1")
+        self.assertIsNone(self.runtime.job)
+        self.assertEqual(bound.output, self.root / "job1")
+        self.assertIs(self.runtime.selection, self.selection)   # parent untouched
+        self.assertEqual(self.runtime.selection.extra_env, {})
+        self.assertEqual((bound.selection.mode, bound.selection.index,
+                          bound.selection.vulkan_gpu_id, bound.selection.torch_index),
+                         ("pinned_index", 2, 2, 0))
+
+    def test_per_job_caches_are_isolated_and_created(self):
+        bound = self.runtime.for_job(self.selection, job="eval_1", output=self.root / "job1")
+        other = self.runtime.for_job(self.selection, job="eval_2", output=self.root / "job2")
+        self.assertNotEqual(bound.selection.extra_env["XDG_CACHE_HOME"],
+                            other.selection.extra_env["XDG_CACHE_HOME"])
+        for path in bound.selection.extra_env.values():
+            self.assertTrue(Path(path).is_dir(), path)
+        environment = bound.environment()
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(environment["TMPDIR"], bound.selection.extra_env["TMPDIR"])
+
+    def test_identity_mode_keeps_the_whole_visible_set(self):
+        """Identity addressing is only correct *because* nothing renumbers the cards.
+
+        Narrowing an identity selection to one visible card makes every index above 0 an
+        invalid CUDA ordinal -- measured on the 5090 pool: ``CUDA_VISIBLE_DEVICES=3`` with
+        ``gpu_id=3`` aborts in ``OptixDevice.cpp`` (``cuDeviceGet(&m_cudaDevice, 3)`` ->
+        ``CUDA_ERROR_INVALID_DEVICE``, "Available devices: 0-0"), which is why the engine
+        index and the process index agreeing per card is the whole contract.
+        """
+        identity = SimDeviceSelection("identity", 2, "GPU-ccc", 2, 2, None, "hybrid", {})
+        bound = self.runtime.for_job(identity, job="eval_1", output=self.root / "job1")
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}):
+            self.assertEqual(bound.environment()["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            environment = bound.environment()
+        self.assertNotEqual(environment.get("CUDA_VISIBLE_DEVICES"), "0",
+                            "an identity selection must never narrow the visible set")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", environment,
+                         "an unset outer value stays unset; an empty one is not exported")
+        self.assertEqual(bound.evaluation_device_flags(),
+                         ["--device-gpu-id", "2", "--renderer", "hybrid",
+                          "--device-torch-index", "2"])
+
+    def test_a_selection_without_a_job_still_contributes_device_metadata(self):
+        bound = self.runtime.for_job(self.selection, job="")
+        self.assertNotIn("job", bound.device_metadata())
+
+    def test_training_is_narrowed_to_one_card_so_its_ordinal_stays_honest(self):
+        """``--device cuda`` is ordinal 0 of the *trainer's* view, not of the node.
+
+        Under identity addressing the trainer's view is the whole node, so a job leased to
+        card 3 would train on card 0 -- the same split the engine had, one space over.  The
+        training view is therefore narrowed to the leased card, where ordinal 0 means the
+        leased card in both modes (and training can never touch a neighbour's memory).
+        """
+        identity = SimDeviceSelection("identity", 3, "GPU-ddd", 3, 3, None, "hybrid", {})
+        self.runtime.selection = identity
+        training = self.runtime.training_selection()
+        self.assertEqual((training.mode, training.index, training.vulkan_gpu_id,
+                          training.torch_index, training.cuda_visible),
+                         ("identity", 3, 3, 0, "3"))
+        self.assertEqual(training.uuid, identity.uuid)      # the same card, not a new one
+        self.assertEqual(self.runtime.environment(selection=training)["CUDA_VISIBLE_DEVICES"],
+                         "3")
+        self.assertIsNone(identity.cuda_visible, "the shared selection is left untouched")
+
+    def test_the_three_environment_building_entry_points_align_their_default_device(self):
+        """Dropping any of these three calls silently restores the cross-card residual.
+
+        Nothing in a receipt pointed at a single owner of the second probe's 1030 MiB on card
+        0, so the rule is enforced structurally instead: every process that builds an
+        environment or loads a policy under a plan -- the evaluator shim, the collection
+        worker, the policy child -- asks ``devices`` for the plan's ordinal before it touches
+        CUDA, and only when a plan set one.
+        """
+        research = Path(__file__).parents[1] / "autosim/research"
+        for name in ("evaluation.py", "collection_worker.py", "policy_rpc.py"):
+            source = (research / name).read_text()
+            self.assertIn("align_process_defaults", source, name)
+            self.assertIn("default_device_index", source, name)
+
+    def test_a_pinned_selection_reaches_training_unchanged(self):
+        self.runtime.selection = self.selection
+        self.assertEqual(self.runtime.training_selection(), self.selection)
+
+    def test_an_unbound_runtime_trains_on_the_legacy_device(self):
+        self.assertIsNone(self.runtime.training_selection())
+
+
+def four_devices():
+    return [{"index": index, "uuid": f"GPU-{index}"} for index in range(4)]
+
+
+def judged(name, index, *, passed=True, abort=None, checks=None):
+    row = {"name": name, "device_index": index,
+           "judged": {"passed": passed, "own_device_uuid": f"GPU-{index}",
+                      "checks": checks or {"completed": passed, "real_simulation": passed,
+                                           "one_episode": passed, "no_worker_failure": True,
+                                           "own_device_grew": passed,
+                                           "others_stayed_idle": passed}}}
+    if abort is not None:
+        row["abort"] = abort
+    return row
+
+
+ORDINAL_ABORT = {"kind": "invalid_device_ordinal", "cards_touched_before_abort": [],
+                 "evidence": "Invalid device ID: 1. Available devices: 0-0"}
+SPLIT_ABORT = {"kind": "aborted_after_a_card_started", "cards_touched_before_abort": ["GPU-3"],
+               "evidence": "1 card(s) had already started the engine"}
+
+
+def diagnostics_ok():
+    return [{"name": "C", "status": "failed", "startup_receipt": {
+                "status": "failed", "returncode": -6,
+                "startup_phase": "environment_constructing",
+                "initializations_recorded": False}, "abort": SPLIT_ABORT},
+            {"name": "D", "prediction_met": True, "returncode": 0}]
+
+
+class ProbeVerdictTests(unittest.TestCase):
+    """Which mode a node verified, on which devices -- and what a failure is *called*.
+
+    The ladder runs C (negative control), D (cheap diagnostic), B_i (preferred mode, every
+    allocated card), A_i (fallback, every card it must cover) and the concurrent pair.
+    """
+
+    def verdict(self, *arms, mode="pinned_index"):
+        return device_probe.probe_verdict(arms=list(arms), allocation=four_devices(),
+                                          requested_mode=mode)
+
+    def concurrent(self, *a):
+        return [judged("concurrent_a", 3, passed=a[0] if a else True),
+                judged("concurrent_b", 2, passed=a[1] if len(a) > 1 else True)]
+
+    def test_the_fallback_wins_when_the_preferred_mode_only_works_on_card_zero(self):
+        """The measured shape of this cluster: index 0 passes, indices 1+ die at cuDeviceGet."""
+        arms = diagnostics_ok() + [judged("B_0", 0)] + \
+            [judged(f"B_{i}", i, passed=False, abort=ORDINAL_ABORT) for i in (1, 2, 3)] + \
+            [judged(f"A_{i}", i) for i in range(4)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertEqual(verdict["selection_mode"], "identity")
+        self.assertEqual(verdict["winner"], "fallback")
+        self.assertTrue(verdict["passed"])
+        self.assertEqual(verdict["verified_devices"], ["GPU-0", "GPU-1", "GPU-2", "GPU-3"])
+        self.assertTrue(verdict["verified_every_allocated_device"])
+        self.assertEqual(verdict["model_discrepancies"], [])
+        self.assertEqual(len(verdict["mode_limitations"]), 1)
+        self.assertIn("only valid on physical index 0", verdict["mode_limitations"][0])
+        self.assertEqual(verdict["devices_verified_under_preferred_mode"]["1"]["abort"]["kind"],
+                         "invalid_device_ordinal")
+
+    def test_the_preferred_mode_wins_when_it_covers_every_card(self):
+        arms = diagnostics_ok() + [judged(f"B_{i}", i) for i in range(4)] + \
+            [judged("A_3", 3)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertEqual((verdict["winner"], verdict["selection_mode"], verdict["passed"]),
+                         ("preferred", "pinned_index", True))
+        self.assertEqual(verdict["mode_limitations"], [])
+
+    def test_a_mode_that_missed_one_card_is_not_a_capability(self):
+        arms = diagnostics_ok() + [judged("B_0", 0)] + \
+            [judged(f"B_{i}", i, passed=False, abort=ORDINAL_ABORT) for i in (1, 2, 3)] + \
+            [judged(f"A_{i}", i, passed=i != 2) for i in range(4)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertIsNone(verdict["selection_mode"])
+        self.assertFalse(verdict["passed"])
+        self.assertIn("no_addressing_mode_verified_every_device",
+                      verdict["model_discrepancies"])
+
+    def test_a_mode_that_never_ran_on_some_card_is_not_verified_for_it(self):
+        """Only devices that ran an episode under the winning mode may be called usable."""
+        arms = diagnostics_ok() + [judged("B_0", 0)] + [judged("A_3", 3)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertEqual((verdict["selection_mode"], verdict["passed"]), ("pinned_index", False))
+        self.assertIn("the_winning_mode_did_not_verify_every_allocated_device",
+                      verdict["model_discrepancies"])
+
+    def test_a_preferred_failure_with_no_named_cause_is_a_discrepancy(self):
+        arms = diagnostics_ok() + [judged("B_0", 0),
+                                   judged("B_1", 1, passed=False)] + \
+            [judged(f"A_{i}", i) for i in range(4)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertEqual(verdict["selection_mode"], "identity")
+        self.assertIn("preferred_mode_failed_without_a_named_cause",
+                      verdict["model_discrepancies"])
+
+    def test_concurrency_is_part_of_the_verdict_not_a_footnote(self):
+        arms = diagnostics_ok() + [judged(f"B_{i}", i) for i in range(4)] + \
+            [judged("A_3", 3)] + self.concurrent(True, False)
+        verdict = self.verdict(*arms)
+        self.assertFalse(verdict["passed"])
+        self.assertIn("two_devices_never_ran_an_episode_at_the_same_time",
+                      verdict["model_discrepancies"])
+
+    def test_a_negative_control_that_did_not_abort_blocks_the_receipt(self):
+        negative = {"name": "C", "status": "completed", "startup_receipt": {}}
+        diagnostic = {"name": "D", "prediction_met": True, "returncode": 0}
+        arms = [negative, diagnostic] + [judged(f"B_{i}", i) for i in range(4)] + \
+            [judged("A_3", 3)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertFalse(verdict["passed"])
+        self.assertIn("negative_control_did_not_reproduce_the_abort",
+                      verdict["model_discrepancies"])
+
+    def test_a_negative_control_that_died_before_reaching_a_card_is_inconclusive(self):
+        """The second probe's C arm died like the ordinal arms did -- same rc, same phase.
+
+        Accepting that as "reproduced the historical abort" is how a ladder ends up citing a
+        crash it never observed, so a control that never reached a card is called inconclusive
+        and blocks the receipt instead.
+        """
+        negative = {"name": "C", "status": "failed", "startup_receipt": {
+                        "status": "failed", "returncode": -6,
+                        "startup_phase": "environment_constructing",
+                        "initializations_recorded": False},
+                    "abort": {"kind": "aborted_before_any_card_moved"}}
+        diagnostic = {"name": "D", "prediction_met": True, "returncode": 0}
+        arms = [negative, diagnostic] + [judged(f"B_{i}", i) for i in range(4)] + \
+            [judged("A_3", 3)] + self.concurrent()
+        verdict = self.verdict(*arms)
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["negative_control_reproduced_abort"], False)
+        self.assertIn("negative_control_aborted_before_reaching_a_card",
+                      verdict["model_discrepancies"])
+
+
+class CrossCardResidualTests(unittest.TestCase):
+    """A card nobody leased that moved anyway is reported with a *name*, not a shrug.
+
+    The second probe measured 1030 MiB on card 0 while an identity arm ran on card 3 and
+    recorded no process, so the finding could not be acted on.  Whether that memory is a
+    library defaulting to device 0 (bounded, idle, the arm's own process) or somebody else's
+    work is the difference between "documented" and "unsafe", and only the holder says which.
+    """
+
+    GROWTHS = {"GPU-3": {"growth_mib": 4606, "mean_utilization_pct": 5.9,
+                         "processes": {"4242": {"mib": 4606, "cmd": "python -m eval", "parent": 1}}},
+               "GPU-0": {"growth_mib": 1030, "mean_utilization_pct": 0.0,
+                         "processes": {"4242": {"mib": 1030, "cmd": "python -m eval", "parent": 1}}},
+               "GPU-1": {"growth_mib": 3, "mean_utilization_pct": 0.0, "processes": {}}}
+
+    def test_only_devices_over_the_ceiling_are_reported_and_each_names_its_holders(self):
+        rows = device_probe.foreign_holders(self.GROWTHS, ["GPU-0", "GPU-1"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["device_uuid"], rows[0]["growth_mib"]), ("GPU-0", 1030))
+        self.assertEqual(rows[0]["mean_utilization_pct"], 0.0)
+        self.assertEqual(rows[0]["holders"], [{"pid": "4242", "mib": 1030,
+                                                "cmd": "python -m eval", "parent": 1}])
+
+    def test_the_verdict_carries_the_residual_and_the_pid_that_ran_the_arm(self):
+        arm = judged("A_3", 3)
+        arm["own_pid"] = 4242
+        arm["judged"]["foreign_holders"] = device_probe.foreign_holders(self.GROWTHS,
+                                                                        ["GPU-0", "GPU-1"])
+        verdict = device_probe.probe_verdict(arms=[arm], allocation=four_devices(),
+                                             requested_mode="identity")
+        row = verdict["cross_card_residual"][0]
+        self.assertEqual((row["arm"], row["device_index"], row["own_pid"], row["growth_mib"]),
+                         ("A_3", 3, 4242, 1030))
+        self.assertEqual(row["holders"][0]["pid"], "4242")
+        # A residual is evidence, not a veto on its own: the device that ran the episode and
+        # the other devices' own checks still decide, which is what the reason list shows.
+        self.assertEqual(verdict["devices_verified_under_winning_mode"]["3"]["own_pid"], 4242)
+
+    def test_judge_separates_the_ceiling_from_the_attribution(self):
+        """The check stays strict; what changes is that failing it now has a witness."""
+        peak = {uuid: {"peak_memory_mib": row["growth_mib"] + 1, "mean_utilization_pct": 0.0,
+                       "samples": 5, "processes": row["processes"]}
+                for uuid, row in self.GROWTHS.items()}
+        baseline = {uuid: {"peak_memory_mib": 1} for uuid in self.GROWTHS}
+        result = device_probe.judge({"status": "completed", "execution_mode": "real_simulation",
+                                     "episode_count": 1},
+                                    own_uuid="GPU-3", allocation=list(self.GROWTHS),
+                                    baseline=baseline, peak=peak)
+        self.assertFalse(result["checks"]["others_stayed_idle"])
+        self.assertEqual([row["device_uuid"] for row in result["foreign_holders"]], ["GPU-0"])
+
+    def test_a_phase_receipt_names_its_process_so_a_holder_can_be_matched_to_it(self):
+        """``own_pid`` is read from the arm's phase receipt; without it a holder has no owner."""
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            evaluation.startup_phase(output, "environment_constructing", policy_has_acted=False)
+            receipt = json.loads((output / "startup.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["pid"], os.getpid())
+            self.assertEqual(receipt["phase"], "environment_constructing")
+            self.assertEqual(receipt["default_device"], {},
+                             "a process that never selected a device reports no alignment")
+
+
+class AbortClassificationTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+
+    def classify(self, text, growths=None):
+        (self.root / "process").mkdir(exist_ok=True)
+        (self.root / "process/stdout.log").write_text(text, encoding="utf-8")
+        return device_probe.classify_abort(output=self.root, growths=growths or {})
+
+    def test_the_driver_ordinal_abort_is_named_by_the_engines_own_message(self):
+        result = self.classify("Using CUDA device: NVIDIA GeForce RTX 5090 | ID: 0\n"
+                               "Invalid device ID: 1. Available devices: 0-0\n"
+                               "ERROR: OptixDevice.cpp(132): cuDeviceGet(&m_cudaDevice, "
+                               "m_ordinal) (101) CUDA_ERROR_INVALID_DEVICE: invalid device "
+                               "ordinal\n", {"GPU-1": {"growth_mib": 3}})
+        self.assertEqual(result["kind"], "invalid_device_ordinal")
+        self.assertIn("CUDA_ERROR_INVALID_DEVICE", result["evidence"])
+        self.assertEqual(result["cards_touched_before_abort"], [])
+
+    def test_a_death_after_a_card_started_is_not_a_death_before_one(self):
+        after = self.classify("...\n[EmbodiChain INFO] Physics successfully bound\n",
+                              {"GPU-3": {"growth_mib": 1633}, "GPU-0": {"growth_mib": 62}})
+        self.assertEqual(after["kind"], "aborted_after_a_card_started")
+        self.assertEqual(after["cards_touched_before_abort"], ["GPU-3"])
+        before = self.classify("...\n", {"GPU-1": {"growth_mib": 3}})
+        self.assertEqual(before["kind"], "aborted_before_any_card_moved")
+        self.assertEqual(before["cards_touched_before_abort"], [])
+
+    def test_a_missing_log_still_classifies_from_what_moved(self):
+        result = device_probe.classify_abort(output=self.root / "absent",
+                                             growths={"GPU-2": {"growth_mib": 900}})
+        self.assertEqual(result["kind"], "aborted_after_a_card_started")
+
+
+if __name__ == "__main__":
+    unittest.main()

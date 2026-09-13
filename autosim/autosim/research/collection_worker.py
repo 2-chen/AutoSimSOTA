@@ -249,7 +249,97 @@ def bind_action_bank(env, env_id: str, action_config: dict):
     return env
 
 
+def seed_offset_stream(*, offset: int, master_seed: int, receipt: Path | None = None) -> dict:
+    """Start the collector's own seed stream ``offset`` draws in, without editing it.
+
+    The benchmark builds one ``np.random.RandomState(collection_seed)`` and draws one
+    ``randint(0, 2**31 - 1)`` per reset, so burning ``offset`` identical draws first makes
+    this process's first reset the master bank's ``offset``-th seed.  Only the draw *count*
+    changes the stream, so the slice is exact rather than an approximation -- the same
+    argument, and the same numpy-level shim, as ``evaluation._seeded_numpy``.
+
+    Matching on the *seed value* is what keeps every other RandomState in the process alone:
+    the benchmark's correction path builds ``RandomState(collection_seed ^ 0x5A17C0DE)`` and
+    the engine seeds itself, and neither should be shifted by a collection block.  A second
+    construction with the plain master seed is refused rather than double-burned, because
+    that would mean the file grew a second stream and this shim no longer covers what it
+    claims to.
+
+    ``receipt`` is rewritten as the stream is seen: this process is expected to end in the
+    benchmark's own native exit (see ``main``), so nothing after the run can report what the
+    shim did.  The receipt is the shard's direct evidence that its block start was performed
+    rather than merely declared -- the coverage audit reads it.
+    """
+    import numpy
+
+    from .common import atomic_json
+
+    real = numpy.random.RandomState
+    state = {"offset": int(offset), "master_seed": int(master_seed), "streams_seen": 0,
+             "burned_draws": 0}
+
+    def publish():
+        if receipt is not None:
+            atomic_json(Path(receipt), dict(state, kind="collection_seed_offset",
+                                            schema_version=1))
+
+    class _OffsetRandomState:
+        """A RandomState that skips the draws belonging to earlier blocks."""
+
+        def __new__(cls, seed=None, *args, **kwargs):
+            instance = real(seed, *args, **kwargs) if seed is not None else real(*args, **kwargs)
+            if isinstance(seed, (int, numpy.integer)) and int(seed) == state["master_seed"]:
+                state["streams_seen"] += 1
+                if state["streams_seen"] > 1:
+                    raise RuntimeError(
+                        "the collector constructed a second RandomState(master_seed); the "
+                        "seed-offset shim covers exactly one collection stream")
+                for _ in range(state["offset"]):
+                    instance.randint(0, 2**31 - 1)
+                state["burned_draws"] = state["offset"]
+                publish()
+            return instance
+
+    publish()                       # streams_seen=0: the shim is installed and watching
+    numpy.random.RandomState = _OffsetRandomState
+    return state
+
+
+def _pop_seed_offset(argv: list[str]) -> int:
+    """Take ``--collection_seed_offset`` out of argv: run_env.py's parser does not know it."""
+    if "--collection_seed_offset" not in argv:
+        return 0
+    position = argv.index("--collection_seed_offset")
+    offset = int(argv[position + 1])
+    del argv[position:position + 2]
+    if offset < 0:
+        raise ValueError("collection seed offset must not be negative")
+    return offset
+
+
 def main():
+    # The benchmark's scripts/run_env.py flushes its collection manifest *before*
+    # env.close() precisely because DexSim's destroy() is expected to end the process
+    # from native code (os._exit(0)) right there. Our launcher disables that native exit
+    # globally, because the official evaluator writes evaluation_metrics.json *after*
+    # env.close() and would otherwise lose it -- but with the native exit disabled this
+    # collection run only survives close() to segfault in the interpreter's final GC
+    # (exit code -11, which autosim records as a failed collection). Restore the
+    # teardown the benchmark expects; collection is the only stage that wants it.
+    os.environ["EMBODICHAIN_SIM_EXIT_PROCESS"] = "1"
+
+    # Under a device plan this process builds the environment with every card visible (the
+    # engine resolves its physical index by NVML UUID), so anything that takes the *default*
+    # device -- warp's ``wp.launch`` in a contact sensor, a bare ``cuda`` in torch -- would
+    # land on card 0 rather than on the card this collection leased.  The plan's own ordinal
+    # is in the environment (see ``Runtime.environment``); a legacy single-GPU collection has
+    # no such variable and no such ambiguity.
+    from .devices import align_process_defaults, default_device_index
+
+    planned_index = default_device_index()
+    if planned_index is not None:
+        align_process_defaults(planned_index)
+
     import gymnasium as gym
     import embodichain.lab.scripts.run_env as expert_script
     from .registry import TASK_IDS, load_task
@@ -257,7 +347,16 @@ def main():
     settle_steps = int(os.environ.get("AUTOSIM_EXPERT_SETTLE_STEPS", "75"))
     if not 0 <= settle_steps <= 100:
         raise ValueError("expert terminal hold budget must be in [0,100]")
+    # A sharded collection starts its share of the attempt stream mid-bank.  The offset has
+    # to be consumed here rather than forwarded: run_env.py's parser has no such flag.
+    offset = _pop_seed_offset(sys.argv)
     manifest = Path(sys.argv[sys.argv.index("--collection_manifest") + 1])
+    if offset:
+        if "--collection_seed" not in sys.argv:
+            raise ValueError("a collection seed offset needs the master --collection_seed")
+        seed_offset_stream(offset=offset,
+                           master_seed=int(sys.argv[sys.argv.index("--collection_seed") + 1]),
+                           receipt=manifest.parent / "seed_offset.json")
     requested_profile = (
         sys.argv[sys.argv.index("--collection_profile") + 1]
         if "--collection_profile" in sys.argv else "full_random"

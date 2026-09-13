@@ -1,0 +1,197 @@
+"""Run one phase's independent jobs over the run's device set.
+
+A *phase* is a set of jobs nothing inside it depends on: a round's targeted collection
+beside its original collection, the official baseline beside the candidate evaluations,
+the three final-confirmation evaluations.  Everything *between* phases stays a dependency
+chain -- multi-device work never reorders scientific dependencies, it only stops
+independent work from queueing behind work it does not need.
+
+With one device this is a `for` loop, which is what it has always been, and it writes no
+new artifacts.  With a multi-device plan the same jobs go through ``Scheduler``, which is
+where the questions a parallel run has to answer get answered on the record: which card
+each job held, why a job that could not start did not, and what it cost.
+
+Two deliberate properties:
+
+* **A completed job is not re-run.** ``Scheduler.restore`` reads ``outcome.json`` /
+  ``failure.json``; a completed job's result is recovered through the job's *own* cache
+  (every callable here is idempotent by construction), and a failed job stays failed -- a
+  score-bearing evaluation is never silently retried by a resume.
+* **A phase fails as a whole.** The first failure is recorded against its job and raised
+  once the other jobs have finished, so the run cannot continue on a partial phase while
+  other jobs are still writing into it.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from .common import now
+from .devices import SimDeviceSelection, select
+from .scheduler import Job, Scheduler, ScheduleRefused
+
+# A job's own wall-clock bound, used for the budget gate only; a real episode evaluation is
+# minutes of environment construction plus per-episode marginal cost (see devices.shard_count).
+DEFAULT_RESERVE_SECONDS = 900.0
+
+
+@dataclass(frozen=True)
+class PhaseJob:
+    """One job in a phase: what to run, and what it is expected to cost."""
+
+    name: str
+    category: str
+    run: Callable[[Any], Any]
+    estimate_seconds: float = 0.0
+    reserve_seconds: float = DEFAULT_RESERVE_SECONDS
+    kind: str = ""
+
+    def as_job(self) -> Job:
+        return Job(self.name, category=self.category, kind=self.kind or self.category,
+                   estimate_seconds=self.estimate_seconds, reserve_seconds=self.reserve_seconds)
+
+
+def plan_devices(plan: dict) -> list[dict]:
+    """The plan's usable rows, each carrying the addressing it froze."""
+    return [dict(device) for device in (plan.get("usable") or [])]
+
+
+def schedule_limit(plan: dict, max_parallel_jobs: int | None) -> int:
+    """How many heavy jobs may run at once: the plan's cap, never wider than the plan."""
+    requested = plan.get("max_parallel_jobs") if max_parallel_jobs is None else max_parallel_jobs
+    return max(1, min(int(requested or 1), len(plan_devices(plan)) or 1))
+
+
+def is_scheduled(plan: dict | None, max_parallel_jobs: int | None) -> bool:
+    """True only for a multi-device plan that permits more than one heavy job.
+
+    Anything else -- no plan (every legacy invocation), a plan equivalent to the legacy
+    single-device run, or ``--max-parallel-jobs 1`` -- takes the sequential path and
+    produces exactly the artifacts it produced before this module existed.
+    """
+    if plan is None or plan.get("legacy_equivalence"):
+        return False
+    if len(plan_devices(plan)) < 2:
+        return False
+    return schedule_limit(plan, max_parallel_jobs) > 1
+
+
+def episodes_of(result: Any) -> int | None:
+    """Charge the job with the episodes it actually produced, when it reports them."""
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("episodes")
+    if isinstance(rows, list):
+        return len(rows)
+    for key in ("accepted_episodes", "accepted", "episodes"):
+        value = result.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _selection_of(device: dict, mode: str) -> SimDeviceSelection:
+    frozen = device.get("selection")
+    return SimDeviceSelection(**frozen) if frozen else select(device, mode)
+
+
+def run_phase(*, phase: str, jobs: Sequence[PhaseJob], runtime, plan: dict | None,
+              output: Path, max_parallel_jobs: int | None = None, ledger=None,
+              run_id: str = "run", lease_root: Path | None = None) -> dict[str, Any]:
+    """Run every job, on the plan's devices when there is more than one, else in order.
+
+    Returns ``{job name: result}``.  Raises ``RuntimeError`` naming each failure once the
+    phase has stopped -- a phase is not partially usable, because the pipeline's next step
+    reads all of its outputs.
+    """
+    jobs = list(jobs)
+    names = [job.name for job in jobs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate job name in phase {phase}: {names}")
+    if not is_scheduled(plan, max_parallel_jobs):
+        return {job.name: job.run(runtime) for job in jobs}
+
+    devices = plan_devices(plan)
+    mode = plan.get("mode") or "pinned_index"
+    limit = schedule_limit(plan, max_parallel_jobs)
+    root = Path(output) / phase
+    scheduler = Scheduler(jobs=[job.as_job() for job in jobs], devices=devices, output=root,
+                          ledger=ledger, max_parallel_jobs=limit, run_id=run_id,
+                          lease_root=lease_root)
+    by_name = {job.name: job for job in jobs}
+    restored = scheduler.restore()
+    results: dict[str, Any] = {}
+    pending: list[PhaseJob] = []
+    for job in jobs:
+        state = scheduler.state(job.name)
+        if state == "completed":
+            # Its own cache answers this without touching a device; the scheduler's record
+            # is the reason we know it is safe to ask rather than to re-run.
+            results[job.name] = job.run(runtime)
+        elif state == "failed":
+            raise RuntimeError(
+                f"phase {phase} job {job.name} is recorded failed; refusing to retry "
+                f"score-bearing work ({scheduler.failure_path(job.name)})")
+        else:
+            pending.append(job)
+    if not pending:
+        scheduler.write_snapshot()
+        return results
+
+    failures: dict[str, str] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(limit, len(devices))) as pool:
+            futures: dict[Any, Any] = {}
+            while pending or futures:
+                for assignment in scheduler.plan_step()["assignments"]:
+                    job = by_name[assignment.job.name]
+                    device = assignment.devices[0]
+                    bound = runtime.for_job(_selection_of(device, mode), job=job.name,
+                                            output=scheduler.job_output(job.name))
+                    # The lease is taken *before* the work is submitted: a job that starts
+                    # running first and leases second would be, for that window, work on a
+                    # device the run does not hold.
+                    scheduler.start(assignment)
+                    futures[pool.submit(job.run, bound)] = assignment
+                    pending.remove(job)
+                if not futures:
+                    blocked = scheduler.plan_step()["waiting"]
+                    raise ScheduleRefused(
+                        f"phase {phase} cannot place any job: "
+                        + "; ".join(f"{item.job.name} waits for {item.reason} ({item.detail})"
+                                    for item in blocked))
+                done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    assignment = futures.pop(future)
+                    name = assignment.job.name
+                    try:
+                        result = future.result()
+                    except Exception as exc:          # recorded, then raised as a group
+                        failures[name] = f"{type(exc).__name__}: {exc}"
+                        scheduler.complete(name, status="failed",
+                                           detail={"phase": phase, "error": failures[name][:400]})
+                    except BaseException:
+                        raise                          # Ctrl-C: the abandon path below
+                    else:
+                        results[name] = result
+                        scheduler.complete(name, episodes=episodes_of(result),
+                                           detail={"phase": phase,
+                                                   "devices": [str(device["uuid"])
+                                                               for device in assignment.devices]})
+                scheduler.write_snapshot()
+    except BaseException:
+        # Nothing is left holding a device or looking runnable once the phase is over.
+        for name in list(scheduler.running):
+            with suppress(Exception):
+                scheduler.abandon(name, reason=f"phase {phase} aborted")
+        raise
+    scheduler.decisions.append({"phase": phase, "finished_at": now(), "restored": restored,
+                                "completed": sorted(results), "failed": sorted(failures)})
+    scheduler.write_snapshot()
+    if failures:
+        raise RuntimeError(f"phase {phase} jobs failed: {failures}")
+    return results
