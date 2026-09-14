@@ -745,6 +745,196 @@ class CrossCardResidualTests(unittest.TestCase):
                              "a process that never selected a device reports no alignment")
 
 
+#: Card 0's residual, copied from the run of record (job ``pt-2xib2ilt``, 2026-09-14, arms
+#: ``A_*/startup_census.jsonl`` + ``device_probe.json``): every evaluator process parks one
+#: CUDA context on card 0 while ``make_env_from_configs`` builds the environment, and the
+#: alignment's own context sits on the leased card from ``devices_aligned`` onward.
+ZERO_CARD = "GPU-8be632a8-d7c8-bc44-b7f3-7b226e1cbdff"
+LEASED_CARD = "GPU-2f24b1f9-73ce-1599-e1be-742cc3c43f8e"
+RUN_ROOT = "/data/AutoResearch/AutoSimSOTA/AutoSimSOTA"
+#: Truncated at 300 chars by ``accounting.describe_process``, exactly as the receipt stores it
+#: -- which is why the checkout check looks for the *prefix* and not for the arm's own output.
+WORKER_CMD = ("/data/AutoResearch/AutoSimSOTA/AutoSimSOTA/.venv/bin/python -m "
+              "autosim.research.evaluation --task click_bell --checkpoint "
+              "/data/AutoResearch/AutoSimSOTA/AutoSimSOTA/RoboSynChallenge/checkpoints/"
+              "ACT_sim_click_bell --output /data/AutoResearch/AutoSimSOTA/AutoSimSOTA/"
+              "autoresearch_runs/RoboSynChallenge/")
+CENSUS_PHASES = ("main_start", "official_imported", "devices_aligned",
+                 "environment_constructing", "environment_ready", "evaluation_reset_started")
+
+
+def measured_census(*, zero_card_at=("environment_ready", "evaluation_reset_started"),
+                    leased_card_at=("devices_aligned", "environment_constructing",
+                                    "environment_ready", "evaluation_reset_started")) -> list[dict]:
+    """The per-phase timeline an arm writes, with only the *presence* of each card varying."""
+    rows = []
+    for phase in CENSUS_PHASES:
+        own = {}
+        if phase in leased_card_at:
+            own[LEASED_CARD] = 532 if phase in ("devices_aligned",
+                                                "environment_constructing") else 3577
+        if phase in zero_card_at:
+            own[ZERO_CARD] = 506
+        rows.append({"phase": phase, "memory": {"own": own, "children": {}}})
+    return rows
+
+
+def residual(*, growth=525, utilization=0.0, uuid=ZERO_CARD, holders=None) -> dict:
+    """A residual row as ``foreign_holders`` builds it inside ``judge``."""
+    row = {"growth_mib": growth, "mean_utilization_pct": utilization,
+           "processes": holders if holders is not None else
+           {"3673": {"mib": 506, "cmd": WORKER_CMD, "parent": 362}}}
+    return device_probe.foreign_holders({uuid: row}, [uuid])[0]
+
+
+def worker(pid="3673", mib=506, cmd=WORKER_CMD) -> dict:
+    return {pid: {"mib": mib, "cmd": cmd, "parent": 362}}
+
+
+class EngineContextExceptionTests(unittest.TestCase):
+    """The one residual that is accepted, and everything that must still be refused.
+
+    ``others_stayed_idle`` has to stop calling a *measured, bounded, attributable, idle* CUDA
+    context "somebody else's work" -- otherwise the 4-GPU plan is refused forever by a fact
+    about the engine that no available lever moves.  What it must not do is accept the shape
+    blindly: the holder, the size, the utilization and the timeline all have to agree, and
+    each of them is a falsification point below.
+    """
+
+    def accepted(self, row=None, *, census=None, run_root=RUN_ROOT):
+        return device_probe.engine_own_context(
+            row if row is not None else residual(),
+            census=measured_census() if census is None else census, run_root=run_root)
+
+    def test_the_measured_shape_is_accepted(self):
+        result = self.accepted()
+        self.assertTrue(result["accepted"], result["reason"])
+        self.assertEqual(result["holder_pids"], ["3673"])
+
+    def test_two_concurrent_workers_are_two_contexts_not_one_leak(self):
+        """The pair doubles the *card's* growth to 1046 MiB; the bound is per holder, so the
+        concurrency arm is not refused for containing its sibling's context as well."""
+        row = residual(growth=1046, holders={**worker("6430"), **worker("6431")})
+        self.assertTrue(self.accepted(row)["accepted"])
+
+    def test_a_single_holder_above_the_bound_is_not_a_context(self):
+        result = self.accepted(residual(holders=worker(mib=1200)))
+        self.assertFalse(result["accepted"])
+        self.assertIn("single-context bound", result["reason"])
+
+    def test_a_busy_card_is_computing_not_only_holding_a_context(self):
+        self.assertFalse(self.accepted(residual(utilization=5.9))["accepted"])
+
+    def test_a_holder_that_is_not_this_projects_worker_is_never_accepted(self):
+        result = self.accepted(residual(holders=worker(cmd="/usr/bin/python3 -m torchrun "
+                                                           "--nproc_per_node 4 train.py")))
+        self.assertFalse(result["accepted"])
+        self.assertIn("not this project's worker", result["reason"])
+
+    def test_a_worker_from_another_checkout_is_somebody_elses_run(self):
+        """A job that never installed the platform root we are running from is not our job."""
+        other = WORKER_CMD.replace(RUN_ROOT, "/data/other/AutoSimSOTA")
+        result = self.accepted(residual(holders=worker(cmd=other)))
+        self.assertFalse(result["accepted"])
+        self.assertIn("does not belong to this checkout", result["reason"])
+
+    def test_a_growth_no_process_could_be_named_for_is_a_failure(self):
+        result = self.accepted(residual(holders={}))
+        self.assertFalse(result["accepted"])
+        self.assertIn("no process", result["reason"])
+
+    def test_a_card_already_holding_memory_before_the_engine_is_built_is_not_accepted(self):
+        result = self.accepted(census=measured_census(zero_card_at=("official_imported",
+                                                                    "environment_ready")))
+        self.assertFalse(result["accepted"])
+        self.assertIn("already holding memory before", result["reason"])
+
+    def test_without_a_timeline_nothing_is_accepted(self):
+        for census in ([], measured_census(zero_card_at=()), [{"phase": "devices_aligned",
+                                                               "memory": {}}]):
+            with self.subTest(census=census):
+                self.assertFalse(self.accepted(census=census)["accepted"],
+                                 "an unplaceable growth is not a pass")
+
+    def test_a_child_holding_the_card_counts_as_this_arms_memory(self):
+        census = measured_census(zero_card_at=())
+        for row in census:
+            if row["phase"] == "environment_ready":
+                row["memory"]["children"] = {ZERO_CARD: 506}
+        self.assertTrue(self.accepted(census=census)["accepted"])
+
+    def test_a_card_held_by_a_stranger_at_an_early_phase_does_not_appear_in_our_census(self):
+        """The census only ever names this process and its children, so it cannot be used to
+        prove anything about a foreign holder -- hence the cmd check above."""
+        self.assertEqual(device_probe.appeared_only_while_the_engine_was_built(
+            "GPU-somebody-else", measured_census()), False)
+
+    def test_acceptance_is_recorded_per_card_and_never_silences_the_check(self):
+        """The verdict keeps the residual *and* the acceptance, so the receipt still shows the
+        megabytes: accepting is a documented exception, not a clean measurement."""
+        peaks = {LEASED_CARD: {"peak_memory_mib": 5000, "mean_utilization_pct": 40.0,
+                               "samples": 5, "processes": worker("1000", 4000)},
+                 ZERO_CARD: {"peak_memory_mib": 526, "mean_utilization_pct": 0.0,
+                             "samples": 5, "processes": worker()}}
+        baseline = {LEASED_CARD: {"peak_memory_mib": 1}, ZERO_CARD: {"peak_memory_mib": 1}}
+        result = device_probe.judge({"status": "completed", "execution_mode": "real_simulation",
+                                     "episode_count": 1},
+                                    own_uuid=LEASED_CARD, allocation=[LEASED_CARD, ZERO_CARD],
+                                    baseline=baseline, peak=peaks,
+                                    census=measured_census(), run_root=RUN_ROOT)
+        self.assertTrue(result["checks"]["others_stayed_idle"], result["foreign_holders"])
+        self.assertTrue(result["passed"])
+        self.assertEqual([row["device_uuid"] for row in result["accepted_residuals"]],
+                         [ZERO_CARD])
+        self.assertEqual(result["foreign_holders"][0]["growth_mib"], 525)
+
+    def test_a_foreign_holder_alongside_an_accepted_one_still_fails_the_arm(self):
+        peaks = {LEASED_CARD: {"peak_memory_mib": 5000, "mean_utilization_pct": 40.0,
+                               "samples": 5, "processes": worker("1000", 4000)},
+                 ZERO_CARD: {"peak_memory_mib": 1526, "mean_utilization_pct": 0.0, "samples": 5,
+                             "processes": {**worker(), **worker("9999", 1000,
+                                                                "/usr/bin/python3 train.py")}}}
+        baseline = {uuid: {"peak_memory_mib": 1} for uuid in peaks}
+        result = device_probe.judge({"status": "completed", "execution_mode": "real_simulation",
+                                     "episode_count": 1},
+                                    own_uuid=LEASED_CARD, allocation=list(peaks),
+                                    baseline=baseline, peak=peaks,
+                                    census=measured_census(), run_root=RUN_ROOT)
+        self.assertFalse(result["checks"]["others_stayed_idle"])
+        self.assertFalse(result["passed"])
+
+    def test_the_verdict_carries_the_standing_of_every_residual(self):
+        arm = {"name": "A_1", "device_index": 1, "own_pid": 3673,
+               "judged": {"passed": True, "own_device_uuid": LEASED_CARD,
+                          "checks": {"others_stayed_idle": True},
+                          "foreign_holders": [
+                   {**residual(), **self.accepted()},
+                   {**residual(uuid=LEASED_CARD), "accepted": False, "reason": "no process "
+                    "could be named for the growth"}]}}
+        verdict = device_probe.probe_verdict(arms=[arm], allocation=[],
+                                             requested_mode="identity")
+        self.assertEqual([row["accepted"] for row in verdict["cross_card_residual"]],
+                         [True, False])
+        self.assertEqual(verdict["cross_card_residual"][1]["reason"],
+                         "no process could be named for the growth")
+
+    def test_a_run_without_a_timeline_is_refused_by_the_judge_not_by_the_caller(self):
+        """``record`` passes whatever census the arm produced, including nothing at all."""
+        result = device_probe.judge({"status": "completed", "execution_mode": "real_simulation",
+                                    "episode_count": 1},
+                                    own_uuid=LEASED_CARD, allocation=[LEASED_CARD, ZERO_CARD],
+                                    baseline={uuid: {"peak_memory_mib": 1}
+                                              for uuid in (LEASED_CARD, ZERO_CARD)},
+                                    peak={LEASED_CARD: {"peak_memory_mib": 5000,
+                                                        "mean_utilization_pct": 40.0, "samples": 5,
+                                                        "processes": worker("1000", 4000)},
+                                          ZERO_CARD: {"peak_memory_mib": 526,
+                                                      "mean_utilization_pct": 0.0, "samples": 5,
+                                                      "processes": worker()}},
+                                    census=[], run_root=RUN_ROOT)
+        self.assertFalse(result["checks"]["others_stayed_idle"])
+
+
 class AbortClassificationTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory()

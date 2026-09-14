@@ -17,9 +17,12 @@ contrast, is the fallback production form and is expected to pass as well -- it 
 rejected for being dangerous under concurrency (any ``cuda``/``cuda:0`` default lands on
 card 0).  The 2026-09-13 ladder measured that caveat more precisely: A completes a real
 episode on every card, and the torch/warp default device is aligned to the leased card, but
-each arm still leaves ~525 MiB on card 0.  Passing arms are folded into a probe receipt
-keyed by node+driver+device set; a multi-device run without a matching receipt refuses to
-start (unknown capability is never assumed available).
+each arm still leaves ~525 MiB on card 0.  That residual is one CUDA context the engine
+creates while it is built, and it is the *only* thing ``others_stayed_idle`` accepts without
+a clean measurement -- see ``engine_own_context`` for the four conditions it has to satisfy
+and for why no lever removes it.  Passing arms are folded into a probe receipt keyed by
+node+driver+device set; a multi-device run without a matching receipt refuses to start
+(unknown capability is never assumed available).
 
     python -m autosim.research.device_probe --workspace <platform_root> --output <dir>
 """
@@ -50,6 +53,17 @@ VULKAN_COUNT = re.compile(r"vulkan_physical_device_count=(\d+)")
 VULKAN_UUID = re.compile(r"uuid=(GPU-[0-9a-fA-F-]+|\S+)")
 OWN_GROWTH_MIB = 1024          # the device that ran the episode must grow at least this much
 OTHER_CEILING_MIB = 512        # every other allocated device must stay under this
+#: Bound for the one thing that is allowed to exceed that ceiling: the CUDA context the
+#: *engine* creates on card 0 while it is constructed.  Measured 2026-09-14 at ~506 MiB per
+#: process (a context, the same size as the one the default-device alignment creates on the
+#: leased card), at 0.0% utilization, held by the arm's own pid.  The bound is per holder,
+#: so two concurrent arms parking one context each are both inside it.  See
+#: ``engine_own_context`` for why this is accepted rather than removed.
+ENGINE_CONTEXT_CEILING_MIB = 640
+ENGINE_CONTEXT_UTILIZATION_PCT = 1.0
+#: Command-line markers of this project's own worker processes; a holder that matches none of
+#: them is somebody else's work and is never accepted.
+RUN_WORKER_MARKERS = ("autosim.research.evaluation", "autosim.research.collection_worker")
 
 TORCH_SNIPPET = (
     "import json, torch\n"
@@ -254,30 +268,121 @@ def node_isolation_measurement(python: Path, base_env: Mapping[str, str], device
     return measurement
 
 
+def appeared_only_while_the_engine_was_built(uuid: str, census: Sequence[dict]) -> bool | None:
+    """Did this card gain memory no earlier than the environment being built?
+
+    ``True``  -- absent at every phase up to and including ``environment_constructing`` and
+                 present once the environment is ready;
+    ``False`` -- the timeline contradicts that (the card was already holding memory while the
+                 process was still importing, aligning, or before it built anything);
+    ``None``  -- no timeline to read, which is *not* a pass: without the phases the difference
+                 between a library that allocates at import and the engine is exactly what
+                 cannot be told apart.
+
+    Only the arm's own process and its children count: a card held by someone else is not
+    this arm's memory at any phase.
+    """
+    before, after = [], []
+    for row in census:
+        memory = row.get("memory") or {}
+        here = uuid in (memory.get("own") or {}) or uuid in (memory.get("children") or {})
+        if row.get("phase") in {"environment_ready", "evaluation_reset_started"}:
+            after.append(here)
+        else:
+            before.append(here)
+    if not after:
+        return None
+    if any(before):
+        return False
+    return any(after)
+
+
+def engine_own_context(row: dict, *, census: Sequence[dict] = (), run_root: str | None = None) -> dict:
+    """Is this foreign-card growth the engine's own CUDA context, or something unexplained?
+
+    Measured on 2026-09-14 (job ``pt-2xib2ilt``, per-phase census in every arm): each
+    evaluator process parks ~506 MiB on card 0 **while the environment is constructed** --
+    the census is empty at ``main_start``, ``official_imported``, ``devices_aligned`` and
+    ``environment_constructing``, and card 0 holds 506 MiB in ``nvidia-smi``'s compute-apps
+    list at ``environment_ready``, owned by the arm's own pid, at 0.0% utilization.  It is one
+    CUDA context, the same size as the one the default-device alignment creates on the leased
+    card, and no available lever moves it: no device environment variable reaches the engine
+    (the 2026-09-13 binary survey found none), ``sim_device="cuda:N"`` would switch the physics
+    backend and change the benchmark protocol, a ``CUDA_VISIBLE_DEVICES`` permutation would
+    break the physical-index-equals-ordinal correspondence the engine needs on the OptiX side,
+    and node-level device hiding needs ``CAP_SYS_ADMIN`` plus ``/dev/nvidiaN`` mount points
+    this container does not have (both measured, both absent).
+
+    So the check accepts *this shape* and nothing else: every holder is one of this project's
+    own worker processes, each holds at most one context, the card's mean utilization is
+    ~zero, and the timeline says the memory appeared no earlier than the environment being
+    built.  A foreign or unattributable holder, a holder above the bound, a card that was
+    already busy while the process was importing or aligning, or no timeline at all is still a
+    failure.  Acceptance is recorded per card in the receipt -- an accepted residual is a
+    measured, bounded, named fact, not a clean measurement.
+    """
+    holders = list(row.get("holders") or [])
+    if not holders:
+        return {"accepted": False, "reason": "no process could be named for the growth"}
+    over = [h for h in holders if (h.get("mib") or 0) > ENGINE_CONTEXT_CEILING_MIB]
+    if over:
+        return {"accepted": False,
+                "reason": f"holder pid {over[0].get('pid')} holds {over[0].get('mib')} MiB, "
+                          f"above the {ENGINE_CONTEXT_CEILING_MIB} MiB single-context bound"}
+    if (row.get("mean_utilization_pct") or 0.0) > ENGINE_CONTEXT_UTILIZATION_PCT:
+        return {"accepted": False, "reason": "the card was computing, not only holding a context"}
+    for holder in holders:
+        cmd = str(holder.get("cmd") or "")
+        if not any(marker in cmd for marker in RUN_WORKER_MARKERS):
+            return {"accepted": False,
+                    "reason": f"pid {holder.get('pid')} is not this project's worker process"}
+        if run_root and run_root not in cmd:
+            return {"accepted": False,
+                    "reason": f"pid {holder.get('pid')} does not belong to this checkout"}
+    timeline = appeared_only_while_the_engine_was_built(str(row.get("device_uuid")), census)
+    if timeline is None:
+        return {"accepted": False, "reason": "no startup census to place the growth in time"}
+    if not timeline:
+        return {"accepted": False,
+                "reason": "the census shows this card was already holding memory before the "
+                          "environment was built"}
+    return {"accepted": True,
+            "reason": "one CUDA context per own worker process, first seen at environment_ready",
+            "holder_pids": [h.get("pid") for h in holders]}
+
+
 def judge(arm: dict, *, own_uuid: str, allocation: list[str], baseline: dict, peak: dict,
-          idle_uuids: list[str] | None = None) -> dict:
+          idle_uuids: list[str] | None = None, census: Sequence[dict] | None = None,
+          run_root: str | None = None) -> dict:
     """The leased device must have run it -- and no device that should be idle may move.
 
     ``idle_uuids`` defaults to "every allocated device except this one", which is the right
     expectation for a sequential arm.  A concurrent arm must instead name the devices its
     sibling legitimately occupies, or it would fail on its own sibling's memory.
+
+    Growth above ``OTHER_CEILING_MIB`` on an idle card fails unless it is the engine's own
+    CUDA context -- see ``engine_own_context``, which requires the holder, the size, the
+    utilization *and* the timeline to agree before it accepts anything.
     """
     growths = {uuid: _growth(peak, baseline, uuid) for uuid in allocation}
     own = growths.get(own_uuid, {})
     idle = [uuid for uuid in (allocation if idle_uuids is None else idle_uuids)
             if uuid != own_uuid]
+    residuals = foreign_holders(growths, idle)
+    for row in residuals:
+        row.update(engine_own_context(row, census=census or (), run_root=run_root))
     checks = {
         "completed": arm.get("status") == "completed",
         "real_simulation": arm.get("execution_mode") == "real_simulation",
         "one_episode": arm.get("episode_count") == 1,
         "no_worker_failure": not arm.get("worker_failure"),
         "own_device_grew": (own.get("growth_mib") or 0) >= OWN_GROWTH_MIB,
-        "others_stayed_idle": all((growths.get(uuid, {}).get("growth_mib") or 0) < OTHER_CEILING_MIB
-                                  for uuid in idle),
+        "others_stayed_idle": not [row for row in residuals if not row.get("accepted")],
     }
     return {"checks": checks, "passed": all(checks.values()), "growth_mib": growths,
             "own_device_uuid": own_uuid, "idle_devices": idle,
-            "foreign_holders": foreign_holders(growths, idle)}
+            "foreign_holders": residuals,
+            "accepted_residuals": [row for row in residuals if row.get("accepted")]}
 
 
 def foreign_holders(growths: Mapping[str, dict], idle: Sequence[str]) -> list[dict]:
@@ -585,7 +690,9 @@ def main() -> int:                                # noqa: C901 -- a linear ladde
                idle_uuids: list[str] | None = None) -> dict:
         result["judged"] = judge(result, own_uuid=device["uuid"],
                                  allocation=[g["uuid"] for g in allocation], baseline=baseline,
-                                 peak=peak, idle_uuids=idle_uuids)
+                                 peak=peak, idle_uuids=idle_uuids,
+                                 census=result.get("startup_census") or [],
+                                 run_root=str(platform_root))
         result["device_index"] = device["index"]
         receipt["arms"].append(result)
         print(f"[{result['name']}] index={device['index']} passed={result['judged']['passed']} "
@@ -723,10 +830,12 @@ def main() -> int:                                # noqa: C901 -- a linear ladde
     for row in verdict["cross_card_residual"]:
         names = "; ".join(f"pid {h.get('pid')} ({h.get('cmd') or h.get('note') or '?'}, "
                           f"parent {h.get('parent')})" for h in row.get("holders") or [])
+        standing = ("accepted as the engine's own CUDA context" if row.get("accepted")
+                    else f"UNEXPLAINED ({row.get('reason')})")
         print(f"CROSS-CARD RESIDUAL: arm {row['arm']} (own pid {row.get('own_pid')}) left "
               f"{row.get('growth_mib')} MiB on device {row['device_index']} "
               f"[{row['device_uuid']}] at {row.get('mean_utilization_pct')}% utilization, "
-              f"held by {names or 'no process nvidia-smi could name'}")
+              f"held by {names or 'no process nvidia-smi could name'} -- {standing}")
     for note in verdict.get("mode_limitations") or []:
         print(f"MODE LIMITATION: {note}")
     print(f"receipt: {args.output / 'device_probe.json'}")
