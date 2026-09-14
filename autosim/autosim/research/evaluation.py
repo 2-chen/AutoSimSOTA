@@ -254,11 +254,18 @@ def main() -> None:
     if (output / "evaluation_metrics.json").exists():
         raise FileExistsError("refusing to overwrite an existing evaluation")
     output.mkdir(parents=True, exist_ok=True)
+    # The census starts here, and it starts *before* anything official is loaded: everything
+    # autosim imports at module scope (including whatever ``policy_rpc`` pulls in) is already
+    # loaded, the official evaluator's own imports are not.  Memory already on a foreign card
+    # at this row is autosim's or its imports'; memory that appears only at the next row is the
+    # official evaluator's module-scope import (embodichain/dexsim/torch/warp).
+    startup_phase(output, "main_start", policy_has_acted=False)
     spec = load_task(repo, args.task)
     source = repo / "scripts/eval_policy.py"
     module_spec = importlib.util.spec_from_file_location("official_robosyn_evaluator", source)
     official = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(official)
+    startup_phase(output, "official_imported", policy_has_acted=False)
     import yaml
 
     config = yaml.safe_load((repo / f"policy/{args.policy}/deploy_policy.yml").read_text())

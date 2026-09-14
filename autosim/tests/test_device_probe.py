@@ -331,6 +331,16 @@ class StartupCensusTests(unittest.TestCase):
         align = source.split("def _select_cuda(")[1].split("\ndef ")[0]
         self.assertIn('startup_phase(output, "devices_aligned"', align)
 
+    def test_the_import_rows_bracket_every_module_scope_import(self):
+        """One row before anything official loads, one after: the import gets a when."""
+        source = Path(evaluation.__file__).read_text(encoding="utf-8")
+        main = source.split("def main() -> None:")[1]
+        start = main.index('startup_phase(output, "main_start"')
+        loaded = main.index('startup_phase(output, "official_imported"')
+        exec_module = main.index("module_spec.loader.exec_module(official)")
+        self.assertLess(start, exec_module)
+        self.assertLess(exec_module, loaded)
+
 
 class ConcurrentSamplerTests(unittest.TestCase):
     """The 2026-09-13 ladder's concurrent arms reported zero growth on every card.
