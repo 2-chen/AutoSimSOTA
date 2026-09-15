@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import os
 import time
 
 from autosim.robosyn_mvp import gpu_lock
@@ -14,6 +15,44 @@ from .ledger import SeedLedger, compare
 from .proposals import Proposal, propose
 from .registry import TASK_IDS, load_task
 from .runtime import Runtime
+
+
+_NON_SOURCE_DIRECTORIES = frozenset({
+    ".venv", "venv", ".git", ".hg", ".svn", "__pycache__", ".cache",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".conda",
+    "site-packages", "dist-packages", "node_modules",
+})
+
+
+def source_tree_files(root: Path, suffix: str) -> list[Path]:
+    """Enumerate project source without entering environments or linked trees."""
+    root = Path(root)
+    if root.is_symlink():
+        return []
+    files = []
+    for directory, children, names in os.walk(root, topdown=True, followlinks=False):
+        base = Path(directory)
+        children[:] = sorted(name for name in children
+                             if name not in _NON_SOURCE_DIRECTORIES
+                             and not (base / name).is_symlink()
+                             and not (base / name / "pyvenv.cfg").is_file())
+        files.extend(base / name for name in sorted(names) if name.endswith(suffix))
+    return files
+
+
+def controller_source_files(runtime: Runtime) -> list[Path]:
+    """Freeze scientific code/config; dependency identity belongs to environment contracts."""
+    files = source_tree_files(runtime.eval_repo / "robosynchallenge", ".py")
+    files += source_tree_files(runtime.eval_repo / "configs", ".json")
+    files += source_tree_files(runtime.workspace / "AutoSimSOTA/EmbodiChain/embodichain/lab", ".py")
+    files += list(Path(__file__).parent.glob("*.py"))
+    files += list(Path(__file__).parent.parent.glob("robosyn*.py"))
+    files += source_tree_files(runtime.repo / "policy/act", ".py")
+    files += [runtime.eval_repo / "scripts/eval_policy.py",
+              runtime.repo / "policy/act/scripts/train.py",
+              runtime.repo / "scripts/run_env.py",
+              runtime.eval_repo / "policy/act/deploy_policy.py"]
+    return sorted(set(files))
 
 
 @dataclass(frozen=True)
@@ -140,17 +179,7 @@ class ResearchController:
         if protocol_path.exists():
             frozen = read_json(protocol_path)
         else:
-            files = list((self.runtime.eval_repo / "robosynchallenge").rglob("*.py"))
-            files += list((self.runtime.eval_repo / "configs").rglob("*.json"))
-            files += list((self.runtime.workspace / "AutoSimSOTA/EmbodiChain/embodichain/lab").rglob("*.py"))
-            files += list(Path(__file__).parent.glob("*.py"))
-            files += list(Path(__file__).parent.parent.glob("robosyn*.py"))
-            files += list((self.runtime.repo / "policy/act").rglob("*.py"))
-            files += [self.runtime.eval_repo / "scripts/eval_policy.py",
-                      self.runtime.repo / "policy/act/scripts/train.py",
-                      self.runtime.repo / "scripts/run_env.py",
-                      self.runtime.eval_repo / "policy/act/deploy_policy.py"]
-            frozen = freeze_files(files)
+            frozen = freeze_files(controller_source_files(self.runtime))
             atomic_json(protocol_path, frozen)
 
         def gate(stage):

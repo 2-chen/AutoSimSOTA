@@ -69,6 +69,17 @@ def normalize_uuid(value: str) -> str:
     return text[4:] if text.upper().startswith("GPU-") else text
 
 
+def normalize_uuid_mapping(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a comparison index without changing persisted GPU identities."""
+    result: dict[str, Any] = {}
+    for uuid, value in values.items():
+        key = normalize_uuid(uuid)
+        if key in result and result[key] != value:
+            raise ValueError(f"conflicting receipt values for GPU UUID {key}")
+        result[key] = value
+    return result
+
+
 def gpu_class(model: str) -> str:
     return "".join(ch for ch in model.lower() if ch.isalnum())[-12:] or "unknown"
 
@@ -278,22 +289,31 @@ def outer_allowed(environ: Mapping[str, str], gpus: Sequence[dict]) -> tuple[lis
     record = {"CUDA_VISIBLE_DEVICES": environ.get("CUDA_VISIBLE_DEVICES"),
               "NVIDIA_VISIBLE_DEVICES": environ.get("NVIDIA_VISIBLE_DEVICES")}
     allowed, reason = list(gpus), "no outer filter"
-    nvidia_visible = (environ.get("NVIDIA_VISIBLE_DEVICES") or "").strip()
-    if nvidia_visible.lower() == "void":
-        allowed, reason = [], "NVIDIA_VISIBLE_DEVICES=void exposes no device"
-    elif nvidia_visible and nvidia_visible.lower() != "all":
-        wanted = {normalize_uuid(u) for u in nvidia_visible.split(",")}
-        allowed = [g for g in allowed if g.get("uuid") and normalize_uuid(g["uuid"]) in wanted]
-        reason = "restricted by NVIDIA_VISIBLE_DEVICES"
-    cuda_visible = (environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
-    if cuda_visible and cuda_visible.lower() not in {"all", "none", "void"}:
-        try:
-            positions = [int(part) for part in cuda_visible.split(",")]
-        except ValueError:
-            allowed, reason = [], f"unparseable CUDA_VISIBLE_DEVICES={cuda_visible!r}"
-        else:
-            allowed = [g for g in allowed if g.get("index") in positions]
-            reason = "restricted by CUDA_VISIBLE_DEVICES"
+    for variable in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        if variable not in environ:
+            continue
+        visible = environ[variable].strip()
+        if variable == "NVIDIA_VISIBLE_DEVICES" and visible.lower() == "all":
+            continue
+        if not visible or visible.lower() in {"none", "void", "-1"}:
+            allowed, reason = [], f"{variable}={visible!r} exposes no device"
+            continue
+        selected = []
+        for token in visible.split(","):
+            token = token.strip()
+            if token.isdecimal():
+                matches = [g for g in allowed if g.get("index") == int(token)]
+            elif token.startswith(("GPU-", "MIG-")):
+                matches = [g for g in allowed if g.get("uuid") and
+                           normalize_uuid(g["uuid"]).startswith(normalize_uuid(token))]
+            else:
+                matches = []
+            if len(matches) != 1 or matches[0] in selected:
+                # CUDA stops enumeration at the first invalid identifier. Never widen it.
+                break
+            selected.append(matches[0])
+        allowed = selected
+        reason = f"restricted by {variable}"
     record["allowed_indices"] = [g.get("index") for g in allowed]
     record["reason"] = reason
     return allowed, record
@@ -302,13 +322,11 @@ def outer_allowed(environ: Mapping[str, str], gpus: Sequence[dict]) -> tuple[lis
 def cuda_child_env(environ: Mapping[str, str], outer: Mapping[str, Any]) -> dict[str, str]:
     """The environment a torch query must run in to report the truth about this process.
 
-    An *empty* ``CUDA_VISIBLE_DEVICES`` means "no device visible" to the CUDA runtime, which
-    is not the same as leaving the variable unset -- so an unset/empty outer value is removed
-    rather than exported.
+    Empty is a deliberate mask; only an absent variable may be removed.
     """
     child = dict(environ)
     visible = outer.get("CUDA_VISIBLE_DEVICES")
-    if visible:
+    if visible is not None:
         child["CUDA_VISIBLE_DEVICES"] = str(visible)
     else:
         child.pop("CUDA_VISIBLE_DEVICES", None)
@@ -357,6 +375,10 @@ def discover(*, runner: Callable[..., str] = run_text,
     cuda_rows = list(torch_rows) if torch_rows is not None else torch_devices(
         python or sys.executable, env=cuda_child_env(environ, outer))
     torch_by_uuid = {normalize_uuid(str(r["uuid"])): r for r in cuda_rows if r.get("uuid")}
+    excluded = [{"index": g["index"], "reason": "no UUID reported by nvidia-smi" if not g.get("uuid")
+                 else "not visible to CUDA"} for g in allowed
+                if normalize_uuid(g.get("uuid") or "") not in torch_by_uuid]
+    allowed = [g for g in allowed if normalize_uuid(g.get("uuid") or "") in torch_by_uuid]
     order_mismatch = None
     for position, row in enumerate(cuda_rows):
         if row.get("index") == position and position < len(gpus):
@@ -366,6 +388,7 @@ def discover(*, runner: Callable[..., str] = run_text,
                                   f"torch {row['uuid']}")
     for gpu in gpus:
         key = normalize_uuid(gpu["uuid"]) if gpu.get("uuid") else None
+        gpu["class_name"] = gpu_class(gpu.get("model") or "")
         gpu["compute_pids"] = [r["pid"] for r in by_uuid.get(key or "", [])]
         gpu["capability"] = "unknown"
         if key and key in torch_by_uuid:
@@ -373,6 +396,9 @@ def discover(*, runner: Callable[..., str] = run_text,
         gpu["busy_evidence"] = []
     disk = disk_path or Path.cwd()
     usage = shutil.disk_usage(disk)
+    from .host_resources import capacity
+    limits = capacity()
+    topology = runner([NVIDIA_SMI, "topo", "-m"])
     return {
         "schema_version": 1,
         "host": host or os.uname().nodename,
@@ -380,14 +406,18 @@ def discover(*, runner: Callable[..., str] = run_text,
         "compute_apps": compute,
         "outer": outer,
         "allowed": [g["index"] for g in allowed],
+        "excluded": excluded,
         "visible_index_to_uuid": {str(g["index"]): g["uuid"] for g in allowed},
         "cuda_index_to_uuid": {str(r["index"]): str(r["uuid"]) for r in cuda_rows},
         "cuda_order_mismatch": order_mismatch,
         "errors": {"gpu_query": _error(table), "compute_apps": _error(apps)},
-        "cpu": {"model": _cpu_model(), "logical_count": os.cpu_count()},
-        "memory": _memory_info(),
+        "cpu": {"model": _cpu_model(), **limits["cpu"]},
+        "memory": limits["memory"],
+        "cgroup_version": limits["cgroup_version"],
         "disk": {"path": str(disk), "free_bytes": usage.free},
         "renderers": {str(g["index"]): renderer_for(g.get("model") or "") for g in gpus},
+        "topology": {"source":"nvidia-smi topo -m", "raw":topology[:24000],
+                     "error":_error(topology), "nvlink_assumed":False},
     }
 
 
@@ -420,7 +450,7 @@ def apply_capability(report: dict, receipt: dict | None, *,
     device's own ``uuid`` field is untouched and stays the identity every other record
     (lease, plan, accounting) is keyed by.
     """
-    per_uuid = (receipt or {}).get("devices", {})
+    per_uuid = normalize_uuid_mapping((receipt or {}).get("devices", {}))
     lock_held = index_lock_held or legacy_index_lock_held
     for gpu in report["gpus"]:
         # Without a UUID the device cannot be leased (the lock is keyed by it), cannot be
@@ -491,8 +521,11 @@ def identity_is_safe(report: Mapping[str, Any]) -> tuple[bool, str]:
     """
     outer = report.get("outer") or {}
     visible = str(outer.get("CUDA_VISIBLE_DEVICES") or "").strip()
-    if not visible or visible.lower() in {"all", "void", "none"}:
-        return True, ""
+    if outer.get("CUDA_VISIBLE_DEVICES") is None:
+        mismatch = report.get("cuda_order_mismatch")
+        return (False, str(mismatch)) if mismatch else (True, "")
+    if not visible:
+        return False, "CUDA_VISIBLE_DEVICES is empty (no CUDA device is visible)"
     try:
         listed = [int(part) for part in visible.split(",")]
     except ValueError:
@@ -545,7 +578,9 @@ def build_plan(*, report: dict, requested: str, mode: str, max_parallel_jobs: in
         "usable": usable,
         "waiting": [{"index": g["index"], "uuid": g["uuid"], "capability": g["capability"],
                      "reason": ", ".join(g.get("busy_evidence") or []) or g["capability"]}
-                    for g in waiting],
+                    for g in waiting] + ([{"index": g["index"], "uuid": None, "capability": "unknown",
+                        "reason": g["reason"]} for g in report.get("excluded", [])]
+                        if requested in (None, "auto") else []),
         "allowed_uuids": [g["uuid"] for g in report["gpus"] if g["index"] in allowed],
         "visible_index_to_uuid": report["visible_index_to_uuid"],
         "cuda_order_mismatch": report.get("cuda_order_mismatch"),

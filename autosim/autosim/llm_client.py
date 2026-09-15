@@ -118,14 +118,14 @@ class LLMClient:
                     timeout=timeout,
                 )
             except requests.RequestException as exc:
-                if attempts > retries + 1:
+                if attempts >= retries + 1:
                     raise RuntimeError(f"LLM API transport error: {type(exc).__name__}") from exc
                 time.sleep(min(2 ** (attempts - 1), 4))
                 continue
             if resp.status_code == 200:
                 break
             # Providers may echo credentials or prompt material in error bodies.
-            if resp.status_code in {401, 403} or attempts > retries + 1 or (
+            if resp.status_code in {401, 403} or attempts >= retries + 1 or (
                 resp.status_code != 429 and resp.status_code < 500
             ):
                 raise RuntimeError(f"LLM API HTTP {resp.status_code}")

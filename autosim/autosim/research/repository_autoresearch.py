@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -34,10 +34,12 @@ from .devices import NoCompatibleDevice
 from .job_runner import PhaseJob, run_phase as run_phase_jobs
 from .ledger import SeedLedger, compare
 from .registry import TASK_IDS, load_task
+from .recovery_agent import RecoveryAgent, development_failure_snapshot, error_kind
 from .robosyn_adapter import PROFILE_FAMILIES, RoboSynAdapter
 from .runtime import (Runtime, retryable_collection_startup, retryable_evaluation_startup,
                       startup_receipt)
 from .task_diagnostics import task_failure_analysis
+from .harness_config import load_harness_policy, policy_identity
 
 
 SCHEMA_VERSION = 1
@@ -123,8 +125,26 @@ class MilestoneConfig:
     multi_gpu_probe: bool = False
     probe_if_needed: bool = False
     probe_smoke_timeout: int = 900
+    compute_mode: str = "legacy"
+    compute_controller: str = "heuristic"
+    compute_env_file: str | None = None
+    compute_codegen: str = "disabled"
+    recovery_controller: str = "auto"
+    recovery_max_calls: int = 8
+    recovery_max_tokens: int = 80_000
+    harness_config: str | None = None
 
     def validate(self) -> "MilestoneConfig":
+        if self.recovery_controller not in {"auto", "api", "disabled"}:
+            raise ValueError("invalid recovery controller")
+        if not 1 <= self.recovery_max_calls <= 32 or not 4000 <= self.recovery_max_tokens <= 500_000:
+            raise ValueError("invalid recovery API budget")
+        if self.compute_mode not in {"legacy", "auto"} or self.compute_controller not in {"heuristic", "api"}:
+            raise ValueError("invalid compute execution mode/controller")
+        if self.compute_codegen not in {"disabled", "validated"}:
+            raise ValueError("invalid compute codegen mode")
+        if self.compute_codegen == "validated" and (self.compute_controller != "api" or self.compute_mode != "auto"):
+            raise ValueError("validated compute codegen requires adaptive execution and the API compute controller")
         if self.task != "auto" and self.task not in TASK_IDS:
             raise ValueError(f"unknown RoboSyn task: {self.task}")
         if self.controller not in {"api", "fixed", "random", "heuristic"}:
@@ -160,10 +180,13 @@ def protocol_budget(config: MilestoneConfig) -> dict[str, Any]:
     """
     budget = asdict(config) | {"output_root": str(config.output_root)}
     budget.pop("allow_api_egress", None)
+    budget.pop("harness_config", None)
     for key in ("gpus", "device_mode", "max_parallel_jobs", "gpu_hours",
                 "accept_device_plan", "multi_gpu_probe", "probe_if_needed",
-                "probe_smoke_timeout"):
+                "probe_smoke_timeout", "compute_mode", "compute_controller", "compute_env_file", "compute_codegen"):
         budget.pop(key, None)
+    for key in ("recovery_controller", "recovery_max_calls", "recovery_max_tokens"):
+        budget.pop(key, None)  # resolved recovery policy has its own frozen protocol block
     return budget
 
 
@@ -423,6 +446,115 @@ class RepositoryAutoResearch:
         # Parallel jobs in one phase share this object's state file and capability index;
         # both are read-modify-write, so every mutation goes through one lock.
         self.lock = threading.RLock()
+        self._last_recovery: dict | None = None
+        self._last_recovery_stage: str | None = None
+        self.harness = load_harness_policy(config.harness_config)
+        self.harness_enabled = config.compute_mode == "auto" or config.harness_config is not None
+        if self.harness_enabled:
+            immutable_json(self.run_root / "harness_policy.json", self.harness)
+        self.probe_charges: list[dict] = []
+        self.harness_artifacts = None
+
+    def recovery_enabled(self) -> bool:
+        return self.config.recovery_controller == "api" or (
+            self.config.recovery_controller == "auto" and self.config.controller == "api")
+
+    def _recovery_decision(self, snapshot: dict) -> dict | None:
+        if not self.recovery_enabled() or self.config.dry_run or self.config.probe_only:
+            return None
+        # Save the local incident even if the API is unavailable. It must not hide
+        # the triggering exception or cause another charged request on restart.
+        root = self.run_root / "recovery"
+        self._last_recovery_stage = self.state.get("stage")
+        incident = root / "incidents" / object_digest(snapshot)
+        atomic_json(incident / "snapshot.json", snapshot)
+        try:
+            self._require_api_egress_authorization()
+            deadline = getattr(self.runtime, "deadline", None)
+            if deadline is not None and deadline - time.monotonic() < 185:
+                raise TimeoutError("insufficient remaining wall budget for recovery API")
+            from .compute_agent import client_from_file
+            env_file = Path(os.environ.get("AUTOSIM_ENV_FILE") or
+                            self.config.compute_env_file or PROJECT_ROOT / ".env")
+            client = client_from_file(env_file) if env_file.is_file() else LLMClient()
+            if not client.available:
+                raise RuntimeError("recovery API credentials unavailable")
+            record = RecoveryAgent(root, client, max_calls=self.config.recovery_max_calls,
+                                   max_tokens=self.config.recovery_max_tokens).decide(snapshot)
+            self._last_recovery = record
+            self.save(recovery=record)
+            return record
+        except Exception as exc:
+            failure = {"incident": str(incident), "status": "recovery_unavailable",
+                       "error_type": type(exc).__name__, "action": "stop"}
+            atomic_json(incident / "unavailable.json", failure)
+            self._last_recovery = failure
+            self.save(recovery=failure)
+            return None
+
+    def _infrastructure_failure(self, exc: Exception) -> dict | None:
+        """Give the API real process evidence and registered repair tools, never sealed data."""
+        if not self.harness_enabled:
+            return None
+        from .infrastructure_recovery import supervisor_incident
+        remaining = max(0, self.runtime.deadline-time.monotonic()) if self.runtime and self.runtime.deadline else 0
+        revision = self.runtime._execution_code_digest() if self.runtime else "uninitialized"
+        from .execution_activation import active_execution_identity
+        active = active_execution_identity()
+        if active:
+            revision = active["execution_revision"]
+        record = supervisor_incident(self.run_root, run_id=self.config.run_id,
+            stage=self.state.get("stage", "unknown"), exception=exc, source_revision=revision,
+            environment_fingerprint=getattr(self, "environment_contract", {}).get("fingerprint", "unknown"),
+            deadline_epoch=time.time()+remaining, final_opened=bool(self.state.get("final_confirmation_opened")))
+        self.save(infrastructure_incident={"path": record["path"],
+            "incident_id": record["incident"]["incident_id"],
+            "failure_kind": record["incident"]["failure_kind"]})
+        if (not self.recovery_enabled() or not self.harness["repair"]["enabled"]
+                or self.config.dry_run or self.config.probe_only or remaining < 185):
+            return record
+        self._require_api_egress_authorization()
+        from .compute_agent import ComputeAgent, client_from_file
+        from .repair_agent import RepairAgent
+        from .repair_tools import production_repair_tools
+        env_file = Path(os.environ.get("AUTOSIM_ENV_FILE") or self.config.compute_env_file or PROJECT_ROOT / ".env")
+        incident = record["incident"]
+        repair_root = self.run_root / "repair" / incident["incident_id"]
+        try:
+            client = client_from_file(env_file)
+            broker = production_repair_tools(incident, source_root=PROJECT_ROOT, output=repair_root / "tools",
+                deadline_epoch=time.time()+min(remaining, self.harness["repair"]["max_seconds"]), ledger=self.ledger,
+                max_candidates=self.harness["repair"]["max_candidates"])
+            transport = ComputeAgent(self.run_root / "recovery/api", client,
+                max_calls=self.config.recovery_max_calls, max_tokens=self.config.recovery_max_tokens)
+            # This incident now belongs to the tool-driven repair session. An
+            # unknown remote outcome must not trigger a second, differently keyed
+            # diagnostic API request in the outer exception handler.
+            self._last_recovery_stage = self.state.get("stage")
+            result = RepairAgent(repair_root / "agent", client, tools=broker, transport=transport).run(incident)
+            if result.get("api_used"):
+                self._last_recovery_stage = self.state.get("stage")
+            self.save(infrastructure_repair={"path": str(repair_root), "status": result["status"],
+                                           "api_used": bool(result.get("api_used"))})
+            if result["status"] == "activation_requested":
+                atomic_json(self.run_root / "repair_activation_request.json", result["result"])
+        except Exception as repair_error:
+            atomic_json(repair_root / "unavailable.json", {"status": "unavailable",
+                        "error_type": type(repair_error).__name__, "original_incident": incident["incident_id"]})
+        return record
+
+    @staticmethod
+    def _bind_recovery_params(proposal: dict, context: dict) -> dict:
+        params = context.get("recovery_training_constraints", {})
+        if params and proposal.get("decision") != "stop":
+            if not isinstance(proposal.get("training"), dict) or not isinstance(
+                    proposal["training"].get("params"), dict):
+                raise ValueError("recovery proposal requires training.params object")
+            # Applied before normal proposal validation, using only the registered
+            # scientific search space. Cached proposal records contain the actual values.
+            proposal = {**proposal, "training": {**proposal["training"], "params": {
+                **proposal["training"]["params"], **params}}}
+        return proposal
 
     def _master_seed(self, role: str) -> int:
         """Derive independent, reproducible banks for each research replicate.
@@ -449,7 +581,7 @@ class RepositoryAutoResearch:
         return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
 
     def _require_api_egress_authorization(self) -> None:
-        if (self.config.controller == "api" and self.task != "click_bell"
+        if ((self.config.controller == "api" or self.recovery_enabled()) and self.task != "click_bell"
                 and not self.config.allow_api_egress):
             raise PermissionError(
                 "non-ClickBell DeepSeek use requires explicit --allow-api-egress; "
@@ -491,6 +623,8 @@ class RepositoryAutoResearch:
                        if key in budget and budget[key] != value}
             if changed:
                 raise ValueError(f"completed run protocol differs from request: {changed}")
+            if read_json(protocol_path).get("execution_contract") == "adaptive_compute_v1":
+                return self.state
             recorded_devices = budget.get("devices")
             requested_plan = self._requested_plan_identity()
             if recorded_devices and not requested_plan:
@@ -568,6 +702,12 @@ class RepositoryAutoResearch:
         plain loop over the same calls.
         """
         assert self.runtime is not None
+        if self.plan and self.plan.get("unified_scheduler"):
+            # These callbacks are orchestration nodes. Runtime submits their actual CPU/GPU
+            # leaves, including all shards, so a parent never holds a GPU needed by its child.
+            self.runtime.compute_ledger = self.device_ledger()
+            self._refresh_compute_plan()
+            return {job.name: job.run(self.runtime) for job in jobs}
         ledger = self.device_ledger()
         results = run_phase_jobs(phase=phase, jobs=jobs, runtime=self.runtime, plan=self.plan,
                                  output=self.run_root / "schedule",
@@ -586,9 +726,23 @@ class RepositoryAutoResearch:
         """
         if self.config.gpus is None:
             return None
+        validation = self.harness["validation"]
+        if (self.harness_enabled and validation["force_probe"]
+                and not (self.config.dry_run or self.config.probe_only)):
+            measured = []
+            for index in range(validation["probe_repetitions"]):
+                outcome = self._run_device_probe(workspace, repetition=index)
+                measured.append(outcome)
+                atomic_json(self.run_root / "native_admission_runs.json", measured)
+                if not outcome["published"]:
+                    raise RuntimeError(f"native admission failed: {outcome['detail']}")
         try:
             plan = self._plan_once(workspace)
         except DeviceReceiptMissing as exc:
+            if self.config.compute_mode == "auto" and (self.config.dry_run or self.config.probe_only):
+                self.save(stage="compute_probe_required", compute_admission={"status":"not_measured",
+                    "reason":str(exc),"dry_run_started_no_native_or_api_work":True})
+                return None
             # No receipt for *this* container.  A receipt is keyed by the node it was taken
             # on and this cluster's container hostname is job-scoped, so a receipt from
             # another job can never authorize this one -- measuring here is the only way a
@@ -600,7 +754,7 @@ class RepositoryAutoResearch:
             outcome = self._run_device_probe(workspace)
             if not outcome["published"]:
                 raise RuntimeError(
-                    f"multi-device plan refused: {exc}; the in-run device probe did not "
+                    "multi-device plan refused; the in-run device probe did not "
                     f"publish a usable receipt ({outcome['detail']})"
                 ) from exc
             try:
@@ -612,7 +766,12 @@ class RepositoryAutoResearch:
                 ) from again
         except (DevicePlanRefused, NoCompatibleDevice) as exc:
             raise RuntimeError(f"multi-device plan refused: {exc}") from exc
-        write_plan(self.run_root, plan)
+        if self.config.compute_mode == "auto":
+            from .compute_planner import upgrade_plan, publish_execution_plan
+            plan = upgrade_plan(plan, output=self.run_root)
+            publish_execution_plan(self.run_root, plan)
+        else:
+            write_plan(self.run_root, plan)
         if self.runtime is not None:
             self.runtime.plan = plan
         self.save(stage="device_plan_resolved", device_plan=plan_summary(plan),
@@ -622,6 +781,28 @@ class RepositoryAutoResearch:
                             "class_name": gpu.get("class_name"), "renderer": gpu.get("renderer")}
                            for gpu in plan["usable"]])
         return plan
+
+    def _refresh_compute_plan(self) -> None:
+        if self.config.dry_run or self.config.probe_only or not self.plan or not self.plan.get("unified_scheduler"):
+            return
+        from .compute_planner import ComputePlanner, publish_execution_plan
+        from .profiling import ProfileStore
+        planner = ComputePlanner(self.run_root / "compute", controller=self.config.compute_controller,
+            env_file=Path(self.config.compute_env_file) if self.config.compute_env_file else self.runtime.platform_root / ".env")
+        telemetry = {"workload_profiles": ProfileStore(self.runtime.output / "compute/profiles").summary()}
+        decision = planner.propose(self.plan, telemetry=telemetry)
+        values = decision["parameters"]
+        self.plan = {**self.plan, "max_parallel_jobs": values["max_parallel_jobs"],
+                     "execution_parameters": values}
+        self.plan["plan_digest"] = object_digest({k:v for k,v in self.plan.items() if k != "plan_digest"})
+        self.runtime.plan = self.plan
+        self.runtime.cost_model["execution_parameters"] = values
+        # Once logical shard boundaries exist Runtime keeps the recorded boundaries.
+        self.runtime.shard_min_episodes = values["shard_min_episodes"]
+        if self.config.compute_codegen == "validated" and planner.agent:
+            from .compute_codegen import AuditOptimizer
+            self.runtime.audit_optimizer = AuditOptimizer(self.run_root / "compute/codegen", planner.agent)
+        publish_execution_plan(self.run_root, self.plan)
 
     def _plan_once(self, workspace: Path) -> dict:
         """One resolution attempt against whatever receipt this container already has."""
@@ -634,7 +815,7 @@ class RepositoryAutoResearch:
                             worker_spec=os.environ.get("SCO_WORKER_SPEC"))
 
     def _run_device_probe(self, workspace: Path, *, runner: Callable[..., int] | None = None,
-                          ) -> dict[str, Any]:
+                          repetition: int = 0) -> dict[str, Any]:
         """Measure this container's devices, the way the full run will address them.
 
         Runs the ladder as its own process (`device_probe.main`), for the same reason the
@@ -647,6 +828,8 @@ class RepositoryAutoResearch:
         this node cannot do fails here, in the measurement, rather than later mid-phase.
         """
         output = self.run_root / "device_probe"
+        if repetition:
+            output = output / "repetitions" / f"probe_{repetition + 1}"
         output.mkdir(parents=True, exist_ok=True)
         mode = (self.config.device_mode if self.config.device_mode in {"pinned_index", "identity"}
                 else "pinned_index")
@@ -654,14 +837,72 @@ class RepositoryAutoResearch:
                    "--workspace", str(workspace), "--output", str(output),
                    "--task", self.task, "--gpus", self.config.gpus,
                    "--mode", mode, "--smoke-timeout", str(int(self.config.probe_smoke_timeout))]
+        if self.config.compute_mode == "auto":
+            command[2] = "autosim.research.compute_probe"
+            command[command.index("--mode") + 1] = "identity" if self.config.device_mode == "auto" else self.config.device_mode
+            remaining = (self.runtime.deadline-time.monotonic()) if self.runtime.deadline else self.config.hours*3600
+            if remaining < 120:
+                raise TimeoutError("remaining run budget cannot afford compute admission probing")
+            command[command.index("--smoke-timeout")+1] = str(min(self.config.probe_smoke_timeout,int(remaining)-60))
+            if self.config.gpu_hours is not None:
+                command += ["--gpu-hours", str(self.config.gpu_hours)]
+            lifecycle = self.harness["lifecycle"]
+            incident_timeout = min(lifecycle["incident_timeout"], max(30, int(remaining) - 60))
+            command += ["--startup-attempts", str(lifecycle["startup_attempts"]),
+                        "--recovery-max-calls", str(self.config.recovery_max_calls if self.recovery_enabled() else 0),
+                        "--recovery-max-tokens", str(self.config.recovery_max_tokens),
+                        "--incident-timeout", str(incident_timeout),
+                        "--probe-repetition", str(repetition),
+                        "--minimum-overlap-seconds", str(lifecycle["minimum_overlap_seconds"])]
+            if lifecycle["construction_concurrency"] is not None:
+                command += ["--construction-concurrency", str(lifecycle["construction_concurrency"])]
+            if self.config.harness_config:
+                command += ["--harness-config", str(Path(self.config.harness_config).absolute())]
+            validation = self.harness["validation"]
+            warm = repetition > 0 and repetition == validation["probe_repetitions"] - 1
+            command += ["--cache-mode", "warm" if warm else "cold"]
+            if warm:
+                previous = (self.run_root / "device_probe/device_probe.json" if repetition == 1 else
+                            self.run_root / "device_probe/repetitions" / f"probe_{repetition}" / "device_probe.json")
+                namespace = read_json(previous).get("native_cache_namespace")
+                if not namespace:
+                    raise RuntimeError("warm probe requires a verified prior cache namespace")
+                command += ["--cache-namespace", namespace]
         self.save(stage="device_probe_running", device_probe={
             "command": " ".join(command), "output": str(output),
             "note": "no device receipt for this container; measuring this node before the plan",
         })
         started = time.time()
-        returncode = (runner or subprocess.call)(command)
+        if runner is not None:
+            returncode = runner(command)
+        else:
+            from .common import run_command
+            timeout = max(1, int(self.runtime.deadline - time.monotonic()) - 30) if (
+                self.runtime is not None and self.runtime.deadline) else self.config.probe_smoke_timeout + 60
+            process_root = output / "supervisor_process"
+            continuation_attempt = int(os.environ.get("AUTOSIM_CONTINUATION_ATTEMPT", "1"))
+            if continuation_attempt > 1 and (process_root / "process.json").is_file():
+                from .resume_boundary import load_resume_receipt
+                launch = read_json(Path(os.environ["AUTOSIM_LAUNCH_MANIFEST"]))
+                load_resume_receipt(Path(os.environ["AUTOSIM_RESUME_RECEIPT"]),
+                    expected_sha256=os.environ["AUTOSIM_RESUME_RECEIPT_SHA256"],
+                    run_root=self.run_root, scientific_contract=launch["scientific_contract"],
+                    execution_revision=os.environ["AUTOSIM_EXECUTION_REVISION"])
+                process_root = output / f"supervisor_process_attempt_{continuation_attempt}"
+            try:
+                process = run_command(command, cwd=workspace, env=dict(os.environ),
+                                      output=process_root, timeout=timeout,
+                                      metadata={"job": "native_admission", "generation": repetition})
+            except RuntimeError:
+                if not (process_root / "process.json").exists():
+                    raise
+                process = read_json(process_root / "process.json")
+            returncode = process.get("returncode", 1)
         artifact = output / "device_probe.json"
         receipt = read_json(artifact) if artifact.is_file() else {}
+        if not receipt and (output / "inventory.json").exists():
+            report = read_json(output / "inventory.json")
+            receipt = {"allocation":[d for d in report["gpus"] if d["index"] in report["allowed"]],"passed":False}
         self.probe_charge = {
             "job": "device_probe", "category": "probe", "wall_seconds": time.time() - started,
             "status": "completed" if returncode == 0 else f"failed(rc={returncode})",
@@ -672,25 +913,35 @@ class RepositoryAutoResearch:
                        "verdict": receipt.get("verdict"), "returncode": returncode,
                        "artifact": str(artifact)},
         }
-        published = bool(receipt.get("passed"))
+        self.probe_charges.append(self.probe_charge)
+        published = bool(receipt.get("passed")) and returncode == 0
         self.save(stage="device_probe_finished", device_probe={
             "returncode": returncode, "passed": published,
             "mode": receipt.get("mode"), "verified_devices": receipt.get("verified_devices"),
             "verdict": receipt.get("verdict"), "artifact": str(artifact),
         })
-        return {"published": published, "artifact": str(artifact),
-                "detail": f"rc={returncode}, passed={published}, mode={receipt.get('mode')}"}
+        primary = receipt.get("primary_failure") or receipt.get("failure")
+        return {"published": published, "artifact": str(artifact), "primary_failure": primary,
+                "detail": (f"rc={returncode}, passed={published}, mode={receipt.get('mode')}, "
+                           f"primary={redact(str(primary))}, evidence={artifact}")}
 
     def _charge_device_probe(self) -> None:
         """Put the in-run probe on the same account as everything else it paid for."""
-        charge = getattr(self, "probe_charge", None)
+        charges = self.probe_charges or [getattr(self, "probe_charge", None)]
         ledger = self.device_ledger()
-        if not charge or ledger is None:
+        if ledger is None:
             return
-        ledger.charge(Charge(job=charge["job"], category=charge["category"],
-                             status=charge["status"], devices=tuple(charge["devices"]),
-                             wall_seconds=float(charge["wall_seconds"]),
-                             detail=charge["detail"]))
+        for charge in charges:
+            if not charge:
+                continue
+            item = Charge(job=charge["job"], category=charge["category"],
+                          status=charge["status"], devices=tuple(charge["devices"]),
+                          wall_seconds=float(charge["wall_seconds"]), detail=charge["detail"])
+            key = "probe_" + object_digest(charge["detail"])
+            if hasattr(ledger, "settle"):
+                ledger.settle(item, reservation_key=key, settlement_id=key)
+            else:
+                ledger.charge(item)
 
     def _requested_plan_identity(self) -> dict[str, Any]:
         """What this invocation asks for, in the plan-identity vocabulary.
@@ -721,6 +972,10 @@ class RepositoryAutoResearch:
         if not recorded_path.is_file():
             return
         recorded = read_json(recorded_path)
+        if self.config.compute_mode == "auto":
+            if recorded.get("execution_contract") != "adaptive_compute_v1":
+                raise ValueError("legacy protocol requires an explicit new run-id for adaptive execution")
+            return
         recorded_devices = (recorded.get("budget") or {}).get("devices")
         resolved = (protocol.get("budget") or {}).get("devices")
         if recorded_devices and not resolved:
@@ -776,7 +1031,21 @@ class RepositoryAutoResearch:
         eval_repo = eval_candidate if eval_candidate.is_dir() else self.repo
         self.runtime = Runtime(workspace, self.run_root / "runtime", self.config.gpu,
                                repo_path=self.repo, eval_repo_path=eval_repo)
+        self.runtime.harness_config = self.harness
         self.runtime.output.mkdir(parents=True, exist_ok=True)
+        if self.harness_enabled and not (self.config.dry_run or self.config.probe_only):
+            from .environment_contract import collect_environment_contract
+            inventory_path = self.run_root.parents[2] / "allocation_inventory.json"
+            self.environment_contract = collect_environment_contract(
+                self.repo, interpreters={"simulation": self.runtime.python, "training": self.runtime.train_python},
+                assets={"official_dataset": {"path": self.assets["official_dataset"]},
+                        "official_checkpoint": {"path": self.assets["official_checkpoint"]}},
+                source_files=[Path(__file__), self.repo / "policy/act/checkpoint_compat.py"],
+                inventory=read_json(inventory_path) if inventory_path.exists() else None,
+                checkpoint=Path(self.assets["official_checkpoint"]),
+                output=self.run_root / "environment_manifest.json")
+            if self.environment_contract["status"] != "passed":
+                raise RuntimeError("environment/checkpoint contract failed; see environment_manifest.json")
         project_root = self.runtime.platform_root.absolute()
         owned_paths = [Path(__file__).resolve(), self.repo, eval_repo.absolute(),
                        self.runtime.python.absolute()]
@@ -794,11 +1063,16 @@ class RepositoryAutoResearch:
             "external_system_dependencies": ["GPU driver", "system shared libraries"],
             "note": "credential file is loaded from the project root; historical priors are literal protocol context, not runtime reads",
         })
+        if self.config.compute_mode == "auto" and not (self.config.dry_run or self.config.probe_only):
+            self.start_or_resume_budget()
         self.plan = self._resolve_device_plan(workspace)
         # Open the GPU-hour account with the run's wall clock, not with the first job: the
         # ledger is what bounds the second, third and tenth job, so it has to have been
         # counting since the budget did.
         self.device_ledger()
+        self.runtime.compute_ledger = self.ledger
+        if self.harness["validation"]["stage"] != "native_admission":
+            self._refresh_compute_plan()
         self._charge_device_probe()
         budget = protocol_budget(self.config)
         protocol = {
@@ -812,8 +1086,48 @@ class RepositoryAutoResearch:
         # Only a plan that is *not* legacy equivalent changes the run's identity.  A
         # `--gpus 0` plan addresses exactly the card and the way `--gpu 0` does, so it stays
         # out of the frozen protocol.
-        if self.plan is not None and not self.plan["legacy_equivalence"]:
+        if self.config.compute_mode == "auto":
+            protocol["execution_contract"] = "adaptive_compute_v1"
+        elif self.plan is not None and not self.plan["legacy_equivalence"]:
             protocol["devices"] = devices_protocol_block(self.plan)
+        if self.harness_enabled:
+            protocol["harness"] = {"version": 1, "policy_sha256": policy_identity(self.harness),
+                                   "scientific_retry_after_reset": False}
+            launch_path = os.environ.get("AUTOSIM_LAUNCH_MANIFEST")
+            if launch_path:
+                launch_file = Path(launch_path).absolute()
+                if launch_file.parent != self.run_root.parents[2]:
+                    raise RuntimeError("launch manifest is outside this run allocation")
+                launch = read_json(launch_file)
+                if launch.get("run_id") != self.config.run_id or Path(launch.get("run_root", "")).absolute() != self.run_root:
+                    raise RuntimeError("launch manifest belongs to another run")
+                if launch.get("scientific_contract"):
+                    science = launch["scientific_contract"]
+                    recipe = {"--task": self.task, "--controller": self.config.controller,
+                              "--rounds": str(self.config.rounds), "--attempts-per-round": str(self.config.attempts_per_round),
+                              "--training-steps": str(self.config.screen_steps),
+                              "--development-episodes": str(self.config.development_episodes),
+                              "--selection-episodes": str(self.config.selection_episodes),
+                              "--final-episodes": str(self.config.final_episodes), "--train-seed": str(self.config.train_seed)}
+                    if science.get("recipe") != recipe:
+                        raise RuntimeError("launch scientific recipe differs from actual research arguments")
+                    frozen = read_json(launch_file.parent / "source_manifest.json")
+                    expected = {name: value for name, value in frozen.items() if name.startswith("RoboSynChallenge/")}
+                    if science.get("benchmark_source") != expected:
+                        raise RuntimeError("launch scientific source differs from frozen benchmark")
+                    protocol["continuation_scientific_contract"] = science
+        if self.recovery_enabled():
+            protocol["recovery"] = {"version": 1, "controller": "api",
+                "max_calls": self.config.recovery_max_calls, "max_tokens": self.config.recovery_max_tokens,
+                "automatic_action": "quarantine_nonfinite_candidate_development",
+                "other_failures": "diagnose_and_stop", "final_feedback_forbidden": True}
+        compatibility = self.runtime.eval_repo / "policy/act/checkpoint_compat.py"
+        if compatibility.is_file():
+            protocol["act_checkpoint_contract"] = {
+                "normalization": "checkpoint_inline_v1", "strict_loading": True,
+                "implementation_sha256": digest(compatibility),
+                "prior_unprocessed_evaluations_comparable": False,
+            }
         self._check_recorded_plan(protocol)
         immutable_json(self.run_root / "run_request.json", {
             "schema_version": 1, "run_id": self.config.run_id,
@@ -822,6 +1136,23 @@ class RepositoryAutoResearch:
             "protocol_sha256": object_digest(protocol),
         })
         immutable_json(self.run_root / "protocol.json", protocol)
+        if self.harness_enabled:
+            from .repository_harness import HarnessArtifacts
+            from .execution_activation import active_execution_identity
+            active = active_execution_identity()
+            compatibility = None
+            compatibility_path = os.environ.get("AUTOSIM_EXECUTION_COMPATIBILITY")
+            if compatibility_path:
+                path = Path(compatibility_path).absolute()
+                if (path.parent != self.run_root.parents[2] / "continuation"
+                        or digest(path) != os.environ.get("AUTOSIM_EXECUTION_COMPATIBILITY_SHA256")):
+                    raise RuntimeError("execution compatibility receipt is not host-pinned")
+                compatibility = read_json(path)
+                if not active or compatibility.get("to_revision") != active["execution_revision"]:
+                    raise RuntimeError("execution compatibility does not match the activated revision")
+            self.harness_artifacts = HarnessArtifacts(self.run_root, self.runtime, protocol,
+                execution_revision=active["execution_revision"] if active else None,
+                compatibility=compatibility)
         if not self.config.probe_only:
             self._reserve_banks()
         self.save(status="running", stage="initialized", repo=str(self.repo), benchmark=BENCHMARK, task=self.task)
@@ -876,12 +1207,15 @@ class RepositoryAutoResearch:
         assert self.runtime is not None and self.spec is not None
         runtime = bound or self.runtime
         path = self.run_root / "evaluations" / f"{label}_{purpose}"
-        cached = self._existing_evaluation(path, purpose, count)
+        cached = (self.harness_artifacts.begin_evaluation(checkpoint, path, purpose, master, count)
+                  if self.harness_artifacts else self._existing_evaluation(path, purpose, count))
         if cached is not None:
             result = cached
         else:
             result = runtime.evaluate(self.spec, checkpoint, path, episodes=count,
                                       master_seed=master, purpose=purpose)
+            if self.harness_artifacts:
+                self.harness_artifacts.commit_evaluation(checkpoint, path, purpose, master, count, result)
         self.update_capability("native_evaluation", "verified", {
             "evaluation": str(path), "execution_mode": result.get("execution_mode"),
             "checkpoint_sha256": digest(checkpoint / "model.safetensors"),
@@ -892,10 +1226,14 @@ class RepositoryAutoResearch:
     def propose(self, round_index: int, context: dict[str, Any]) -> dict[str, Any]:
         path = self.run_root / "rounds" / f"round_{round_index}" / "proposal.json"
         if path.is_file():
-            return read_json(path)["proposal"]
+            cached = read_json(path)["proposal"]
+            if self._bind_recovery_params(cached, context) != cached:
+                raise RuntimeError("cached proposal conflicts with recovery constraints")
+            return cached
         if self.config.controller != "api":
             proposal = control_proposal(
                 self.config.controller, round_index, context, seed=self.config.train_seed)
+            proposal = self._bind_recovery_params(proposal, context)
             proposal = validate_proposal(
                 proposal, round_index=round_index,
                 evidence_id=context["development_evidence_id"],
@@ -938,7 +1276,7 @@ class RepositoryAutoResearch:
                 content, metadata = client.chat_with_metadata(
                     current_system, current_user, max_tokens=4096, timeout=120,
                     thinking="disabled")
-                proposal = validate_proposal(_json_object(content), round_index=round_index,
+                proposal = validate_proposal(self._bind_recovery_params(_json_object(content), context), round_index=round_index,
                     evidence_id=context["development_evidence_id"],
                     parent_checkpoint_sha256=context["parent_checkpoint_sha256"],
                     parent_data_version=context["parent_data_version"],
@@ -1158,15 +1496,25 @@ class RepositoryAutoResearch:
         assert self.runtime is not None and self.spec is not None
         round_dir = self.run_root / "rounds" / f"round_{round_index}"
         result_path = round_dir / "round_result.json"
+        if self.harness_artifacts:
+            self.harness_artifacts.begin_round(round_dir, round_index, context, cumulative)
         if result_path.is_file():
             result = read_json(result_path)
-            return result, [(x["profile"], Path(x["root"])) for x in result["cumulative_data"]]
+            self.state["rounds"] = [r for r in self.state["rounds"] if r["round"] != round_index]
+            self.state["rounds"].append({k: result[k] for k in (
+                "round", "proposal_id", "checkpoint", "development_summary", "status") if k in result})
+            self.save(stage=f"round_{round_index}_{result['status']}")
+            return result, (cumulative if result["status"] == "stopped_by_controller" else
+                            [(x["profile"], Path(x["root"])) for x in result["cumulative_data"]])
+        self.save(stage=f"round_{round_index}_proposal")
         proposal = self.propose(round_index, context)
         if proposal.get("decision", "experiment") == "stop":
             result = {"round": round_index, "proposal_id": proposal["proposal_id"],
                       "proposal": proposal, "status": "stopped_by_controller",
                       "reason": proposal["hypothesis"], "completed_at": now()}
             atomic_json(result_path, result)
+            if self.harness_artifacts:
+                self.harness_artifacts.commit_round(result_path, result)
             self.state["rounds"].append({
                 "round": round_index, "proposal_id": proposal["proposal_id"],
                 "status": "stopped_by_controller"})
@@ -1181,6 +1529,7 @@ class RepositoryAutoResearch:
         # The two collections of a round share no seed bank, no output directory and no
         # checkpoint, and neither result can change the other's -- which is what makes them
         # the phase a second device actually buys: on one device they run in this order.
+        self.save(stage=f"round_{round_index}_collection")
         collected = self.run_phase(f"round_{round_index}_collection", [
             PhaseJob("collection_targeted", "collection",
                      lambda bound: self._collect_one(
@@ -1236,10 +1585,18 @@ class RepositoryAutoResearch:
         if round_index == 1 and not any(x["profile"] != "full_random" for x in admitted):
             raise RuntimeError("required targeted/correction probe produced no admitted training data")
         mixture = self._make_mixture(round_index, proposal, cumulative)
+        self.save(stage=f"round_{round_index}_training")
         checkpoint = self.runtime.train(self.spec, Path(self.assets["official_dataset"]),
             round_dir / "candidate", steps=self.config.screen_steps,
             params=proposal["training"]["params"], mixture=mixture,
             seed=self.config.train_seed, pretrained=Path(self.assets["official_checkpoint"]))
+        if self.harness_artifacts:
+            from .environment_contract import inspect_act_checkpoint
+            contract = inspect_act_checkpoint(checkpoint,
+                compatibility_file=self.runtime.eval_repo / "policy/act/checkpoint_compat.py")
+            atomic_json(round_dir / "candidate/checkpoint_contract.json", contract)
+            if contract.get("status") != "passed":
+                raise RuntimeError("trained checkpoint contract failed before native evaluation")
         self.update_capability("act_training", "verified", {
             "checkpoint": str(checkpoint), "steps": self.config.screen_steps,
             "checkpoint_sha256": digest(checkpoint / "model.safetensors"),
@@ -1248,11 +1605,34 @@ class RepositoryAutoResearch:
         if not any(int(x.get("yielded_samples", 0)) > 0 and x.get("source_kind") == "research_requested_collection"
                    for x in exposure.get("parts", [])):
             raise RuntimeError("admitted API-requested data received no actual training batch exposure")
-        dev = self.evaluate(checkpoint, f"round_{round_index}_candidate", "development",
-                            self._master_seed("development"), self.config.development_episodes)
         evaluation_dir = self.run_root / "evaluations" / f"round_{round_index}_candidate_development"
         analysis_path = round_dir / "candidate_failure_analysis.json"
-        if analysis_path.is_file():
+        self.save(stage=f"round_{round_index}_candidate_development")
+        recovery = None
+        try:
+            dev = self.evaluate(checkpoint, f"round_{round_index}_candidate", "development",
+                                self._master_seed("development"), self.config.development_episodes)
+        except Exception:
+            if not self.recovery_enabled():
+                raise
+            baseline = self._existing_evaluation(self.run_root / "evaluations/official_act_development",
+                                                "development", self.config.development_episodes)
+            snapshot = development_failure_snapshot(evaluation_dir,
+                state_dim=self.spec.state_dim, checkpoint_sha256=digest(checkpoint / "model.safetensors"),
+                baseline_verified=(baseline is not None and baseline.get("execution_mode") == "real_simulation"
+                                   and baseline.get("summary", {}).get("episode_count") == self.config.development_episodes),
+                round_index=round_index,
+                rounds_remaining=self.config.rounds - round_index,
+                training_params=proposal["training"]["params"], training_space=TRAINING_SPACE)
+            recovery = self._recovery_decision(snapshot)
+            if recovery is None or recovery["decision"]["action"] != "quarantine_candidate":
+                raise
+            dev = None
+        if recovery is not None:
+            candidate_analysis = {"status": "invalid_candidate", "metrics_valid": False,
+                                  "recovery": recovery, "development_failure": snapshot}
+            atomic_json(analysis_path, candidate_analysis)
+        elif analysis_path.is_file():
             candidate_analysis = read_json(analysis_path)
         elif self.task == "click_bell":
             candidate_analysis = clickbell_failure_analysis(evaluation_dir, analysis_path)
@@ -1266,11 +1646,21 @@ class RepositoryAutoResearch:
                   "development_evaluation": str(evaluation_dir),
                   "candidate_failure_analysis": str(analysis_path),
                   "candidate_evidence_id": object_digest(candidate_analysis),
-                  "development_summary": _summary(dev), "training_exposure_audit": str(round_dir / "candidate" / "training_exposure_audit.json"),
-                  "status": "completed", "completed_at": now()}
+                  "development_summary": _summary(dev) if dev is not None else None,
+                  "training_exposure_audit": str(round_dir / "candidate" / "training_exposure_audit.json"),
+                  "status": "quarantined" if recovery else "completed", "completed_at": now()}
+        if recovery:
+            healthy_checkpoint = Path(context["current_policy_checkpoint"])
+            result.update(recovery=recovery, fallback_policy_checkpoint=str(healthy_checkpoint),
+                fallback_policy_checkpoint_sha256=digest(healthy_checkpoint / "model.safetensors"),
+                fallback_policy_failure_analysis=context["development_evidence"].get(
+                    "current_policy_failure_analysis", context["development_evidence"]))
         atomic_json(result_path, result)
+        if self.harness_artifacts:
+            self.harness_artifacts.commit_round(result_path, result)
+        self.state["rounds"] = [r for r in self.state["rounds"] if r["round"] != round_index]
         self.state["rounds"].append({k: result[k] for k in ("round", "proposal_id", "checkpoint", "development_summary", "status")})
-        self.save(stage=f"round_{round_index}_completed")
+        self.save(stage=f"round_{round_index}_{result['status']}")
         return result, cumulative
 
     def _feedback_context(self, baseline_analysis: dict[str, Any], prior: dict[str, Any] | None) -> dict[str, Any]:
@@ -1283,6 +1673,9 @@ class RepositoryAutoResearch:
         exposure = read_json(Path(prior["training_exposure_audit"])) if prior is not None else None
         current_analysis = (read_json(Path(prior["candidate_failure_analysis"]))
                             if prior is not None else baseline_analysis)
+        quarantined = prior is not None and prior.get("status") == "quarantined"
+        if quarantined:
+            current_analysis = prior["fallback_policy_failure_analysis"]
         evidence = baseline_analysis if prior is None else {
             "baseline_failure_analysis_summary": compact_baseline,
             "previous_round": prior["round"],
@@ -1293,10 +1686,14 @@ class RepositoryAutoResearch:
                 ("profile", "source_kind", "expected_sampling_mass", "realized_sampling_mass", "yielded_samples")}
                 for row in exposure.get("parts", [])],
             "previous_development_summary": prior["development_summary"],
-            "current_policy_checkpoint_sha256": prior["checkpoint_sha256"],
+            "current_policy_checkpoint_sha256": (prior["fallback_policy_checkpoint_sha256"]
+                                                  if quarantined else prior["checkpoint_sha256"]),
             "current_policy_failure_analysis": current_analysis,
-            "current_policy_evidence_id": prior["candidate_evidence_id"],
+            "current_policy_evidence_id": object_digest(current_analysis),
         }
+        if quarantined:
+            evidence.update(previous_candidate_status="quarantined", previous_candidate_metrics_valid=False,
+                            recovery=prior["recovery"])
         evidence_id = object_digest(evidence)
         suffix = "baseline.json" if prior is None else f"round_{prior['round']}_feedback.json"
         atomic_json(self.run_root / "evidence" / suffix,
@@ -1322,17 +1719,29 @@ class RepositoryAutoResearch:
                 "development_evidence_id": evidence_id, "development_evidence": evidence,
                 "parent_checkpoint_sha256": self.assets["checkpoint_weight_sha256"],
                 "parent_data_version": self.assets["dataset_info_sha256"],
-                "current_policy_checkpoint": (prior["checkpoint"] if prior is not None
+                "current_policy_checkpoint": (prior["fallback_policy_checkpoint"] if quarantined else
+                                              prior["checkpoint"] if prior is not None
                                               else self.assets["official_checkpoint"]),
+                "recovery_training_constraints": (prior["recovery"]["decision"]["next_trial_training_params"]
+                                                  if quarantined else {}),
                 "must_use_current_policy_feedback": prior is not None}
 
-    def _select(self, baseline: dict[str, Any], rounds: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _select(self, baseline: dict[str, Any], rounds: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Score the baseline and every candidate on one frozen bank.
 
         These evaluations share a seed bank and a checkpoint per row, and none of them can
         change another's number, so they are one phase: on several devices they run at the
         same time, and on one they run in the order they always did, official first.
         """
+        excluded = [{"round": row["round"], "status": row["status"], "checkpoint": row["checkpoint"]}
+                    for row in rounds if row["status"] != "completed"]
+        rounds = [row for row in rounds if row["status"] == "completed"]
+        if not rounds:
+            selection = {"status": "no_valid_candidates", "excluded_candidates": excluded,
+                         "candidates": [], "selected_round": None, "selected_checkpoint": None,
+                         "qualifies_for_final": False, "selection_evaluation_performed": False}
+            atomic_json(self.run_root / "selection.json", selection)
+            return None, selection
         seed = self._master_seed("selection_validation")
         episodes = self.config.selection_episodes
         estimate = self.phase_estimate(episodes)
@@ -1357,7 +1766,7 @@ class RepositoryAutoResearch:
             return (summary["success_rate"], -summary["average_action_steps"],
                     -summary.get("average_inference_time_per_episode_seconds", float("inf")))
         selected_row, selected_metrics, comparison = max(candidates, key=key)
-        selection = {"official_summary": _summary(official), "candidates": [
+        selection = {"excluded_candidates": excluded, "official_summary": _summary(official), "candidates": [
             {"round": row["round"], "summary": _summary(metrics), "vs_official": comp}
             for row, metrics, comp in candidates], "selected_round": selected_row["round"],
             "selected_checkpoint": selected_row["checkpoint"], "selected_summary": _summary(selected_metrics),
@@ -1396,6 +1805,9 @@ class RepositoryAutoResearch:
             "base_policy_loader_sha256": digest(export_base / "policy/act/deploy_policy.py"),
             "overlays": {str(path): digest(self.repo / path) for path in overlay_paths},
         }
+        compatibility = export_base / "policy/act/checkpoint_compat.py"
+        if compatibility.is_file():
+            export_composition["base_act_checkpoint_compat_sha256"] = digest(compatibility)
         if destination.exists():
             prior_manifest = destination / "AUTORESEARCH_MANIFEST.json"
             prior_composition = (read_json(prior_manifest).get("export_composition")
@@ -1481,9 +1893,20 @@ class RepositoryAutoResearch:
         if digest(staged_checkpoint / "model.safetensors") != digest(
                 checkpoint_dest / "model.safetensors"):
             raise RuntimeError("short-path staged checkpoint differs from exported checkpoint")
+        if self.harness_artifacts:
+            from .environment_contract import inspect_act_checkpoint
+            contract = inspect_act_checkpoint(staged_checkpoint,
+                compatibility_file=staged_repo / "policy/act/checkpoint_compat.py")
+            atomic_json(self.run_root / "export_checkpoint_contract.json", contract)
+            if contract.get("status") != "passed":
+                raise RuntimeError("exported checkpoint contract failed before native validation")
         export_runtime = Runtime(self.runtime.workspace, self.run_root / "export_validation",
                                  self.config.gpu, repo_path=staged_repo,
                                  eval_repo_path=staged_repo, python_path=self.runtime.python)
+        export_runtime.deadline = self.runtime.deadline
+        export_runtime.harness_config = self.harness
+        export_runtime.compute_ledger = self.ledger
+        export_runtime.plan = self.plan
         export_spec = load_task(staged_repo, self.task)
         smoke = None
         startup_failures = []
@@ -1498,7 +1921,7 @@ class RepositoryAutoResearch:
             try:
                 smoke = export_runtime.evaluate(export_spec, staged_checkpoint, smoke_dir,
                                                 episodes=1, master_seed=bank["master_seed"],
-                                                purpose="smoke", startup_attempts=1,
+                                                purpose="smoke", startup_attempts=self.harness["lifecycle"]["startup_attempts"],
                                                 # 900 s is a real budget, not a token bound. The
                                                 # environment takes ~360 s to construct before the
                                                 # first reset in this cluster (measured on the run's
@@ -1598,6 +2021,14 @@ class RepositoryAutoResearch:
                 return completed
             self.initialize()
             assert self.runtime is not None and self.spec is not None
+            if (self.harness_enabled and self.harness["validation"]["stage"] == "native_admission"
+                    and not (self.config.dry_run or self.config.probe_only)):
+                receipt = read_json(self.run_root / "device_probe/device_probe.json")
+                self.save(status="prepared", stage="native_admission_complete",
+                          native_admission_passed=bool(receipt.get("passed")),
+                          execution_complete=False, result_valid=False,
+                          note="native admission validation only; no scientific score claim")
+                return self.state
             if self.config.dry_run or self.config.probe_only:
                 self.save(status="prepared", stage="dry_run_complete",
                           note=("capability/asset probe completed; no API, simulator, training, or score claim"
@@ -1623,6 +2054,7 @@ class RepositoryAutoResearch:
             # multi-device run holding index 0 would block its own first lease.
             holding_legacy = self.plan is None or self.plan["legacy_equivalence"]
             with gpu_lock(self.config.gpu) if holding_legacy else nullcontext():
+                self.save(stage="official_data_audit")
                 official_audit_path = self.run_root / "official_data_audit"
                 official_audit_file = official_audit_path / "data_audit.json"
                 if official_audit_file.is_file():
@@ -1634,6 +2066,7 @@ class RepositoryAutoResearch:
                     "info_sha256": official_audit.get("info_sha256"),
                     "video_decode_scope": official_audit.get("dataset", {}).get("video_decode_scope"),
                 })
+                self.save(stage="official_development")
                 official_dev = self.evaluate(Path(self.assets["official_checkpoint"]), "official_act", "development",
                                              self._master_seed("development"), self.config.development_episodes)
                 analysis_path = self.run_root / "evidence" / "official_development_failure_analysis.json"
@@ -1656,12 +2089,14 @@ class RepositoryAutoResearch:
                     rounds.append(prior)
                 if not rounds:
                     raise RuntimeError("controller stopped without producing any candidate")
+                self.save(stage="selection_validation")
                 selected_row, selection = self._select(official_dev, rounds)
                 compact_steps = self.config.screen_steps
                 official_cont: Path | None = None
-                candidate = Path(selected_row["checkpoint"])
+                candidate = Path(selected_row["checkpoint"]) if selected_row is not None else None
                 # The full 80K path is explicit and decided before final confirmation.
-                if self.config.full_budget:
+                if self.config.full_budget and selected_row is not None:
+                    self.save(stage="full_budget_training_and_recheck")
                     candidate = self.runtime.train(self.spec, Path(self.assets["official_dataset"]),
                         self.run_root / "rounds" / f"round_{selected_row['round']}" / "candidate",
                         steps=80_000, params=selected_row["proposal"]["training"]["params"],
@@ -1729,32 +2164,36 @@ class RepositoryAutoResearch:
                         deployment = candidate
                 else:
                     atomic_json(self.run_root / "final_confirmation_not_opened.json", {
-                        "reason": "selected candidate did not improve at least 3pp on selection validation",
+                        "reason": ("no valid candidates" if selected_row is None else
+                                   "selected candidate did not improve at least 3pp on selection validation"),
                         "selection": selection})
+                self.save(stage="export_validation")
                 exported = self._export(deployment, candidate, final)
                 export_validation = read_json(self.run_root / "export_validation.json")
                 completed = bool(final and final["engineering_improvement_gate_passed"])
                 result_contract = {
                     "execution_complete": True,
-                    "result_valid": True,
+                    "result_valid": selected_row is not None,
                     "performance_improved": completed,
                     "hypothesis_supported": None,
                     "export_runtime_verified": bool(export_validation.get("export_runtime_verified")),
                     "reasons": {
                         "performance": "final confirmation improvement gate" if completed else
+                                       "no valid candidates" if selected_row is None else
                                        "candidate did not pass final improvement gate",
                         "hypothesis": "performance comparison does not isolate a causal mechanism",
                         "export": export_validation["status"],
                     },
                 }
                 self.save(status="completed" if completed else "completed_without_target_improvement",
-                          stage="complete", selected_checkpoint=str(candidate), deployment_checkpoint=str(deployment),
+                          stage="complete", selected_checkpoint=str(candidate) if candidate else None, deployment_checkpoint=str(deployment),
                           official_continuation_checkpoint=(str(official_cont) if official_cont else None),
                           optimized_repo=str(exported),
-                          api_closed_loop_completed=self.config.controller == "api",
+                          api_closed_loop_completed=self.config.controller == "api" and selected_row is not None,
+                          quarantined_rounds=[r["round"] for r in rounds if r["status"] == "quarantined"],
                           decision_controller=self.config.controller,
                           performance_target_achieved=completed,
-                          execution_complete=True, result_valid=True,
+                          execution_complete=True, result_valid=selected_row is not None,
                           hypothesis_supported=None,
                           export_runtime_verified=result_contract["export_runtime_verified"],
                           run_result=result_contract,
@@ -1766,7 +2205,22 @@ class RepositoryAutoResearch:
                       error="KeyboardInterrupt: run stopped by operator; partial artifacts retained")
             raise
         except Exception as exc:
+            infrastructure = None
+            try:
+                infrastructure = self._infrastructure_failure(exc)
+            except Exception as incident_error:
+                # Preserve the actual business exception when diagnostics themselves fail.
+                self.save(infrastructure_diagnostic_error=type(incident_error).__name__)
+            if self._last_recovery_stage != self.state.get("stage"):
+                # Non-development failures receive no metrics, seeds or trajectories.
+                # Keep final confirmation sealed even when the failure occurs there.
+                self._recovery_decision({"schema_version": 1, "scope": "supervisor_failure",
+                    "stage": self.state.get("stage", "unknown"), "exception_type": type(exc).__name__,
+                    "failure_kind": error_kind(str(exc)), "quarantine_eligible": False,
+                    "allowed_training_params": {}, "research_feedback_permitted": False,
+                    **({"infrastructure_evidence": infrastructure["evidence"]} if infrastructure else {})})
             self.save(status="blocked", stage=self.state.get("stage", "unknown"),
+                      result_valid=False,
                       error=redact(f"{type(exc).__name__}: {exc}"))
             raise
 
@@ -1784,6 +2238,18 @@ def make_parser() -> argparse.ArgumentParser:
                         help="Single-device form: the GPU index this run uses (default 0). "
                              "Cannot be combined with the --gpus family, which would make "
                              "the intended device set ambiguous")
+    parser.add_argument("--legacy-single", action="store_true", help="Keep the historical single GPU execution path")
+    parser.add_argument("--compute-controller", choices=["heuristic", "api"], default="heuristic",
+                        help="Execution tuning policy, independent of the scientific research controller")
+    parser.add_argument("--compute-env-file", type=Path, default=PROJECT_ROOT / ".env")
+    parser.add_argument("--compute-codegen", choices=["disabled", "validated"], default="disabled",
+                        help="Allow bounded audit-function optimization after measurement and payback checks")
+    parser.add_argument("--recovery-controller", choices=["auto", "api", "disabled"], default="auto",
+                        help="Failure Agent: auto enables API recovery with the API research controller")
+    parser.add_argument("--recovery-max-calls", type=int, default=8)
+    parser.add_argument("--recovery-max-tokens", type=int, default=80_000)
+    parser.add_argument("--harness-config", type=Path,
+                        help="Versioned native lifecycle, repair, continuation and validation policy JSON")
     parser.add_argument("--gpus", default=None,
                         help="Multi-device form: 'auto' or a comma-separated device list such "
                              "as 0,1. Requires a passing device-probe receipt for this node "
@@ -1892,6 +2358,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     _reject_ambiguous_devices(parser, args)
+    adaptive = not args.legacy_single and args.gpu is None and not args.multi_gpu_probe
+    if adaptive:
+        args.gpus = args.gpus or "auto"
+        args.probe_if_needed = True
     if args.multi_gpu_probe:
         # No research run, no plan: this invocation only measures the node and publishes the
         # receipt a later --gpus run consumes.
@@ -1972,6 +2442,12 @@ def main(argv: list[str] | None = None) -> int:
                              multi_gpu_probe=args.multi_gpu_probe,
                              probe_if_needed=args.probe_if_needed,
                              probe_smoke_timeout=args.probe_smoke_timeout)
+    config = replace(config, compute_mode="auto" if adaptive else "legacy",
+                     compute_controller=args.compute_controller,
+                     compute_env_file=str(args.compute_env_file), compute_codegen=args.compute_codegen,
+                     recovery_controller=args.recovery_controller, recovery_max_calls=args.recovery_max_calls,
+                     recovery_max_tokens=args.recovery_max_tokens,
+                     harness_config=str(args.harness_config.absolute()) if args.harness_config else None)
     runner = RepositoryAutoResearch(config)
     try:
         result = runner.execute()
@@ -1980,7 +2456,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"State: {runner.state_path}")
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["status"] in {"completed", "prepared"} else 3
+    # A completed search with no improvement is a valid operational outcome.
+    # SCO must not label graceful candidate quarantine/official fallback a crash.
+    return 0 if result["status"] in {"completed", "completed_without_target_improvement", "prepared"} else 3
 
 
 if __name__ == "__main__":

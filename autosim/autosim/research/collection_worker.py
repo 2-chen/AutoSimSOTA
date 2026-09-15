@@ -351,6 +351,8 @@ def main():
     # to be consumed here rather than forwarded: run_env.py's parser has no such flag.
     offset = _pop_seed_offset(sys.argv)
     manifest = Path(sys.argv[sys.argv.index("--collection_manifest") + 1])
+    from .native_cache import configure_native_cache
+    configure_native_cache(manifest.parent)
     if offset:
         if "--collection_seed" not in sys.argv:
             raise ValueError("a collection seed offset needs the master --collection_seed")

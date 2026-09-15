@@ -82,6 +82,39 @@ class ResolvePlanTests(unittest.TestCase):
         self.assertEqual(plan["requested_mode"], "auto")
         self.assertEqual(plan["probe_receipt_mode"], "identity")
 
+    def test_cached_probe_uuid_spellings_preserve_admission_and_capabilities(self):
+        capabilities = {"cuda": "verified", "train": "verified", "physics": "verified",
+                        "render": "verified", "policy_inference": "verified"}
+        for spelling in ("prefixed", "bare", "mixed"):
+            with self.subTest(spelling=spelling):
+                keys = [("GPU-" if spelling == "prefixed" or
+                         (spelling == "mixed" and i % 2) else "") + uuid
+                        for i, uuid in enumerate(UUIDS)]
+                row = receipt(mode="identity")
+                row["devices"] = {key: "verified_sim" for key in keys}
+                row["device_capabilities"] = {key: capabilities for key in keys}
+                self.publish(row)
+                plan = self.resolve(mode="auto", max_parallel_jobs=4)
+                self.assertEqual([g["uuid"] for g in plan["usable"]],
+                                 ["GPU-" + uuid for uuid in UUIDS])
+                self.assertTrue(all(g["capabilities"] == capabilities for g in plan["usable"]))
+
+    def test_prefixed_receipt_preserves_busy_and_unknown_device_exclusions(self):
+        row = receipt()
+        row["devices"] = {"GPU-" + uuid: "verified_sim" for uuid in UUIDS}
+        row["devices"]["GPU-" + UUIDS[2]] = "unknown"
+        self.publish(row)
+        plan = self.resolve(report=make_report(table=BUSY), accept_partial=True)
+        self.assertEqual([g["index"] for g in plan["usable"]], [1, 3])
+        self.assertEqual([g["capability"] for g in plan["waiting"]], ["busy", "unknown"])
+
+    def test_conflicting_uuid_alias_verdicts_are_refused(self):
+        row = receipt()
+        row["devices"]["GPU-" + UUIDS[0]] = "incompatible"
+        self.publish(row)
+        with self.assertRaisesRegex(ValueError, "conflicting.*UUID"):
+            self.resolve()
+
     def test_unverified_devices_wait_with_a_reason_instead_of_being_used(self):
         self.publish(receipt(verified=UUIDS[:2]))
         plan = self.resolve(requested="auto", accept_partial=True)

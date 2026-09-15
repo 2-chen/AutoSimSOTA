@@ -20,8 +20,11 @@ def policy_observation(obs: dict, contract: dict) -> dict[str, np.ndarray]:
     state = numpy_value(obs["robot"]["qpos"]).astype(np.float32)
     if state.ndim == 1:
         state = state[None]
-    if state.shape != (1, contract["state_dim"]) or not np.isfinite(state).all():
-        raise ValueError(f"invalid state shape/values: {state.shape}")
+    if state.shape != (1, contract["state_dim"]):
+        raise ValueError(f"invalid state shape: {state.shape}; expected (1, {contract['state_dim']})")
+    if not np.isfinite(state).all():
+        indices = np.flatnonzero(~np.isfinite(state)).tolist()
+        raise ValueError(f"non-finite observation.state: shape={state.shape}, indices={indices}")
     batch = {"observation.state": np.ascontiguousarray(state)}
     for camera in contract["cameras"]:
         value = numpy_value(obs["sensor"][camera]["color"])

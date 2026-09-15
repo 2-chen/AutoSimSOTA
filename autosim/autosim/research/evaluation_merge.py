@@ -229,8 +229,14 @@ def merge_evaluation_shards(*, output: Path, purpose: str, master_seed: int, epi
                 problems.append(f"episode seed {seed} appears in shards "
                                 f"{seen_seeds[seed]} and {index}")
             seen_seeds[seed] = index
-        if "shard" not in protocol:
+        whole_bank_worker = (len(blocks) == 1 and int(block["offset"]) == 0
+                             and int(block["size"]) == episodes and protocol.get("episodes") == episodes
+                             and protocol.get("seed") == master_seed)
+        if "shard" not in protocol and not whole_bank_worker:
             problems.append(f"shard {index} protocol carries no shard block")
+        if "shard" in protocol and protocol["shard"] != {
+                "index":index,"count":len(blocks),"seed_offset":int(block["offset"]),"episodes":int(block["size"])}:
+            problems.append(f"shard {index} protocol block does not match the frozen partition")
         if (directory / "worker_failure.json").is_file():
             problems.append(f"shard {index} recorded a worker failure")
         process_path = directory / "process/process.json"
@@ -241,6 +247,7 @@ def merge_evaluation_shards(*, output: Path, purpose: str, master_seed: int, epi
         shard_receipts.append({
             "index": index, "directory": str(directory), "attempt": attempt_of(directory),
             "offset": int(block["offset"]), "size": int(block["size"]),
+            "whole_bank_worker_without_shard_metadata":whole_bank_worker and "shard" not in protocol,
             "episode_seeds": got,
             "metrics_sha256": digest(metrics_path), "protocol_sha256": digest(protocol_path),
             "process_sha256": digest(process_path) if process_record else None,

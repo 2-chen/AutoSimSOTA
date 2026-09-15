@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .accounting import UtilizationSampler
-from .common import atomic_json, digest, now
+from .common import atomic_json, digest, now, read_json
 from .devices import (SimDeviceSelection, discover, probe_receipt_key, run_text, select,
                       write_probe_receipt)
 from .registry import load_task
@@ -444,30 +444,36 @@ def run_arm(*, name: str, runtime: Runtime, spec, checkpoint: Path, output: Path
             with local:
                 data = bound.evaluate(spec, checkpoint, output, episodes=1,
                                       master_seed=master_seed, purpose="smoke",
-                                      startup_attempts=1, smoke_timeout=smoke_timeout)
+                                      smoke_timeout=smoke_timeout)
         else:
             data = bound.evaluate(spec, checkpoint, output, episodes=1, master_seed=master_seed,
-                                  purpose="smoke", startup_attempts=1, smoke_timeout=smoke_timeout)
+                                  purpose="smoke", smoke_timeout=smoke_timeout)
         arm.update(status="completed", execution_mode=data.get("execution_mode"),
                    episode_count=len(data.get("episodes") or []), summary=data.get("summary"))
+        active_output = Path(data.get("artifact_directory", output))
     except Exception as exc:                      # noqa: BLE001 -- the receipt is the result
+        active_output = next((output / f"startup_attempt_{attempt}" for attempt in (3, 2)
+                              if (output / f"startup_attempt_{attempt}" / "process/process.json").is_file()), output)
         arm.update(status="failed", error_type=type(exc).__name__, error=str(exc)[:400],
-                   startup_receipt=startup_receipt(output))
+                   startup_receipt=startup_receipt(active_output))
     arm["elapsed_seconds"] = round(time.time() - started, 1)
-    failure = output / "worker_failure.json"
+    arm["artifact_directory"] = str(active_output)
+    lifecycle = active_output / "lifecycle.json"
+    arm["lifecycle"] = read_json(lifecycle) if lifecycle.is_file() else None
+    failure = active_output / "worker_failure.json"
     arm["worker_failure"] = (json.loads(failure.read_text(encoding="utf-8"))
                              if failure.is_file() else None)
     arm["memory"] = {uuid: _growth(local.summary(), baseline, uuid) for uuid in local.summary()}
     # Per-card memory of this arm's own process at each phase it reached: the number says a
     # card leaked, the timeline says which phase did it.
-    arm["startup_census"] = startup_census(output)
+    arm["startup_census"] = startup_census(active_output)
     # Which process ran this arm, so a foreign holder on another card can be compared against
     # it.  A context the arm's *own* process left on card 0 and a stranger's process is the
     # difference between "this library defaults to device 0" and "another job is sharing my
     # card", and the two need opposite responses.
-    arm["own_pid"] = (startup_receipt(output) or {}).get("pid")
+    arm["own_pid"] = (startup_receipt(active_output) or {}).get("pid")
     if arm.get("status") != "completed":
-        arm["abort"] = classify_abort(output=output, growths=arm["memory"])
+        arm["abort"] = classify_abort(output=active_output, growths=arm["memory"])
     arm["_baseline"], arm["_peak"] = baseline, local.summary()
     return arm
 

@@ -9,6 +9,8 @@ import os
 import re
 import signal
 import subprocess
+import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,13 +40,22 @@ def read_json(path: Path) -> Any:
 
 def atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def redact(text: str) -> str:
@@ -132,7 +143,10 @@ def run_command(command: list[str], *, cwd: Path, env: dict[str, str],
     started = time.monotonic()
     with (output / "stdout.log").open("w", encoding="utf-8") as log:
         try:
-            process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log,
+            guarded = ([sys.executable, str(Path(__file__).with_name("process_guard.py")),
+                        str(os.getpid()), str(output.absolute() / "worker_identity.json"), *command]
+                       if metadata.get("job") else command)
+            process = subprocess.Popen(guarded, cwd=cwd, env=env, stdout=log,
                                        stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as exc:
             record.update(status="failed_to_start", returncode=None,
@@ -155,6 +169,9 @@ def run_command(command: list[str], *, cwd: Path, env: dict[str, str],
             record.update(returncode=process.returncode, status="interrupted",
                           error=type(exc).__name__)
         finally:
+            identity = output / "worker_identity.json"
+            if identity.exists():
+                record.update(read_json(identity))
             record.update(finished_at=now(), elapsed_seconds=time.monotonic() - started)
             atomic_json(result_path, record)
     if record["status"] != "completed":

@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .common import assert_frozen, atomic_json, exclusive, freeze_files, now, read_json, redact
+from .controller import source_tree_files
 from .official_smoke import official_assets
 from .registry import TASK_IDS
 from .runtime import Runtime
@@ -45,11 +46,11 @@ def run(runtime, tasks, *, wait_hours=24, suite_hours=420):
     path = directory / "state.json"
     state = optional(path) or {"created_at": now(), "steps": [], "tasks": {}}
     protocol_path = directory / "frozen_core.json"
-    files = list(Path(__file__).parent.glob("*.py"))
-    files += list(Path(__file__).parent.parent.glob("robosyn*.py"))
-    files += list((runtime.repo / "policy/act").rglob("*.py"))
-    files += [runtime.repo / "scripts/run_env.py", runtime.repo / "policy/act/scripts/train.py"]
     if not protocol_path.exists():
+        files = list(Path(__file__).parent.glob("*.py"))
+        files += list(Path(__file__).parent.parent.glob("robosyn*.py"))
+        files += source_tree_files(runtime.repo / "policy/act", ".py")
+        files += [runtime.repo / "scripts/run_env.py", runtime.repo / "policy/act/scripts/train.py"]
         atomic_json(protocol_path, freeze_files(files))
     frozen = read_json(protocol_path)
     started, idle_since = time.monotonic(), time.monotonic()

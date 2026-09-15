@@ -49,6 +49,16 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(sorted(ledger.snapshot()["gpu_hours"]["by_class"]), ["rtx5090"])
         self.assertEqual(ledger.snapshot()["gpu_hours"]["by_class"]["rtx5090"], 2.0)
 
+    def test_allocation_start_includes_inventory_time_and_survives_resume(self):
+        ledger = self.ledger(wall=1000)
+        ledger.begin_allocation("node", 2, started_epoch=self.clock()-100)
+        self.assertAlmostEqual(ledger.elapsed_wall, 100)
+        self.assertAlmostEqual(ledger.allocated_gpu_hours, 200/3600)
+        restored = self.ledger(wall=1000)
+        self.clock.advance(50)
+        restored.end_allocation()
+        self.assertAlmostEqual(restored.allocated_gpu_hours, 300/3600)
+
     def test_one_device_for_one_hour_is_one_gpu_hour(self):
         ledger = self.ledger()
         ledger.charge(Charge(job="eval", category="evaluation",

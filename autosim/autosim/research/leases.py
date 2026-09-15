@@ -61,6 +61,11 @@ def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
+        if Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[0] == "Z":
+            return False
+    except (OSError, IndexError):
+        pass
+    try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False

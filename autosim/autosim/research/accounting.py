@@ -14,6 +14,7 @@ Heterogeneous devices are counted per class and never summed as if they were equ
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -70,6 +71,10 @@ class BudgetLedger:
         self.device_seconds: dict[str, float] = {}
         self.by_category: dict[str, float] = {name: 0.0 for name in CATEGORIES}
         self.by_class: dict[str, float] = {}
+        self.lock = threading.RLock()
+        self.reservations: dict[str, dict] = {}
+        self.allocation_active = False
+        self.allocation_intervals: list[dict] = []
         if path.is_file():
             self._restore(read_json(path))
 
@@ -78,6 +83,10 @@ class BudgetLedger:
         self.started_at = record.get("wall_clock", {}).get("budget_started_at_epoch", self.started_at)
         self.wall_charged = float(record.get("wall_clock", {}).get("charged_seconds", 0.0))
         hours = record.get("gpu_hours", {})
+        previous_limit = hours.get("limit")
+        if previous_limit is not None:
+            self.gpu_hours_limit = min(self.gpu_hours_limit, previous_limit) if self.gpu_hours_limit is not None else previous_limit
+        self.wall_limit = min(self.wall_limit, record.get("wall_clock", {}).get("limit_seconds", self.wall_limit))
         self.gpu_seconds = float(hours.get("charged", 0.0)) * 3600.0
         self.waiting_gpu_seconds = float(hours.get("waiting_gpu_hours", 0.0)) * 3600.0
         self.device_seconds = {k: float(v) for k, v in record.get("occupancy",
@@ -86,6 +95,75 @@ class BudgetLedger:
                             for name in CATEGORIES}
         self.by_class = {k: float(v) for k, v in hours.get("by_class", {}).items()}
         self.charges = list(record.get("jobs", []))
+        self.reservations = record.get("reservations", {})
+        self.allocation_intervals = record.get("allocation_intervals", [])
+        self.allocation_active = bool(self.allocation_intervals and
+                                      self.allocation_intervals[-1].get("ended") is None)
+
+    @property
+    def reserved_gpu_seconds(self) -> float:
+        return sum(row["devices"] * max(row["estimate_seconds"] + row["reserve_seconds"],
+                                         self.clock() - row["started"])
+                   for row in self.reservations.values())
+
+    def reserve(self, key: str, *, devices: int, estimate_seconds: float,
+                reserve_seconds: float = 0, category: str = "evaluation") -> None:
+        with self.lock:
+            if key in self.reservations:
+                raise RuntimeError(f"budget already reserved: {key}")
+            verdict = self.may_start(devices=devices, estimate_seconds=estimate_seconds,
+                                     reserve_seconds=reserve_seconds, category=category)
+            if not verdict["allowed"]:
+                raise RuntimeError(f"budget refused: {verdict['reason']}")
+            self.reservations[key] = {"devices": devices, "estimate_seconds": estimate_seconds,
+                                      "reserve_seconds": reserve_seconds, "category": category,
+                                      "started": self.clock()}
+            self.write()
+
+    def release_reservation(self, key: str) -> None:
+        with self.lock:
+            self.reservations.pop(key, None)
+            self.write()
+
+    def begin_allocation(self, allocation_id: str, devices: int, *, started_epoch: float | None = None) -> None:
+        with self.lock:
+            if self.allocation_active:
+                if self.allocation_intervals[-1]["allocation_id"] != allocation_id:
+                    raise RuntimeError("previous allocation must be reconciled before replacement")
+                return
+            import math
+            started = self.clock() if started_epoch is None else float(started_epoch)
+            if not math.isfinite(started) or not 0 <= started <= self.clock() or devices < 0:
+                raise ValueError("invalid allocation start/count")
+            self.started_at = min(self.started_at, started)
+            self.allocation_intervals.append({"allocation_id": allocation_id, "devices": devices,
+                                               "started": started, "ended": None})
+            self.allocation_active = True
+            self.write()
+
+    def end_allocation(self) -> None:
+        with self.lock:
+            if self.allocation_active:
+                self.allocation_intervals[-1]["ended"] = self.clock()
+            self.allocation_active = False
+            self.write()
+
+    def reconcile_allocation(self, allocation_id: str, *, ended_epoch: float, evidence: dict) -> None:
+        with self.lock:
+            row = next(r for r in self.allocation_intervals if r["allocation_id"] == allocation_id)
+            if not evidence or not row["started"] <= ended_epoch <= self.clock():
+                raise ValueError("allocation end requires a valid observed interval and evidence")
+            if row["ended"] is not None and row["ended"] != ended_epoch:
+                raise ValueError("allocation already reconciled to another endpoint")
+            row.update(ended=ended_epoch, release_evidence=evidence)
+            self.allocation_active = self.allocation_intervals[-1]["ended"] is None
+            self.write()
+
+    @property
+    def allocated_gpu_hours(self) -> float:
+        return sum(row["devices"] * max(0, (row["ended"] if row["ended"] is not None
+                                            else self.clock()) - row["started"])
+                   for row in self.allocation_intervals) / 3600
 
     # ---- budgets ---------------------------------------------------------
     @property
@@ -104,10 +182,12 @@ class BudgetLedger:
     def remaining_gpu_hours(self) -> float | None:
         if self.gpu_hours_limit is None:
             return None
-        return self.gpu_hours_limit - self.charged_gpu_hours
+        spent = self.allocated_gpu_hours if self.allocation_intervals else self.charged_gpu_hours
+        return self.gpu_hours_limit - spent
 
     def may_start(self, *, devices: int = 1, estimate_seconds: float,
-                  reserve_seconds: float = 0.0, category: str = "evaluation") -> dict:
+                  reserve_seconds: float = 0.0, category: str = "evaluation",
+                  additional_gpu_seconds: float = 0.0) -> dict:
         """Both budgets must afford the estimate plus the reserved verification cost."""
         need = float(estimate_seconds) + float(reserve_seconds)
         if category not in CATEGORIES:
@@ -116,7 +196,13 @@ class BudgetLedger:
             return {"allowed": False, "reason": "wall_clock",
                     "remaining_wall_seconds": self.remaining_wall, "needed_seconds": need}
         remaining_hours = self.remaining_gpu_hours
-        if remaining_hours is not None and remaining_hours * 3600.0 < devices * need:
+        reserved = self.reserved_gpu_seconds + additional_gpu_seconds
+        if self.allocation_intervals:
+            reserved = additional_gpu_seconds + sum(
+                row["devices"] * max(0, row["estimate_seconds"] + row["reserve_seconds"]
+                                       - (self.clock() - row["started"]))
+                for row in self.reservations.values())
+        if remaining_hours is not None and remaining_hours * 3600.0 < devices * need + reserved:
             return {"allowed": False, "reason": "gpu_hours",
                     "remaining_gpu_hours": remaining_hours,
                     "needed_gpu_hours": devices * need / 3600.0}
@@ -125,6 +211,16 @@ class BudgetLedger:
                 "remaining_gpu_hours": remaining_hours}
 
     # ---- charging --------------------------------------------------------
+    def settle(self, charge: Charge, *, reservation_key: str, settlement_id: str) -> dict:
+        with self.lock:
+            existing = next((r for r in self.charges if r.get("settlement_id") == settlement_id), None)
+            if existing is None:
+                existing = self.charge(charge)
+                existing["settlement_id"] = settlement_id
+            self.reservations.pop(reservation_key, None)
+            self.write()
+            return existing
+
     def charge(self, charge: Charge) -> dict:
         if charge.category not in CATEGORIES:
             raise ValueError(f"unknown accounting category: {charge.category}")
@@ -185,6 +281,10 @@ class BudgetLedger:
             },
             "devices": self.devices,
             "jobs": self.charges,
+            "reservations": dict(self.reservations),
+            "reserved_gpu_hours": self.reserved_gpu_seconds / 3600,
+            "allocated_gpu_hours": self.allocated_gpu_hours,
+            "allocation_intervals": list(self.allocation_intervals),
         }
 
     def write(self) -> Path:
@@ -204,8 +304,14 @@ def describe_process(pid: int, *, proc: Path = Path("/proc")) -> dict:
     try:
         raw = (proc / str(pid) / "cmdline").read_bytes()
     except OSError as exc:
+        if pid == os.getpid() and proc == Path("/proc"):
+            return {"cmd": " ".join([sys.executable, *sys.argv])[:300], "parent": os.getppid(),
+                    "source": "current_process_arguments", "proc_unreadable": exc.strerror}
         return {"cmd": None, "note": f"unreadable: {exc.strerror or exc}"}
     argv = [part for part in raw.decode("utf-8", "replace").split("\0") if part]
+    if not argv and pid == os.getpid() and proc == Path("/proc"):
+        return {"cmd": " ".join([sys.executable, *sys.argv])[:300], "parent": os.getppid(),
+                "source": "current_process_arguments"}
     return {"cmd": " ".join(argv)[:300] if argv else None,
             "parent": _parent_of(pid, proc=proc)}
 

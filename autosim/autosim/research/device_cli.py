@@ -21,7 +21,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .common import atomic_json, object_digest, now
 from .devices import (NoCompatibleDevice, apply_capability, build_plan, describe, discover,
-                      load_probe_receipt, probe_cache_dir, probe_receipt_key, run_text)
+                      load_probe_receipt, normalize_uuid, normalize_uuid_mapping,
+                      probe_cache_dir, probe_receipt_key, run_text)
 
 # The fields that make two plans the *same experiment*; occupancy is runtime state, and a
 # card becoming free or busy must not by itself invalidate a resume.
@@ -115,6 +116,9 @@ def resolve_plan(*, platform_root: Path, requested: str | None, mode: str,
             f"the receipt for key {key[:12]} was verified under mode {resolved!r}, "
             f"not the requested {mode!r}; re-run the probe in the requested mode")
     report = apply_capability(dict(report), receipt)
+    capabilities = normalize_uuid_mapping(receipt.get("device_capabilities", {}))
+    for d in report["gpus"]:
+        d["capabilities"] = dict(capabilities.get(normalize_uuid(d.get("uuid") or ""), {}))
     if not report.get("usable"):
         raise NoCompatibleDevice(describe(report))
     plan = build_plan(report=report, requested=requested, mode=resolved,

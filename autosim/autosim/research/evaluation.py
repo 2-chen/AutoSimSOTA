@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+from collections import deque
 from pathlib import Path
 
 from .common import assert_frozen, atomic_json, digest, event, freeze_files, read_json
 from .collection_worker import capture_training_scene_evidence
-from .policy_rpc import RemoteAdapter, observation_digest, policy_observation
+from .policy_rpc import RemoteAdapter, numpy_value, observation_digest, policy_observation
 from .registry import load_task
+from .native_lifecycle import NativeLifecycle
 
 
 def _seeded_numpy(offset: int):
@@ -76,6 +78,8 @@ def _select_cuda(index: int, output: Path) -> None:
     from .devices import align_process_defaults, default_device_index
 
     record = align_process_defaults(int(index), warp=default_device_index() is not None)
+    from .native_cache import configure_native_cache
+    configure_native_cache(output)
     _ALIGNMENT.clear()
     _ALIGNMENT.update(record)
     startup_phase(output, "devices_aligned", policy_has_acted=False)
@@ -152,19 +156,26 @@ def certification_fields(spec, purpose: str) -> dict:
 class TraceEnv:
     """Only reads state. It never calls success, reset, RNG or step for diagnostics."""
 
-    def __init__(self, env, spec, output: Path, adapter, purpose):
+    def __init__(self, env, spec, output: Path, adapter, purpose, lifecycle=None):
         self.env, self.spec, self.output, self.adapter = env, spec, output, adapter
         self.purpose = purpose
         self.seed = None
         self.steps = 0
+        self._native_barrier_done = False
+        self.lifecycle = lifecycle
+        self._recent_dynamics = deque(maxlen=4)
+        self._nonfinite_recorded = False
 
     def __getattr__(self, name):
         return getattr(self.env, name)
 
     def reset(self, *args, **kwargs):
+        if self.lifecycle:
+            self.lifecycle.before_reset()
         startup_phase(self.output, "evaluation_reset_started", seed=kwargs.get("seed"))
         obs, info = self.env.reset(*args, **kwargs)
         self.seed, self.steps = kwargs.get("seed"), 0
+        self._recent_dynamics.clear()
         fingerprint = observation_digest(policy_observation(obs, self.spec.as_dict()))
         event(self.output / "initializations.jsonl", "reset", seed=self.seed,
               allowed_observation_sha256=fingerprint)
@@ -173,11 +184,57 @@ class TraceEnv:
         return obs, info
 
     def step(self, action):
+        if self.lifecycle:
+            self.lifecycle.step_started()
         result = self.env.step(action)
+        if self.lifecycle:
+            self.lifecycle.step_completed()
         self.steps += 1
+        self._capture_dynamics(action, result[0])
         if self.steps % 10 == 0:
             self._trace(result[0], result[-1])
         return result
+
+    def _capture_dynamics(self, action, obs):
+        """Keep four steps in memory; flush once on invalid state, without changing it.
+
+        No extra simulator calls and no camera payloads. Final banks remain sealed.
+        A diagnostic I/O failure must not replace the actual evaluator outcome.
+        """
+        if self.purpose in {"final", "final_confirmation"} or self._nonfinite_recorded:
+            return
+        try:
+            import numpy as np
+            def numbers(value):
+                array = numpy_value(value).reshape(-1)
+                return [float(v) if np.isfinite(v) else None for v in array[:256]]
+            state = numpy_value(obs["robot"]["qpos"])
+            self._recent_dynamics.append({"step": self.steps, "action": numbers(action),
+                "qpos": numbers(state), "qvel": (numbers(obs["robot"]["qvel"])
+                                                  if "qvel" in obs["robot"] else None)})
+            if os.environ.get("AUTOSIM_DYNAMICS_TRACE") == "1":
+                # Explicit diagnostic replay only; keep native units alongside
+                # normalized policy observations to identify actuator/contract bugs.
+                robot = self.env.unwrapped.robot
+                if not (self.output / "dynamics_contract.json").exists():
+                    atomic_json(self.output / "dynamics_contract.json", {
+                        "joint_names": list(robot.joint_names),
+                        "active_joint_ids": numbers(self.env.unwrapped.active_joint_ids),
+                        "qpos_limits": numpy_value(robot.body_data.qpos_limits).tolist()})
+                event(self.output / "dynamics_trace.jsonl", "dynamics", seed=self.seed,
+                    **self._recent_dynamics[-1], raw_qpos_all=numbers(robot.get_qpos()),
+                    raw_qvel_all=numbers(robot.get_qvel()),
+                    target_qpos_all=numbers(robot.body_data._target_qpos))
+            if not np.isfinite(state).all():
+                atomic_json(self.output / "nonfinite_dynamics.json", {
+                    "seed": self.seed, "first_observed_step": self.steps,
+                    "nonfinite_indices": np.flatnonzero(~np.isfinite(state)).tolist(),
+                    "recent_steps": list(self._recent_dynamics),
+                    "nonfinite_encoding": "null; original observation is never modified",
+                    "causal_status": "first observed invalid state; underlying solver cause not established"})
+                self._nonfinite_recorded = True
+        except Exception:
+            pass
 
     def _trace(self, obs, info):
         if self.purpose in {"final", "final_confirmation"}:
@@ -193,6 +250,8 @@ class TraceEnv:
               privileged_development_diagnostics_only=True)
 
     def close(self):
+        if self.lifecycle:
+            self.lifecycle.work_finished()
         path = self.output / "evaluation_metrics.json"
         if path.exists():
             assert_frozen(read_json(self.output / "protocol.json")["frozen_files"])
@@ -254,6 +313,8 @@ def main() -> None:
     if (output / "evaluation_metrics.json").exists():
         raise FileExistsError("refusing to overwrite an existing evaluation")
     output.mkdir(parents=True, exist_ok=True)
+    lifecycle = NativeLifecycle(output)
+    lifecycle.start()
     # The census starts here, and it starts *before* anything official is loaded: everything
     # autosim imports at module scope (including whatever ``policy_rpc`` pulls in) is already
     # loaded, the official evaluator's own imports are not.  Memory already on a foreign card
@@ -292,14 +353,29 @@ def main() -> None:
 
     def wrapped_factory(*factory_args, **factory_kwargs):
         startup_phase(output, "environment_constructing", policy_has_acted=False)
+        lifecycle.constructing()
+        if lifecycle.config.get("inject_before_ready"):
+            # Explicit native-admission validation only; never present in scored workers.
+            if args.purpose != "smoke" or not lifecycle.config.get("validation_injection"):
+                raise ValueError("native fault injection is restricted to validation probes")
+            import signal
+            atomic_json(output / "injected_failure.json", {**lifecycle.identity,
+                        "kind": "SIGSEGV", "phase": "constructing", "reset_started": False})
+            os.kill(os.getpid(), signal.SIGSEGV)
         env, gym_config = make_env(*factory_args, **factory_kwargs)
         startup_phase(output, "environment_ready", policy_has_acted=False)
-        return TraceEnv(env, spec, output, adapter, args.purpose), gym_config
+        lifecycle.ready()
+        if lifecycle.config:
+            startup_phase(output, "native_barrier_released", policy_has_acted=False)
+        return TraceEnv(env, spec, output, adapter, args.purpose, lifecycle), gym_config
 
     official.make_env_from_configs = wrapped_factory
     files = [source, repo / f"policy/{args.policy}/deploy_policy.py", Path(__file__),
              Path(__file__).with_name("policy_rpc.py"), Path(spec.gym_config), Path(spec.action_config),
              repo / f"robosynchallenge/tasks/{args.task}/{args.task}.py"]
+    compatibility = repo / f"policy/{args.policy}/checkpoint_compat.py"
+    if compatibility.is_file():
+        files.append(compatibility)
     protocol = {"task": spec.as_dict(), "purpose": args.purpose,
                 "frozen_files": freeze_files(files), "checkpoint_sha256": digest(args.checkpoint / "model.safetensors"),
                 "seed": args.seed, "episodes": args.episodes, "policy": args.policy}
@@ -313,11 +389,14 @@ def main() -> None:
         official.main()
     except BaseException as exc:
         atomic_json(output / "worker_failure.json", {"error": f"{type(exc).__name__}: {exc}"})
+        lifecycle.failed(exc)
         raise
     else:
         certify_official_metrics(output, spec, args.purpose)
+        lifecycle.completed()
     finally:
         adapter.close()
+        lifecycle.close()
 
 
 if __name__ == "__main__":

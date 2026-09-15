@@ -469,11 +469,28 @@ class RuntimeDeviceBindingTests(unittest.TestCase):
         other = self.runtime.for_job(self.selection, job="eval_2", output=self.root / "job2")
         self.assertNotEqual(bound.selection.extra_env["XDG_CACHE_HOME"],
                             other.selection.extra_env["XDG_CACHE_HOME"])
-        for path in bound.selection.extra_env.values():
+        for name in ("XDG_CACHE_HOME", "MPLCONFIGDIR", "TMPDIR"):
+            path = bound.selection.extra_env[name]
             self.assertTrue(Path(path).is_dir(), path)
         environment = bound.environment()
         self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "2")
         self.assertEqual(environment["TMPDIR"], bound.selection.extra_env["TMPDIR"])
+
+    def test_native_writers_are_separated_by_gpu_but_reuse_serial_cache(self):
+        from dataclasses import replace
+        self.runtime.plan = {"unified_scheduler": True}
+        a = self.runtime.for_job(self.selection, job="first", output=self.root / "first")
+        b = self.runtime.for_job(self.selection, job="next", output=self.root / "next")
+        c = self.runtime.for_job(replace(self.selection, uuid="GPU-other"),
+                                 job="parallel", output=self.root / "parallel")
+        self.assertEqual(a.selection.extra_env["AUTOSIM_NATIVE_CACHE"],
+                         b.selection.extra_env["AUTOSIM_NATIVE_CACHE"])
+        self.assertNotEqual(a.selection.extra_env["AUTOSIM_NATIVE_CACHE"],
+                            c.selection.extra_env["AUTOSIM_NATIVE_CACHE"])
+        self.assertEqual(a.selection.extra_env["TORCH_HOME"],
+                         c.selection.extra_env["TORCH_HOME"])
+        self.assertNotEqual(a.selection.extra_env["EMBODICHAIN_DATA_ROOT"],
+                            c.selection.extra_env["EMBODICHAIN_DATA_ROOT"])
 
     def test_identity_mode_keeps_the_whole_visible_set(self):
         """Identity addressing is only correct *because* nothing renumbers the cards.
