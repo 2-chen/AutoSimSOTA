@@ -31,6 +31,14 @@ TASK_ROLES = {
     "sample_loading": {"objects": ["cube", "rack"], "family": "precise_place"},
 }
 
+#: Tasks whose benchmark expert entrypoint needs the training-only ActionBank binding.
+#: A discovered capability of the upstream repo, not a policy choice.
+EXPERT_ADAPTERS = {"handle_basket": "action_bank"}
+
+#: Tasks with a validated policy-correction adapter. Everything else collects with the
+#: official expert only; the controller is told which, rather than being handed a menu.
+CORRECTION_CAPABLE = {"click_bell"}
+
 EVENT_FAMILIES = {
     "randomize_light": "appearance", "randomize_visual_material": "appearance",
     "randomize_camera_intrinsics": "camera", "randomize_camera_extrinsics": "camera",
@@ -68,16 +76,44 @@ class TaskSpec:
         return object_digest(self.as_dict())
 
 
+def _declared_uids(gym: dict, key: str) -> list[str]:
+    """Entity uids the task's own config declares under `key`."""
+    value = gym.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(row["uid"]) for row in value
+            if isinstance(row, dict) and row.get("uid") is not None]
+
+
+def derive_roles(gym: dict, task: str) -> dict[str, Any]:
+    """Read the task's entities out of its config instead of a hand-kept table.
+
+    The config already names every object and articulation, and the telemetry layer
+    reports them under exactly these names, so a table here was duplicated metadata
+    that had to be hand-edited before a new task could run at all.
+    """
+    objects = [uid for uid in _declared_uids(gym, "rigid_object")
+               if not uid.startswith("distractor")]
+    articulations = _declared_uids(gym, "articulation")
+    roles: dict[str, Any] = {"objects": sorted(objects), "articulations": sorted(articulations)}
+    # `family` is a semantic label with no config equivalent. The table is a preset, not a
+    # gate: an unlisted task gets an explicit "unclassified" rather than a missing key, so
+    # telemetry stays the same shape and nothing downstream has to special-case it.
+    preset = TASK_ROLES.get(task) or {}
+    roles["family"] = preset.get("family", "unclassified")
+    return roles
+
+
 def load_task(repo: Path, task: str, setting: str = "random") -> TaskSpec:
-    if task not in TASK_IDS:
-        raise ValueError(f"not a production RoboSyn task: {task}")
+    # No task allow-list: any task whose config exists is loadable. The config's own
+    # `id` is the environment id, so a separate table could only disagree with it.
     if setting != "random":
         raise ValueError("ranking suite only supports the frozen random setting")
     gym_path = repo / "configs" / task / setting / "gym_config.json"
     action_path = repo / "configs" / task / "action_config.json"
+    if not gym_path.is_file():
+        raise ValueError(f"no {setting} gym config for task: {task}")
     gym, action = read_json(gym_path), read_json(action_path)
-    if gym["id"] != TASK_IDS[task]:
-        raise ValueError(f"unexpected environment ID for {task}: {gym['id']}")
     if "action_config" in action:
         action = action["action_config"]
     parts = tuple(gym["env"]["control_parts"])
@@ -99,9 +135,12 @@ def load_task(repo: Path, task: str, setting: str = "random") -> TaskSpec:
         instruction=recorder["instruction"]["lang"], gym_config=str(gym_path.absolute()),
         action_config=str(action_path.absolute()), config_hashes={
             str(gym_path.absolute()): digest(gym_path), str(action_path.absolute()): digest(action_path)},
-        event_families=families, roles=TASK_ROLES[task],
-        correction_supported=(task == "click_bell"),
-        expert_adapter={"handle_basket": "action_bank"}.get(task, "official"),
+        event_families=families, roles=derive_roles(gym, task),
+        # These two describe capabilities of the benchmark's own adapters, not preferences
+        # the controller picks from, so they stay table-driven -- but as defaults, not gates:
+        # an unlisted task gets the standard answer and still runs.
+        correction_supported=task in CORRECTION_CAPABLE,
+        expert_adapter=EXPERT_ADAPTERS.get(task, "official"),
     )
 
 

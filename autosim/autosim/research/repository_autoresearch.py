@@ -38,7 +38,7 @@ from .recovery_agent import RecoveryAgent, development_failure_snapshot, error_k
 from .robosyn_adapter import PROFILE_FAMILIES, RoboSynAdapter
 from .runtime import (Runtime, retryable_collection_startup, retryable_evaluation_startup,
                       startup_receipt)
-from .task_diagnostics import task_failure_analysis
+from .task_diagnostics import task_evidence
 from .harness_config import load_harness_policy, policy_identity
 
 
@@ -46,12 +46,30 @@ SCHEMA_VERSION = 1
 BENCHMARK = "RoboSynChallenge"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 COLLECTION_PROFILES = set(PROFILE_FAMILIES)
-TRAINING_SPACE = {
-    "optimizer_lr": {5e-6, 1e-5, 2e-5},
-    "n_action_steps": {10, 25, 50},
-    "action_loss_profile": {"legacy_mask_mean", "valid_mean"},
-    "image_augmentation_profile": {"none", "photometric_mild", "camera_geometry_mild"},
+#: Numeric training controls the controller may set freely, with sane outer bounds.
+#: Bounds exist to reject nonsense, not to steer the search: the trainer accepts any
+#: value in range, so the previous three-value menus only narrowed the space.
+TRAINING_BOUNDS = {
+    "optimizer_lr": (1e-8, 1e-1),
+    "n_action_steps": (1, 4096),
+    "kl_weight": (0.0, 1e5),
+    "dropout": (0.0, 0.99),
+    "batch_size": (1, 4096),
 }
+
+#: Parameters the trainer *dispatches* on. These are a capability list, not a policy:
+#: an unlisted value has no implementation behind it, so the controller is told what
+#: exists rather than being allowed to discover it by failing a round.
+TRAINING_OPTIONS = {
+    "action_loss_profile": {"legacy_mask_mean", "valid_mean"},
+    "image_augmentation_profile": {"none", "clutter_occlusion_mild", "photometric_mild",
+                                   "photometric_strong", "camera_geometry_mild",
+                                   "illumination_step_mild"},
+}
+
+#: Everything the controller may set: numeric names carry (min, max), dispatched-on
+#: names carry the implemented value set.
+TRAINING_SPACE = {**TRAINING_BOUNDS, **TRAINING_OPTIONS}
 
 
 def load_deepseek_environment(repo: Path | None = None, *, project_root: Path | None = None) -> dict[str, Any]:
@@ -112,6 +130,10 @@ class MilestoneConfig:
     hours: float = 24.0
     full_budget: bool = False
     allow_api_egress: bool = False
+    #: Reopen a finished run with a fresh wall-clock window, keeping its completed rounds.
+    #: Without this the budget clock is keyed to the first start and never resets, so a run
+    #: that spent its hours is unresumable under the same run id.
+    continue_run: bool = False
     dry_run: bool = False
     probe_only: bool = False
     # Multi-device knobs.  All of them default to the absent value: a plain `--gpu i`
@@ -155,8 +177,11 @@ class MilestoneConfig:
             raise ValueError("--max-parallel-jobs must be at least 1")
         if self.gpu_hours is not None and self.gpu_hours <= 0:
             raise ValueError("--gpu-hours must be positive")
-        if not 1 <= self.rounds <= 8:
-            raise ValueError("research rounds must be in [1,8]")
+        # 0 means "keep going": the loop then ends only when the controller says stop or
+        # the wall clock runs out. A fixed cap made the search stop on a round count the
+        # caller guessed in advance rather than on evidence.
+        if self.rounds < 0:
+            raise ValueError("research rounds must be >= 0 (0 = until the controller stops)")
         if self.attempts_per_round < 2 or self.screen_steps < 1:
             raise ValueError("collection attempts and training steps must be positive")
         if not 0 <= self.min_original_fraction <= 1:
@@ -180,6 +205,9 @@ def protocol_budget(config: MilestoneConfig) -> dict[str, Any]:
     """
     budget = asdict(config) | {"output_root": str(config.output_root)}
     budget.pop("allow_api_egress", None)
+    # Reopening a finished run is an invocation-level permission like egress, not an
+    # experiment variable: a continued run keeps the same frozen protocol it started under.
+    budget.pop("continue_run", None)
     budget.pop("harness_config", None)
     for key in ("gpus", "device_mode", "max_parallel_jobs", "gpu_hours",
                 "accept_device_plan", "multi_gpu_probe", "probe_if_needed",
@@ -260,6 +288,7 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
                       allowed_collection_modes: set[str] | None = None,
                       attempts_per_round: int = 100,
                       training_steps: int = 20_000,
+                      development_episodes: int = 40,
                       min_original_fraction: float = 0.5) -> dict[str, Any]:
     required = {"proposal_id", "parent_checkpoint_sha256", "parent_data_version",
                 "development_evidence_id", "hypothesis", "primary_intervention",
@@ -271,18 +300,35 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
     # information the validator does not already bind (round_index is validated against
     # proposal_id and the evidence ids), so it must not fail an otherwise valid proposal --
     # it is dropped below to keep the persisted proposal canonical.
-    extra = [field for field in extra if field not in {"decision", "round"}]
+    extra = [field for field in extra if field not in {"decision", "round", "resolution"}]
     if missing or extra:
         raise ValueError(f"proposal schema mismatch; missing={missing}; extra={extra}")
     raw.pop("round", None)
+    # Optional: how many episodes this round's own development evidence should draw on.
+    # Without this the controller could see that two cohorts overlap but had no way to ask
+    # for the resolution that would separate them, so it could only guess or stop.
+    resolution = raw.get("resolution") or {}
+    if set(resolution) - {"development_episodes", "note"}:
+        raise ValueError("resolution schema mismatch")
+    requested_episodes = int(resolution.get("development_episodes", development_episodes))
+    if requested_episodes < 1:
+        raise ValueError("development episodes must be positive")
+    raw["resolution"] = {
+        "development_episodes": requested_episodes,
+        "note": str(resolution.get("note") or ""),
+    }
     if raw["development_evidence_id"] != evidence_id:
         raise ValueError("proposal cites the wrong development evidence")
     if raw["parent_checkpoint_sha256"] != parent_checkpoint_sha256:
         raise ValueError("proposal cites the wrong parent checkpoint")
     if raw["parent_data_version"] != parent_data_version:
         raise ValueError("proposal cites the wrong data version")
-    if raw["primary_intervention"] not in {"targeted_data", "policy_correction", "data_processing"}:
-        raise ValueError("unregistered primary intervention")
+    # A free label the controller names itself. The old three-value menu forced every idea
+    # into one of three buckets and then double-checked it agreed with the collection mode;
+    # what actually constrains execution is the collection mode, which is still validated
+    # against the adapters the benchmark really provides.
+    if not str(raw["primary_intervention"]).strip():
+        raise ValueError("primary intervention must be a non-empty label")
     decision = raw.get("decision", "experiment")
     if decision not in {"experiment", "stop"}:
         raise ValueError("decision must be experiment or stop")
@@ -292,15 +338,18 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
     modes = allowed_collection_modes or {"expert", "policy_correction"}
     if collection["mode"] not in modes:
         raise ValueError("unsupported collection mode")
-    if (raw["primary_intervention"] == "policy_correction") != (
-            collection["mode"] == "policy_correction"):
-        raise ValueError("primary intervention and collection mode are inconsistent")
     profiles = COLLECTION_PROFILES if allowed_profiles is None else allowed_profiles
     if collection["profile"] not in profiles:
-        raise ValueError("unsupported targeted collection profile")
+        raise ValueError(f"collection profile {collection['profile']!r} is not one this "
+                         f"benchmark implements; available: {sorted(profiles)}")
     targeted, original = int(collection["targeted_attempts"]), int(collection["original_attempts"])
-    if targeted + original > attempts_per_round or min(targeted, original) < 0:
-        raise ValueError("collection must fit the attempt budget")
+    # The controller may ask for a larger collection than the nominal round budget. The run's
+    # wall clock is what actually limits it, and the executor already enforces that, so an
+    # extra ceiling here would only stop it from spending budget it has.
+    ceiling = max(attempts_per_round, 10_000)
+    if targeted + original > ceiling or min(targeted, original) < 0:
+        raise ValueError(f"collection of {targeted + original} attempts exceeds the "
+                         f"supported ceiling of {ceiling}")
     minimum_original = int(attempts_per_round * min_original_fraction + 0.999999)
     if decision != "stop" and original < minimum_original:
         raise ValueError("collection does not preserve the protocol's minimum original-distribution coverage")
@@ -311,24 +360,56 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
     if collection["enabled"] and not 1 <= int(collection["target_episodes"]) <= max(1, targeted):
         raise ValueError("invalid targeted episode request")
     training = raw["training"]
-    if set(training) != {"steps", "params", "targeted_sampling_mass", "phase_weights", "horizon_floor"}:
+    if set(training) - {"steps", "params", "targeted_sampling_mass", "phase_weights",
+                        "horizon_floor", "phase_bins"}:
         raise ValueError("training schema mismatch")
-    if int(training["steps"]) != training_steps:
-        raise ValueError("candidate training steps differ from the frozen run protocol")
+    if not {"steps", "params", "targeted_sampling_mass", "phase_weights",
+            "horizon_floor"} <= set(training):
+        raise ValueError("training schema mismatch")
+    # Training steps are the controller's experiment variable, not a frozen constant: it
+    # may spend more or less compute on a round it judges worth it. The wall clock is the
+    # real bound and the executor already enforces it, so no second ceiling is invented here.
+    if int(training["steps"]) < 1:
+        raise ValueError("training steps must be positive")
     params = training["params"]
-    if set(params) - set(TRAINING_SPACE):
-        raise ValueError("unregistered training parameter")
+    registered = set(TRAINING_BOUNDS) | set(TRAINING_OPTIONS)
+    if set(params) - registered:
+        raise ValueError(f"unregistered training parameter: {sorted(set(params) - registered)}")
     for name, value in params.items():
-        if value not in TRAINING_SPACE[name]:
-            raise ValueError(f"training parameter outside allowed space: {name}")
-    if not 0.05 <= float(training["targeted_sampling_mass"]) <= 0.5:
-        raise ValueError("targeted sampling mass must be in [0.05,0.5]")
-    phase_names = set(training["phase_weights"])
-    if phase_names not in ({"early", "middle", "late"},
-                           {"early", "approach", "contact_recovery"}):
-        raise ValueError("phase weights must cover the three registered progress bins")
+        if name in TRAINING_BOUNDS:
+            low, high = TRAINING_BOUNDS[name]
+            if not low <= float(value) <= high:
+                raise ValueError(f"{name}={value} is outside the supported range [{low}, {high}]")
+        elif value not in TRAINING_OPTIONS[name]:
+            raise ValueError(f"{name}={value!r} has no implementation; "
+                             f"supported: {sorted(TRAINING_OPTIONS[name])}")
+    # Sampling mass is the controller's lever over how hard it leans on the targeted set;
+    # the old 0.5 ceiling ruled out the very region the earlier experiments found decisive.
+    if not 0.0 < float(training["targeted_sampling_mass"]) <= 1.0:
+        raise ValueError("targeted sampling mass must be in (0,1]")
     if any(float(v) <= 0 for v in training["phase_weights"].values()):
         raise ValueError("phase weights must be positive")
+    # Optional: the controller may define its own progress bins instead of weighting the
+    # three pre-set ones. Coverage of [0,1] is a requirement of the sampler, not a policy.
+    if training.get("phase_bins") is not None:
+        bins = training["phase_bins"]
+        if not isinstance(bins, list) or not bins:
+            raise ValueError("phase_bins must be a non-empty list")
+        spans = []
+        for row in bins:
+            if set(row) != {"name", "start", "end", "weight"}:
+                raise ValueError("each phase bin needs name, start, end and weight")
+            if float(row["weight"]) <= 0:
+                raise ValueError("phase bin weights must be positive")
+            if not 0.0 <= float(row["start"]) < float(row["end"]):
+                raise ValueError(f"phase bin {row['name']!r} has an empty or negative span")
+            spans.append((float(row["start"]), float(row["end"])))
+        spans.sort()
+        if spans[0][0] > 0.0 or spans[-1][1] < 1.0:
+            raise ValueError("phase bins must cover the whole episode from 0 to 1")
+        for (_, end), (start, _) in zip(spans, spans[1:]):
+            if start > end:
+                raise ValueError("phase bins must not leave gaps")
     if not 0 < float(training["horizon_floor"]) <= 1:
         raise ValueError("horizon floor must be in (0,1]")
     if not str(raw["hypothesis"]).strip() or not str(raw["expected_validation"]).strip():
@@ -346,19 +427,28 @@ def build_prompt(round_index: int, context: dict[str, Any]) -> tuple[str, str]:
     modes = context.get("allowed_collection_modes", ["expert"])
     attempts = int(context.get("attempts_per_round", 100))
     steps = int(context.get("training_steps", 20_000))
+    development_episodes = int(context.get("development_episodes", 40))
     original_fraction = float(context.get("min_original_fraction", 0.25))
     original = max(1, int(attempts * original_fraction + 0.999999))
     targeted = attempts - original
     system = (
         "You are the research decision module for a simulator manipulation task. Return exactly one JSON object "
-        "matching the supplied schema. You may only select registered collection and ACT training controls. "
-        "Never change observations, the success judge, evaluation seeds, horizon, evaluator, or execute code. "
+        "matching the supplied schema. The schema's example values are a workable starting point, not a menu: "
+        "you may set any numeric training control within the published bounds, name your own intervention, and "
+        "define your own progress bins. The only fixed quantities are the ones that keep results comparable "
+        "across rounds -- observations, the success judge, evaluation seeds, the evaluator -- plus whatever the "
+        "benchmark or trainer genuinely does not implement, which is listed as an implemented choice. "
         "Treat diagnostics as evidence with stated limitations, not proven causality. Round 1 must request at "
         "least one targeted attempt and at least as many original-distribution attempts. For any enabled "
         f"collection, targeted_attempts + original_attempts must be <={attempts}, with at least {original} "
         "original-distribution attempts. From round 2 onward, choose decision=stop when current evidence is "
         "already saturated or no legal experiment is justified; a stop object must set collection.enabled=false "
-        "and all three collection counts to zero. Do not infer task semantics absent from the supplied contract."
+        "and all three collection counts to zero. Do not infer task semantics absent from the supplied contract. "
+        "You control your own evidence resolution: set resolution.development_episodes to raise or lower how many "
+        "episodes this round is judged on, and training.steps to spend more or less compute. If the failure and "
+        "success cohorts overlap so much that you cannot tell whether an intervention would help, raise the "
+        "resolution and say so in resolution.note rather than guessing or stopping. Explain in the hypothesis why "
+        "the resolution you chose is enough to test the claim you are making."
     )
     schema = {
         "decision": "experiment|stop",
@@ -366,7 +456,7 @@ def build_prompt(round_index: int, context: dict[str, Any]) -> tuple[str, str]:
         "parent_checkpoint_sha256": context["parent_checkpoint_sha256"],
         "parent_data_version": context["parent_data_version"],
         "development_evidence_id": context["development_evidence_id"],
-        "hypothesis": "string", "primary_intervention": "targeted_data|policy_correction|data_processing",
+        "hypothesis": "string", "primary_intervention": "your own short label for what you are changing",
         "collection": {"enabled": True, "mode": "|".join(modes),
                        "profile": "|".join(profiles),
                        "targeted_attempts": targeted, "original_attempts": original,
@@ -374,53 +464,25 @@ def build_prompt(round_index: int, context: dict[str, Any]) -> tuple[str, str]:
         "training": {"steps": steps, "params": {"action_loss_profile": "valid_mean"},
                      "targeted_sampling_mass": 0.5,
                      "phase_weights": {"early": 0.75, "middle": 1.0, "late": 3.0},
+                     "phase_bins": "optional: [{name,start,end,weight},...] covering 0..1, "
+                                   "to define your own progress bins instead",
                      "horizon_floor": 0.25},
+        "resolution": {"development_episodes": development_episodes,
+                       "note": "why this resolution can test your claim"},
         "expected_validation": "string",
     }
     user = json.dumps({"round": round_index, "required_schema": schema,
-                       "allowed_training_values": {k: sorted(v, key=str) for k, v in TRAINING_SPACE.items()},
+                       "training_parameters_you_may_set": {
+                           "free_numeric": {k: {"min": low, "max": high}
+                                            for k, (low, high) in TRAINING_BOUNDS.items()},
+                           "implemented_choices": {k: sorted(v) for k, v in TRAINING_OPTIONS.items()},
+                       },
                        "context": context}, ensure_ascii=False, sort_keys=True)
     return system, user
 
 
 def _summary(metrics: dict[str, Any]) -> dict[str, Any]:
     return dict(metrics["summary"])
-
-
-def clickbell_failure_analysis(evaluation: Path, output: Path) -> dict[str, Any]:
-    """Combine generic motion evidence with ClickBell scene/contact slices.
-
-    The press-depth signal is sampled every ten steps and is therefore kept as
-    an exploratory diagnostic, never promoted to the official success judge.
-    """
-    result = analyze(evaluation)
-    try:
-        from .failure_slice_analysis import _load_repeat
-
-        metrics = read_json(evaluation / "evaluation_metrics.json")
-        artifact = Path(metrics.get("artifact_directory", evaluation))
-        _, episodes, _ = _load_repeat(artifact)
-        labels = ("success", "near_threshold_press", "contact_insufficient_press",
-                  "no_button_contact", "unclassified")
-        result["clickbell_diagnostics"] = {
-            "contact_outcomes_from_ten_step_sampled_qpos": {
-                label: sum(row["contact_class"] == label for row in episodes) for label in labels
-            },
-            "camera_high": {
-                "episodes": sum(bool(row["camera_high"]) for row in episodes),
-                "failures": sum(bool(row["camera_high"]) and not row["success"] for row in episodes),
-            },
-            "clutter_near": {
-                "episodes": sum(bool(row["clutter_near"]) for row in episodes),
-                "failures": sum(bool(row["clutter_near"]) and not row["success"] for row in episodes),
-            },
-            "measurement_status": "exploratory_ten_step_sampling_not_official_judge",
-        }
-    except (KeyError, ValueError, FileNotFoundError) as exc:
-        result["clickbell_diagnostics"] = {
-            "measurement_status": "unavailable", "reason": redact(f"{type(exc).__name__}: {exc}")}
-    atomic_json(output, result)
-    return result
 
 
 class RepositoryAutoResearch:
@@ -661,7 +723,13 @@ class RepositoryAutoResearch:
             atomic_json(path, document)
 
     def start_or_resume_budget(self) -> None:
-        """Use one wall-clock budget across retries and process restarts."""
+        """Use one wall-clock budget across retries and process restarts.
+
+        With ``--continue-run`` the window restarts here instead: an explicit request to
+        carry a finished run further is a new budget, not a resumption of the old one.
+        """
+        if self.config.continue_run:
+            self.state.pop("budget_started_at", None)
         started_text = self.state.get("budget_started_at") or self.state["created_at"]
         started = datetime.fromisoformat(started_text)
         current = datetime.now().astimezone()
@@ -1047,19 +1115,28 @@ class RepositoryAutoResearch:
             if self.environment_contract["status"] != "passed":
                 raise RuntimeError("environment/checkpoint contract failed; see environment_manifest.json")
         project_root = self.runtime.platform_root.absolute()
-        owned_paths = [Path(__file__).resolve(), self.repo, eval_repo.absolute(),
-                       self.runtime.python.absolute()]
+        # Platform-owned code and interpreter must not escape the project: that is an
+        # integrity property of this installation.
+        owned_paths = [Path(__file__).resolve(), self.runtime.python.absolute()]
         escaped = [str(path) for path in owned_paths
                    if path != project_root and project_root not in path.parents]
         if escaped:
             raise RuntimeError(f"standalone project boundary violation: {escaped}")
+        # The benchmark and its evaluation copy are inputs the caller named on the command
+        # line, not platform-owned code. Living outside the project directory is the normal
+        # case for "point this at any benchmark repository", so record them as declared
+        # external reads rather than forbidding the layout.
+        input_paths = [self.repo, eval_repo.absolute()]
+        external_inputs = sorted({str(path) for path in input_paths
+                                  if path != project_root and project_root not in path.parents})
         atomic_json(self.run_root / "project_boundary.json", {
             "status": "passed" if (self.run_root == project_root or project_root in self.run_root.parents)
                       else "explicit_external_output",
             "project_root": str(project_root),
             "owned_runtime_paths": [str(path) for path in owned_paths],
+            "declared_input_paths": [str(path) for path in input_paths],
             "artifact_output": str(self.run_root),
-            "cross_project_research_reads": [],
+            "cross_project_research_reads": external_inputs,
             "external_system_dependencies": ["GPU driver", "system shared libraries"],
             "note": "credential file is loaded from the project root; historical priors are literal protocol context, not runtime reads",
         })
@@ -1244,6 +1321,7 @@ class RepositoryAutoResearch:
                     {"expert", "policy_correction"} if self.spec.correction_supported else {"expert"}),
                 attempts_per_round=self.config.attempts_per_round,
                 training_steps=self.config.screen_steps,
+                development_episodes=self.config.development_episodes,
                 min_original_fraction=self.config.min_original_fraction)
             atomic_json(path, {
                 "schema_version": SCHEMA_VERSION, "proposal": proposal,
@@ -1472,17 +1550,27 @@ class RepositoryAutoResearch:
         else:
             profile_masses["full_random"] = 1.0
         weights = proposal["training"]["phase_weights"]
-        middle_name = "middle" if "middle" in weights else "approach"
-        late_name = "late" if "late" in weights else "contact_recovery"
+        bins = proposal["training"].get("phase_bins")
+        if bins:
+            # The sampler selects with `start <= progress < end`, so the last bin has to
+            # reach past 1.0 or the final frame of every episode is left uncovered.
+            bins = [dict(row) for row in bins]
+            last = max(range(len(bins)), key=lambda i: float(bins[i]["end"]))
+            bins[last]["end"] = max(float(bins[last]["end"]), 1.01)
+        else:
+            middle_name = "middle" if "middle" in weights else "approach"
+            late_name = "late" if "late" in weights else "contact_recovery"
+            bins = [
+                {"name": "early", "start": 0.0, "end": 0.45, "weight": float(weights["early"])},
+                {"name": "middle", "start": 0.45, "end": 0.75,
+                 "weight": float(weights[middle_name])},
+                {"name": "late", "start": 0.75, "end": 1.01,
+                 "weight": float(weights[late_name])},
+            ]
         sampling = {"strategy": "stratified_phase", "profile_masses": profile_masses,
-                    "phase_bins": [
-                        {"name": "early", "start": 0.0, "end": 0.45, "weight": float(weights["early"])},
-                        {"name": "middle", "start": 0.45, "end": 0.75,
-                         "weight": float(weights[middle_name])},
-                        {"name": "late", "start": 0.75, "end": 1.01,
-                         "weight": float(weights[late_name])},
-                    ], "horizon_weighting": {"mode": "linear_floor", "chunk_size": 50,
-                                              "floor": float(proposal["training"]["horizon_floor"])}}
+                    "phase_bins": bins,
+                    "horizon_weighting": {"mode": "linear_floor", "chunk_size": 50,
+                                          "floor": float(proposal["training"]["horizon_floor"])}}
         payload = {"schema_version": 4, "kind": "robosyn_research_mixture",
                    "datasets": entries, "sampling": sampling,
                    "total_episodes": sum(x["episode_count"] for x in entries),
@@ -1586,10 +1674,18 @@ class RepositoryAutoResearch:
             raise RuntimeError("required targeted/correction probe produced no admitted training data")
         mixture = self._make_mixture(round_index, proposal, cumulative)
         self.save(stage=f"round_{round_index}_training")
+        # Continue from the acting policy, not from the released checkpoint. Training every
+        # round from the same starting weights meant the search never accumulated: the data
+        # mixture grew across rounds while the weights were reset each time, so a round could
+        # only ever be judged against the official baseline, never built upon. Round one's
+        # acting checkpoint is the official checkpoint, so this degrades to the old behaviour
+        # there. Note this gives a multi-round candidate several rounds of training budget, so
+        # it is no longer a matched comparison against the untuned official checkpoint; use a
+        # same-total-steps official-data continuation as the control.
         checkpoint = self.runtime.train(self.spec, Path(self.assets["official_dataset"]),
-            round_dir / "candidate", steps=self.config.screen_steps,
+            round_dir / "candidate", steps=int(proposal["training"]["steps"]),
             params=proposal["training"]["params"], mixture=mixture,
-            seed=self.config.train_seed, pretrained=Path(self.assets["official_checkpoint"]))
+            seed=self.config.train_seed, pretrained=acting_checkpoint)
         if self.harness_artifacts:
             from .environment_contract import inspect_act_checkpoint
             contract = inspect_act_checkpoint(checkpoint,
@@ -1608,19 +1704,24 @@ class RepositoryAutoResearch:
         evaluation_dir = self.run_root / "evaluations" / f"round_{round_index}_candidate_development"
         analysis_path = round_dir / "candidate_failure_analysis.json"
         self.save(stage=f"round_{round_index}_candidate_development")
+        # This round's own evidence resolution, as requested by the controller. The frozen
+        # selection bank is untouched, so candidates stay mutually comparable; what changes
+        # is how much the controller gets to see before deciding its next move.
+        dev_episodes = int((proposal.get("resolution") or {}).get(
+            "development_episodes", self.config.development_episodes))
         recovery = None
         try:
             dev = self.evaluate(checkpoint, f"round_{round_index}_candidate", "development",
-                                self._master_seed("development"), self.config.development_episodes)
+                                self._master_seed("development"), dev_episodes)
         except Exception:
             if not self.recovery_enabled():
                 raise
             baseline = self._existing_evaluation(self.run_root / "evaluations/official_act_development",
-                                                "development", self.config.development_episodes)
+                                                "development", dev_episodes)
             snapshot = development_failure_snapshot(evaluation_dir,
                 state_dim=self.spec.state_dim, checkpoint_sha256=digest(checkpoint / "model.safetensors"),
                 baseline_verified=(baseline is not None and baseline.get("execution_mode") == "real_simulation"
-                                   and baseline.get("summary", {}).get("episode_count") == self.config.development_episodes),
+                                   and baseline.get("summary", {}).get("episode_count") == dev_episodes),
                 round_index=round_index,
                 rounds_remaining=self.config.rounds - round_index,
                 training_params=proposal["training"]["params"], training_space=TRAINING_SPACE)
@@ -1634,10 +1735,9 @@ class RepositoryAutoResearch:
             atomic_json(analysis_path, candidate_analysis)
         elif analysis_path.is_file():
             candidate_analysis = read_json(analysis_path)
-        elif self.task == "click_bell":
-            candidate_analysis = clickbell_failure_analysis(evaluation_dir, analysis_path)
         else:
-            candidate_analysis = task_failure_analysis(self.task, evaluation_dir, analysis_path)
+            candidate_analysis = task_evidence(self.task, evaluation_dir, analysis_path,
+                                               repo=getattr(self.runtime, "repo", None))
         result = {"round": round_index, "proposal_id": proposal["proposal_id"],
                   "proposal": proposal, "admitted_data": admitted,
                   "cumulative_data": [{"profile": p, "root": str(r)} for p, r in cumulative],
@@ -1664,20 +1764,41 @@ class RepositoryAutoResearch:
         return result, cumulative
 
     def _feedback_context(self, baseline_analysis: dict[str, Any], prior: dict[str, Any] | None) -> dict[str, Any]:
-        compact_baseline = {
-            "summary": baseline_analysis.get("summary"),
-            "categories": baseline_analysis.get("categories"),
-            "clickbell_diagnostics": baseline_analysis.get("clickbell_diagnostics"),
-            "limitations": baseline_analysis.get("limitations"),
-        }
         exposure = read_json(Path(prior["training_exposure_audit"])) if prior is not None else None
         current_analysis = (read_json(Path(prior["candidate_failure_analysis"]))
                             if prior is not None else baseline_analysis)
         quarantined = prior is not None and prior.get("status") == "quarantined"
         if quarantined:
             current_analysis = prior["fallback_policy_failure_analysis"]
+        # Every round carries the same shape of evidence: the baseline in full plus the
+        # whole history of rounds so far. An earlier version handed round 1 the complete
+        # analysis and then reduced the baseline from round 2 on (dropping the per-episode
+        # detail), so the controller's information shrank as the search went on -- the
+        # opposite of what a continuing search needs.
+        history = []
+        for row in self.state.get("rounds", []):
+            index = row.get("round")
+            record = {k: row.get(k) for k in ("round", "proposal_id", "status")}
+            result_path = self.run_root / "rounds" / f"round_{index}" / "round_result.json"
+            if result_path.is_file():
+                result = read_json(result_path)
+                proposal = result.get("proposal") or {}
+                record.update(hypothesis=proposal.get("hypothesis"),
+                              primary_intervention=proposal.get("primary_intervention"),
+                              collection=proposal.get("collection"),
+                              development_summary=result.get("development_summary"),
+                              selection_summary=result.get("selection_summary"),
+                              checkpoint=result.get("checkpoint"))
+                analysis_path = result.get("candidate_failure_analysis")
+                if analysis_path and Path(analysis_path).is_file():
+                    round_analysis = read_json(Path(analysis_path))
+                    record["task_evidence"] = (round_analysis.get("task_evidence")
+                                               or round_analysis.get("analysis")
+                                               or round_analysis)
+            history.append(record)
         evidence = baseline_analysis if prior is None else {
-            "baseline_failure_analysis_summary": compact_baseline,
+            "baseline_failure_analysis": baseline_analysis,
+            "round_history": history,
             "previous_round": prior["round"],
             "previous_proposal": prior["proposal"],
             "previous_admitted_data": [{k: row[k] for k in ("profile", "accepted_episodes", "attempts_consumed")}
@@ -1699,13 +1820,6 @@ class RepositoryAutoResearch:
         atomic_json(self.run_root / "evidence" / suffix,
                     {"evidence_id": evidence_id, "evidence": evidence})
         assert self.adapter is not None
-        historical = ({
-            "official_plus_1500_targeted_local_data": "49% to 74% on a historical same-seed 500-episode local evaluation",
-            "residual": "47 of 48 historical candidate failures were heuristically labeled insufficient press depth",
-            "warning": "historical combination changed data and processing together and is not this run's result",
-        } if self.task == "click_bell" else {
-            "status": "no_task_specific_prior_injected",
-        })
         return {"task_contract": self.spec.as_dict(),
                 "benchmark_challenges": self.adapter.challenge_context(self.spec),
                 "capabilities": [row.as_dict() for row in self.adapter.capabilities(self.spec)],
@@ -1714,8 +1828,8 @@ class RepositoryAutoResearch:
                                              if self.spec.correction_supported else ["expert"]),
                 "attempts_per_round": self.config.attempts_per_round,
                 "training_steps": self.config.screen_steps,
+                "development_episodes": self.config.development_episodes,
                 "min_original_fraction": self.config.min_original_fraction,
-                "historical_noncausal_prior": historical,
                 "development_evidence_id": evidence_id, "development_evidence": evidence,
                 "parent_checkpoint_sha256": self.assets["checkpoint_weight_sha256"],
                 "parent_data_version": self.assets["dataset_info_sha256"],
@@ -2016,7 +2130,9 @@ class RepositoryAutoResearch:
 
     def execute(self) -> dict[str, Any]:
         try:
-            completed = self._completed_result()
+            # `--continue-run` deliberately reopens a finished run, so the cached
+            # "already done" answer must not short-circuit it.
+            completed = None if self.config.continue_run else self._completed_result()
             if completed is not None:
                 return completed
             self.initialize()
@@ -2072,21 +2188,25 @@ class RepositoryAutoResearch:
                 analysis_path = self.run_root / "evidence" / "official_development_failure_analysis.json"
                 if analysis_path.is_file():
                     baseline_analysis = read_json(analysis_path)
-                elif self.task == "click_bell":
-                    baseline_analysis = clickbell_failure_analysis(
-                        self.run_root / "evaluations/official_act_development", analysis_path)
                 else:
-                    baseline_analysis = task_failure_analysis(
-                        self.task, self.run_root / "evaluations/official_act_development", analysis_path)
+                    baseline_analysis = task_evidence(
+                        self.task, self.run_root / "evaluations/official_act_development",
+                        analysis_path, repo=getattr(self.runtime, "repo", None))
                 cumulative: list[tuple[str, Path]] = []
                 rounds = []
                 prior = None
-                for round_index in range(1, self.config.rounds + 1):
+                # `--rounds 0` means keep optimising: the loop then ends when the controller
+                # judges the evidence saturated or the wall clock runs out, rather than on a
+                # round count guessed before the run started. Each round still chains from the
+                # previous candidate, so the search accumulates instead of restarting.
+                round_index = 1
+                while self.config.rounds == 0 or round_index <= self.config.rounds:
                     prior, cumulative = self.run_round(
                         round_index, self._feedback_context(baseline_analysis, prior), cumulative)
                     if prior["status"] == "stopped_by_controller":
                         break
                     rounds.append(prior)
+                    round_index += 1
                 if not rounds:
                     raise RuntimeError("controller stopped without producing any candidate")
                 self.save(stage="selection_validation")
@@ -2286,6 +2406,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-budget", action="store_true", help="Precommit to 80K candidate/control continuation")
     parser.add_argument("--allow-api-egress", action="store_true",
                         help="Explicitly authorize sending this non-ClickBell task's structured contract and failure summaries to the configured API")
+    parser.add_argument("--continue-run", action="store_true",
+                        help="Reopen a finished run with a fresh wall-clock window, keeping its completed rounds")
     parser.add_argument("--robotwin-training-epochs", type=int, choices=[2000, 6000], default=6000,
                         help="RoboTwin ACT epoch budget; ignored by RoboSyn")
     parser.add_argument("--robotwin-evaluation-episodes", type=int, default=20,
@@ -2433,6 +2555,7 @@ def main(argv: list[str] | None = None) -> int:
                              min_original_fraction=args.min_original_fraction,
                              full_budget=args.full_budget,
                              allow_api_egress=args.allow_api_egress,
+                             continue_run=args.continue_run,
                              dry_run=args.dry_run,
                              probe_only=args.probe_only,
                              gpus=args.gpus, device_mode=args.device_mode,

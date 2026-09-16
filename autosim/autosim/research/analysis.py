@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +22,13 @@ def analyze(evaluation: Path, output: Path | None = None) -> dict:
         for line in trace_path.read_text().splitlines():
             row = json.loads(line)
             traces[int(row["seed"])].append(row)
-    categories, details = Counter(), []
+    # Measure, do not label.  This used to bucket every failure into one of three
+    # names chosen here (large_object_height_drop / little_object_motion /
+    # incomplete_after_motion), which meant the set of recognisable failures was
+    # fixed in advance for every task at once.  The numbers below are what the
+    # controller reasons from; naming and thresholding them is its job.
+    measurements = []
     for episode in metrics["episodes"]:
-        if episode["success"]:
-            categories["success"] += 1
-            continue
         rows = traces[episode["episode_seed"]]
         max_move, max_drop, max_joint = 0.0, 0.0, 0.0
         missing = sum(len(r.get("missing", [])) for r in rows)
@@ -45,22 +47,16 @@ def analyze(evaluation: Path, output: Path | None = None) -> dict:
                     if "qpos" in data and "qpos" in initial[name]:
                         max_joint = max(max_joint, float(np.abs(np.asarray(data["qpos"]) -
                                                                np.asarray(initial[name]["qpos"])).max()))
-        if not observed:
-            category = "insufficient_telemetry"
-        elif max_drop > 0.15:
-            category = "large_object_height_drop"
-        elif max_move < 0.015 and max_joint < 0.002:
-            category = "little_object_motion"
-        else:
-            category = "incomplete_after_motion"
-        categories[category] += 1
-        details.append({"episode_seed": episode["episode_seed"], "category": category,
-                        "max_object_displacement_m": max_move, "max_height_drop_m": max_drop,
-                        "max_articulation_change": max_joint, "missing_measurements": missing,
-                        "confidence": "low" if missing or not observed else "heuristic",
-                        "causal_explanation": "not_established"})
+        measurements.append({"episode_seed": episode["episode_seed"],
+                             "success": bool(episode["success"]),
+                             "max_object_displacement_m": max_move,
+                             "max_height_drop_m": max_drop,
+                             "max_articulation_change": max_joint,
+                             "missing_measurements": missing,
+                             "measured": bool(observed),
+                             "confidence": "low" if missing or not observed else "heuristic"})
     result = {"source": str(evaluation), "purpose": metrics["purpose"], "summary": metrics["summary"],
-              "categories": dict(categories), "failures": details,
+              "measurements": measurements,
               "limitations": ["progress observations are not official stage labels",
                               "10-step sampling may miss transient contacts",
                               "visual causes cannot be inferred from motion alone"]}

@@ -228,11 +228,11 @@ def cpu_runner(tmp_path, monkeypatch, *, rounds=2, all_invalid=False, error=None
         atomic_json(output / "evaluation_metrics.json", result)
         return result
     runtime.evaluate = evaluate
-    def analyze(evaluation, path):
-        value = {"summary": {"fixture_only": True}, "categories": {}}
+    def analyze(task, evaluation, path, repo=None):
+        value = {"summary": {"fixture_only": True}, "task_evidence": {"task": task}}
         atomic_json(path, value)
         return value
-    monkeypatch.setattr(research, "clickbell_failure_analysis", analyze)
+    monkeypatch.setattr(research, "task_evidence", analyze)
     deployments = []
     def export(deployment, selected, final):
         deployments.append(deployment)

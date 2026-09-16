@@ -33,7 +33,12 @@ def fingerprint_dataset(root: Path, store: Path) -> dict:
                 for name, row in contents.items()}
     content_id = object_digest(identity)
     path = store / f"content_{content_id}.json"
-    result = {"schema_version": 2, "root": str(root),
+    # The manifest is content-addressed by construction: its filename is the hash of the
+    # relative paths and bytes below. Recording the live absolute path inside it made the
+    # record location-dependent, so relocating a dataset produced the same content_id with
+    # a different payload and the immutability check rejected it. Location belongs in the
+    # sidecar index keyed by root, which is already written per location.
+    result = {"schema_version": 2,
               "content_id": content_id, "files": contents,
               "coverage": "all files under meta/data/videos; HF cache and readme excluded",
               "cache_validation": "relative path, size, and mtime_ns before hash reuse"}

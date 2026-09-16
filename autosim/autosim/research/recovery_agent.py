@@ -105,7 +105,12 @@ def development_failure_snapshot(evaluation: Path, *, state_dim: int,
             "aggregate_metrics_valid": False, "quarantine_eligible": bool(eligible),
             "evaluation_checkpoint_matches": request_matches,
             "previous_training_params": training_params,
-            "allowed_training_params": {k: sorted(v) for k, v in training_space.items()},
+            # Numeric controls carry bounds rather than an enumerated set, so report them as
+            # ranges; only the dispatched-on choices are a finite list.
+            "allowed_training_params": {
+                name: (sorted(spec) if isinstance(spec, (set, frozenset))
+                       else {"min": spec[0], "max": spec[1]})
+                for name, spec in training_space.items()},
             "causal_limit": "Observation invalidity is established; the first action/physics cause is not isolated."}
 
 
@@ -152,7 +157,14 @@ def validate_decision(value: dict, snapshot: dict) -> dict:
         raise ValueError("invalid next trial parameters")
     allowed = snapshot.get("allowed_training_params", {})
     for name, item in params.items():
-        if type(item) not in (str, int, float) or name not in allowed or item not in allowed[name]:
+        if type(item) not in (str, int, float) or name not in allowed:
+            raise ValueError("next trial parameter outside registered research space")
+        space = allowed[name]
+        # Numeric controls are published as a closed range; dispatched-on choices as a set.
+        if isinstance(space, dict) and {"min", "max"} <= set(space):
+            if type(item) not in (int, float) or not float(space["min"]) <= float(item) <= float(space["max"]):
+                raise ValueError("next trial parameter outside registered research space")
+        elif item not in space:
             raise ValueError("next trial parameter outside registered research space")
     for key in ("diagnosis", "next_trial_rationale"):
         if not isinstance(value[key], str) or not 1 <= len(value[key]) <= 2000:

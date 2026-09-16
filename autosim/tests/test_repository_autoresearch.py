@@ -70,10 +70,16 @@ def test_proposal_contract_accepts_bounded_targeted_collection():
     ({"primary_intervention": "targeted_data",
       "collection": {"enabled": True, "mode": "expert", "profile": "targeted_camera",
                      "targeted_attempts": 60, "original_attempts": 40, "target_episodes": 30}}, "minimum original-distribution"),
-    ({"training": {"steps": 20_000, "params": {"optimizer_lr": 0.1},
+    # Numeric controls are free within published bounds; only values past the bound are
+    # rejected, and only choices with no implementation behind them are refused outright.
+    ({"training": {"steps": 20_000, "params": {"optimizer_lr": 1e3},
                    "targeted_sampling_mass": 0.2,
                    "phase_weights": {"early": 1, "approach": 1, "contact_recovery": 1},
-                   "horizon_floor": 0.25}}, "outside allowed space"),
+                   "horizon_floor": 0.25}}, "outside the supported range"),
+    ({"training": {"steps": 20_000, "params": {"action_loss_profile": "not_implemented"},
+                   "targeted_sampling_mass": 0.2,
+                   "phase_weights": {"early": 1, "approach": 1, "contact_recovery": 1},
+                   "horizon_floor": 0.25}}, "has no implementation"),
 ])
 def test_proposal_contract_rejects_invalid_or_leaking_actions(mutation, message):
     with pytest.raises(ValueError, match=message):

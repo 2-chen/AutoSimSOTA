@@ -179,13 +179,34 @@ class Runtime:
 
     @property
     def platform_root(self) -> Path:
-        """Support both a standalone AutoSimSOTA root and the legacy parent layout."""
-        return (self.workspace if (self.workspace / "RoboSynChallenge").is_dir()
-                else self.workspace / "AutoSimSOTA")
+        """Where this installation's own assets live: ``.venv``, ``EmbodiChain``, ``embodichain_data``.
+
+        This is a property of the AutoSimSOTA installation, not of where the benchmark
+        repository happens to sit.  Keying off ``workspace/RoboSynChallenge`` made the
+        root depend on an unrelated checkout: moving a benchmark outside the project
+        directory silently redirected the venv, the simulator package, the asset root
+        and the library path at once.  Set ``AUTOSIM_PLATFORM_ROOT`` to override.
+        """
+        override = os.environ.get("AUTOSIM_PLATFORM_ROOT")
+        if override:
+            return Path(override).expanduser().absolute()
+        for candidate in (self.workspace, self.workspace / "AutoSimSOTA"):
+            if (candidate / ".venv").is_dir() or (candidate / "EmbodiChain").is_dir():
+                return candidate
+        # No installation assets found; preserve the historical standalone answer.
+        return self.workspace / "AutoSimSOTA" if (self.workspace / "AutoSimSOTA").is_dir() else self.workspace
 
     @property
     def repo(self) -> Path:
-        return (self.repo_path or self.platform_root / "RoboSynChallenge").absolute()
+        if self.repo_path is not None:
+            return self.repo_path.absolute()
+        # The benchmark is a separate checkout and may live outside the platform root,
+        # including directly under the workspace.
+        for candidate in (self.platform_root / "RoboSynChallenge",
+                          self.workspace / "RoboSynChallenge"):
+            if candidate.is_dir():
+                return candidate.absolute()
+        return (self.platform_root / "RoboSynChallenge").absolute()
 
     @property
     def eval_repo(self) -> Path:

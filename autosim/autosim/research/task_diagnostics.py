@@ -1,9 +1,23 @@
-"""Task-semantic observation plugins; none of these replace native judges."""
+"""Raw task evidence for the controller to interpret.
+
+This module deliberately names no failure modes and applies no thresholds.  It
+reports *what was observed* -- the task's own success predicate, the entities the
+task declared, and the trajectories those entities followed -- and leaves the
+interpretation to the controller.  Hand-written per-task analyzers used to live
+here; they fixed the set of recognisable failures in advance and silently
+degenerated to `no_verified_task_semantic_plugin` for every task nobody had
+written one for, so the system's reach was capped by how many analyzers existed.
+
+Everything below is derived from artifacts the pipeline already records:
+`telemetry.jsonl` files entities under the names the task's own config gives
+them, which is why nothing here needs to know what a "bottle" or a "basket" is.
+"""
 
 from __future__ import annotations
 
+import ast
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +26,16 @@ import numpy as np
 from .analysis import analyze
 from .common import atomic_json, read_json
 
+#: Predicate functions worth quoting to the controller, in the order the
+#: benchmark defines them.  Missing ones are simply absent from the evidence.
+_PREDICATE_NAMES = ("is_task_success", "_evaluate_task_state", "_evaluate_success")
 
-def _matrix(value: Any) -> np.ndarray:
-    return np.asarray(value, dtype=np.float64).reshape(-1, 4, 4)[0]
+
+def _matrix(value: Any) -> np.ndarray | None:
+    array = np.asarray(value, dtype=np.float64)
+    if array.size < 16:
+        return None
+    return array.reshape(-1, 4, 4)[0]
 
 
 def _traces(evaluation: Path) -> tuple[dict, dict[int, list[dict]]]:
@@ -24,99 +45,167 @@ def _traces(evaluation: Path) -> tuple[dict, dict[int, list[dict]]]:
     path = artifact / "telemetry.jsonl"
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
             row = json.loads(line)
             rows[int(row["seed"])].append(row)
     return metrics, rows
 
 
-def _water(metrics: dict, traces: dict[int, list[dict]]) -> dict[str, Any]:
-    categories = Counter()
-    episodes = []
-    for episode in metrics["episodes"]:
-        if episode["success"]:
+def success_predicate_source(repo: Path | None, task: str) -> dict[str, Any]:
+    """Quote the task's own success predicate.
+
+    The predicate is the ground truth for what "worked" means, and the pipeline
+    already hashes this file for the frozen protocol.  Quoting it costs nothing
+    beyond reading a file it already read, and it replaces the hand-copied
+    constants that task-specific analyzers used to duplicate (and drift from).
+    """
+    if repo is None:
+        return {"status": "repository_not_supplied"}
+    path = Path(repo) / "robosynchallenge" / "tasks" / task / f"{task}.py"
+    if not path.is_file():
+        return {"status": "predicate_source_not_found", "expected": str(path)}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return {"status": "predicate_source_unparsable", "error": str(exc), "path": str(path)}
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _PREDICATE_NAMES:
+            segment = ast.get_source_segment(text, node)
+            if segment:
+                found[node.name] = segment
+    if not found:
+        return {"status": "no_predicate_function_found", "path": str(path),
+                "looked_for": list(_PREDICATE_NAMES)}
+    return {"status": "quoted", "path": str(path), "functions": found}
+
+
+def _trajectory(rows: list[dict]) -> dict[str, Any]:
+    """Per-entity displacement and final state over one episode's samples."""
+    if not rows:
+        return {"samples": 0}
+    ordered = sorted(rows, key=lambda row: row.get("step") or 0)
+    names: set[str] = set()
+    for row in ordered:
+        names.update((row.get("entities") or {}).keys())
+
+    entities: dict[str, Any] = {}
+    for name in sorted(names):
+        poses = []
+        for row in ordered:
+            entry = (row.get("entities") or {}).get(name) or {}
+            pose = _matrix(entry.get("pose"))
+            if pose is not None:
+                poses.append(pose)
+        if not poses:
+            entities[name] = {"observed": False}
             continue
-        rows = [row for row in traces[episode["episode_seed"]]
-                if "bottle" in row.get("entities", {}) and "cup" in row.get("entities", {})]
-        if not rows:
-            category = "insufficient_task_telemetry"
-            detail = {}
-        else:
-            bottle = [_matrix(row["entities"]["bottle"]["pose"]) for row in rows]
-            cup = [_matrix(row["entities"]["cup"]["pose"]) for row in rows]
-            initial_z = bottle[0][2, 3]
-            lift = max(pose[2, 3] - initial_z for pose in bottle)
-            angles = [float(np.arccos(np.clip(pose[2, 1], -1, 1))) for pose in bottle]
-            cup_angles = [float(np.arccos(np.clip(pose[2, 2], -1, 1))) for pose in cup]
-            distances = []
-            for bottle_pose, cup_pose in zip(bottle, cup):
-                mouth = bottle_pose[:3, 3] + 0.236 * bottle_pose[:3, 1]
-                distances.append(float(np.linalg.norm((cup_pose[:3, 3] - mouth)[:2])))
-            if max(cup_angles) >= np.pi / 4:
-                category = "cup_fall_observed"
-            elif lift <= 0.03:
-                category = "bottle_not_lifted"
-            elif min(distances) >= 0.08:
-                category = "bottle_mouth_not_aligned_over_cup"
-            elif max(angles) <= np.pi / 4:
-                category = "pouring_tilt_not_observed"
-            elif angles[-1] >= np.pi / 4:
-                category = "upright_return_not_observed"
-            else:
-                category = "incomplete_despite_sampled_event_sequence"
-            detail = {"max_bottle_lift_m": float(lift),
-                      "max_bottle_tilt_rad": max(angles),
-                      "final_bottle_tilt_rad": angles[-1],
-                      "min_mouth_to_cup_xy_m": min(distances),
-                      "max_cup_tilt_rad": max(cup_angles)}
-        categories[category] += 1
-        episodes.append({"episode_seed": episode["episode_seed"], "category": category, **detail})
-    return {"plugin": "water_pouring_v1", "categories": dict(categories), "episodes": episodes,
-            "measurement_status": "exploratory_sampled_task_events_not_native_judge"}
+        start, end = poses[0], poses[-1]
+        translations = np.asarray([pose[:3, 3] for pose in poses])
+        entities[name] = {
+            "observed": True,
+            "sample_count": len(poses),
+            "start_xyz": [round(float(v), 5) for v in start[:3, 3]],
+            "final_xyz": [round(float(v), 5) for v in end[:3, 3]],
+            "max_displacement_from_start_m": round(
+                float(np.linalg.norm(translations - translations[0], axis=1).max()), 5),
+            "net_displacement_m": round(float(np.linalg.norm(end[:3, 3] - start[:3, 3])), 5),
+            "min_z_m": round(float(translations[:, 2].min()), 5),
+            "max_z_m": round(float(translations[:, 2].max()), 5),
+            "start_up_axis": [round(float(v), 4) for v in start[:3, 2]],
+            "final_up_axis": [round(float(v), 4) for v in end[:3, 2]],
+        }
+
+    qpos = [np.asarray(row["robot_qpos"], dtype=np.float64).ravel()
+            for row in ordered if row.get("robot_qpos") is not None]
+    joint = {}
+    if qpos:
+        stacked = np.vstack(qpos)
+        joint = {
+            "dim": int(stacked.shape[1]),
+            "max_abs_change": round(float(np.abs(stacked - stacked[0]).max()), 5),
+            "final_abs_change": round(float(np.abs(stacked[-1] - stacked[0]).max()), 5),
+        }
+
+    missing: set[str] = set()
+    unavailable: set[str] = set()
+    for row in ordered:
+        missing.update(row.get("missing") or [])
+        unavailable.update(str(v) for v in (row.get("unavailable_realized_parameters") or []))
+    return {
+        "samples": len(ordered),
+        "step_range": [ordered[0].get("step"), ordered[-1].get("step")],
+        "entities": entities,
+        "robot_joint": joint,
+        "missing": sorted(missing),
+        "unavailable_realized_parameters": sorted(unavailable),
+    }
 
 
-def _handle(metrics: dict, traces: dict[int, list[dict]]) -> dict[str, Any]:
-    categories = Counter()
+def _contrast(episodes: list[dict]) -> dict[str, Any]:
+    """How measured quantities differ between episodes that succeeded and failed.
+
+    Reported as raw distributions.  Whether any of these differences is the
+    reason for failure is a judgement the controller makes, not one encoded here.
+    """
+    def collect(cohort: list[dict]) -> dict[str, Any]:
+        totals: dict[str, list[float]] = defaultdict(list)
+        for episode in cohort:
+            trajectory = episode["trajectory"]
+            for name, stats in (trajectory.get("entities") or {}).items():
+                if not stats.get("observed"):
+                    continue
+                totals[f"{name}.max_displacement_from_start_m"].append(
+                    stats["max_displacement_from_start_m"])
+                totals[f"{name}.net_displacement_m"].append(stats["net_displacement_m"])
+                totals[f"{name}.z_range_m"].append(round(stats["max_z_m"] - stats["min_z_m"], 5))
+            joint = trajectory.get("robot_joint") or {}
+            if "max_abs_change" in joint:
+                totals["robot_joint.max_abs_change"].append(joint["max_abs_change"])
+        return {
+            name: {"n": len(values), "mean": round(float(np.mean(values)), 5),
+                   "min": round(float(np.min(values)), 5),
+                   "max": round(float(np.max(values)), 5)}
+            for name, values in sorted(totals.items()) if values
+        }
+
+    succeeded = [e for e in episodes if e["success"]]
+    failed = [e for e in episodes if not e["success"]]
+    return {"success_cohort": collect(succeeded), "failure_cohort": collect(failed),
+            "counts": {"success": len(succeeded), "failure": len(failed)}}
+
+
+def task_evidence(task: str, evaluation: Path, output: Path,
+                  repo: Path | None = None) -> dict[str, Any]:
+    """Assemble everything the controller can legitimately reason from.
+
+    `analyze()` is deliberately not merged in: it labels each episode with a fixed
+    set of failure categories, and inheriting those would hand the controller the
+    same pre-named answer this module exists to stop supplying.
+    """
+    legacy = analyze(evaluation)
+    metrics, traces = _traces(evaluation)
     episodes = []
-    for episode in metrics["episodes"]:
-        if episode["success"]:
-            continue
-        rows = [row for row in traces[episode["episode_seed"]]
-                if "basket" in row.get("entities", {}) and "milk" in row.get("entities", {})]
-        if not rows:
-            category = "insufficient_task_telemetry"
-            detail = {}
-        else:
-            basket = [_matrix(row["entities"]["basket"]["pose"]) for row in rows]
-            milk = [_matrix(row["entities"]["milk"]["pose"]) for row in rows]
-            y_move = max(pose[1, 3] - basket[0][1, 3] for pose in basket)
-            lift = max(pose[2, 3] - basket[0][2, 3] for pose in basket)
-            distances = [float(np.linalg.norm(milk_pose[:2, 3] - basket_pose[:2, 3]))
-                         for basket_pose, milk_pose in zip(basket, milk)]
-            final_in = distances[-1] < 0.10 and milk[-1][2, 3] > basket[-1][2, 3]
-            if lift <= 0.01:
-                category = "basket_lift_not_observed"
-            elif y_move <= 0.15:
-                category = "basket_transport_not_observed"
-            elif not final_in:
-                category = "milk_not_observed_in_basket_at_end"
-            else:
-                category = "stability_or_unsampled_condition_incomplete"
-            detail = {"max_basket_lift_m": float(lift), "max_basket_y_displacement_m": float(y_move),
-                      "min_milk_basket_xy_m": min(distances), "final_milk_in_basket_observation": bool(final_in)}
-        categories[category] += 1
-        episodes.append({"episode_seed": episode["episode_seed"], "category": category, **detail})
-    return {"plugin": "handle_basket_v1", "categories": dict(categories), "episodes": episodes,
-            "measurement_status": "exploratory_sampled_task_events_not_native_judge"}
-
-
-def task_failure_analysis(task: str, evaluation: Path, output: Path) -> dict[str, Any]:
-    result = analyze(evaluation)
-    if task in {"water_pouring", "handle_basket"}:
-        metrics, traces = _traces(evaluation)
-        result["task_diagnostics"] = (_water(metrics, traces) if task == "water_pouring"
-                                      else _handle(metrics, traces))
-    else:
-        result["task_diagnostics"] = {
-            "plugin": None, "measurement_status": "no_verified_task_semantic_plugin"}
+    for episode in metrics.get("episodes", []):
+        seed = int(episode["episode_seed"])
+        episodes.append({"episode_seed": seed, "success": bool(episode["success"]),
+                         "action_steps": episode.get("action_steps"),
+                         "trajectory": _trajectory(traces.get(seed) or [])})
+    result = {
+        "source": legacy.get("source"), "purpose": legacy.get("purpose"),
+        "summary": legacy.get("summary"),
+        "task_evidence": {
+            "task": task,
+            "measurement_status": "raw_observations_no_categories_assigned",
+            "success_predicate_source": success_predicate_source(repo, task),
+            "episodes": episodes,
+            "contrast": _contrast(episodes),
+            "unlike_the_old_plugin": (
+                "no failure modes are named and no thresholds are applied here; derive both "
+                "from success_predicate_source and the contrast distributions"),
+        },
+    }
     atomic_json(output, result)
     return result
