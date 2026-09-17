@@ -604,6 +604,14 @@ def main():
 
         return research_main(sys.argv[2:])
 
+    if first_arg == "scout":
+        # Read an unfamiliar benchmark and report what it can do. Separate from
+        # `research` because it answers a different question -- `scout` asks whether this
+        # benchmark can support a research loop at all, `research` runs one.
+        from autosim.research.scout import main as scout_main
+
+        return scout_main(sys.argv[2:])
+
     if first_arg == "run":
         parser = argparse.ArgumentParser(description="AutoSim Run — Generic Optimization")
         parser.add_argument("run_cmd", nargs="?")

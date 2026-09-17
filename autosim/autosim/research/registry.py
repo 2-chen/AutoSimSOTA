@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -60,11 +60,15 @@ class TaskSpec:
     control_parts: tuple[str, ...]
     recorded_fps: float
     instruction: str
-    gym_config: str
-    action_config: str
-    config_hashes: dict[str, str]
-    event_families: dict[str, list[str]]
-    roles: dict[str, Any]
+    # Everything below is how *this* benchmark states its setup, and a benchmark that
+    # states it differently has nothing to put here. They default to empty rather than
+    # being required, so a task contract stays a description of the task instead of a
+    # description of one simulator's file layout.
+    gym_config: str = ""
+    action_config: str = ""
+    config_hashes: dict[str, str] = field(default_factory=dict)
+    event_families: dict[str, list[str]] = field(default_factory=dict)
+    roles: dict[str, Any] = field(default_factory=dict)
     correction_supported: bool = False
     expert_adapter: str = "official"
 

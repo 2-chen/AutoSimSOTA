@@ -60,6 +60,34 @@ DeepSeek 负责研究提案，不负责执行 GPU 训练。
   跑通（`robotwin_validate_20260917`）：clean 库 +30 pp（7:1，p=0.035）、randomized 库 +15 pp（3:0，p=0.125）。
   每库 20 局，**方向性结果，未达统计确证**。
 
+### 陌生 benchmark 的自动接入
+
+给一个**从未见过**的 benchmark 仓库路径，系统自己读它、写出适配声明、逐条核对：
+
+```bash
+.venv/bin/autosim scout /path/to/SomeBenchmark --run-id onboard
+```
+
+流程是：**确定性扫描**（文件树、清单、把每个源文件里出现的信号按文件列出来，不作判断）→
+**LLM 决定读哪些文件** → **LLM 分两段写声明**（身份与任务合同 / 能力与可调空间）→
+**系统逐条核对**：路径是否存在、模式匹配到几个文件、声明里写进 `path` 的是不是一句话、
+声明的观测与动作维度是否与录制数据一致、仓库外的资产是否真有归属证据。
+模型声称的每一条与系统核实的每一条分开记录在 `verification.json` 里。
+
+在 **LIBERO** 上实测（`autoresearch_runs/scouting/libero_onboarded_v3`，约 40 秒）：
+
+| 系统自动得到 | 结果 |
+|---|---|
+| 身份与任务 | 130 个任务，从 `bddl_files/*/*.bddl` 数出来 |
+| 任务合同 | `state_dim=47, action_dim=7`，相机 `agentview_rgb`/`eye_in_hand_rgb` 128×128，`max_episode_steps=1000` —— **与录制的 HDF5 一致** |
+| 可调空间 | 从 LIBERO 自己的 CLI/配置推出：`device`、`use-depth`、`policy.policy_type`、`lifelong.algo`、`train.loss_scale` … |
+| 适配器协议 | `check_adapter` 报 0 个缺项 |
+| **`new_trajectory_generation`** | **unsupported** —— 它读了 `collect_demonstration.py`，发现里面是 `device.start_control()` + `input2action(...)` 的人工遥操作循环 |
+| `official_policy` | unsupported —— 它没有认领隔壁 RoboSyn 的 checkpoint，理由是这个路径不在本仓库任何脚本或配置里出现 |
+
+结论：接口能自动接通，**能力不能**。LIBERO 没有能自动产出成功轨迹的专家，而闭环的第一步就是采集新数据，
+所以系统给出的是一条阻塞理由，而不是跑八小时后失败。
+
 ## 复现
 
 上面的命令已用 `--dry-run` 逐字段比对过 `full_run_20260917` 记录的 `protocol.json`，
