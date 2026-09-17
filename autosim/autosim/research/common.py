@@ -191,6 +191,10 @@ def benchmark_roots(workspace: Path) -> list[Path]:
     by ``AUTOSIM_BENCHMARK_ROOT``. Deriving a single path from the project layout made
     moving a benchmark a code change; searching is what keeps it a preference.
     """
+    # Absolute first: `Path(".").parent` is `Path(".")`, so a relative workspace silently
+    # loses the parent as a search root and the nested walk resolves against the wrong
+    # directory. Everything downstream assumes these are real locations.
+    workspace = Path(workspace).expanduser().resolve()
     roots: list[Path] = []
     configured = os.environ.get(BENCHMARK_ROOT_ENV)
     if configured:
@@ -198,7 +202,7 @@ def benchmark_roots(workspace: Path) -> list[Path]:
     roots.extend([workspace, workspace.parent])
     seen, unique = set(), []
     for root in roots:
-        resolved = root.expanduser()
+        resolved = root.expanduser().resolve()
         if resolved not in seen and resolved.is_dir():
             seen.add(resolved)
             unique.append(resolved)
