@@ -38,6 +38,9 @@ from .recovery_agent import RecoveryAgent, development_failure_snapshot, error_k
 from .robosyn_adapter import PROFILE_FAMILIES, RoboSynAdapter
 from .runtime import (Runtime, retryable_collection_startup, retryable_evaluation_startup,
                       startup_receipt)
+from .adapter_protocol import OptimizationSpace
+from .decision import build_request as shared_build_request
+from .decision import validate_proposal as shared_validate
 from .skills import skills_reference
 from .task_diagnostics import task_evidence
 from .harness_config import load_harness_policy, policy_identity
@@ -58,27 +61,6 @@ ACTION_CHUNK_SIZE = 50
 #: bound here must be one the implementation actually honours -- publishing a wider
 #: range than the trainer accepts fails the round on a value the controller was told
 #: was legal.
-TRAINING_BOUNDS = {
-    "optimizer_lr": (1e-8, 1e-1),
-    "n_action_steps": (1, ACTION_CHUNK_SIZE),
-    "kl_weight": (0.0, 1e5),
-    "dropout": (0.0, 0.99),
-    "batch_size": (1, 4096),
-}
-
-#: Parameters the trainer *dispatches* on. These are a capability list, not a policy:
-#: an unlisted value has no implementation behind it, so the controller is told what
-#: exists rather than being allowed to discover it by failing a round.
-TRAINING_OPTIONS = {
-    "action_loss_profile": {"legacy_mask_mean", "valid_mean"},
-    "image_augmentation_profile": {"none", "clutter_occlusion_mild", "photometric_mild",
-                                   "photometric_strong", "camera_geometry_mild",
-                                   "illumination_step_mild"},
-}
-
-#: Everything the controller may set: numeric names carry (min, max), dispatched-on
-#: names carry the implemented value set.
-TRAINING_SPACE = {**TRAINING_BOUNDS, **TRAINING_OPTIONS}
 
 
 def load_deepseek_environment(repo: Path | None = None, *, project_root: Path | None = None) -> dict[str, Any]:
@@ -293,212 +275,102 @@ def _json_object(text: str) -> dict[str, Any]:
 
 def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str,
                       parent_checkpoint_sha256: str, parent_data_version: str,
-                      allowed_profiles: set[str] | None = None,
-                      allowed_collection_modes: set[str] | None = None,
+                      space: OptimizationSpace,
                       attempts_per_round: int = 100,
-                      training_steps: int = 20_000,
-                      development_episodes: int = 40,
                       min_original_fraction: float = 0.5) -> dict[str, Any]:
-    required = {"proposal_id", "parent_checkpoint_sha256", "parent_data_version",
-                "development_evidence_id", "hypothesis", "primary_intervention",
-                "collection", "training", "expected_validation"}
-    missing, extra = sorted(required - set(raw)), sorted(set(raw) - required)
-    # `decision` is an optional schema field. `round` is not part of the schema at all:
-    # build_prompt() sends the request as {"round": n, "required_schema": {...}, ...}, and
-    # the model sometimes echoes that wrapper key back into its answer. It carries no
-    # information the validator does not already bind (round_index is validated against
-    # proposal_id and the evidence ids), so it must not fail an otherwise valid proposal --
-    # it is dropped below to keep the persisted proposal canonical.
-    extra = [field for field in extra if field not in {"decision", "round", "resolution"}]
-    if missing or extra:
-        raise ValueError(f"proposal schema mismatch; missing={missing}; extra={extra}")
-    raw.pop("round", None)
-    # Optional: how many episodes this round's own development evidence should draw on.
-    # Without this the controller could see that two cohorts overlap but had no way to ask
-    # for the resolution that would separate them, so it could only guess or stop.
-    resolution = raw.get("resolution") or {}
-    if set(resolution) - {"development_episodes", "note"}:
-        raise ValueError("resolution schema mismatch")
-    requested_episodes = int(resolution.get("development_episodes", development_episodes))
-    if requested_episodes < 1:
-        raise ValueError("development episodes must be positive")
-    raw["resolution"] = {
-        "development_episodes": requested_episodes,
-        "note": str(resolution.get("note") or ""),
-    }
-    if raw["development_evidence_id"] != evidence_id:
-        raise ValueError("proposal cites the wrong development evidence")
-    if raw["parent_checkpoint_sha256"] != parent_checkpoint_sha256:
-        raise ValueError("proposal cites the wrong parent checkpoint")
-    if raw["parent_data_version"] != parent_data_version:
-        raise ValueError("proposal cites the wrong data version")
-    # A free label the controller names itself. The old three-value menu forced every idea
-    # into one of three buckets and then double-checked it agreed with the collection mode;
-    # what actually constrains execution is the collection mode, which is still validated
-    # against the adapters the benchmark really provides.
-    if not str(raw["primary_intervention"]).strip():
+    """RoboSynChallenge's rules on top of the shared decision layer.
+
+    The schema, the value space and every range come from the adapter's declaration. What
+    remains here is what is specific to this benchmark: a probe requirement on round one
+    and a floor on original-distribution coverage, both of which are properties of how
+    this benchmark's rounds are required to be shaped.
+    """
+    submitted = dict(raw)
+    # `round` is not part of the schema: build_prompt sends the request wrapped with it and
+    # the model sometimes echoes that wrapper back. It carries nothing the validator does
+    # not already bind, so it is dropped rather than failing an otherwise valid proposal.
+    submitted.pop("round", None)
+    outcome = shared_validate(
+        submitted, space=space, evidence_id=evidence_id,
+        evidence_field="development_evidence_id",
+        extra_fields=("primary_intervention",),
+        required_context={"parent_checkpoint_sha256": parent_checkpoint_sha256,
+                          "parent_data_version": parent_data_version})
+    if not str(outcome["primary_intervention"]).strip():
         raise ValueError("primary intervention must be a non-empty label")
-    decision = raw.get("decision", "experiment")
-    if decision not in {"experiment", "stop"}:
-        raise ValueError("decision must be experiment or stop")
-    collection = raw["collection"]
-    if set(collection) != {"enabled", "mode", "profile", "targeted_attempts", "original_attempts", "target_episodes"}:
-        raise ValueError("collection schema mismatch")
-    modes = allowed_collection_modes or {"expert", "policy_correction"}
-    if collection["mode"] not in modes:
-        raise ValueError("unsupported collection mode")
-    profiles = COLLECTION_PROFILES if allowed_profiles is None else allowed_profiles
-    if collection["profile"] not in profiles:
-        raise ValueError(f"collection profile {collection['profile']!r} is not one this "
-                         f"benchmark implements; available: {sorted(profiles)}")
-    targeted, original = int(collection["targeted_attempts"]), int(collection["original_attempts"])
-    # The controller may ask for a larger collection than the nominal round budget. The run's
-    # wall clock is what actually limits it, and the executor already enforces that, so an
-    # extra ceiling here would only stop it from spending budget it has.
-    ceiling = max(attempts_per_round, 10_000)
-    if targeted + original > ceiling or min(targeted, original) < 0:
-        raise ValueError(f"collection of {targeted + original} attempts exceeds the "
-                         f"supported ceiling of {ceiling}")
+
+    collection = outcome["collection"]
+    decision = outcome["decision"]
+    targeted = int(collection["targeted_attempts"])
+    original = int(collection["original_attempts"])
     minimum_original = int(attempts_per_round * min_original_fraction + 0.999999)
     if decision != "stop" and original < minimum_original:
-        raise ValueError("collection does not preserve the protocol's minimum original-distribution coverage")
+        raise ValueError("collection does not preserve the protocol's minimum "
+                         "original-distribution coverage")
     minimum_probe = min(20, max(1, attempts_per_round // 2))
     if decision != "stop" and round_index == 1 and (
             not collection["enabled"] or targeted < minimum_probe):
-        raise ValueError(f"round one must execute a targeted collection probe of at least {minimum_probe} attempts")
+        raise ValueError(f"round one must execute a targeted collection probe of at least "
+                         f"{minimum_probe} attempts")
     if collection["enabled"] and not 1 <= int(collection["target_episodes"]) <= max(1, targeted):
         raise ValueError("invalid targeted episode request")
-    training = raw["training"]
-    if set(training) - {"steps", "params", "targeted_sampling_mass", "phase_weights",
-                        "horizon_floor", "phase_bins"}:
-        raise ValueError("training schema mismatch")
-    if not {"steps", "params", "targeted_sampling_mass", "phase_weights",
-            "horizon_floor"} <= set(training):
-        raise ValueError("training schema mismatch")
-    # Training steps are the controller's experiment variable, not a frozen constant: it
-    # may spend more or less compute on a round it judges worth it. The wall clock is the
-    # real bound and the executor already enforces it, so no second ceiling is invented here.
-    if int(training["steps"]) < 1:
-        raise ValueError("training steps must be positive")
-    params = training["params"]
-    registered = set(TRAINING_BOUNDS) | set(TRAINING_OPTIONS)
-    if set(params) - registered:
-        raise ValueError(f"unregistered training parameter: {sorted(set(params) - registered)}")
-    for name, value in params.items():
-        if name in TRAINING_BOUNDS:
-            low, high = TRAINING_BOUNDS[name]
-            if not low <= float(value) <= high:
-                raise ValueError(f"{name}={value} is outside the supported range [{low}, {high}]")
-        elif value not in TRAINING_OPTIONS[name]:
-            raise ValueError(f"{name}={value!r} has no implementation; "
-                             f"supported: {sorted(TRAINING_OPTIONS[name])}")
-    # Sampling mass is the controller's lever over how hard it leans on the targeted set;
-    # the old 0.5 ceiling ruled out the very region the earlier experiments found decisive.
-    if not 0.0 < float(training["targeted_sampling_mass"]) <= 1.0:
-        raise ValueError("targeted sampling mass must be in (0,1]")
-    if any(float(v) <= 0 for v in training["phase_weights"].values()):
-        raise ValueError("phase weights must be positive")
-    # Optional: the controller may define its own progress bins instead of weighting the
-    # three pre-set ones. Coverage of [0,1] is a requirement of the sampler, not a policy.
-    if training.get("phase_bins") is not None:
-        bins = training["phase_bins"]
-        if not isinstance(bins, list) or not bins:
-            raise ValueError("phase_bins must be a non-empty list")
-        spans = []
-        for row in bins:
-            if set(row) != {"name", "start", "end", "weight"}:
-                raise ValueError("each phase bin needs name, start, end and weight")
-            if float(row["weight"]) <= 0:
-                raise ValueError("phase bin weights must be positive")
-            if not 0.0 <= float(row["start"]) < float(row["end"]):
-                raise ValueError(f"phase bin {row['name']!r} has an empty or negative span")
-            spans.append((float(row["start"]), float(row["end"])))
-        spans.sort()
-        if spans[0][0] > 0.0 or spans[-1][1] < 1.0:
-            raise ValueError("phase bins must cover the whole episode from 0 to 1")
-        for (_, end), (start, _) in zip(spans, spans[1:]):
-            if start > end:
-                raise ValueError("phase bins must not leave gaps")
-    if not 0 < float(training["horizon_floor"]) <= 1:
-        raise ValueError("horizon floor must be in (0,1]")
-    if not str(raw["hypothesis"]).strip() or not str(raw["expected_validation"]).strip():
-        raise ValueError("hypothesis and validation expectation are required")
     if decision == "stop":
         if round_index == 1:
             raise ValueError("round one cannot stop before the required bounded probe")
         if collection["enabled"] or targeted or original or int(collection["target_episodes"]):
             raise ValueError("stop decision must request zero collection work")
-    return raw
+    return outcome
 
 
-def build_prompt(round_index: int, context: dict[str, Any]) -> tuple[str, str]:
-    profiles = context.get("allowed_collection_profiles", sorted(COLLECTION_PROFILES))
-    modes = context.get("allowed_collection_modes", ["expert"])
-    attempts = int(context.get("attempts_per_round", 100))
-    steps = int(context.get("training_steps", 20_000))
-    development_episodes = int(context.get("development_episodes", 40))
-    original_fraction = float(context.get("min_original_fraction", 0.25))
-    original = max(1, int(attempts * original_fraction + 0.999999))
-    targeted = attempts - original
-    system = (
-        "You are the research decision module for a simulator manipulation task. Return exactly one JSON object "
-        "matching the supplied schema. The schema's example values are a workable starting point, not a menu: "
-        "you may set any numeric training control within the published bounds, name your own intervention, and "
-        "define your own progress bins. The only fixed quantities are the ones that keep results comparable "
-        "across rounds -- observations, the success judge, evaluation seeds, the evaluator -- plus whatever the "
-        "benchmark or trainer genuinely does not implement, which is listed as an implemented choice. "
-        "Treat diagnostics as evidence with stated limitations, not proven causality. Round 1 must request at "
-        "least one targeted attempt and at least as many original-distribution attempts. For any enabled "
-        f"collection, targeted_attempts + original_attempts must be <={attempts}, with at least {original} "
-        "original-distribution attempts. From round 2 onward, choose decision=stop when current evidence is "
-        "already saturated or no legal experiment is justified; a stop object must set collection.enabled=false "
-        "and all three collection counts to zero. Do not infer task semantics absent from the supplied contract. "
-        "You control your own evidence resolution: set resolution.development_episodes to raise or lower how many "
-        "episodes this round is judged on, and training.steps to spend more or less compute. If the failure and "
-        "success cohorts overlap so much that you cannot tell whether an intervention would help, raise the "
-        "resolution and say so in resolution.note rather than guessing or stopping. Explain in the hypothesis why "
-        "the resolution you chose is enough to test the claim you are making."
+
+def build_prompt(round_index: int, context: dict[str, Any],
+                 space: OptimizationSpace) -> tuple[str, str]:
+    """The request for one round.
+
+    The schema, the value space and the prose that describes them all come from the
+    adapter's declaration, so this function adds only what is specific to RoboSynChallenge:
+    the two parent digests the proposal must echo back, and the skill library.
+    """
+    system, request = shared_build_request(
+        space,
+        evidence=context,
+        evidence_id=context["development_evidence_id"],
+        evidence_field="development_evidence_id",
+        # Methods read from the on-disk skill library. Reference, not policy: nothing
+        # validates against them and the controller may contradict any of them.
+        method_library=skills_reference(
+            benchmark=BENCHMARK,
+            task=(context.get("task_contract") or {}).get("name")),
     )
-    schema = {
-        "decision": "experiment|stop",
-        "proposal_id": f"round_{round_index}_<short_name>",
-        "parent_checkpoint_sha256": context["parent_checkpoint_sha256"],
-        "parent_data_version": context["parent_data_version"],
-        "development_evidence_id": context["development_evidence_id"],
-        "hypothesis": "string", "primary_intervention": "your own short label for what you are changing",
-        "collection": {"enabled": True, "mode": "|".join(modes),
-                       "profile": "|".join(profiles),
-                       "targeted_attempts": targeted, "original_attempts": original,
-                       "target_episodes": targeted},
-        "training": {"steps": steps, "params": {"action_loss_profile": "valid_mean"},
-                     "targeted_sampling_mass": 0.5,
-                     "phase_weights": {"early": 0.75, "middle": 1.0, "late": 3.0},
-                     "phase_bins": "optional: [{name,start,end,weight},...] covering 0..1, "
-                                   "to define your own progress bins instead",
-                     "horizon_floor": 0.25},
-        "resolution": {"development_episodes": development_episodes,
-                       "note": "why this resolution can test your claim"},
-        "expected_validation": "string",
-    }
-    user = json.dumps({"round": round_index, "required_schema": schema,
-                       "training_parameters_you_may_set": {
-                           "free_numeric": {k: {"min": low, "max": high}
-                                            for k, (low, high) in TRAINING_BOUNDS.items()},
-                           "implemented_choices": {k: sorted(v) for k, v in TRAINING_OPTIONS.items()},
-                       },
-                       # Methods read from the on-disk skill library. Reference, not policy:
-                       # nothing validates against them and the controller may contradict any
-                       # of them. Deliberately outside `context` so adding a skill file does
-                       # not change the evidence identity of a round.
-                       "methods_reference": skills_reference(
-                           benchmark=BENCHMARK,
-                           task=(context.get("task_contract") or {}).get("name")),
-                       "context": context}, ensure_ascii=False, sort_keys=True)
-    return system, user
+    payload = json.loads(request)
+    # Sent as a wrapper key the model sometimes echoes; dropped by the validator.
+    payload["round"] = round_index
+    payload["required_skeleton"].update(
+        parent_checkpoint_sha256=context["parent_checkpoint_sha256"],
+        parent_data_version=context["parent_data_version"],
+        primary_intervention="your own short label for what you are changing",
+    )
+    return system, json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
 
 
 def _summary(metrics: dict[str, Any]) -> dict[str, Any]:
     return dict(metrics["summary"])
+
+
+
+def training_space_view(space: OptimizationSpace) -> dict[str, Any]:
+    """The declared training axes as a name -> accepted-values mapping, for the recovery
+    agent's snapshot. Ranges stay ranges; choices stay explicit lists."""
+    view: dict[str, Any] = {}
+    for axis in space.axes("training"):
+        if axis.group != "params":
+            continue
+        if axis.kind == "choice":
+            view[axis.name] = sorted(axis.values, key=str)
+        else:
+            view[axis.name] = (axis.low, axis.high)
+    return view
 
 
 class RepositoryAutoResearch:
@@ -1316,6 +1188,11 @@ class RepositoryAutoResearch:
         })
         return result
 
+    def space(self) -> OptimizationSpace:
+        """What this task's controller may vary, as its adapter declares it."""
+        assert self.adapter is not None
+        return self.adapter.optimization_space(self.task)
+
     def propose(self, round_index: int, context: dict[str, Any]) -> dict[str, Any]:
         path = self.run_root / "rounds" / f"round_{round_index}" / "proposal.json"
         if path.is_file():
@@ -1332,12 +1209,8 @@ class RepositoryAutoResearch:
                 evidence_id=context["development_evidence_id"],
                 parent_checkpoint_sha256=context["parent_checkpoint_sha256"],
                 parent_data_version=context["parent_data_version"],
-                allowed_profiles=self.allowed_profiles,
-                allowed_collection_modes=(
-                    {"expert", "policy_correction"} if self.spec.correction_supported else {"expert"}),
+                space=self.space(),
                 attempts_per_round=self.config.attempts_per_round,
-                training_steps=self.config.screen_steps,
-                development_episodes=self.config.development_episodes,
                 min_original_fraction=self.config.min_original_fraction)
             atomic_json(path, {
                 "schema_version": SCHEMA_VERSION, "proposal": proposal,
@@ -1348,7 +1221,7 @@ class RepositoryAutoResearch:
         client = LLMClient()
         if not client.available:
             raise RuntimeError("DEEPSEEK_API_KEY is not set in the autosim process environment")
-        system, user = build_prompt(round_index, context)
+        system, user = build_prompt(round_index, context, self.space())
         request_record = {
             "round": round_index, "request_sha256": object_digest({"system": system, "user": user}),
             "requested_model": client.model, "base_url": client.base_url,
@@ -1374,11 +1247,8 @@ class RepositoryAutoResearch:
                     evidence_id=context["development_evidence_id"],
                     parent_checkpoint_sha256=context["parent_checkpoint_sha256"],
                     parent_data_version=context["parent_data_version"],
-                    allowed_profiles=self.allowed_profiles,
-                    allowed_collection_modes=(
-                        {"expert", "policy_correction"} if self.spec.correction_supported else {"expert"}),
+                    space=self.space(),
                     attempts_per_round=self.config.attempts_per_round,
-                    training_steps=self.config.screen_steps,
                     min_original_fraction=self.config.min_original_fraction)
                 record = {"schema_version": SCHEMA_VERSION, "proposal": proposal,
                           "provider": metadata, "repair_attempt": repair,
@@ -1761,7 +1631,7 @@ class RepositoryAutoResearch:
                                    and baseline.get("summary", {}).get("episode_count") == dev_episodes),
                 round_index=round_index,
                 rounds_remaining=self.config.rounds - round_index,
-                training_params=proposal["training"]["params"], training_space=TRAINING_SPACE)
+                training_params=proposal["training"]["params"], training_space=training_space_view(self.space()))
             recovery = self._recovery_decision(snapshot)
             if recovery is None or recovery["decision"]["action"] != "quarantine_candidate":
                 raise

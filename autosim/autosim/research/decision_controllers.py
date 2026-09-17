@@ -79,5 +79,12 @@ def control_proposal(strategy: str, round_index: int, context: dict[str, Any], *
             "targeted_sampling_mass": targeted_mass,
             "phase_weights": phase_weights, "horizon_floor": 0.25,
         },
+        # Resolution is a knob every arm chooses, so a control that left it out would be
+        # comparing against a treatment held to a different evidence budget. The controls
+        # take the run's own development resolution: they are matched on what they measure.
+        "resolution": {
+            "development_episodes": int(context["development_episodes"]),
+            "note": "held at the run's development resolution so the arm is budget-matched",
+        },
         "expected_validation": "higher paired development success under the frozen evaluator",
     }

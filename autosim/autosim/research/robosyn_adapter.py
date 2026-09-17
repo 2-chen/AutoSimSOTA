@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .adapter_protocol import Axis, OptimizationSpace
 from .common import digest, read_json
 from .contracts import CapabilityRecord
 from .registry import EVENT_FAMILIES, TASK_IDS, TaskSpec, inventory, load_task
@@ -200,6 +201,130 @@ class RoboSynAdapter:
             "realized camera/material parameters are not available for readback")
             for profile in diagnostic_only)
         return records
+
+    #: What this benchmark's trainer implements. Facts about the ACT trainer shipped in
+    #: the repository, declared here rather than written into the decision layer.
+    TRAINING_BOUNDS = {
+        "optimizer_lr": (1e-8, 1e-1),
+        "n_action_steps": (1, 50),
+        "kl_weight": (0.0, 1e5),
+        "dropout": (0.0, 0.99),
+        "batch_size": (1, 4096),
+    }
+    #: (implemented values, the one this benchmark has reason to believe works). The second
+    #: is only the skeleton's starting point; every value in the first is proposable.
+    TRAINING_OPTIONS = {
+        "action_loss_profile": (("legacy_mask_mean", "valid_mean"), "valid_mean"),
+        "image_augmentation_profile": (("none", "clutter_occlusion_mild", "photometric_mild",
+                                        "photometric_strong", "camera_geometry_mild",
+                                        "illumination_step_mild"), "photometric_mild"),
+    }
+    PHASE_BIN_NAMES = ("early", "middle", "late")
+
+    @staticmethod
+    def _valid_phase_weights(value: Any) -> bool:
+        if not isinstance(value, dict) or not value:
+            return False
+        if any(not isinstance(v, (int, float)) or v <= 0 for v in value.values()):
+            return False
+        return set(value) in ({"early", "middle", "late"},
+                              {"early", "approach", "contact_recovery"})
+
+    @staticmethod
+    def _valid_phase_bins(value: Any) -> bool:
+        if not isinstance(value, list) or not value:
+            return False
+        spans = []
+        for row in value:
+            if not isinstance(row, dict) or set(row) != {"name", "start", "end", "weight"}:
+                return False
+            if float(row["weight"]) <= 0 or not 0.0 <= float(row["start"]) < float(row["end"]):
+                return False
+            spans.append((float(row["start"]), float(row["end"])))
+        spans.sort()
+        if spans[0][0] > 0.0 or spans[-1][1] < 1.0:
+            return False
+        return all(start <= end for (_, end), (start, _) in zip(spans, spans[1:]))
+
+    def optimization_space(self, task: str) -> OptimizationSpace:
+        """Everything the controller may vary for this task.
+
+        Derived from the task's own contract where the legal values depend on it -- the
+        collection profiles a task offers follow from the event families its config
+        declares -- and from the trainer's implemented set otherwise.
+        """
+        spec = load_task(self.repo, task)
+        profiles = tuple(sorted(self.collection_profiles(spec)))
+        modes = ("expert", "policy_correction") if spec.correction_supported else ("expert",)
+        attempts = 100  # the nominal round budget; the wall clock is the real ceiling
+        # Every parameter here is optional in the proposal because the trainer supplies a
+        # default for each (`runtime.Trainer` merges the proposal over its own defaults).
+        # Declaring them required would overstate the contract: a proposal that names one
+        # parameter and leaves the rest alone is executable, and the matched control arms
+        # are exactly that shape. They are still listed in the skeleton, so the controller
+        # sees them and their defaults.
+        params = tuple(
+            [Axis(name, "number", "trainer parameter", low=low, high=high, default=default,
+                  group="params", optional=True)
+             for (name, (low, high)), default in zip(
+                 self.TRAINING_BOUNDS.items(), (1e-5, 25, 10.0, 0.1, 32))]
+            + [Axis(name, "choice", "implemented choice", values=values,
+                    default=preferred, group="params", optional=True)
+               for name, (values, preferred) in self.TRAINING_OPTIONS.items()]
+        )
+        return OptimizationSpace(
+            collection=(
+                Axis("enabled", "choice", "whether this round collects new data",
+                     values=(True, False), default=True),
+                Axis("mode", "choice", "how the expert is driven",
+                     values=modes, default=modes[0]),
+                Axis("profile", "choice",
+                     "which distribution the targeted collection draws from; the profiles a "
+                     "task offers follow from the event families its config declares",
+                     values=profiles, default=profiles[0] if profiles else "full_random"),
+                Axis("targeted_attempts", "integer",
+                     "attempts spent on the targeted distribution", low=0, high=10_000,
+                     default=int(attempts * 0.75)),
+                Axis("original_attempts", "integer",
+                     "attempts spent on the original distribution", low=0, high=10_000,
+                     default=int(attempts * 0.25)),
+                Axis("target_episodes", "integer",
+                     "episodes the targeted collection aims for", low=0, high=10_000,
+                     default=int(attempts * 0.75)),
+            ),
+            training=(
+                Axis("steps", "integer", "candidate training steps", low=1, high=1_000_000,
+                     default=20_000),
+                *params,
+                Axis("targeted_sampling_mass", "number",
+                     "share of training samples drawn from the targeted distribution",
+                     low=0.001, high=1.0, default=0.5),
+                Axis("phase_weights", "structure",
+                     "a weight per progress bin, positive, keyed by the three registered "
+                     "bin names", default={"early": 0.75, "middle": 1.0, "late": 3.0},
+                     validator=self._valid_phase_weights),
+                Axis("horizon_floor", "number",
+                     "floor on the action-chunk validity weight", low=0.001, high=1.0,
+                     default=0.25),
+                Axis("phase_bins", "structure",
+                     "optional: define your own progress bins instead of weighting the three "
+                     "registered ones; each needs name, start, end and weight, and together "
+                     "they must cover the episode from 0 to 1",
+                     default=None, optional=True, validator=self._valid_phase_bins),
+            ),
+            # A third section: how many episodes this round's own evidence draws on. It is
+            # neither a collection knob nor a training knob, so it is declared as its own
+            # section rather than forced into one of the two.
+            extra=(("resolution", (
+                Axis("development_episodes", "integer",
+                     "episodes this round is judged on; raise it when the success and failure "
+                     "cohorts overlap too much to tell whether an intervention helped",
+                     low=1, high=10_000, default=40),
+                Axis("note", "structure",
+                     "why this resolution can test the claim you are making",
+                     default="", validator=lambda v: isinstance(v, str)),
+            )),),
+        )
 
     @staticmethod
     def challenge_context(spec: TaskSpec) -> dict[str, Any]:

@@ -1,17 +1,109 @@
 # AutoSimSOTA
 
-面向具身仿真 benchmark 的可审计自动研究系统。核心入口接收 benchmark 仓库路径，发现任务与能力，由研究控制器提出实验，再由本地执行器完成数据采集、质检、policy训练、原生评测、候选选择与导出。DeepSeek负责研究提案，不负责执行GPU训练。
+面向具身仿真 benchmark 的可审计自动研究系统。
+
+一条指令接收 benchmark 仓库路径，系统自己完成：识别任务与能力 → 构建证据 → 由 LLM 研究控制器提出实验 →
+定向采集数据 → 质检准入 → 训练 policy → 原生评测 → 候选选择 → 冻结确认 → 导出可运行的优化后仓库。
+DeepSeek 负责研究提案，不负责执行 GPU 训练。
+
+```bash
+.venv/bin/autosim research /path/to/RoboSynChallenge \
+  --task water_pouring --controller api --allow-api-egress --gpu 0 \
+  --rounds 2 --attempts-per-round 100 --training-steps 20000 \
+  --development-episodes 40 --selection-episodes 100 --final-episodes 200 \
+  --train-seed 1000 --min-original-fraction 0.25 --hours 24
+```
+
+## 阶段性成果
+
+### RoboSynChallenge / water_pouring：同种子配对确认
+
+一次上述指令（`run_id=full_run_20260917`，2026-09-17，墙钟约 8.7 小时，2 轮全部完成），
+在冻结的 200 局确认库上、三条臂使用**完全相同**的初始状态种子：
+
+| 臂 | 成功 | 成功率 | vs 候选（配对 McNemar 精确检验） |
+|---|---|---|---|
+| 官方 ACT checkpoint | 94/200 | **47.0%** | 候选多赢 70 局、少赢 6 局，**+32.0 pp，p = 3.2e-15** |
+| 等预算纯官方数据续训 | 103/200 | **51.5%** | 候选多赢 62 局、少赢 7 局，**+27.5 pp，p = 2.1e-12** |
+| 本系统候选 | 158/200 | **79.0%** | — |
+
+第二条对照是这个结果的关键：它与候选**同轮数、同 20000 步、同初始 checkpoint、同训练种子**，
+只是数据全部来自官方数据集。所以提升不是"多训练了一会儿"造成的。
+
+导出验证：`export_validation.status = passed`，优化后的仓库在真实仿真器中跑通原生 episode
+（`execution_mode = real_simulation`）。这是导出可用性的冒烟检查，不是性能声明。
+
+### 系统自己收敛到的方案
+
+两轮的提案、假设、期望验证全部由 LLM 依据证据写出，没有任何按任务预置的规则：
+
+- **第 1 轮** — 从 40 局开发证据里读出失败队列（bottle 净位移 0.092 m vs 成功队列 0.203 m、
+  cup 缺少成功局的 z_range 抬升），判断为"抓取后未复位"的恢复类失败，选择 `targeted_recovery`
+  定向采集 75 次、保留 25 次原始分布采样、0.5 采样质量、20000 步。
+  开发库 15/40 → **31/40**。
+- **第 2 轮** — 控制器自己指出第 1 轮没有分离出"定向数据有用"和"这个 profile 有用"，
+  引用技能库中"profile 选择是本任务上最弱的杠杆"这条经验，设计了等质量等步数的对照：
+  换成 `targeted_clutter`。开发库 31/40 → 29/40（配对零结果），选择阶段 77/100 vs 75/100，
+  第 1 轮候选被选中。这正是它自己写下的零点条件——"换 profile 没有差别，说明 profile
+  选择不是约束"——系统据此收敛，而没有继续在第三个 profile 上浪费预算。
+
+每轮的提案、假设、理由、证据 id、期望验证都落在
+`autoresearch_runs/<benchmark>/<run_id>/rounds/round_N/proposal.json`，可逐轮审计。
+
+### 跨 benchmark 泛化
+
+决策层（`autosim/research/decision.py`）里**没有任何 benchmark 名称**：提示词、schema 与校验
+全部由适配器声明的优化空间生成。接入新 benchmark = 写一个适配器，不改决策层。
+
+- **RoboSynChallenge** — 上表即为其结果。
+- **RoboTwin 2.0 / beat_block_hammer** — 同一个决策层、同一条指令形态，`controller=api` 单轮闭环
+  跑通（`robotwin_validate_20260917`）：clean 库 +30 pp（7:1，p=0.035）、randomized 库 +15 pp（3:0，p=0.125）。
+  每库 20 局，**方向性结果，未达统计确证**。
+
+## 复现
+
+上面的命令已用 `--dry-run` 逐字段比对过 `full_run_20260917` 记录的 `protocol.json`，
+除 `dry_run` 标志本身外**零差异**——即这条命令就是当时跑出上表的命令。
+
+前置条件：
+
+1. benchmark 仓库 checkout（路径由你提供；也可用 `AUTOSIM_BENCHMARK_ROOT` 指定搜索目录）。
+2. 仿真器与 ACT 训练所需的独立环境、数据与资产（本仓库不打包）。
+3. 一块可用 GPU。
+4. 项目根目录 `.env` 中的 `DEEPSEEK_API_KEY`（`chmod 600`；该文件已被 `.gitignore` 忽略，永不入库）。
+
+产物落在 `autoresearch_runs/<benchmark>/<run_id>/`，包含逐轮提案、证据、评测、选择、
+确认报告与导出验证。中途中断可用同一 `--run-id` 加 `--continue-run` 续跑。
+
+想先确认环境而不动 API/GPU：
+
+```bash
+.venv/bin/autosim research /absolute/path/to/RoboSynChallenge --probe-only
+```
+
+## 诚实的边界
+
+- 上表是**本机、单任务、200 局**的结果，不是官方隐藏赛道成绩，也不是 SOTA 认证；
+  与公开榜单的数值不可直接相比（本地复评官方 checkpoint 为 47.0%，不等于榜单上该 checkpoint 的分数）。
+- 候选臂相对等预算对照，同时改变了三件事：训练数据的来源、混合采样方式、损失与增广 profile。
+  **本运行没有把增益归因到其中任何单独一项**——第 2 轮正是控制器自己去测其中一项的尝试。
+- 同种子配对检验排除了初始状态方差，但**没有排除仿真器本身的确定性差异**；
+  报告中的 `interpretation` 字段保留了这条限制原文。
+- RoboTwin 一栏样本量小，仅作泛化性的方向性证据。
+- 多卡与任意 benchmark 零样本适配仍未验证。
 
 ## 仓库边界
 
-- `autosim/`：Python包、CLI、适配器、研究执行器和测试；也保留早期实验模块。
-- `patches/`：RoboSyn/RoboTwin等外部仓库的本地兼容修改与基准版本记录，不包含完整上游代码或资产。
-- `docs/`：发布检查与当前可移植性限制。
+- `autosim/`：Python 包、CLI、适配器、研究执行器、技能库与测试。
+- `patches/`：RoboSyn/RoboTwin 等外部仓库的本地兼容修改与基准版本记录，不含完整上游代码或资产。
+- `docs/`：发布检查与可移植性限制。
 - `.env.example`：无凭据配置模板。
 
-第三方RoboSynChallenge、RoboTwin、EmbodiChain不是本项目核心代码。虚拟环境、模型、数据、缓存、运行报告和本地历史plan不进入Git；忽略规则不删除这些本地文件。实际维护的总计划目前位于本仓库外，不是运行依赖。
+第三方 RoboSynChallenge、RoboTwin、EmbodiChain 不是本项目核心代码。虚拟环境、模型、数据、缓存、
+运行报告和本地历史 plan 不进入 Git；忽略规则不删除这些本地文件。实际维护的总计划位于本仓库外，
+不是运行依赖。
 
-## 安装与CPU检查
+## 安装与 CPU 检查
 
 从本仓库根目录执行：
 
@@ -22,19 +114,13 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 ```
 
-这只安装核心依赖，不安装仿真器、CUDA、ACT训练依赖或资产。真实研究需要按对应benchmark配置独立环境及数据。项目根目录的`.env`用于本地API配置；不要把密钥放进提交、报告或命令示例。
+这只安装核心依赖，不安装仿真器、CUDA、ACT 训练依赖或资产。真实研究需要按对应 benchmark
+配置独立环境及数据。项目根目录 `.env` 用于本地 API 配置；不要把密钥放进提交、报告或命令示例。
 
-```bash
-# 仅发现能力，不启动API或GPU训练；路径由使用者提供
-.venv/bin/autosim research /absolute/path/to/RoboSynChallenge --probe-only
-```
-
-完整流程见[研究入口说明](autosim/autosim/research/README.md)。其中历史机器路径和结果是开发记录，不是便携部署承诺；发布前请阅读[发布检查](docs/RELEASE_READINESS.md)。
-
-## 当前验证范围
-
-ClickBell已有真实API闭环及本地提升证据；Water/Handle只有小规模本地先导，RoboTwin已完成单轮启发式闭环但没有性能提升。尚未证明API决策优于等预算随机/固定对照，也没有自动多卡或任意benchmark零样本适配能力。结果不是官方隐藏赛道或SOTA认证。
+完整流程见[研究入口说明](autosim/autosim/research/README.md)；发布前请阅读[发布检查](docs/RELEASE_READINESS.md)。
 
 ## 许可与发布
 
-尚未确定本仓库整体许可证，请维护者在公开发布前确认核心代码来源并选择许可证。第三方组件各自遵循原许可证；兼容补丁不改变其权利归属。不要因早期README的许可证徽章而推断本仓库整体已获MIT授权。
+尚未确定本仓库整体许可证，请维护者在公开发布前确认核心代码来源并选择许可证。
+第三方组件各自遵循原许可证；兼容补丁不改变其权利归属。
+不要因早期 README 的许可证徽章而推断本仓库整体已获 MIT 授权。

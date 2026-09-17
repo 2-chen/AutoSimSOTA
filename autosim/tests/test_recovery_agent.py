@@ -1,6 +1,7 @@
 """Recovery control-flow tests use CPU fixtures, never claim simulator results."""
 import json
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +14,22 @@ from autosim.research.evaluation import TraceEnv
 from autosim.research.policy_rpc import policy_observation
 from autosim.research.recovery_agent import RecoveryAgent, development_failure_snapshot, validate_decision
 from autosim.research import repository_autoresearch as research
+from autosim.research.common import find_benchmark
+from autosim.research.robosyn_adapter import RoboSynAdapter
+
+
+@lru_cache(maxsize=1)
+def declared_space():
+    """The task's real declaration, so fixture proposals face the contract the system runs.
+
+    Read from the adapter rather than restated: these fixtures exercise failure handling,
+    and a local copy of the schema would let them keep passing after the real one moved.
+    """
+    repo = find_benchmark("RoboSynChallenge", Path(__file__).resolve().parents[2],
+                          marker="scripts/eval_policy.py")
+    if repo is None:
+        pytest.skip("RoboSynChallenge checkout not found")
+    return RoboSynAdapter(repo).optimization_space("click_bell")
 
 
 def decision(snapshot, **changes):
@@ -48,7 +65,7 @@ def failed_evaluation(path, message="ValueError: invalid state shape/values: (1,
 def snapshot(path, **kwargs):
     return development_failure_snapshot(path, state_dim=14, checkpoint_sha256="fixture",
         baseline_verified=True, round_index=1, rounds_remaining=1,
-        training_params={}, training_space=research.TRAINING_SPACE, **kwargs)
+        training_params={}, training_space=research.training_space_view(declared_space()), **kwargs)
 
 
 def test_legacy_nan_classification_keeps_raw_logs_private(tmp_path):
@@ -181,7 +198,8 @@ def cpu_runner(tmp_path, monkeypatch, *, rounds=2, all_invalid=False, error=None
                      "dataset_info_sha256": digest(data / "meta/info.json")}
     runner.task = "click_bell"
     runner.spec = SimpleNamespace(state_dim=14, correction_supported=True, as_dict=lambda: {"state_dim": 14})
-    runner.adapter = SimpleNamespace(challenge_context=lambda spec: {}, capabilities=lambda spec: [])
+    runner.adapter = SimpleNamespace(challenge_context=lambda spec: {}, capabilities=lambda spec: [],
+                                     optimization_space=lambda task: declared_space())
     runner.allowed_profiles = {"targeted_recovery"}
     runtime = SimpleNamespace(deadline=None, cost_model={}, prepare_data=lambda *args: {})
     runner.runtime = runtime

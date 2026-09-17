@@ -17,6 +17,19 @@ from autosim.research.repository_autoresearch import (
     validate_proposal,
 )
 from autosim.research.decision_controllers import control_proposal
+from autosim.research.robosyn_adapter import RoboSynAdapter
+
+
+@pytest.fixture(scope="module")
+def space():
+    """The real declaration, for the task whose contract these tests exercise.
+
+    Taken from the adapter rather than restated here: the declaration *is* the contract,
+    so a test that carried its own copy would keep passing after the two drifted.
+    """
+    if ROBOSYN is None:
+        pytest.skip("RoboSynChallenge checkout not found")
+    return RoboSynAdapter(ROBOSYN).optimization_space("click_bell")
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -28,6 +41,7 @@ ROBOSYN = find_benchmark("RoboSynChallenge", WORKSPACE, marker="scripts/eval_pol
 
 def proposal(**overrides):
     value = {
+        "decision": "experiment",
         "proposal_id": "round_1_contact",
         "parent_checkpoint_sha256": "weights",
         "parent_data_version": "data",
@@ -40,6 +54,7 @@ def proposal(**overrides):
                      "targeted_sampling_mass": 0.5,
                      "phase_weights": {"early": 0.75, "approach": 1.0, "contact_recovery": 3.0},
                      "horizon_floor": 0.25},
+        "resolution": {"development_episodes": 40, "note": "baseline development resolution"},
         "expected_validation": "improve complete task success on the fixed development bank",
     }
     value.update(overrides)
@@ -62,50 +77,53 @@ def test_repository_misrecognition_is_rejected(tmp_path):
         discover_robosyn(tmp_path)
 
 
-def test_proposal_contract_accepts_bounded_targeted_collection():
+def test_proposal_contract_accepts_bounded_targeted_collection(space):
     result = validate_proposal(proposal(), round_index=1, evidence_id="evidence",
-                               parent_checkpoint_sha256="weights", parent_data_version="data")
+                               parent_checkpoint_sha256="weights", parent_data_version="data",
+                               space=space)
     assert result["collection"]["original_attempts"] >= result["collection"]["targeted_attempts"]
 
 
 @pytest.mark.parametrize("mutation, message", [
-    ({"development_evidence_id": "final-bank"}, "wrong development evidence"),
+    ({"development_evidence_id": "final-bank"}, "does not cite the current evidence"),
     ({"primary_intervention": "targeted_data",
-      "collection": {"enabled": True, "mode": "expert", "profile": "targeted_camera",
+      "collection": {"enabled": True, "mode": "expert", "profile": "targeted_clutter",
                      "targeted_attempts": 60, "original_attempts": 40, "target_episodes": 30}}, "minimum original-distribution"),
     # Numeric controls are free within published bounds; only values past the bound are
     # rejected, and only choices with no implementation behind them are refused outright.
     ({"training": {"steps": 20_000, "params": {"optimizer_lr": 1e3},
                    "targeted_sampling_mass": 0.2,
                    "phase_weights": {"early": 1, "approach": 1, "contact_recovery": 1},
-                   "horizon_floor": 0.25}}, "outside the supported range"),
+                   "horizon_floor": 0.25}}, r"training.params.optimizer_lr does not accept"),
     ({"training": {"steps": 20_000, "params": {"action_loss_profile": "not_implemented"},
                    "targeted_sampling_mass": 0.2,
                    "phase_weights": {"early": 1, "approach": 1, "contact_recovery": 1},
-                   "horizon_floor": 0.25}}, "has no implementation"),
+                   "horizon_floor": 0.25}}, r"training.params.action_loss_profile does not accept"),
 ])
-def test_proposal_contract_rejects_invalid_or_leaking_actions(mutation, message):
+def test_proposal_contract_rejects_invalid_or_leaking_actions(space, mutation, message):
     with pytest.raises(ValueError, match=message):
         validate_proposal(proposal(**mutation), round_index=1, evidence_id="evidence",
-                          parent_checkpoint_sha256="weights", parent_data_version="data")
+                          parent_checkpoint_sha256="weights", parent_data_version="data",
+                          space=space)
 
 
-def test_round_two_prompt_contains_real_round_one_feedback():
+def test_round_two_prompt_contains_real_round_one_feedback(space):
     context = {"development_evidence_id": "feedback-hash", "parent_checkpoint_sha256": "weights",
                "parent_data_version": "data", "round_2_must_use_round_1_feedback": True,
                "development_evidence": {"round_1_development_summary": {"success_rate": 0.7}}}
-    _, user = build_prompt(2, context)
+    _, user = build_prompt(2, context, space)
     assert "feedback-hash" in user and "round_1_development_summary" in user
 
 
-def test_round_two_can_stop_without_spending_more_budget():
+def test_round_two_can_stop_without_spending_more_budget(space):
     value = proposal(
         decision="stop", primary_intervention="data_processing",
-        collection={"enabled": False, "mode": "expert", "profile": "targeted_camera",
+        collection={"enabled": False, "mode": "expert", "profile": "targeted_clutter",
                     "targeted_attempts": 0, "original_attempts": 0, "target_episodes": 0})
     assert validate_proposal(
         value, round_index=2, evidence_id="evidence",
-        parent_checkpoint_sha256="weights", parent_data_version="data")["decision"] == "stop"
+        parent_checkpoint_sha256="weights", parent_data_version="data",
+        space=space)["decision"] == "stop"
 
 
 def test_deepseek_environment_has_precedence(monkeypatch):
@@ -194,22 +212,20 @@ def test_generic_discovery_does_not_require_clickbell_dimensions():
 
 
 @pytest.mark.parametrize("strategy", ["fixed", "random", "heuristic"])
-def test_matched_control_controllers_return_validated_proposals(strategy):
+def test_matched_control_controllers_return_validated_proposals(space, strategy):
     context = {
         "development_evidence_id": "evidence", "parent_checkpoint_sha256": "weights",
         "parent_data_version": "data", "allowed_collection_profiles": [
             "composite_hard", "targeted_camera", "targeted_recovery"],
         "allowed_collection_modes": ["expert"], "attempts_per_round": 40,
-        "training_steps": 5000, "min_original_fraction": 0.25,
+        "training_steps": 5000, "min_original_fraction": 0.25, "development_episodes": 40,
         "development_evidence": {"categories": {"little_object_motion": 3}},
     }
     value = control_proposal(strategy, 1, context, seed=1000)
     result = validate_proposal(
         value, round_index=1, evidence_id="evidence",
         parent_checkpoint_sha256="weights", parent_data_version="data",
-        allowed_profiles=set(context["allowed_collection_profiles"]),
-        allowed_collection_modes={"expert"}, attempts_per_round=40,
-        training_steps=5000, min_original_fraction=0.25)
+        space=space, attempts_per_round=40, min_original_fraction=0.25)
     assert result["collection"]["targeted_attempts"] + result["collection"]["original_attempts"] == 40
 
 
@@ -219,7 +235,7 @@ def test_fixed_control_prefers_readable_profile_without_clickbell_composite():
         "parent_data_version": "data", "allowed_collection_profiles": [
             "targeted_appearance", "targeted_camera", "targeted_clutter", "targeted_recovery"],
         "allowed_collection_modes": ["expert"], "attempts_per_round": 10,
-        "training_steps": 200, "min_original_fraction": 0.25,
+        "training_steps": 200, "min_original_fraction": 0.25, "development_episodes": 40,
         "development_evidence": {},
     }
     value = control_proposal("fixed", 1, context, seed=1000)

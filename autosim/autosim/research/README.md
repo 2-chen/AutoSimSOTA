@@ -1,6 +1,6 @@
 # AutoSimSOTA Repository AutoResearch
 
-统一入口接收一个官方 benchmark 仓库，输出带 checkpoint、manifest 和完整研究账本的衍生仓库。RoboSynChallenge执行器已通过多次原生运行；RoboTwin ACT执行器现已接入同一入口，依次执行官方数据基线、clean/randomized失败证据、API/对照决策、有界专家采集、硬链接混合数据、候选训练、同seed原生评测和导出。RoboTwin首个非smoke端到端运行已完成：系统正确拒绝了性能下降的候选并回退基线；这证明闭环和部署可执行，不证明性能迁移或SOTA。
+统一入口接收一个官方 benchmark 仓库，输出带 checkpoint、manifest 和完整研究账本的衍生仓库。RoboSynChallenge执行器已通过多次原生运行；RoboTwin ACT执行器现已接入同一入口，依次执行官方数据基线、clean/randomized失败证据、API/对照决策、有界专家采集、硬链接混合数据、候选训练、同seed原生评测和导出。RoboTwin已有 API 决策的单轮闭环运行：clean 库 +30 pp（7:1，p=0.035）、randomized 库 +15 pp（3:0，p=0.125），每库 20 局，属方向性证据。RoboSynChallenge/water_pouring 的 200 局同种子配对确认见仓库根 README。
 
 ```bash
 /path/to/AutoSimSOTA/.venv/bin/autosim research /path/to/RoboSynChallenge \
@@ -29,6 +29,12 @@ autosim research RoboSynChallenge --task click_bell --controller fixed --run-id 
 autosim research RoboSynChallenge --task click_bell --controller random --run-id random_seed1
 autosim research RoboSynChallenge --task click_bell --controller heuristic --run-id heuristic_seed1
 
+# 完整确认运行（根 README 中 47.0% / 51.5% / 79.0% 那一行的命令）
+autosim research RoboSynChallenge --task water_pouring --controller api \
+  --allow-api-egress --gpu 0 --rounds 2 --attempts-per-round 100 --training-steps 20000 \
+  --development-episodes 40 --selection-episodes 100 --final-episodes 200 \
+  --train-seed 1000 --min-original-fraction 0.25 --hours 24 --run-id full_run
+
 # RoboTwin：官方数据基线 -> clean/randomized证据 -> 采集 -> 候选 -> 原生配对评测
 autosim research RoboTwin --task beat_block_hammer --controller heuristic \
   --robotwin-training-epochs 6000 --robotwin-evaluation-episodes 20 \
@@ -55,7 +61,20 @@ RoboSyn的DexSim会在真实解析仓库路径过深时于材质创建阶段触�
 6. 独立选型 bank 冻结候选；达到预设门槛后才打开 final bank。官方发布 policy、官方数据续训和候选使用相同 seed 顺序。
 7. 以研究评测实际使用的清洁兼容仓库为导出基底，只叠加有哈希记录的数据采集/训练扩展与 checkpoint，再逐级验证独立加载和原生 episode。只有原生 episode 真正执行才置 `export_runtime_verified=true`。
 
-能力初始状态只是 `declared`；必须有真实仿真/训练回执才升级为 `verified`。缺测量保持 `unknown` 或 `unsupported`。ClickBell 的按压诊断与历史先验只存在于任务插件，不会注入 WaterPouring、HandleBasket 等任务。
+能力初始状态只是 `declared`；必须有真实仿真/训练回执才升级为 `verified`。缺测量保持 `unknown` 或 `unsupported`。
+
+## 决策层与适配器
+
+提示词、提案 schema 与校验集中在 `decision.py`，其中**不含任何 benchmark 名称**：它接收适配器声明的
+`OptimizationSpace`，据此生成请求并校验提案。benchmark 的取值、分组、结构校验与耦合规则全部写在
+适配器里（`robosyn_adapter.py`、`robotwin_adapter.py`）。接入新 benchmark 只需实现
+`adapter_protocol.REQUIRED_METHODS`（`tasks` / `select_task` / `discover` / `task_contract` /
+`capabilities` / `optimization_space`），`check_adapter()` 会在运行前报出缺项，而不是中途崩溃。
+
+证据层同样不按任务分支：`task_evidence()` 输出原始测量（逐实体轨迹、成功/失败队列对比、任务自身
+`is_task_success` 的源码文本）而不命名类别，阈值与因果判断由控制器自己给出。
+`autosim/autosim/skills/*/SKILL.md` 是可增删的方法库，作为参考注入提示词——不参与校验，
+控制器可以推翻其中任何一条。
 
 ## 公平性与结论边界
 

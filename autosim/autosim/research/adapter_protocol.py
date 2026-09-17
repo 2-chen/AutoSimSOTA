@@ -52,9 +52,26 @@ class Axis:
     low: float | None = None
     high: float | None = None
     default: Any = None
+    #: Optional nesting inside the proposal, for benchmarks whose trainer takes its
+    #: parameters as a group. An axis with no group sits directly under
+    #: ``collection`` or ``training``; one with a group sits under that group. The
+    #: nesting is the benchmark's shape, so it is declared here rather than assumed
+    #: by the decision layer.
+    group: str = ""
+    #: For ``kind='structure'``: a predicate the adapter supplies, returning truthy
+    #: when the value is one it can execute. Absent means the axis accepts anything.
+    validator: Any = None
+    #: An optional axis may be left out of a proposal entirely. It is still validated when
+    #: present, and it is not shown in the skeleton -- omitting it means "use the default".
+    optional: bool = False
 
     def accepts(self, value: Any) -> bool:
         try:
+            if self.kind == "structure":
+                # A shape the decision layer has no business understanding -- a list of
+                # progress bins, a per-phase weight map. The adapter owns the check; the
+                # generic layer only insists that one exists.
+                return self.validator is None or bool(self.validator(value))
             if self.kind == "choice":
                 return value in self.values
             if self.kind == "integer":
@@ -68,6 +85,14 @@ class Axis:
         except TypeError:
             return False
         return False
+
+    def explain(self) -> str:
+        """What this axis accepts, in a form the controller can act on."""
+        if self.kind == "choice":
+            return f"one of {list(self.values)}"
+        if self.kind == "structure":
+            return self.description
+        return f"a {self.kind} in [{self.low}, {self.high}]"
 
     def describe(self) -> dict[str, Any]:
         if self.kind == "choice":
@@ -88,33 +113,55 @@ class OptimizationSpace:
 
     collection: tuple[Axis, ...] = ()
     training: tuple[Axis, ...] = ()
+    #: Further top-level sections beyond collection and training. RoboSynChallenge uses
+    #: one for the round's own evidence resolution, which is neither a collection knob
+    #: nor a training knob. Declaring sections rather than fixing two of them is what
+    #: keeps the next benchmark's third section from needing a change here.
+    extra: tuple[tuple[str, tuple[Axis, ...]], ...] = ()
+
+    def sections(self) -> dict[str, tuple[Axis, ...]]:
+        out = {"collection": self.collection, "training": self.training}
+        out.update(dict(self.extra))
+        return out
 
     def axes(self, group: str) -> tuple[Axis, ...]:
-        return self.collection if group == "collection" else self.training
+        return self.sections().get(group, ())
 
     def axis(self, group: str, name: str) -> Axis | None:
         return next((a for a in self.axes(group) if a.name == name), None)
 
     def describe(self) -> dict[str, Any]:
-        return {"collection": {a.name: a.describe() for a in self.collection},
-                "training": {a.name: a.describe() for a in self.training}}
+        return {name: {a.name: a.describe() for a in axes}
+                for name, axes in self.sections().items()}
 
     def skeleton(self) -> dict[str, Any]:
         """The starting point shown to the controller: declared defaults only."""
-        return {"collection": {a.name: a.default for a in self.collection},
-                "training": {a.name: a.default for a in self.training}}
+        return {name: _nest(axes) for name, axes in self.sections().items()}
+
+
+def _nest(axes: Sequence[Axis]) -> dict[str, Any]:
+    """Group axes into the nesting their declaration asks for."""
+    out: dict[str, Any] = {}
+    for axis in axes:
+        if axis.optional and not axis.group:
+            continue
+        if not axis.group:
+            out[axis.name] = axis.default
+            continue
+        out.setdefault(axis.group, {})[axis.name] = axis.default
+    return out
 
 
 def check_space(space: OptimizationSpace) -> list[str]:
     """Structural problems with a declared space, as messages (empty is good)."""
     problems = []
-    for group in ("collection", "training"):
+    for group, axes in space.sections().items():
         seen = set()
-        for axis in space.axes(group):
+        for axis in axes:
             if axis.name in seen:
                 problems.append(f"duplicate axis {group}.{axis.name}")
             seen.add(axis.name)
-            if axis.kind not in {"choice", "integer", "number"}:
+            if axis.kind not in {"choice", "integer", "number", "structure"}:
                 problems.append(f"{group}.{axis.name}: unknown kind {axis.kind!r}")
             elif axis.kind == "choice" and not axis.values:
                 problems.append(f"{group}.{axis.name}: choice axis declares no values")
