@@ -38,6 +38,7 @@ from .recovery_agent import RecoveryAgent, development_failure_snapshot, error_k
 from .robosyn_adapter import PROFILE_FAMILIES, RoboSynAdapter
 from .runtime import (Runtime, retryable_collection_startup, retryable_evaluation_startup,
                       startup_receipt)
+from .skills import skills_reference
 from .task_diagnostics import task_evidence
 from .harness_config import load_harness_policy, policy_identity
 
@@ -46,12 +47,20 @@ SCHEMA_VERSION = 1
 BENCHMARK = "RoboSynChallenge"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 COLLECTION_PROFILES = set(PROFILE_FAMILIES)
+#: The trainer's action-chunk length. `n_action_steps` is the number of actions executed
+#: per inference and cannot exceed it; the trainer enforces that, so the published bound
+#: has to match rather than advertise a range the implementation will refuse.
+ACTION_CHUNK_SIZE = 50
+
 #: Numeric training controls the controller may set freely, with sane outer bounds.
 #: Bounds exist to reject nonsense, not to steer the search: the trainer accepts any
-#: value in range, so the previous three-value menus only narrowed the space.
+#: value in range, so the previous three-value menus only narrowed the space. Every
+#: bound here must be one the implementation actually honours -- publishing a wider
+#: range than the trainer accepts fails the round on a value the controller was told
+#: was legal.
 TRAINING_BOUNDS = {
     "optimizer_lr": (1e-8, 1e-1),
-    "n_action_steps": (1, 4096),
+    "n_action_steps": (1, ACTION_CHUNK_SIZE),
     "kl_weight": (0.0, 1e5),
     "dropout": (0.0, 0.99),
     "batch_size": (1, 4096),
@@ -477,6 +486,13 @@ def build_prompt(round_index: int, context: dict[str, Any]) -> tuple[str, str]:
                                             for k, (low, high) in TRAINING_BOUNDS.items()},
                            "implemented_choices": {k: sorted(v) for k, v in TRAINING_OPTIONS.items()},
                        },
+                       # Methods read from the on-disk skill library. Reference, not policy:
+                       # nothing validates against them and the controller may contradict any
+                       # of them. Deliberately outside `context` so adding a skill file does
+                       # not change the evidence identity of a round.
+                       "methods_reference": skills_reference(
+                           benchmark=BENCHMARK,
+                           task=(context.get("task_contract") or {}).get("name")),
                        "context": context}, ensure_ascii=False, sort_keys=True)
     return system, user
 
@@ -1682,10 +1698,31 @@ class RepositoryAutoResearch:
         # there. Note this gives a multi-round candidate several rounds of training budget, so
         # it is no longer a matched comparison against the untuned official checkpoint; use a
         # same-total-steps official-data continuation as the control.
-        checkpoint = self.runtime.train(self.spec, Path(self.assets["official_dataset"]),
-            round_dir / "candidate", steps=int(proposal["training"]["steps"]),
-            params=proposal["training"]["params"], mixture=mixture,
-            seed=self.config.train_seed, pretrained=acting_checkpoint)
+        try:
+            checkpoint = self.runtime.train(self.spec, Path(self.assets["official_dataset"]),
+                round_dir / "candidate", steps=int(proposal["training"]["steps"]),
+                params=proposal["training"]["params"], mixture=mixture,
+                seed=self.config.train_seed, pretrained=acting_checkpoint)
+        except Exception as exc:
+            # A proposal that cannot be executed is evidence about the proposal, not a reason
+            # to end the search. Record it, keep the round visible in the history, and let the
+            # controller see its own mistake and try something else. Ending the whole run here
+            # made a single bad parameter fatal and left the controller unable to learn from it.
+            failure = f"{type(exc).__name__}: {exc}"
+            result = {"round": round_index, "proposal_id": proposal["proposal_id"],
+                      "proposal": proposal, "status": "failed", "error": failure,
+                      "cumulative_data": [{"profile": p, "root": str(r)} for p, r in cumulative],
+                      "completed_at": now()}
+            atomic_json(round_dir / "round_result.json", result)
+            if self.harness_artifacts:
+                self.harness_artifacts.commit_round(round_dir / "round_result.json", result)
+            self.state["rounds"] = [r for r in self.state["rounds"]
+                                    if r.get("round") != round_index]
+            self.state["rounds"].append({"round": round_index,
+                                         "proposal_id": proposal["proposal_id"],
+                                         "status": "failed", "error": failure})
+            self.save(stage=f"round_{round_index}_failed")
+            return result, cumulative
         if self.harness_artifacts:
             from .environment_contract import inspect_act_checkpoint
             contract = inspect_act_checkpoint(checkpoint,
@@ -1786,9 +1823,13 @@ class RepositoryAutoResearch:
                 record.update(hypothesis=proposal.get("hypothesis"),
                               primary_intervention=proposal.get("primary_intervention"),
                               collection=proposal.get("collection"),
+                              training=proposal.get("training"),
                               development_summary=result.get("development_summary"),
                               selection_summary=result.get("selection_summary"),
-                              checkpoint=result.get("checkpoint"))
+                              checkpoint=result.get("checkpoint"),
+                              # A round that could not run is reported here with its error so the
+                              # controller can see what it proposed and what the system refused.
+                              error=result.get("error"))
                 analysis_path = result.get("candidate_failure_analysis")
                 if analysis_path and Path(analysis_path).is_file():
                     round_analysis = read_json(Path(analysis_path))
@@ -1796,22 +1837,30 @@ class RepositoryAutoResearch:
                                                or round_analysis.get("analysis")
                                                or round_analysis)
             history.append(record)
-        evidence = baseline_analysis if prior is None else {
+        # `round_history` is present on every round, including round one and including a round
+        # that follows a failure. Gating it behind `prior is not None` dropped the record of a
+        # failed round exactly when the controller most needed to see what it had tried.
+        evidence: dict[str, Any] = {
             "baseline_failure_analysis": baseline_analysis,
             "round_history": history,
-            "previous_round": prior["round"],
-            "previous_proposal": prior["proposal"],
-            "previous_admitted_data": [{k: row[k] for k in ("profile", "accepted_episodes", "attempts_consumed")}
-                                       for row in prior["admitted_data"]],
-            "previous_training_exposure": [{k: row.get(k) for k in
-                ("profile", "source_kind", "expected_sampling_mass", "realized_sampling_mass", "yielded_samples")}
-                for row in exposure.get("parts", [])],
-            "previous_development_summary": prior["development_summary"],
-            "current_policy_checkpoint_sha256": (prior["fallback_policy_checkpoint_sha256"]
-                                                  if quarantined else prior["checkpoint_sha256"]),
-            "current_policy_failure_analysis": current_analysis,
-            "current_policy_evidence_id": object_digest(current_analysis),
         }
+        if prior is not None:
+            evidence.update({
+                "previous_round": prior["round"],
+                "previous_proposal": prior["proposal"],
+                "previous_admitted_data": [
+                    {k: row[k] for k in ("profile", "accepted_episodes", "attempts_consumed")}
+                    for row in prior["admitted_data"]],
+                "previous_training_exposure": [
+                    {k: row.get(k) for k in ("profile", "source_kind", "expected_sampling_mass",
+                                             "realized_sampling_mass", "yielded_samples")}
+                    for row in (exposure or {}).get("parts", [])],
+                "previous_development_summary": prior["development_summary"],
+                "current_policy_checkpoint_sha256": (prior["fallback_policy_checkpoint_sha256"]
+                                                     if quarantined else prior["checkpoint_sha256"]),
+                "current_policy_failure_analysis": current_analysis,
+                "current_policy_evidence_id": object_digest(current_analysis),
+            })
         if quarantined:
             evidence.update(previous_candidate_status="quarantined", previous_candidate_metrics_valid=False,
                             recovery=prior["recovery"])
@@ -1847,7 +1896,10 @@ class RepositoryAutoResearch:
         change another's number, so they are one phase: on several devices they run at the
         same time, and on one they run in the order they always did, official first.
         """
-        excluded = [{"round": row["round"], "status": row["status"], "checkpoint": row["checkpoint"]}
+        # A round that could not be executed has no checkpoint: it is excluded here rather
+        # than indexed, so a failed round is reported instead of raising on selection.
+        excluded = [{"round": row["round"], "status": row["status"],
+                     "checkpoint": row.get("checkpoint"), "error": row.get("error")}
                     for row in rounds if row["status"] != "completed"]
         rounds = [row for row in rounds if row["status"] == "completed"]
         if not rounds:
@@ -2200,12 +2252,18 @@ class RepositoryAutoResearch:
                 # round count guessed before the run started. Each round still chains from the
                 # previous candidate, so the search accumulates instead of restarting.
                 round_index = 1
+                feedback_prior = None
                 while self.config.rounds == 0 or round_index <= self.config.rounds:
                     prior, cumulative = self.run_round(
-                        round_index, self._feedback_context(baseline_analysis, prior), cumulative)
+                        round_index, self._feedback_context(baseline_analysis, feedback_prior),
+                        cumulative)
                     if prior["status"] == "stopped_by_controller":
                         break
                     rounds.append(prior)
+                    # A failed round produced no checkpoint and no metrics, so there is nothing
+                    # to carry into the next context; the failure itself stays in round_history,
+                    # which is where the controller reads it and decides what to do differently.
+                    feedback_prior = None if prior["status"] == "failed" else prior
                     round_index += 1
                 if not rounds:
                     raise RuntimeError("controller stopped without producing any candidate")
