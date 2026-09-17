@@ -177,3 +177,52 @@ def run_command(command: list[str], *, cwd: Path, env: dict[str, str],
     if record["status"] != "completed":
         raise RuntimeError(f"process {record['status']} ({record.get('returncode')}): {output / 'stdout.log'}")
     return record
+
+
+#: Colon-separated list of extra directories to search for benchmark checkouts.
+BENCHMARK_ROOT_ENV = "AUTOSIM_BENCHMARK_ROOT"
+
+
+def benchmark_roots(workspace: Path) -> list[Path]:
+    """Directories to search for a benchmark checkout, most specific first.
+
+    Benchmarks are separate checkouts and where they live is the operator's choice:
+    beside the project, grouped with others in a shared directory, or anywhere named
+    by ``AUTOSIM_BENCHMARK_ROOT``. Deriving a single path from the project layout made
+    moving a benchmark a code change; searching is what keeps it a preference.
+    """
+    roots: list[Path] = []
+    configured = os.environ.get(BENCHMARK_ROOT_ENV)
+    if configured:
+        roots.extend(Path(part).expanduser() for part in configured.split(os.pathsep) if part)
+    roots.extend([workspace, workspace.parent])
+    seen, unique = set(), []
+    for root in roots:
+        resolved = root.expanduser()
+        if resolved not in seen and resolved.is_dir():
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def find_benchmark(name: str, workspace: Path, *, marker: str, depth: int = 2) -> Path | None:
+    """Locate a checkout by name and a file that proves what it is.
+
+    Searches each root directly and then one level of subdirectories, so a layout
+    that groups benchmarks under a shared directory works as well as one that keeps
+    them side by side. Nothing here assumes a particular depth or an ancestor count.
+    """
+    for root in benchmark_roots(workspace):
+        direct = root / name
+        if (direct / marker).exists():
+            return direct.absolute()
+        if depth > 1:
+            try:
+                children = sorted(child for child in root.iterdir() if child.is_dir())
+            except OSError:
+                continue
+            for child in children:
+                nested = child / name
+                if (nested / marker).exists():
+                    return nested.absolute()
+    return None

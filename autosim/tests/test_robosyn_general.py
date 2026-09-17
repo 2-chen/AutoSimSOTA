@@ -9,8 +9,9 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from autosim.research.common import assert_frozen, freeze_files, redact
+from autosim.research.common import assert_frozen, find_benchmark, freeze_files, redact
 from autosim.research.ledger import SeedLedger, compare, holm
 from autosim.research.policy_rpc import observation_digest, policy_observation
 from autosim.research.registry import TASK_IDS, filter_training_events, load_task
@@ -26,7 +27,10 @@ from autosim.research.collection_worker import explicit_joint_flip_contract
 from autosim.research.data_version import fingerprint_dataset
 
 
-REPO = Path(__file__).resolve().parents[2] / "RoboSynChallenge"
+REPO = find_benchmark("RoboSynChallenge", Path(__file__).resolve().parents[2],
+                      marker="scripts/eval_policy.py")
+if REPO is None:
+    pytest.skip("no RoboSynChallenge checkout on disk", allow_module_level=True)
 
 
 class GeneralResearchTest(unittest.TestCase):

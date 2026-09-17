@@ -9,8 +9,8 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .common import (assert_frozen, atomic_json, digest, immutable_json, object_digest,
-                     read_json, run_command)
+from .common import (assert_frozen, atomic_json, digest, find_benchmark, immutable_json,
+                     object_digest, read_json, run_command)
 from .devices import DEFAULT_DEVICE_ENV, SimDeviceSelection, select, shard_count
 from .registry import TaskSpec
 from .native_lifecycle import retryable_startup, startup_attempt_limit
@@ -200,13 +200,17 @@ class Runtime:
     def repo(self) -> Path:
         if self.repo_path is not None:
             return self.repo_path.absolute()
-        # The benchmark is a separate checkout and may live outside the platform root,
-        # including directly under the workspace.
-        for candidate in (self.platform_root / "RoboSynChallenge",
-                          self.workspace / "RoboSynChallenge"):
-            if candidate.is_dir():
-                return candidate.absolute()
-        return (self.platform_root / "RoboSynChallenge").absolute()
+        # The benchmark is a separate checkout, and where it lives is the operator's
+        # choice: beside the project, grouped with others in a shared directory, or named
+        # by AUTOSIM_BENCHMARK_ROOT. Found rather than derived, so reorganising the
+        # checkouts is not a code change.
+        found = find_benchmark("RoboSynChallenge", self.workspace,
+                               marker="scripts/eval_policy.py")
+        if found is not None:
+            return found
+        # Nothing on disk: answer with the historical sibling path so the error a caller
+        # eventually raises names a plausible location instead of an empty one.
+        return (self.workspace / "RoboSynChallenge").absolute()
 
     @property
     def eval_repo(self) -> Path:

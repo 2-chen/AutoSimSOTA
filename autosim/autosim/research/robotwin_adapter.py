@@ -7,12 +7,22 @@ from typing import Any
 
 import yaml
 
+from .adapter_protocol import Axis, OptimizationSpace
 from .common import digest, object_digest
 from .contracts import CapabilityRecord
 
 
 class RoboTwinAdapter:
     benchmark = "RoboTwin"
+
+    #: What this benchmark's own trainer and collectors accept. These are facts about
+    #: RoboTwin -- the settings its configs define, the values its ACT trainer handles --
+    #: so they are declared here rather than written into the decision layer.
+    COLLECTION_SETTINGS = ("demo_clean", "demo_randomized")
+    TRAINING_EPOCHS = (2000, 6000)
+    TRAINING_LRS = (1e-5, 5e-6, 2e-5)
+    TRAINING_CHUNKS = (25, 50, 75)
+    TRAINING_KL_WEIGHTS = (1.0, 10.0)
 
     def __init__(self, repo: Path):
         self.repo = repo.absolute()
@@ -91,6 +101,46 @@ class RoboTwinAdapter:
                 "task_data": task_data,
             },
         }
+
+    def task_contract(self, task: str) -> dict[str, Any]:
+        """What the controller is told about this task. Benchmark-authored facts only."""
+        return self.discover(task)["task_contract"]
+
+    @classmethod
+    def declared_space(cls) -> OptimizationSpace:
+        """What the controller may vary here, and the values this benchmark accepts.
+
+        Declared rather than assumed: another benchmark with different collectors or a
+        different trainer declares a different space, and the decision layer follows it
+        without knowing either benchmark's name.
+        """
+        return OptimizationSpace(
+            collection=(
+                Axis("enabled", "choice", "whether this round collects new data at all",
+                     values=(True, False), default=True),
+                Axis("setting", "choice",
+                     "which collection configuration to draw from; the randomized setting "
+                     "varies scene and object placement, the clean one does not",
+                     values=cls.COLLECTION_SETTINGS, default="demo_randomized"),
+                Axis("new_episodes", "choice",
+                     "how many episodes this round asks for; zero means collect nothing",
+                     values=(0, 10), default=10),
+            ),
+            training=(
+                Axis("epochs", "choice", "how long to train the candidate",
+                     values=cls.TRAINING_EPOCHS, default=6000),
+                Axis("lr", "choice", "learning rate", values=cls.TRAINING_LRS, default=1e-5),
+                Axis("chunk_size", "choice", "action chunk length",
+                     values=cls.TRAINING_CHUNKS, default=50),
+                Axis("kl_weight", "choice", "weight on the VAE term",
+                     values=cls.TRAINING_KL_WEIGHTS, default=10.0),
+            ),
+        )
+
+    def optimization_space(self, task: str) -> OptimizationSpace:
+        """This task's space. Refuses a task the repository does not define."""
+        self.select_task(task)
+        return self.declared_space()
 
     def capabilities(self, task: str) -> list[CapabilityRecord]:
         xpolicy_ready = (self.repo / "XPolicyLab/pyproject.toml").is_file()

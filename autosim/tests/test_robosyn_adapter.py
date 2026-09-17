@@ -1,11 +1,18 @@
 from pathlib import Path
 
+import pytest
+
+from autosim.research.common import find_benchmark
 from autosim.research.registry import load_task
 from autosim.research.robosyn_adapter import RoboSynAdapter
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-ROBOSYN = PROJECT.parent / "RoboSynChallenge"
+# Found by content, not by counting parents: where the benchmark checkout lives is the
+# operator's choice, and asserting a depth made moving it a test failure.
+ROBOSYN = find_benchmark("RoboSynChallenge", PROJECT, marker="scripts/eval_policy.py")
+if ROBOSYN is None:
+    pytest.skip("no RoboSynChallenge checkout on disk", allow_module_level=True)
 
 
 def test_composite_hard_is_a_click_bell_only_historical_profile():

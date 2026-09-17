@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from autosim.llm_client import LLMClient
+from autosim.research.common import find_benchmark
 from autosim.research.repository_autoresearch import (
     ClickBellAutoResearch,
     MilestoneConfig,
@@ -20,7 +21,9 @@ from autosim.research.decision_controllers import control_proposal
 
 PROJECT = Path(__file__).resolve().parents[1]
 WORKSPACE = PROJECT.parent
-ROBOSYN = WORKSPACE / "RoboSynChallenge"
+# Found by content rather than assumed as a sibling, so the checkout can live
+# anywhere the operator prefers.
+ROBOSYN = find_benchmark("RoboSynChallenge", WORKSPACE, marker="scripts/eval_policy.py")
 
 
 def proposal(**overrides):
