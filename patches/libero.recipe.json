@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "repo": "/home/wbc/下载/autoresearch/test/LIBERO",
+  "python": "3.10",
+  "note": "Verified working on an RTX 5090 (sm_120). Records what was established by running; every command still runs and every probe still decides.",
+  "commands": [
+    "{conda} create -y -p {prefix} python=3.10",
+    "{python} -m pip install --upgrade pip setuptools wheel",
+    "{python} -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128",
+    "CMAKE_POLICY_VERSION_MINIMUM=3.5 {pip} install egl_probe",
+    "CMAKE_POLICY_VERSION_MINIMUM=3.5 {pip} install --no-build-isolation robosuite==1.4.0 bddl==1.0.1 numpy==1.26.4",
+    "{pip} install mujoco==2.3.7",
+    "{pip} install termcolor tensorboardX python-dateutil future thop wandb matplotlib opencv-python",
+    "{pip} install einops easydict hydra-core==1.2.0 omegaconf transformers==4.21.1 gym==0.25.2 cloudpickle robomimic==0.2.0",
+    "{pip} install --no-deps -e {repo}",
+    "{python} {prefix}/lib/python3.10/site-packages/robosuite/scripts/setup_macros.py"
+  ],
+  "probes": [
+    "MUJOCO_GL=egl {python} -c \"import torch; a=torch.randn(256,256,device='cuda'); b=torch.randn(256,256,device='cuda'); c=a@b; torch.cuda.synchronize(); print('gpu ok', c.sum().item())\"",
+    "MUJOCO_GL=egl LIBERO_PATH={repo} {python} -c \"import os,sys; sys.path.insert(0,'{repo}'); from libero.libero import benchmark, get_libero_path; from libero.libero.envs import OffScreenRenderEnv; ts=benchmark.get_benchmark_dict()['libero_10'](); t=ts.get_task(0); f=os.path.join(get_libero_path('bddl_files'), t.problem_folder, t.bddl_file); e=OffScreenRenderEnv(bddl_file_name=f, camera_heights=128, camera_widths=128); e.seed(0); e.reset(); o,_,_,_=e.step([0.0]*7); print('env ok', [k for k in o if 'image' in k]); e.close()\"",
+    "LIBERO_PATH={repo} {python} -c \"import sys; sys.path.insert(0,'{repo}'); import libero.lifelong.main; print('train ok')\"",
+    "LIBERO_PATH={repo} {python} -c \"import sys; sys.path.insert(0,'{repo}'); import libero.lifelong.evaluate; print('evaluate ok')\""
+  ]
+}
