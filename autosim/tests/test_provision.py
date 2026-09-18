@@ -192,3 +192,35 @@ def test_the_identity_is_the_commands_that_built_it(tmp_path):
 def test_the_machine_is_reported_so_a_plan_can_be_checked_against_it():
     facts = pv.platform_facts()
     assert "os" in facts and "gpus" in facts and "cuda_toolkit" in facts
+
+
+# -- carrying a lesson across environments -------------------------------------------------
+
+def test_a_recipe_can_seed_the_next_build():
+    """A lesson that cost nine rounds should not be relearned from a different prefix.
+
+    The CMake switch was used in one build and lost when the next began elsewhere, because
+    what a build learned about a repository lived only in the environment it learned it in.
+    """
+    seed = pv.seed_plan({"python": "3.10", "commands": ["a"], "probes": ["p"],
+                         "reasoning": "it worked"})
+    assert seed["python"] == "3.10" and seed["commands"] == ["a"] and seed["probes"] == ["p"]
+    assert "seeded" in seed["reasoning"]
+
+
+def test_a_seeded_plan_is_still_only_a_proposal():
+    """The commands run and the probes decide, exactly as for a plan the model wrote."""
+    import inspect
+    source = inspect.getsource(pv.build)
+    assert "seed_plan(seed)" in source
+    assert "Not trusted" in source
+
+
+def test_the_excerpt_carries_the_cause_in_a_short_log_too():
+    """The threshold was a fixed line count, so a log just under it returned its head only
+    and the fix named in its last line was never shown."""
+    log = ("error: wrapper\n" + "\n".join(f"  copying f{i}" for i in range(20))
+           + "\nCMake Error at CMakeLists.txt:1\n"
+             "  add -DCMAKE_POLICY_VERSION_MINIMUM=3.5")
+    excerpt = pv.error_excerpt(log)
+    assert "wrapper" in excerpt and "CMAKE_POLICY_VERSION_MINIMUM" in excerpt

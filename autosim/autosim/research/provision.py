@@ -356,7 +356,7 @@ def error_excerpt(output: str, *, limit: int = 1500) -> str:
     # with a word this function thought to look for: `CMake Error at` and `make: *** Error 2`
     # both matched none of the markers, so a long log returned its opening and nothing else.
     # When there is a lot of output, the end is included on that reasoning alone.
-    if len(lines) > hits[0] + 24:
+    if len(lines) > hits[0] + 16:
         return ("\n".join(head) + "\n...\n" + "\n".join(lines[-14:]))[:limit]
     return "\n".join(head)[:limit]
 
@@ -388,9 +388,24 @@ def conda_executable() -> str:
     return "conda"
 
 
+def seed_plan(recipe: dict[str, Any]) -> dict[str, Any]:
+    """A plan from a previous attempt, to be used before asking for a new one.
+
+    A lesson that cost nine rounds should not have to be relearned because the next build
+    started from a different prefix. What a successful -- or nearly successful -- build
+    established about *this* repository is a fact about the repository, and it survives the
+    environment it was learned in. The plan is still only a proposal: every command is run
+    and every probe decides.
+    """
+    return {"python": recipe["python"], "commands": list(recipe.get("commands") or []),
+            "probes": list(recipe.get("probes") or []),
+            "reasoning": f"seeded from {recipe.get('source', 'a previous attempt')}"}
+
+
 def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | None = None,
           max_rounds: int = 14, step_timeout: int = 3600,
-          manifests: dict[str, str] | None = None) -> dict[str, Any]:
+          manifests: dict[str, str] | None = None,
+          seed: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build until every probe passes, recording only what survived.
 
     The loop is: run the next command; if it fails, ask what to change given the failure and
@@ -425,7 +440,13 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
     survived = [row["command"] for row in record]
 
     if python is None:
-        planned = plan(client, repo, manifests=manifests)
+        # A seeded plan is tried before a new one is asked for. Not trusted: the commands
+        # run and the probes decide, exactly as for a plan the model wrote.
+        if seed is not None and seed.get("commands"):
+            planned = {**seed_plan(seed), "attempts": [
+                {"attempt": 0, "status": "seeded", "reasoning": seed.get("reasoning")}]}
+        else:
+            planned = plan(client, repo, manifests=manifests)
         python, pending = planned["python"], list(planned["commands"])
         probes = list(planned["probes"])
         transcript.append({"stage": "plan", **{k: planned[k] for k in ("reasoning",)},
@@ -435,6 +456,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
     atomic_json(output / "plan.json", {"python": python, "commands": pending, "probes": probes,
                                        "manifests": sorted(manifests), "created_at": now()})
 
+    # The recipe that survived, written beside the environment it produced, so the next
+    # build on this repository starts where this one finished rather than at the beginning.
     values = values_for(prefix, repo, workdir, conda_executable())
     index = 0
     for round_index in range(max_rounds):
@@ -715,6 +738,10 @@ def _finish(output: Path, repo: Path, python: str, record: list[dict[str, Any]],
     work it did: "rounds exhausted" tells a reader nothing they can act on, and the loop's
     own record of what it tried is the evidence for the answer.
     """
+    recipe = {"schema_version": 1, "repo": str(repo), "python": python, "probes": probes,
+              "commands": [row["command"] for row in record if row.get("kind") != "probe"],
+              "source": str(output.name), "verdict": verdict.get("reason", "passed")}
+    atomic_json(output / "recipe.json", recipe)
     result = {"schema_version": 1, "created_at": now(), "repo": str(repo), "python": python,
               "probes": probes, "record": record, "verdict": verdict,
               "content_id": content_id(python, record, repo),

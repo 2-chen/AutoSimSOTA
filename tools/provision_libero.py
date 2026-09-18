@@ -21,8 +21,11 @@ repo = Path("/home/wbc/下载/autoresearch/test/LIBERO")
 output = PROJECT_ROOT / "autoresearch_runs/provisioning/libero"
 
 started = time.time()
+seed_path = output / "seed.json"
+seed = json.loads(seed_path.read_text(encoding="utf-8")) if seed_path.is_file() else None
+print("seeded from:", seed_path if seed else "(no seed; asking the model)", flush=True)
 result = provision.build(repo, client=LLMClient(), prefix=output / "env", output=output,
-                          max_rounds=30, step_timeout=5400)
+                          max_rounds=30, step_timeout=5400, seed=seed)
 print("elapsed:", round((time.time() - started) / 60, 1), "min", flush=True)
 print("verdict:", json.dumps(result["verdict"], ensure_ascii=False)[:500], flush=True)
 print("probes:", json.dumps(result.get("probes"), ensure_ascii=False)[:300], flush=True)
