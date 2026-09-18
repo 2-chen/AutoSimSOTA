@@ -92,6 +92,9 @@ INPUT_VOCABULARY: dict[str, str] = {
     "python": "the interpreter to run with",
     "repo": "absolute path to the benchmark checkout",
     "task": "the task name this stage is for",
+    "setting": "which of the benchmark's own configurations to run under, when it names "
+               "them (a randomisation mode, a scene variant); a value the benchmark "
+               "defines, which the caller selects",
     "dataset": "absolute path to training data, when the stage consumes it",
     "checkpoint": "absolute path to a policy checkpoint, when the stage consumes one",
     "output": "absolute directory the stage should write into",
@@ -123,14 +126,39 @@ ARGV_SYSTEM = (
     "Every value in `declared_parameters` must be read from `i` by the name given, not "
     "written into the function as a literal -- otherwise a corrected value cannot reach the "
     "command, and the correction will look like it had no effect.\n\n"
-    "If the command was run and refused, you may also correct `declared_parameters`: some "
-    "failures are the function's fault and some are a value's, and a program that says it "
-    "cannot load something is telling you which. Return the whole corrected set, not just "
-    "the changed entry, and say in the reasoning what told you the value was wrong.\n\n"
+    "If the command was run and refused, you may also correct or extend "
+    "`declared_parameters`: some failures are the function's fault and some are a value's, "
+    "and a program that says it cannot load something is telling you which. A program "
+    "reporting that a value is missing is asking you to declare it -- add the entry rather "
+    "than reading a key nobody supplies. Return the whole set, not just the changed entry, "
+    "and say in the reasoning what told you the value was wrong.\n\n"
     "Return only {\"source\": \"<the function>\", \"reasoning\": \"<one or two "
     "sentences, including anything the vocabulary could not express>\", "
     "\"parameters\": {\"<name>\": \"<corrected value>\"} (optional)}."
 )
+
+
+def parameter_keys(name: str) -> list[str]:
+    """The keys a parameter is reachable by, however the invocation spells it.
+
+    A parameter is *named* the way the command line spells it -- `--max_episodes` -- and a
+    generated function reads it by whatever key it chose, usually the bare word. Requiring
+    those to match exactly turns a naming convention into a failure, and the failure is
+    reported as a KeyError in a function nobody can see.
+    """
+    bare = str(name).lstrip("-").replace("-", "_")
+    keys = [str(name), bare]
+    if bare != str(name).lstrip("-"):
+        keys.append(str(name).lstrip("-"))
+    return list(dict.fromkeys(keys))
+
+
+def expand_parameters(parameters: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name, value in (parameters or {}).items():
+        for key in parameter_keys(name):
+            out[key] = value
+    return out
 
 
 def error_excerpt(output: str, *, limit: int = 1200) -> str:
@@ -225,7 +253,8 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                 # hardcodes a value instead of reading it from `i` then looks like one that
                 # read it, which is precisely the difference this loop exists to find.
                 try:
-                    argv = checked_function(source, name)({**inputs_for_verify, **revised})
+                    argv = checked_function(source, name)(
+                        {**inputs_for_verify, **expand_parameters(revised)})
                 except Exception as exc:
                     raise ValueError(f"{name} could not build a command: "
                                      f"{type(exc).__name__}: {exc}") from None

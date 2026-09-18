@@ -75,9 +75,14 @@ class DeclarativeBackend:
         supplied.setdefault("repo", str(self.repo))
         supplied.setdefault("extra", {})
         # Declared values are settled for this repository, so they are added rather than
-        # asked for. A generated function may read them and may not need them.
-        for name, row in (self.parameters.get(stage) or {}).items():
-            supplied.setdefault(name, row.get("value"))
+        # asked for. A generated function may read them and may not need them, and it reads
+        # them by whatever key it chose, so a parameter is reachable by every spelling of
+        # its name rather than only the one the command line uses.
+        from .execution_derive import expand_parameters
+        for key, value in expand_parameters(
+                {name: row.get("value") for name, row in
+                 (self.parameters.get(stage) or {}).items()}).items():
+            supplied.setdefault(key, value)
         argv = self._functions[stage](supplied)
         if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
             raise ValueError(f"{argv_name(stage)} did not return a list of strings")
