@@ -12,6 +12,7 @@ program's own words, because a stage that did not run is a finding and not a cra
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -65,13 +66,37 @@ def main() -> int:
             continue
         source = (document.get("sources") or {}).get(stage, {}).get("source")
         if not source:
-            source, log = execution_derive.generate_argv(
+            # The program is the judge. A command that looks right and names flags the
+            # entry point does not accept is caught by running it, and only by running it:
+            # nothing that reads the repository knows what `evaluate.py` accepts, and its
+            # usage line states it exactly.
+            def verify(argv: list[str], stage: str = stage) -> dict:
+                try:
+                    done = subprocess.run([str(a) for a in argv], text=True,
+                                          capture_output=True, timeout=180, cwd=str(repo),
+                                          env={**os.environ, "PYTHONPATH": str(repo),
+                                               "MUJOCO_GL": "egl"})
+                except subprocess.TimeoutExpired:
+                    return {"ok": True}          # the arguments were accepted
+                return {"ok": done.returncode == 0,
+                        "error": (done.stderr or "") + "\n" + (done.stdout or "")}
+
+            source, revised, log = execution_derive.generate_argv(
                 client, stage, entrypoint=str(row.get("entrypoint")),
                 invocation=str(row.get("invocation")), repository_files=document.get("read") or [],
-                declared_parameters={p["name"]: p["value"] for p in (row.get("parameters") or [])})
+                declared_parameters={p["name"]: p["value"] for p in (row.get("parameters") or [])},
+                verify=verify, inputs_for_verify={
+                    "python": str(interpreter), "repo": str(repo), "task": "libero_10",
+                    "dataset": str(repo), "checkpoint": "", "output": str(output / "stage_out"),
+                    "steps": 1, "episodes": 1, "seed": 0, "device": "0", "setting": "random",
+                    "extra": {}})
             if source is None:
                 print(f"{stage}: no command could be generated: {log[-1].get('error', '')[:200]}")
                 continue
+            # A revised value is what the generator settled on, which may differ from the
+            # derivation's first answer.
+            for key, value in (revised or {}).items():
+                parameters.setdefault(stage, {})[key] = {"value": value}
         sources[stage] = source
         parameters[stage] = {p["name"]: p for p in (row.get("parameters") or [])}
 
