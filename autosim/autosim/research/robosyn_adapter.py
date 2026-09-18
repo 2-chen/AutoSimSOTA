@@ -31,6 +31,35 @@ class RoboSynAdapter:
     def __init__(self, repo: Path):
         self.repo = repo.absolute()
 
+    @staticmethod
+    def recognise(repo: Path) -> dict[str, Any]:
+        """Is this checkout RoboSynChallenge at all, before asking anything about a task.
+
+        Identity is a question about the repository and a task is a question inside it, so
+        this asks the first one on markers that do not depend on which task you want. It
+        exists because the two were asked in the wrong order: a checkout that was not
+        RoboSyn produced "no task has both an official ACT checkpoint and dataset", which
+        is a true sentence about a checkout the system should never have been reading.
+        """
+        repo = Path(repo)
+        markers = {
+            "pyproject": repo / "pyproject.toml",
+            "native_evaluator": repo / "scripts" / "eval_policy.py",
+            "task_package": repo / "robosynchallenge" / "tasks",
+        }
+        missing = sorted(name for name, path in markers.items() if not path.exists())
+        named = False
+        if "pyproject" not in missing:
+            text = markers["pyproject"].read_text(encoding="utf-8", errors="replace").lower()
+            named = "robosynchallenge" in text
+        return {"repo": str(repo.absolute()), "benchmark": RoboSynAdapter.benchmark,
+                "recognised": not missing and named,
+                "missing_markers": missing, "pyproject_names_the_project": named,
+                "markers": {name: str(path) for name, path in markers.items()},
+                "how_to_read_it_anyway":
+                    f"autosim scout {repo} --run-id <id> reads an unfamiliar benchmark and "
+                    f"reports what it can and cannot do"}
+
     def task_inventory(self) -> list[dict[str, Any]]:
         return inventory(self.repo)
 

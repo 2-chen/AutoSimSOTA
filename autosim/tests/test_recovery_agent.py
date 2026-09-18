@@ -338,6 +338,16 @@ def test_malformed_next_proposal_remains_a_repairable_validation_error():
             {"recovery_training_constraints": {"optimizer_lr": 5e-6}})
 
 
+def _checkout_looking_like_robosyn(root):
+    """The entry point settles identity before it builds anything, so the fixture must be
+    a checkout it can identify -- otherwise this tests the identity gate, not exit codes."""
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "robosynchallenge" / "tasks").mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text('name = "RoboSynChallenge"\n', encoding="utf-8")
+    (root / "scripts" / "eval_policy.py").write_text("# native evaluator\n", encoding="utf-8")
+    return root
+
+
 @pytest.mark.parametrize("status, code", [("completed", 0), ("completed_without_target_improvement", 0),
                                          ("prepared", 0), ("blocked", 3)])
 def test_cli_operational_exit_code_is_separate_from_improvement(tmp_path, monkeypatch, status, code):
@@ -346,6 +356,7 @@ def test_cli_operational_exit_code_is_separate_from_improvement(tmp_path, monkey
         configurations.append(config)
         return SimpleNamespace(execute=lambda: {"status": status})
     monkeypatch.setattr(research, "RepositoryAutoResearch", fake_runner)
-    assert research.main([str(tmp_path), "--recovery-controller", "api", "--recovery-max-calls", "3"]) == code
+    repo = _checkout_looking_like_robosyn(tmp_path)
+    assert research.main([str(repo), "--recovery-controller", "api", "--recovery-max-calls", "3"]) == code
     assert configurations[0].recovery_controller == "api"
     assert configurations[0].recovery_max_calls == 3

@@ -983,6 +983,17 @@ class RepositoryAutoResearch:
 
     def initialize(self) -> None:
         self.repo, source = resolve_repository(self.config.repo_input, self.run_root)
+        # Identity first. It used to be asked inside `discover`, which needs a task name, so
+        # the task was selected before anyone had established that this repository is
+        # RoboSynChallenge -- and on a checkout that was not, the answer came back as a
+        # missing checkpoint rather than a wrong repository.
+        recognition = RoboSynAdapter.recognise(self.repo)
+        if not recognition["recognised"]:
+            raise ValueError(
+                f"{self.repo} is not a RoboSynChallenge checkout: "
+                f"missing {recognition['missing_markers'] or 'nothing'}, "
+                f"pyproject names the project: {recognition['pyproject_names_the_project']}. "
+                f"{recognition['how_to_read_it_anyway']}")
         self.adapter = RoboSynAdapter(self.repo)
         self._first_step: dict[str, Any] | None = None
         self.task = self.adapter.select_task(self.config.task)
@@ -2482,6 +2493,27 @@ def main(argv: list[str] | None = None) -> int:
         return subprocess.call([sys.executable, *_probe_argv(args)])
     gpu = args.gpu if args.gpu is not None else "0"
     local_repo = Path(args.repo).expanduser()
+    # Identity is settled here, before anything is created, because a run filed under the
+    # wrong benchmark's name is worse than a run that does not start: it looks like a result.
+    # This used to fall through to the RoboSyn path for any checkout that was not RoboTwin,
+    # so pointing it at LIBERO produced "no task has both an official ACT checkpoint and
+    # dataset" and a run directory under `RoboSynChallenge/`.
+    if not ((local_repo / "env_cfg/task_config/demo_randomized.yml").is_file() and (
+            local_repo / "collect_data.sh").is_file()):
+        from .robosyn_adapter import RoboSynAdapter
+
+        recognition = RoboSynAdapter.recognise(local_repo)
+        if not recognition["recognised"]:
+            print(json.dumps({
+                "status": "unrecognised_benchmark",
+                "repo": recognition["repo"],
+                "why": "this checkout is neither a RoboTwin nor a RoboSynChallenge layout",
+                "missing_robosyn_markers": recognition["missing_markers"],
+                "robosyn_pyproject_names_the_project":
+                    recognition["pyproject_names_the_project"],
+                "next": recognition["how_to_read_it_anyway"],
+            }, ensure_ascii=False, indent=2))
+            return 2
     if (local_repo / "env_cfg/task_config/demo_randomized.yml").is_file() and (
             local_repo / "collect_data.sh").is_file():
         from .robotwin_adapter import RoboTwinAdapter

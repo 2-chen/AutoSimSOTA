@@ -11,6 +11,7 @@ from autosim.research.repository_autoresearch import (
     build_prompt,
     discover_robosyn,
     load_deepseek_environment,
+    main,
     make_parser,
     PROJECT_ROOT,
     resolve_assets,
@@ -277,3 +278,38 @@ def test_probe_only_reports_task_with_missing_assets(tmp_path):
     assert manifest["status"] == "incomplete"
     capabilities = json.loads((tmp_path / "RoboSynChallenge/sample-probe/capabilities.json").read_text())
     assert capabilities["task"] == "sample_loading"
+
+
+def test_identity_is_settled_before_anything_is_created(tmp_path, capsys):
+    """A run filed under the wrong benchmark's name is worse than one that never starts.
+
+    Pointing the entry point at a checkout that is neither RoboTwin nor RoboSynChallenge
+    used to fall through to the RoboSyn path: the task was selected before identity was
+    asked about, so the answer came back as a missing ACT checkpoint and a run directory
+    appeared under `RoboSynChallenge/`. Both are now gone.
+    """
+    foreign = tmp_path / "SomeBench"
+    (foreign / "tasks").mkdir(parents=True)
+    (foreign / "setup.py").write_text("setup(name='somebench')\n", encoding="utf-8")
+    output = tmp_path / "runs"
+    assert main([str(foreign), "--run-id", "stray", "--output-root", str(output)]) == 2
+    assert not output.exists(), "an unrecognised checkout must not create a run"
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "unrecognised_benchmark"
+    assert report["next"].startswith("autosim scout")
+
+
+def test_recognition_asks_only_task_independent_questions(tmp_path):
+    """Identity is about the repository; a task is a question inside it."""
+    from autosim.research.robosyn_adapter import RoboSynAdapter
+    bare = tmp_path / "RoboSynChallenge"
+    bare.mkdir()
+    assert RoboSynAdapter.recognise(bare)["recognised"] is False
+    (bare / "scripts").mkdir()
+    (bare / "robosynchallenge" / "tasks").mkdir(parents=True)
+    (bare / "scripts" / "eval_policy.py").write_text("", encoding="utf-8")
+    (bare / "pyproject.toml").write_text('name = "something-else"\n', encoding="utf-8")
+    # Every marker present but the project naming itself otherwise is still not this project.
+    assert RoboSynAdapter.recognise(bare)["recognised"] is False
+    (bare / "pyproject.toml").write_text('name = "RoboSynChallenge"\n', encoding="utf-8")
+    assert RoboSynAdapter.recognise(bare)["recognised"] is True
