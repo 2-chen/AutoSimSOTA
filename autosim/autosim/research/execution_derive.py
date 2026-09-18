@@ -46,7 +46,9 @@ STAGES: dict[str, str] = {
 SYSTEM = (
     "You are reading a benchmark repository to find how each stage of a research loop is "
     "invoked. For every stage listed, name the entry point and how it is called: the file to "
-    "run, the arguments that matter, and what appears on disk when it succeeds. If a stage "
+    "run, the arguments that matter, and what file appears under the output directory when "
+    "it succeeds -- a path or glob, not a description of one, because that is what will be "
+    "looked for. If a stage "
     "has no entry point in this repository, say so and say why -- a missing stage is a "
     "finding, not a failure, and a stage you could not find is a different finding from a "
     "stage the benchmark does not have.\n\n"
@@ -60,7 +62,8 @@ SYSTEM = (
     "parameter whose value you inferred rather than read must say what you inferred it from.\n\n"
     "Return one JSON object of the form {\"stages\": {\"<stage>\": {\"available\": true or "
     "false, \"entrypoint\": \"<path>\", \"invocation\": \"<how it is called>\", \"artifact\": "
-    "\"<what appears on success>\", \"level\": \"entry point, or the path this wraps\", "
+    "\"<a path or glob, relative to the output directory, that exists only on success>\", "
+    "\"level\": \"entry point, or the path this wraps\", "
     "\"parameters\": [{\"name\": \"<as the invocation spells it>\", \"value\": \"<the value "
     "for this repository>\", \"evidence\": \"<where that value comes from>\"}], "
     "\"why\": \"<when unavailable>\"}}, \"reasoning\": \"<how you found them>\"}."
@@ -119,6 +122,29 @@ ARGV_SYSTEM = (
 )
 
 
+def error_excerpt(output: str, *, limit: int = 1200) -> str:
+    """The part of a program's output that says what went wrong.
+
+    Not the tail. A program that prints a version banner on import and then refuses its
+    arguments has its cause *above* output that looks more recent, and a caller that reports
+    the last few lines sends the model a header instead of an error -- which is what
+    happened, four attempts in a row, each regenerating the same wrong command from the same
+    uninformative feedback.
+    """
+    lines = [line for line in output.splitlines() if line.strip()]
+    if not lines:
+        return "(no output)"
+    markers = ("error:", "usage:", "Traceback (most recent call last)", "Error:", "Exception:",
+               "cannot", "No such file", "not found", "unrecognized", "expected one argument")
+    hits = [index for index, line in enumerate(lines)
+            if any(marker in line for marker in markers)
+            or line.lstrip().startswith(("File \"", "raise "))]
+    if hits:
+        start = max(0, hits[0] - 1)
+        return "\n".join(lines[start:start + 14])[:limit]
+    return "\n".join(lines[-8:])[:limit]
+
+
 def argv_function_name(stage: str) -> str:
     return f"stage_argv_{stage}"
 
@@ -126,7 +152,8 @@ def argv_function_name(stage: str) -> str:
 def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                   repository_files: list[str],
                   declared_parameters: dict[str, str] | None = None,
-                  attempts: int = 3) -> tuple[str | None, list[dict[str, Any]]]:
+                  verify: Any = None, attempts: int = 3
+                  ) -> tuple[str | None, list[dict[str, Any]]]:
     """Write the function that turns the system's inputs into this benchmark's command.
 
     Generated rather than templated because invocations differ in kind rather than in
@@ -151,7 +178,10 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
     for repair in range(attempts):
         current = user if repair == 0 else user + json.dumps({
             "rejected": log[-1]["error"],
-            "instruction": f"Return only the corrected {name}, satisfying every constraint."},
+            "instruction": f"Return only the corrected {name}, satisfying every constraint. "
+                           "If the error is from running the command, the program's own "
+                           "usage line is the authority on what it accepts -- build the "
+                           "argv to match it exactly."},
             ensure_ascii=False)
         content, metadata = client.chat_with_metadata(ARGV_SYSTEM, current, max_tokens=3000,
                                                       timeout=180, thinking="disabled")
@@ -163,6 +193,14 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
             except (ValueError, SyntaxError) as exc:
                 from .contract_codegen import _offending_call
                 raise ValueError(f"{exc}{_offending_call(source)}") from None
+            if verify is not None:
+                # The command is run before it is accepted. Nothing static decides whether
+                # a flag exists on a program: the generated argv passed every check and was
+                # refused by the program itself, printing the usage line that says so.
+                outcome = verify(source)
+                if not outcome.get("ok"):
+                    raise ValueError("the command did not run. The program said:\n"
+                                     + error_excerpt(str(outcome.get("error") or "")))
             log.append({"stage": stage, "attempt": repair + 1, "status": "accepted",
                         "reasoning": payload.get("reasoning"),
                         "response_sha256": object_digest(content)})
@@ -214,9 +252,18 @@ def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
             # it is a weaker answer, and the difference is worth keeping visible.
             problems.append(f"stages.{name}.entrypoint is a directory, not a file to run: "
                             f"{entrypoint}")
-        for key in ("invocation", "artifact"):
+        for key in ("invocation",):
             if not str(row.get(key, "")).strip():
                 problems.append(f"stages.{name}.{key} is required when available")
+        artifact = str(row.get("artifact", "")).strip()
+        if not artifact:
+            problems.append(f"stages.{name}.artifact is required when available")
+        elif " " in artifact:
+            # A sentence cannot be looked for. The artifact is what the execution check
+            # waits for, so it has to be a path or a glob relative to the stage's output,
+            # not a description of one.
+            problems.append(f"stages.{name}.artifact must be a path or glob relative to the "
+                            f"output directory, not a sentence: {artifact[:60]!r}")
         parameters = row.get("parameters")
         if parameters is not None and not isinstance(parameters, list):
             problems.append(f"stages.{name}.parameters must be a list when present")

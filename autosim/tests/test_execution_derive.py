@@ -45,7 +45,7 @@ def test_an_unavailable_stage_must_say_why(repo):
 
 def test_an_available_stage_must_name_an_entry_point_that_exists(repo):
     faults = problems_in(answer(train={"available": True, "entrypoint": "scripts/trainer.py",
-                                       "invocation": "python ...", "artifact": "a checkpoint"}),
+                                       "invocation": "python ...", "artifact": "checkpoints/*/model.json"}),
                          repo)
     assert any("does not exist" in fault for fault in faults)
 
@@ -123,7 +123,7 @@ def test_a_declared_parameter_must_say_where_its_value_came_from(repo):
     """
     faults = problems_in(answer(train={
         "available": True, "entrypoint": "scripts/train.py",
-        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "checkpoints/*/model.json",
         "parameters": [{"name": "--policy", "value": "act", "evidence": "  "}]}), repo)
     assert any("parameters[0].evidence is required" in fault for fault in faults)
 
@@ -131,7 +131,7 @@ def test_a_declared_parameter_must_say_where_its_value_came_from(repo):
 def test_a_declared_parameter_must_have_a_value(repo):
     faults = problems_in(answer(train={
         "available": True, "entrypoint": "scripts/train.py",
-        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "checkpoints/*/model.json",
         "parameters": [{"name": "--policy", "value": "", "evidence": "the shipped checkpoints"}]}),
         repo)
     assert any("parameters[0].value is required" in fault for fault in faults)
@@ -140,7 +140,7 @@ def test_a_declared_parameter_must_have_a_value(repo):
 def test_an_evidenced_parameter_is_accepted(repo):
     assert problems_in(answer(train={
         "available": True, "entrypoint": "scripts/train.py",
-        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "checkpoints/*/model.json",
         "parameters": [{"name": "--policy", "value": "act",
                         "evidence": "every shipped checkpoint is named ACT_sim_*"}]}),
         repo) == []
@@ -151,3 +151,36 @@ def test_a_stage_without_parameters_is_fine(repo):
     assert problems_in(answer(evaluate={
         "available": True, "entrypoint": "scripts/eval.py", "invocation": "python scripts/eval.py",
         "artifact": "metrics.json"}), repo) == []
+
+
+# -- the feedback a failed command produces -------------------------------------------------
+
+def test_the_error_excerpt_finds_the_cause_not_the_tail():
+    """A version banner printed on import must not be mistaken for the failure.
+
+    This is not hypothetical: four attempts regenerated the same wrong command because the
+    feedback was the last four lines of a program that announces itself on import.
+    """
+    from autosim.research.execution_derive import error_excerpt
+    output = ("17:40:29 PyTorch version 2.7.1+cu128 available.\n"
+              "17:40:29 Polars version 1.31.0 available.\n"
+              "usage: eval_policy.py [-h] --config CONFIG [--overrides ...]\n"
+              "eval_policy.py: error: unrecognized arguments: --checkpoint /x --task y\n")
+    excerpt = error_excerpt(output)
+    assert "unrecognized arguments" in excerpt
+    assert "usage:" in excerpt
+
+
+def test_the_error_excerpt_keeps_a_traceback_from_its_start():
+    from autosim.research.execution_derive import error_excerpt
+    output = "".join(f"line {i}\n" for i in range(40))
+    output += ("Traceback (most recent call last):\n  File \"x.py\", line 1, in <module>\n"
+               "ModuleNotFoundError: No module named 'jax'\n")
+    excerpt = error_excerpt(output)
+    assert "ModuleNotFoundError" in excerpt and "Traceback" in excerpt
+
+
+def test_the_error_excerpt_falls_back_to_the_tail_when_nothing_announces_itself():
+    from autosim.research.execution_derive import error_excerpt
+    assert error_excerpt("a\nb\nlast thing said") == "a\nb\nlast thing said"
+    assert error_excerpt("") == "(no output)"
