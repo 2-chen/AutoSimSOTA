@@ -85,8 +85,29 @@ DeepSeek 负责研究提案，不负责执行 GPU 训练。
 | **`new_trajectory_generation`** | **unsupported** —— 它读了 `collect_demonstration.py`，发现里面是 `device.start_control()` + `input2action(...)` 的人工遥操作循环 |
 | `official_policy` | unsupported —— 它没有认领隔壁 RoboSyn 的 checkpoint，理由是这个路径不在本仓库任何脚本或配置里出现 |
 
-结论：接口能自动接通，**能力不能**。LIBERO 没有能自动产出成功轨迹的专家，而闭环的第一步就是采集新数据，
-所以系统给出的是一条阻塞理由，而不是跑八小时后失败。
+系统接着**自己提出研究方案**（`strategy.json`），并对着已声明的空间逐条校验：
+
+```json
+{
+  "targeted_collection":   "不可用 —— 仓库里没有自动产出轨迹的专家",
+  "data_selection":        "可用 —— 50 条官方演示/任务",
+  "training_recipe":       "可用",
+  "evaluation_resolution": "可用 —— 评测器接受局数"
+}
+```
+
+第一轮干预（模型自己选的，并给出了可被推翻的判据）：
+
+> 用 LIBERO 自己的 lifelong evaluator，把每轮评测局数提到足以分辨方法差异的量级；
+> 如果放大后的置信区间仍然重叠，说明此前的方法差异本来就是噪声。
+> **推翻它的条件**：同一策略跑两遍的置信区间已经盖住此前报告的组间差距。
+
+**「没有专家」不是「不能研究」，而是少了一族干预手段。** 闭环第一轮执行**方案里的第一个干预**，
+而不是「必须采集」——采集只是其中一个族。`--strategy` 把方案按内容哈希冻进 `protocol.json`，
+同 run-id 换方案续跑会被拒绝。
+
+LIBERO 因此可以走进一条真实路径：官方 50 条演示训 ACT 基线 → 在「选哪些演示 / 怎么加权 / 怎么训」上干预
+→ 用它自己的 50 个固定初始状态评测。全程不需要专家。
 
 ## 复现
 

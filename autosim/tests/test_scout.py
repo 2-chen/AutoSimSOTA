@@ -341,3 +341,165 @@ def test_the_ownership_check_prefers_what_the_data_says(tmp_path):
     write(root / "defs" / "task.bddl", "(define)\n")
     assert recorded_provenance(structures, root)["resolve_inside_repo"] == ["defs/task.bddl"]
     assert recorded_provenance(structures, tmp_path / "elsewhere")["resolve_inside_repo"] == []
+
+
+# -- the plan: what the loop is, not what goes in it ---------------------------------------
+
+def plan_value(**overrides):
+    value = {
+        "strategy_id": "toy-plan",
+        "reasoning": "this benchmark ships demonstrations and an evaluator, and no expert",
+        "intervention_families": {
+            "targeted_collection": {"available": False, "why": "no automated producer"},
+            "data_selection": {"available": True, "why": "50 demos per task",
+                               "axes": ["steps"]},
+            "training_recipe": {"available": True, "why": "the trainer takes parameters",
+                                "axes": ["steps"]},
+            "evaluation_resolution": {"available": True, "why": "the evaluator takes a count",
+                                      "axes": ["steps"]},
+        },
+        "first_intervention": {"family": "training_recipe", "axes": ["steps"],
+                               "hypothesis": "fewer steps leaves the policy underfitted",
+                               "falsified_by": "success is flat or falls as steps rise"},
+        "measurement": "the benchmark's own evaluator on a frozen seed bank",
+        "stop_condition": "a round costs more than the difference it could resolve",
+    }
+    value.update(overrides)
+    return value
+
+
+def space_with(*names):
+    from autosim.research.adapter_protocol import Axis, OptimizationSpace
+    return OptimizationSpace(training=tuple(
+        Axis(name, "integer", "a knob", low=1, high=100, default=10) for name in names))
+
+
+def capabilities(**status):
+    return {name: {"status": status.get(name, "declared")} for name in CAPABILITIES}
+
+
+def test_a_plan_is_checked_against_the_axes_that_exist():
+    from autosim.research.strategy import problems_in
+    faults = problems_in(plan_value(), space_with("steps"), capabilities())
+    assert faults == []
+
+    invented = plan_value(first_intervention={"family": "training_recipe",
+                                              "axes": ["learning_rate_schedule"],
+                                              "hypothesis": "h", "falsified_by": "f"})
+    assert any("does not expose" in fault for fault in
+               problems_in(invented, space_with("steps"), capabilities()))
+
+
+def test_a_plan_cannot_use_a_family_the_benchmark_cannot_support():
+    """Claiming a family is available does not make it available."""
+    from autosim.research.strategy import problems_in
+    value = plan_value()
+    value["intervention_families"]["targeted_collection"] = {
+        "available": True, "why": "it would be nice", "axes": ["steps"]}
+    faults = problems_in(value, space_with("steps"),
+                         capabilities(new_trajectory_generation="unsupported",
+                                      targeted_generation="unsupported"))
+    assert any("is claimed available but the declaration reports" in fault
+               and "new_trajectory_generation" in fault for fault in faults), faults
+
+
+def test_a_first_step_that_cannot_fail_is_refused():
+    from autosim.research.strategy import problems_in
+    value = plan_value(first_intervention={"family": "training_recipe", "axes": ["steps"],
+                                           "hypothesis": "", "falsified_by": ""})
+    faults = problems_in(value, space_with("steps"), capabilities())
+    assert any("measures nothing" in fault for fault in faults)
+
+
+def test_a_plan_built_without_an_expert_uses_the_families_that_remain():
+    """The point of the whole layer: no expert is a missing family, not a dead end."""
+    from autosim.research.strategy import executable_first_step, problems_in
+    value = plan_value()
+    assert problems_in(value, space_with("steps"), capabilities()) == []
+    assert executable_first_step(value)["family"] == "training_recipe"
+
+
+def test_the_round_one_rule_follows_the_plan():
+    from autosim.research.repository_autoresearch import validate_proposal
+    from autosim.research.declaration import space_from
+
+    declaration = {
+        "benchmark": "Toy", "evidence": "e", "repo_markers": ["setup.py"],
+        "tasks": {"kind": "glob", "pattern": "tasks/*.t", "task_id_from": "stem"},
+        "task_contract": {"state_dim": 7, "action_dim": 7, "cameras": {"c": [1, 1, 3]},
+                          "max_episode_steps": 10},
+        "assets": {}, "capabilities": {},
+        "optimization_space": {"collection": [
+            {"name": "enabled", "kind": "choice", "description": "collect or not",
+             "values": [True, False], "default": True},
+            {"name": "mode", "kind": "choice", "description": "driver",
+             "values": ["expert"], "default": "expert"},
+            {"name": "profile", "kind": "choice", "description": "distribution",
+             "values": ["full"], "default": "full"},
+            {"name": "targeted_attempts", "kind": "integer", "description": "a",
+             "low": 0, "high": 100, "default": 10},
+            {"name": "original_attempts", "kind": "integer", "description": "o",
+             "low": 0, "high": 100, "default": 10},
+            {"name": "target_episodes", "kind": "integer", "description": "t",
+             "low": 0, "high": 100, "default": 10}],
+            "training": [{"name": "steps", "kind": "integer", "description": "s",
+                          "low": 1, "high": 1000, "default": 100}],
+            "extra": {"resolution": [
+                {"name": "development_episodes", "kind": "integer", "description": "n",
+                 "low": 1, "high": 1000, "default": 10}]}}}
+    space = space_from(declaration)
+
+    def proposal(enabled, **extra):
+        value = {"decision": "experiment", "proposal_id": "p", "hypothesis": "h",
+                 "expected_validation": "v", "primary_intervention": "x",
+                 "development_evidence_id": "e", "parent_checkpoint_sha256": "w",
+                 "parent_data_version": "d",
+                 "collection": {"enabled": enabled, "mode": "expert", "profile": "full",
+                                # 20 satisfies the round-one probe floor of min(20, 100//2);
+                                # 10 satisfies the 10% original-distribution coverage floor.
+                                "targeted_attempts": 20 if enabled else 0,
+                                "original_attempts": 10 if enabled else 0,
+                                "target_episodes": 20 if enabled else 0},
+                 "training": {"steps": 100},
+                 "resolution": {"development_episodes": 10}}
+        value.update(extra)
+        return value
+
+    kwargs = dict(round_index=1, evidence_id="e", parent_checkpoint_sha256="w",
+                  parent_data_version="d", space=space, attempts_per_round=100,
+                  min_original_fraction=0.1)
+
+    # No plan: the historical rule, unchanged.
+    with pytest.raises(ValueError, match="targeted collection probe"):
+        validate_proposal(proposal(False), **kwargs)
+
+    # A plan that collects: the probe is still required.
+    with pytest.raises(ValueError, match="targeted collection probe"):
+        validate_proposal(proposal(False), first_step={"family": "targeted_collection"},
+                          **kwargs)
+    assert validate_proposal(proposal(True), first_step={"family": "targeted_collection"},
+                             **kwargs)["collection"]["enabled"] is True
+
+    # A plan that does not collect: collecting is now the wrong experiment.
+    with pytest.raises(ValueError, match="which does not collect"):
+        validate_proposal(proposal(True), first_step={"family": "training_recipe"}, **kwargs)
+    assert validate_proposal(proposal(False), first_step={"family": "training_recipe"},
+                             **kwargs)["decision"] == "experiment"
+
+
+def test_a_supplied_plan_is_frozen_into_the_protocol(tmp_path):
+    """A plan decides what round one does, so a run is tied to the plan it started under."""
+    from autosim.research.repository_autoresearch import MilestoneConfig, protocol_budget
+    from autosim.research.common import atomic_json, digest
+
+    plan_path = tmp_path / "strategy.json"
+    atomic_json(plan_path, {"strategy": plan_value()})
+
+    plain = MilestoneConfig(repo_input="r", output_root=tmp_path, run_id="a")
+    planned = MilestoneConfig(repo_input="r", output_root=tmp_path, run_id="b",
+                              strategy=str(plan_path))
+    # A run without a plan keeps exactly the budget it had before plans existed.
+    assert "strategy" not in protocol_budget(plain)
+    assert "strategy" not in protocol_budget(planned)
+    assert digest(plan_path)
+    assert planned.strategy == str(plan_path)

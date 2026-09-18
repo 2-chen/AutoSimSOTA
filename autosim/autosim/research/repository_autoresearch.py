@@ -125,6 +125,11 @@ class MilestoneConfig:
     #: Without this the budget clock is keyed to the first start and never resets, so a run
     #: that spent its hours is unresumable under the same run id.
     continue_run: bool = False
+    #: A plan produced by `autosim scout`, as a path to its `strategy.json`. Absent means
+    #: the historical protocol, in which round one collects. Supplying one makes the loop
+    #: follow that plan's first step instead, which is what lets a benchmark with no
+    #: automated expert be researched through the families it does have.
+    strategy: str | None = None
     dry_run: bool = False
     probe_only: bool = False
     # Multi-device knobs.  All of them default to the absent value: a plain `--gpu i`
@@ -206,6 +211,10 @@ def protocol_budget(config: MilestoneConfig) -> dict[str, Any]:
         budget.pop(key, None)
     for key in ("recovery_controller", "recovery_max_calls", "recovery_max_tokens"):
         budget.pop(key, None)  # resolved recovery policy has its own frozen protocol block
+    # The plan is an experiment variable, not an invocation-level knob, so it is recorded --
+    # but in its own block, like `devices` and `harness`, because a run without a plan must
+    # keep a budget byte-identical to the runs that predate the feature.
+    budget.pop("strategy", None)
     return budget
 
 
@@ -277,7 +286,8 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
                       parent_checkpoint_sha256: str, parent_data_version: str,
                       space: OptimizationSpace,
                       attempts_per_round: int = 100,
-                      min_original_fraction: float = 0.5) -> dict[str, Any]:
+                      min_original_fraction: float = 0.5,
+                      first_step: dict[str, Any] | None = None) -> dict[str, Any]:
     """RoboSynChallenge's rules on top of the shared decision layer.
 
     The schema, the value space and every range come from the adapter's declaration. What
@@ -304,14 +314,31 @@ def validate_proposal(raw: dict[str, Any], *, round_index: int, evidence_id: str
     targeted = int(collection["targeted_attempts"])
     original = int(collection["original_attempts"])
     minimum_original = int(attempts_per_round * min_original_fraction + 0.999999)
-    if decision != "stop" and original < minimum_original:
+    # Coverage is a rule about the *balance* of a collection, so it applies to a round that
+    # collects. Demanding original-distribution coverage from a round that collects nothing
+    # is a rule about a decision that was not taken.
+    if decision != "stop" and collection["enabled"] and original < minimum_original:
         raise ValueError("collection does not preserve the protocol's minimum "
                          "original-distribution coverage")
+    # Round one must execute the plan's first intervention. That used to mean a collection
+    # probe unconditionally, which turned "the benchmark ships an expert" into a
+    # precondition for researching it at all -- true of the benchmark this loop was built
+    # on, false of the next one. The probe is required when the plan's first step is
+    # collection, and when there is no plan the old rule stands unchanged.
+    wants_collection = first_step is None or first_step.get("family") == "targeted_collection"
     minimum_probe = min(20, max(1, attempts_per_round // 2))
-    if decision != "stop" and round_index == 1 and (
+    if decision != "stop" and round_index == 1 and wants_collection and (
             not collection["enabled"] or targeted < minimum_probe):
         raise ValueError(f"round one must execute a targeted collection probe of at least "
                          f"{minimum_probe} attempts")
+    if first_step is not None and first_step.get("family") not in (None, "targeted_collection"):
+        # A plan whose first step is not collection says this benchmark is researched by
+        # other means, so a proposal that collects anyway is not the planned experiment and
+        # must not be recorded as if it were.
+        if collection["enabled"]:
+            raise ValueError(
+                f"the plan's first step is {first_step['family']}, which does not collect; "
+                f"set collection.enabled false or supply a plan whose first step collects")
     if collection["enabled"] and not 1 <= int(collection["target_episodes"]) <= max(1, targeted):
         raise ValueError("invalid targeted episode request")
     if decision == "stop":
@@ -571,8 +598,14 @@ class RepositoryAutoResearch:
             changed = {key: {"recorded": budget.get(key), "requested": value}
                        for key, value in requested_fields.items()
                        if key in budget and budget[key] != value}
+            recorded_plan = (read_json(protocol_path).get("strategy") or {}).get("sha256")
+            requested_plan = digest(Path(self.config.strategy)) if self.config.strategy else None
             if changed:
                 raise ValueError(f"completed run protocol differs from request: {changed}")
+            if recorded_plan != requested_plan:
+                raise ValueError(
+                    "this run-id was started under a different research plan; the plan "
+                    "decides what round one executes, so a resumed run must supply the same one")
             if read_json(protocol_path).get("execution_contract") == "adaptive_compute_v1":
                 return self.state
             recorded_devices = budget.get("devices")
@@ -951,6 +984,7 @@ class RepositoryAutoResearch:
     def initialize(self) -> None:
         self.repo, source = resolve_repository(self.config.repo_input, self.run_root)
         self.adapter = RoboSynAdapter(self.repo)
+        self._first_step: dict[str, Any] | None = None
         self.task = self.adapter.select_task(self.config.task)
         discovery = self.adapter.discover(self.task)
         try:
@@ -1055,6 +1089,15 @@ class RepositoryAutoResearch:
             protocol["execution_contract"] = "adaptive_compute_v1"
         elif self.plan is not None and not self.plan["legacy_equivalence"]:
             protocol["devices"] = devices_protocol_block(self.plan)
+        if self.config.strategy:
+            # Recorded by content, not by path: the plan decides what round one does, so a
+            # run must be tied to the plan it started under rather than to whatever that
+            # file happens to point at later.
+            plan_path = Path(self.config.strategy)
+            protocol["strategy"] = {
+                "path": str(plan_path.absolute()), "sha256": digest(plan_path),
+                "strategy_id": read_json(plan_path)["strategy"]["strategy_id"],
+                "first_step": self.first_step()}
         if self.harness_enabled:
             protocol["harness"] = {"version": 1, "policy_sha256": policy_identity(self.harness),
                                    "scientific_retry_after_reset": False}
@@ -1193,6 +1236,21 @@ class RepositoryAutoResearch:
         assert self.adapter is not None
         return self.adapter.optimization_space(self.task)
 
+    def first_step(self) -> dict[str, Any] | None:
+        """The plan's first intervention, or None when this run has no plan.
+
+        Carried into validation rather than into the prompt: the controller is told the
+        space it may move, and the plan decides which part of that space round one has to
+        move. A plan that is not enforced is a suggestion.
+        """
+        if not self.config.strategy:
+            return None
+        if self._first_step is None:
+            from .strategy import executable_first_step
+            self._first_step = executable_first_step(
+                read_json(Path(self.config.strategy))["strategy"])
+        return self._first_step
+
     def propose(self, round_index: int, context: dict[str, Any]) -> dict[str, Any]:
         path = self.run_root / "rounds" / f"round_{round_index}" / "proposal.json"
         if path.is_file():
@@ -1211,7 +1269,8 @@ class RepositoryAutoResearch:
                 parent_data_version=context["parent_data_version"],
                 space=self.space(),
                 attempts_per_round=self.config.attempts_per_round,
-                min_original_fraction=self.config.min_original_fraction)
+                min_original_fraction=self.config.min_original_fraction,
+                first_step=self.first_step())
             atomic_json(path, {
                 "schema_version": SCHEMA_VERSION, "proposal": proposal,
                 "provider": {"kind": self.config.controller, "api_used": False},
@@ -1249,7 +1308,8 @@ class RepositoryAutoResearch:
                     parent_data_version=context["parent_data_version"],
                     space=self.space(),
                     attempts_per_round=self.config.attempts_per_round,
-                    min_original_fraction=self.config.min_original_fraction)
+                    min_original_fraction=self.config.min_original_fraction,
+                    first_step=self.first_step())
                 record = {"schema_version": SCHEMA_VERSION, "proposal": proposal,
                           "provider": metadata, "repair_attempt": repair,
                           "response_sha256": object_digest(content), "validation": "passed", "created_at": now()}
@@ -2331,6 +2391,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-episodes", type=int, default=200)
     parser.add_argument("--train-seed", type=int, default=1000)
     parser.add_argument("--min-original-fraction", type=float, default=0.25)
+    parser.add_argument("--strategy", default=None,
+                        help="Path to a strategy.json from `autosim scout`. Round one then "
+                             "executes that plan's first intervention instead of always "
+                             "collecting.")
     parser.add_argument("--full-budget", action="store_true", help="Precommit to 80K candidate/control continuation")
     parser.add_argument("--allow-api-egress", action="store_true",
                         help="Explicitly authorize sending this non-ClickBell task's structured contract and failure summaries to the configured API")
@@ -2481,6 +2545,7 @@ def main(argv: list[str] | None = None) -> int:
                              final_episodes=args.final_episodes,
                              train_seed=args.train_seed,
                              min_original_fraction=args.min_original_fraction,
+                             strategy=args.strategy,
                              full_budget=args.full_budget,
                              allow_api_egress=args.allow_api_egress,
                              continue_run=args.continue_run,

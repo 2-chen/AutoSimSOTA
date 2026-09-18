@@ -33,6 +33,7 @@ from typing import Any
 
 from .common import atomic_json, event, now, object_digest, redact
 from .declaration import CAPABILITIES, STATUSES, DeclarativeAdapter, problems_in, space_from, verify
+from .strategy import executable_first_step, plan
 from .survey import peek_many, summarise, survey
 
 
@@ -465,13 +466,47 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
     from .adapter_protocol import check_adapter
     structural = check_adapter(adapter)
     summary = _summary(declaration, result, structural)
+
+    # What the loop should be is a decision about this benchmark, so it is asked for after
+    # the facts are established and checked against them. Without a plan the system has an
+    # adapter and nothing to do with it; with one it has a research programme, and a
+    # benchmark that cannot collect data gets one built from the families it does have.
+    # Gated on the adapter protocol alone, not on the blocking list. A plan is reasoning
+    # about what to do with what exists, and it is most useful precisely when something is
+    # missing -- a plan that reads "the dataset path is wrong, fix it, then do X" is
+    # better than no plan and a complaint. What the plan must satisfy is checked against
+    # the declared space and the established capabilities, which is a real check.
+    research_plan, plan_log = None, []
+    if not structural:
+        try:
+            research_plan, plan_log = plan(
+                adapter.optimization_space(adapter.select_task("auto")),
+                result["capabilities"], client, benchmark=declaration["benchmark"],
+                evidence={"declaration_reasoning": declaration["evidence"],
+                          "capability_notes": {name: row.get("limitation") for name, row
+                                               in result["capabilities"].items()}},
+                output=output)
+        except ValueError as exc:
+            summary["plan_fault"] = redact(str(exc))
+    if research_plan is not None:
+        summary["plan"] = {
+            "strategy_id": research_plan["strategy_id"],
+            "families": {name: bool(row.get("available"))
+                         for name, row in research_plan["intervention_families"].items()},
+            "first_step": executable_first_step(research_plan),
+            "measurement": research_plan["measurement"],
+            "stop_condition": research_plan["stop_condition"],
+        }
+    atomic_json(output / "strategy.json",
+                {"schema_version": 1, "created_at": now(), "strategy": research_plan,
+                 "attempts": plan_log})
     atomic_json(output / "onboarding.json",
                 {"schema_version": 1, "created_at": now(), "repo": str(repo),
                  "benchmark": declaration["benchmark"], "summary": summary,
                  "readiness": "ready" if not summary["blocking"] else "blocked",
                  "checks_passed": result["state"] == "verified",
                  "structural_faults": structural})
-    return {"declaration": declaration, "verification": result,
+    return {"declaration": declaration, "verification": result, "strategy": research_plan,
             "summary": summary, "structural_faults": structural}
 
 
@@ -479,10 +514,19 @@ def _summary(declaration: dict[str, Any], result: dict[str, Any],
              structural: list[str]) -> dict[str, Any]:
     """What the system can and cannot count on, in the system's own vocabulary.
 
-    `blocking` is not a verdict on the benchmark. It is the list of things the research
-    loop needs and does not have, and it is the answer worth returning early: the loop's
-    first stage is collecting new data, so a benchmark that cannot produce a trajectory
-    without a person cannot run the loop however good the rest of it is.
+    `blocking` holds only what stops *any* research on this benchmark: an unconfirmed
+    identity, no tasks, no way to measure, no way to train. Everything else here is a
+    fact about what is available, and which facts matter depends on the research plan --
+    which is a question for the planner, not for this function.
+
+    An earlier version of this function also refused a benchmark with no automated
+    trajectory producer, on the grounds that a round begins by collecting data. That was
+    true of the one benchmark the loop was built on and false in general: a benchmark that
+    ships demonstrations and an evaluator supports research into which demonstrations are
+    used and how they are weighted, which needs no new trajectories at all. Encoding one
+    benchmark's shape as a precondition for every benchmark is the mistake this whole
+    layer exists to stop making, so the availability of each intervention is reported as a
+    fact and the choice between them belongs to the plan.
     """
     capabilities = result["capabilities"]
     blocking = []
@@ -508,11 +552,6 @@ def _summary(declaration: dict[str, Any], result: dict[str, Any],
     if capabilities.get("native_evaluation", {}).get("status") == "failed":
         blocking.append({"reason": "the declared evaluator could not be located",
                          "detail": capabilities["native_evaluation"].get("limitation")})
-    if capabilities.get("new_trajectory_generation", {}).get("status") == "unsupported":
-        blocking.append({
-            "reason": "the loop's first stage is collecting new data and this benchmark "
-                      "has no way to produce a successful trajectory without a person",
-            "detail": capabilities["new_trajectory_generation"].get("limitation")})
     if structural:
         blocking.append({"reason": "the declaration does not satisfy the adapter protocol",
                          "detail": structural})
