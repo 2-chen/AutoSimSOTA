@@ -191,6 +191,13 @@ def problems_in(declaration: dict[str, Any],
                 problems.append(f"assets.{name} must be an object")
                 continue
             path = asset.get("path")
+            if path not in (None, "") and str(asset.get("why", "")).strip():
+                # A path and a reason-it-is-absent answer the same question. Accepting both
+                # let a declaration say "no released checkpoint exists here" while handing
+                # over a checkpoint path -- and the existence check then verified the path
+                # without ever reading the sentence contradicting it.
+                problems.append(f"assets.{name} gives both a path and a why; a path says it "
+                                f"is there and a why says it is not -- give one")
             if path in (None, ""):
                 continue
             if not isinstance(path, str):
@@ -204,6 +211,15 @@ def problems_in(declaration: dict[str, Any],
                 # different fields.
                 problems.append(f"assets.{name}.path must be a path, not a sentence; the "
                                 f"explanation belongs in assets.{name}.why")
+
+    # Distinct files, because a demonstration set and a trained policy are different things
+    # and one path named for both describes neither. This caught a declaration that pointed
+    # both at a task definition, which the existence check then verified as both.
+    named = {name: str(asset.get("path")) for name, asset in
+             (declaration.get("assets") or {}).items()
+             if isinstance(asset, dict) and asset.get("path")}
+    if len(set(named.values())) < len(named):
+        problems.append(f"assets name the same file more than once: {named}")
 
     if "optimization_space" not in declaration:
         return problems

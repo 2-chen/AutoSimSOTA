@@ -350,6 +350,27 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
     return declaration, attempts
 
 
+def _neighbours(repo: Path, pattern: str, limit: int = 4) -> list[str]:
+    """Real paths in the repository whose name resembles a pattern that matched nothing."""
+    name = Path(str(pattern)).name
+    if not name or name == "*":
+        return []
+    found: list[str] = []
+    for path in sorted(Path(repo).rglob(name))[:limit]:
+        if path.is_file():
+            found.append(str(path.relative_to(repo)))
+    if found:
+        return found
+    # The basename may itself be too specific; fall back to the suffix, which is what the
+    # reader was reaching for when it wrote the pattern.
+    suffix = Path(name).suffix
+    if suffix:
+        for path in sorted(Path(repo).rglob(f"*{suffix}"))[:limit]:
+            if path.is_file():
+                found.append(str(path.relative_to(repo)))
+    return found
+
+
 def path_faults(result: dict[str, Any]) -> dict[str, Any]:
     """Checks that failed for a reason the draft could fix, with what was looked for.
 
@@ -368,9 +389,14 @@ def path_faults(result: dict[str, Any]) -> dict[str, Any]:
                 "you_wrote": row.get("path"),
                 "files_the_survey_found": row.get("nearest_surveyed", [])}
     if not result.get("tasks"):
+        # Same treatment a failed asset path gets: the point is not that it failed but where
+        # the files actually are. A pattern that misses by one directory is a correction, and
+        # a model told only "no match" rewrites the same wrong guess -- which is what a
+        # repair round did here before this was added.
         faults["tasks"] = {"reason": "your pattern matched no files",
                            "you_wrote": result.get("task_pattern"),
-                           "note": "a pattern containing < or > matches nothing"}
+                           "note": "a pattern containing < or > matches nothing",
+                           "files_like_it": result.get("task_pattern_neighbours", [])}
     for name, row in result.get("capabilities", {}).items():
         limitation = row.get("limitation") or ""
         if row.get("status") == "failed" and "does not exist" in limitation:
@@ -407,6 +433,7 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
     result = verify(declaration, repo, survey_report=report)
     result["surveyed_assets"] = [row["path"] for row in
                                  report["datasets"] + report["model_artifacts"]]
+    result["task_pattern_neighbours"] = _neighbours(repo, declaration["tasks"].get("pattern", ""))
 
     # A check that failed because a path was mistyped is worth one retry: the model can see
     # what was looked for and fix it, which is the difference between a declaration that
@@ -430,6 +457,8 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
         attempts += more
         repaired = verify(repair, repo, survey_report=report)
         repaired["surveyed_assets"] = result["surveyed_assets"]
+        repaired["task_pattern_neighbours"] = _neighbours(
+            repo, repair["tasks"].get("pattern", ""))
         atomic_json(output / f"verification_repair_{round_index + 1}.json", repaired)
         if len(path_faults(repaired)) < len(faults):
             declaration, result = repair, repaired

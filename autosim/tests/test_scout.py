@@ -538,3 +538,31 @@ def test_the_library_is_a_directory_of_files_not_a_list_in_code():
     assert "where-successes-come-from" in names
     assert all(Path(row["source"]).name == "SKILL.md" for row in library["skills"])
     assert library["library"]["add_a_method_by"].startswith("dropping a SKILL.md")
+
+
+# -- assets that describe two things at once -----------------------------------------------
+
+def test_an_asset_cannot_be_both_present_and_absent():
+    """A path and a reason-it-is-not-there answer the same question."""
+    value = declaration(assets={"checkpoint": {"path": "models/act.bin",
+                                              "why": "no released checkpoint exists"}})
+    assert any("gives both a path and a why" in fault for fault in problems_in(value))
+
+
+def test_two_assets_cannot_name_the_same_file():
+    """A demonstration set and a trained policy are not the same file.
+
+    Found by running the scout on LIBERO, where both pointed at a task definition and the
+    existence check verified both: it asked whether the path resolved, which it did, and
+    never whether the thing at that path was the kind of thing claimed.
+    """
+    value = declaration(assets={"dataset": {"path": "tasks/pick.bddl"},
+                                "checkpoint": {"path": "tasks/pick.bddl"}})
+    assert any("name the same file more than once" in fault for fault in problems_in(value))
+
+
+def test_distinct_assets_are_left_alone():
+    value = declaration(assets={"dataset": {"path": "data/demos.hdf5"},
+                                "checkpoint": {"why": "none released"}})
+    faults = problems_in(value)
+    assert not any("same file" in fault or "both a path" in fault for fault in faults)
