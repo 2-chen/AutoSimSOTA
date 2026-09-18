@@ -24,6 +24,8 @@ started = time.time()
 result = provision.build(repo, client=LLMClient(), prefix=output / "env", output=output)
 print("elapsed:", round((time.time() - started) / 60, 1), "min", flush=True)
 print("verdict:", json.dumps(result["verdict"], ensure_ascii=False)[:500], flush=True)
+print("diagnosis:", json.dumps(result.get("diagnosis"), ensure_ascii=False, indent=1)[:1800],
+      flush=True)
 print("survived:", result["survived"], "attempted:", result["attempted"], flush=True)
 for row in result["record"]:
     print("  KEPT", row.get("kind", "cmd"),

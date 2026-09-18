@@ -77,8 +77,11 @@ PLAN_SYSTEM = (
     "lists what its authors used, which is not always everything a component needs, and a "
     "library imported by the code that runs is a dependency whether or not it is listed. "
     "Where you add something the repository does not mention, say so in the reasoning.\n\n"
-    "Where the repository pins a version, use it even if a newer one exists. The repository "
-    "was written against what it pins.\n\n"
+    "Where the repository pins a version, use it even if a newer one exists -- the repository "
+    "was written against what it pins. The exception is a pin that cannot work on "
+    "`machine`: a build for a compute capability this GPU does not report installs and then "
+    "cannot execute, which is worse than failing, because the build looks successful. Where "
+    "that is so, say which pin you are departing from and why, and what the departure risks.\n\n"
     "Return one JSON object: {\"python\": \"<version, e.g. 3.9>\", \"commands\": [\"<command>\", "
     "...], \"probe\": \"<one command using {python} that shows the environment can do the "
     "thing this benchmark exists to do>\", \"reasoning\": \"<what you based this on, and "
@@ -99,6 +102,73 @@ RESUME_SYSTEM = (
     "\"reasoning\": \"<what the failure told you>\", \"unbuildable\": \"<if this cannot be "
     "fixed by installing something, say why; otherwise omit>\"}."
 )
+
+
+RECONSIDER_SYSTEM = (
+    "You are building an environment and the approach is not working: a whole round of "
+    "commands produced nothing that survived. Fixing the failing command one more time has "
+    "not helped, so reconsider the constraint instead.\n\n"
+    "The usual cause is a requirement that cannot be satisfied as stated on this machine -- "
+    "a version that is no longer published, a build for hardware this machine does not have, "
+    "a pin that predates something it now has to coexist with. When that is so, the useful "
+    "move is to name the constraint that is failing and substitute it, saying what you are "
+    "giving up and what would have to be checked afterwards. A package whose pinned build "
+    "targets hardware the machine does not have will install and then fail at first use; "
+    "substituting a build that targets it is the fix, and the risk is that the rest of the "
+    "stack was written against the old one.\n\n"
+    "You are given everything tried so far, with what each attempt reported. Do not repeat "
+    "an approach that has already failed.\n\n"
+    "Return one JSON object: {\"constraint\": \"<the requirement that cannot hold, as it was "
+    "stated>\", \"substitute\": \"<what to use instead>\", \"why\": \"<what makes the "
+    "original impossible here>\", \"cost\": \"<what this gives up, and what would have to "
+    "be checked>\", \"commands\": [\"<the commands to run now>\"], \"unbuildable\": \"<if "
+    "no substitution can work, why not; otherwise omit>\"}"
+)
+
+DIAGNOSE_SYSTEM = (
+    "An environment build has stopped. Say what is in the way, in terms someone can act on, "
+    "and do not overstate what is known.\n\n"
+    "A dependency that is missing is not the same finding as a requirement that cannot be "
+    "satisfied on this machine, and neither is the same as the machine itself being unable to "
+    "host the workload -- a driver, a rendering backend, a compute capability the installed "
+    "builds do not target. They have different remedies and only the first is a matter of "
+    "installing something.\n\n"
+    "The record is what survived; the transcript is everything tried. A command in the record "
+    "has run successfully and is not evidence about the blocker unless it is the one that "
+    "failed.\n\n"
+    "Return one JSON object: {\"blocker\": \"<dependency | requirement-not-satisfiable | "
+    "platform | unresolved>\", \"what\": \"<the specific thing in the way>\", \"evidence\": "
+    "\"<the commands and output that show it>\", \"tried\": [\"<approaches attempted>\"], "
+    "\"would_unblock\": \"<what a person would do, and what it would cost>\", "
+    "\"confidence\": \"<high | medium | low>\"}"
+)
+
+
+def platform_facts(*, timeout: int = 60) -> dict[str, Any]:
+    """What this machine is, so a plan can be checked against it rather than assumed.
+
+    A build planned without this is planned against an imagined machine. The failure that
+    costs most is invisible until first use: a wheel built for a compute capability the card
+    does not have installs perfectly and cannot execute, and no amount of dependency
+    resolution reveals it. Knowing the capability beforehand is what lets a plan avoid it.
+    """
+    facts: dict[str, Any] = {"os": os.uname().sysname, "release": os.uname().release}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,compute_cap,driver_version",
+             "--format=csv,noheader"],
+            text=True, capture_output=True, timeout=timeout, env=os.environ)
+        facts["gpus"] = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        facts["gpus"] = []
+    try:
+        out = subprocess.run(["nvcc", "--version"], text=True, capture_output=True,
+                             timeout=timeout, env=os.environ)
+        facts["cuda_toolkit"] = next((line.strip() for line in out.stdout.splitlines()
+                                      if "release" in line), "not found")
+    except (OSError, subprocess.TimeoutExpired):
+        facts["cuda_toolkit"] = "not found"
+    return facts
 
 
 def manifests_of(repo: Path, *, limit: int = 60_000) -> dict[str, str]:
@@ -258,9 +328,20 @@ def error_excerpt(output: str, *, limit: int = 1500) -> str:
                "not found", "unable to", "failed", "importerror", "modulenotfounderror")
     hits = [index for index, line in enumerate(lines)
             if any(marker in line.lower() for marker in markers)]
-    if hits:
-        return "\n".join(lines[max(0, hits[0] - 1):hits[0] + 14])[:limit]
-    return "\n".join(lines[-8:])[:limit]
+    if not hits:
+        return "\n".join(lines[-8:])[:limit]
+    # Both ends. A build log announces the failure at the top -- `error: subprocess-exited-
+    # with-error` -- and states the cause hundreds of lines later inside the wrapped
+    # compiler output. Reporting only the first gave the model a wrapper and no cause, and
+    # it said so: the root cause "is not yet established".
+    head = lines[max(0, hits[0] - 1):hits[0] + 12]
+    # The cause of a build failure is at the end, and it does not have to announce itself
+    # with a word this function thought to look for: `CMake Error at` and `make: *** Error 2`
+    # both matched none of the markers, so a long log returned its opening and nothing else.
+    # When there is a lot of output, the end is included on that reasoning alone.
+    if len(lines) > hits[0] + 24:
+        return ("\n".join(head) + "\n...\n" + "\n".join(lines[-14:]))[:limit]
+    return "\n".join(head)[:limit]
 
 
 def content_id(python: str, record: list[dict[str, Any]], repo: Path) -> str:
@@ -339,6 +420,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
     values = values_for(prefix, repo, workdir, conda_executable())
     index = 0
     for round_index in range(max_rounds):
+        before = len(record)
         while index < len(pending):
             if substitute(pending[index], values) in survived:
                 # Already done in an earlier attempt; re-running it would be slow and could
@@ -372,7 +454,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                 # which is a finding about the platform and not about the recipe.
                 return _finish(output, repo, python, record, transcript, probe,
                                {"passed": False, "reason": "platform limit",
-                                "detail": result["excerpt"]})
+                                "detail": result["excerpt"]}, client=client)
             pending = pending[:index] + resume(client, repo, record, result,
                                                manifests=manifests, transcript=transcript,
                                                values=values)
@@ -384,23 +466,41 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             if outcome["ok"]:
                 record.append({**outcome, "kind": "probe", "round": round_index + 1})
                 return _finish(output, repo, python, record, transcript, probe,
-                               {"passed": True, "seconds": outcome.get("seconds")})
+                               {"passed": True, "seconds": outcome.get("seconds")},
+                               client=client)
             if outcome["failure_kind"] == "platform":
                 return _finish(output, repo, python, record, transcript, probe,
                                {"passed": False, "reason": "platform limit",
-                                "detail": outcome["excerpt"]})
+                                "detail": outcome["excerpt"]}, client=client)
+            # A round that added nothing is a round that made no progress. Fixing one more
+            # command has been tried and has not worked, so the thing to question is the
+            # requirement rather than the command -- and that is a different question, which
+            # nothing in the loop was asking.
             pending = resume(client, repo, record, {**outcome, "kind": "probe"},
                              manifests=manifests, transcript=transcript, values=values,
                              probing=True)
             index = 0
+        # A round that added nothing made no progress, whether it stopped at the probe or at
+        # a command. Escalating only on the probe left the case that actually occurred --
+        # a build that never reached the probe because one command would not run --
+        # retrying the same class of fix until the rounds ran out.
+        if len(record) == before:
+            revision = reconsider(client, repo, record=record, transcript=transcript,
+                                  manifests=manifests)
+            if revision is None:
+                return _finish(output, repo, python, record, transcript, probe,
+                               {"passed": False, "reason": "no approach left",
+                                "rounds": round_index + 1}, client=client)
+            pending = list(revision["commands"])
+            index = 0
     return _finish(output, repo, python, record, transcript, probe,
-                   {"passed": False, "reason": "rounds exhausted"})
+                   {"passed": False, "reason": "rounds exhausted"}, client=client)
 
 
 def plan(client: Any, repo: Path, *, manifests: dict[str, str], attempts: int = 3
          ) -> dict[str, Any]:
-    payload = json.dumps({"placeholders": PLACEHOLDERS, "declared_dependencies": manifests},
-                         ensure_ascii=False)
+    payload = json.dumps({"placeholders": PLACEHOLDERS, "machine": platform_facts(),
+                          "declared_dependencies": manifests}, ensure_ascii=False)
     log: list[dict[str, Any]] = []
     for repair in range(attempts):
         content, _ = client.chat_with_metadata(
@@ -428,6 +528,7 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
     payload = json.dumps({
         "placeholders": PLACEHOLDERS,
         "declared_dependencies": {k: v[:4000] for k, v in manifests.items()},
+        "machine": platform_facts(),
         "survived_commands": [row["command"] for row in record if row.get("kind") != "probe"],
         "failure": {"command": failure.get("command"), "kind": failure.get("failure_kind"),
                     "excerpt": failure.get("excerpt")},
@@ -458,19 +559,106 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
     return []
 
 
+def brief(transcript: list[dict[str, Any]], *, limit: int = 30) -> list[dict[str, Any]]:
+    """What was tried, compressed to what a reader needs to avoid repeating it."""
+    rows = []
+    for row in transcript[-limit:]:
+        if row.get("kind") in {"reset", "resume", "plan"}:
+            rows.append({"note": row.get("kind"), "commands": row.get("commands"),
+                         "reasoning": str(row.get("reasoning"))[:300]})
+            continue
+        rows.append({"command": str(row.get("command"))[:400], "ok": bool(row.get("ok")),
+                     "kind": row.get("failure_kind"), "said": str(row.get("excerpt"))[:500]})
+    return rows
+
+
+def reconsider(client: Any, repo: Path, *, record: list[dict[str, Any]],
+               transcript: list[dict[str, Any]], manifests: dict[str, str],
+               attempts: int = 2) -> dict[str, Any] | None:
+    """Ask what constraint to give up, rather than how to run the same command again.
+
+    The distinction is the one a build loop needs and does not have: a command that fails
+    can be fixed, and a requirement that cannot hold on this machine cannot. Retrying the
+    second is what turns a build into a loop that never terminates and never concludes --
+    which is what happened here, where a pin built for hardware the machine does not have
+    was retried with every variation of index URL.
+    """
+    payload = json.dumps({
+        "declared_dependencies": {k: v[:3000] for k, v in manifests.items()},
+        "placeholders": PLACEHOLDERS,
+        "machine": platform_facts(),
+        "survived": [row["command"] for row in record],
+        "everything_tried": brief(transcript),
+    }, ensure_ascii=False)
+    for repair in range(attempts):
+        content, _ = client.chat_with_metadata(
+            RECONSIDER_SYSTEM, payload, max_tokens=3000, timeout=300, thinking="disabled")
+        try:
+            value = _object(content)
+            if str(value.get("unbuildable", "")).strip():
+                transcript.append({"kind": "unbuildable", "reason": value["unbuildable"]})
+                return None
+            commands = [str(c) for c in (value.get("commands") or []) if str(c).strip()]
+            if not commands:
+                raise ValueError("commands must be a non-empty list")
+            transcript.append({"kind": "reconsidered", "constraint": value.get("constraint"),
+                               "substitute": value.get("substitute"), "why": value.get("why"),
+                               "cost": value.get("cost"), "commands": commands})
+            return value
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            if repair == attempts - 1:
+                transcript.append({"kind": "reconsider_failed", "error": str(exc)[:300]})
+    return None
+
+
+def diagnose(client: Any, repo: Path, *, record: list[dict[str, Any]],
+             transcript: list[dict[str, Any]], probe: str,
+             verdict: dict[str, Any]) -> dict[str, Any] | None:
+    """Say what is in the way, so a build that stopped is a finding rather than a failure.
+
+    'Rounds exhausted' is the shape a build takes when nobody was asked to conclude. What a
+    reader needs is which of the three kinds of blocker this is, on what evidence, and what
+    would unblock it -- and the three are worth keeping apart because only one of them is a
+    matter of installing something.
+    """
+    payload = json.dumps({
+        "repository": str(repo), "probe": probe, "verdict": verdict,
+        "machine": platform_facts(),
+        "survived": [row["command"] for row in record],
+        "everything_tried": brief(transcript, limit=40),
+    }, ensure_ascii=False)
+    try:
+        content, _ = client.chat_with_metadata(DIAGNOSE_SYSTEM, payload, max_tokens=2000,
+                                              timeout=300, thinking="disabled")
+        return _object(content)
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def probe_environment(probe: str, *, values: dict[str, str], env: dict[str, str], cwd: Path,
                       output: Path, timeout: int = 1800) -> dict[str, Any]:
     return run(substitute(probe, values), env=env, cwd=cwd, timeout=timeout, output=output)
 
 
 def _finish(output: Path, repo: Path, python: str, record: list[dict[str, Any]],
-            transcript: list[dict[str, Any]], probe: str,
-            verdict: dict[str, Any]) -> dict[str, Any]:
+            transcript: list[dict[str, Any]], probe: str, verdict: dict[str, Any],
+            *, client: Any = None) -> dict[str, Any]:
+    """Write the result, and if the build did not succeed, write down what is in the way.
+
+    A build that stops without a diagnosis is a build that failed silently, however much
+    work it did: "rounds exhausted" tells a reader nothing they can act on, and the loop's
+    own record of what it tried is the evidence for the answer.
+    """
     result = {"schema_version": 1, "created_at": now(), "repo": str(repo), "python": python,
               "probe": probe, "record": record, "verdict": verdict,
               "content_id": content_id(python, record, repo),
               "survived": len([r for r in record if r.get("kind") != "probe"]),
               "attempted": len(transcript)}
+    if not verdict.get("passed") and client is not None:
+        result["diagnosis"] = diagnose(client, repo, record=record, transcript=transcript,
+                                       probe=probe, verdict=verdict)
+        if result["diagnosis"]:
+            transcript.append({"kind": "diagnosis", **result["diagnosis"]})
     atomic_json(output / "environment.json", result)
     atomic_json(output / "transcript.json", {"rows": transcript})
     return result
