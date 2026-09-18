@@ -15,8 +15,15 @@ be confidently wrong about some of them. So a declaration is never trusted:
   capabilities is the system's own need rather than any benchmark's feature list.
 
 That last point is why `CAPABILITIES` lives here and not in an adapter. "Can this benchmark
-produce new successful trajectories" is a question the system asks of every benchmark; that
-LIBERO answers it by handing you a teleoperation script is LIBERO's business.
+produce new successful trajectories" is a question the system asks of every benchmark; how
+a particular one answers is its own business.
+
+Answering it well is the hard part, and it is not a matter of searching for a file. A
+benchmark with no expert script may still produce successes -- an environment that
+randomises its initial state at reset and reports per-step success labels every rollout it
+is given, so a policy's own successes can be kept. That reasoning lives in the method
+library rather than as a condition here, because the question "does this repository
+contain an expert" has a definite answer and is the wrong question.
 """
 
 from __future__ import annotations
@@ -40,9 +47,12 @@ CAPABILITIES: dict[str, str] = {
     "official_dataset": "a released set of demonstrations this benchmark authorises as "
                         "training data",
     "official_policy": "a released, already-trained policy to start from or compare against",
+    # The question is what can produce a success, not whether a script exists that does.
+    # Answering the second and reporting it as the first discarded the most common way a
+    # simulation benchmark can be researched, so the definition asks the open question and
+    # leaves the reasoning about how to answer it to the method library.
     "new_trajectory_generation": "produce new successful trajectories without a human in "
-                                 "the loop; this is the one that decides whether the "
-                                 "research loop can collect data at all",
+                                 "the loop",
     "targeted_generation": "bias the above toward a chosen region of the initial-state or "
                            "failure distribution",
     "training": "train or fine-tune a policy on demonstrations",

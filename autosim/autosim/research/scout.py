@@ -33,6 +33,7 @@ from typing import Any
 
 from .common import atomic_json, event, now, object_digest, redact
 from .declaration import CAPABILITIES, STATUSES, DeclarativeAdapter, problems_in, space_from, verify
+from .skills import skills_reference
 from .strategy import executable_first_step, plan
 from .survey import peek_many, summarise, survey
 
@@ -140,6 +141,7 @@ def triage(report: dict[str, Any], client: Any, *, limit: int = 12) -> dict[str,
     content, metadata = client.chat_with_metadata(
         TRIAGE_SYSTEM,
         _envelope("List the files worth reading.", ("files_to_read",),
+                  METHODS=skills_reference(),
                   SURVEY=summarise(report)),
         max_tokens=1200, timeout=120, thinking="disabled")
     try:
@@ -339,6 +341,7 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
         "file contents and the recorded trajectory structure.",
         IDENTITY_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
+        METHODS=skills_reference(),
         SURVEY=summarise(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
         FAILED_CHECKS_ON_YOUR_PREVIOUS_ANSWER=feedback,
@@ -357,6 +360,7 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
         "vary when it works with it.",
         DECISION_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
+        METHODS=skills_reference(benchmark=identity.get("benchmark")),
         ALREADY_ESTABLISHED=identity,
         SURVEY=summarise(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
@@ -482,6 +486,7 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
             research_plan, plan_log = plan(
                 adapter.optimization_space(adapter.select_task("auto")),
                 result["capabilities"], client, benchmark=declaration["benchmark"],
+                methods=skills_reference(benchmark=declaration["benchmark"]),
                 evidence={"declaration_reasoning": declaration["evidence"],
                           "capability_notes": {name: row.get("limitation") for name, row
                                                in result["capabilities"].items()}},

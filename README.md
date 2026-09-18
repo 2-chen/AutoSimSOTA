@@ -82,25 +82,35 @@ DeepSeek 负责研究提案，不负责执行 GPU 训练。
 | 任务合同 | `state_dim=47, action_dim=7`，相机 `agentview_rgb`/`eye_in_hand_rgb` 128×128，`max_episode_steps=1000` —— **与录制的 HDF5 一致** |
 | 可调空间 | 从 LIBERO 自己的 CLI/配置推出：`device`、`use-depth`、`policy.policy_type`、`lifelong.algo`、`train.loss_scale` … |
 | 适配器协议 | `check_adapter` 报 0 个缺项 |
-| **`new_trajectory_generation`** | **unsupported** —— 它读了 `collect_demonstration.py`，发现里面是 `device.start_control()` + `input2action(...)` 的人工遥操作循环 |
+| `new_trajectory_generation` | **declared** —— 见下方「成功轨迹从哪来」 |
 | `official_policy` | unsupported —— 它没有认领隔壁 RoboSyn 的 checkpoint，理由是这个路径不在本仓库任何脚本或配置里出现 |
 
-系统接着**自己提出研究方案**（`strategy.json`），并对着已声明的空间逐条校验：
+**「成功轨迹从哪来」是方法库的一条 skill，不是一条检查。** 第一版把「仓库里有没有专家脚本」当成了「能不能产出成功轨迹」，
+于是判定 LIBERO 不能产出数据 —— 这是错的。LIBERO 的环境每次 reset 都重采样物体位置，`step` 返回 `done = self._check_success()`，
+所以**跑当前策略、用环境自己的判据把成功的留下**，就能产出训练数据，不需要专家、不需要人。
+差别在于：专家从零就能产出，而过滤式采样的产出率≈当前策略成功率 —— 它是**自举**，不是供给。
 
-```json
-{
-  "targeted_collection":   "不可用 —— 仓库里没有自动产出轨迹的专家",
-  "data_selection":        "可用 —— 50 条官方演示/任务",
-  "training_recipe":       "可用",
-  "evaluation_resolution": "可用 —— 评测器接受局数"
-}
-```
+这条推理写在 `autosim/autosim/skills/where-successes-come-from/SKILL.md` 里，作为**参考**注入 scout 与 planner 的提示词：
+不参与校验、可以被推翻、加一条方法就是加一个文件。加上它之后，判定自动从 `unsupported` 变成 `declared`，
+没有新增任何检查。
+
+系统接着**自己提出研究方案**（`strategy.json`），并对着已声明的空间逐条校验。
+它自己把 `targeted_collection` 判为暂不可用，理由比「有/没有专家」细得多：
+
+> 第三个来源——**用 benchmark 自己的逐步成功判据过滤策略 rollout**——是能救回这一族的，
+> 而 LIBERO 的环境确实在 reset 时重采样物体位置（除非 `deterministic_reset`），
+> `step` 也返回 `done = self._check_success()`，所以这个来源**大概率存在**。
+> 但方案不会把开头几轮花在它上面，因为这里真正的区别是**什么时候能用**，不是**能不能用**：
+> 它的产出率取决于策略成功率，而本 benchmark 没有发布策略可供建立这个成功率
+> （`official_policy` 为 unsupported，也没有任何 LIBERO 配置指向 checkpoint）。
+> 因此把它记为「已声明但暂不可用」，并**记为第二轮产出高于下限后的条件回退项**。
 
 第一轮干预（模型自己选的，并给出了可被推翻的判据）：
 
 > 用 LIBERO 自己的 lifelong evaluator，把每轮评测局数提到足以分辨方法差异的量级；
-> 如果放大后的置信区间仍然重叠，说明此前的方法差异本来就是噪声。
-> **推翻它的条件**：同一策略跑两遍的置信区间已经盖住此前报告的组间差距。
+> 如果放大后的区间仍然重叠，说明此前的方法差异本来就是噪声。
+> **推翻它的条件**：同一策略跑两遍的区间已经盖住此前报告的组间差距；
+> 另外「零产出或全零成功」也是真实结果，说明可用策略路径低于下限，第二轮就转向 `training_recipe`。
 
 **「没有专家」不是「不能研究」，而是少了一族干预手段。** 闭环第一轮执行**方案里的第一个干预**，
 而不是「必须采集」——采集只是其中一个族。`--strategy` 把方案按内容哈希冻进 `protocol.json`，

@@ -503,3 +503,38 @@ def test_a_supplied_plan_is_frozen_into_the_protocol(tmp_path):
     assert "strategy" not in protocol_budget(planned)
     assert digest(plan_path)
     assert planned.strategy == str(plan_path)
+
+
+# -- the method library reaches the reader -------------------------------------------------
+
+def test_the_scout_is_given_the_method_library(repo):
+    """The mechanism for guiding the reader is a library, not a condition in the reader."""
+    triage_client = StubClient([json.dumps({"files_to_read": ["scripts/collect.py"]})])
+    scout.triage(survey(repo), triage_client)
+
+    identity = {k: v for k, v in declaration().items()
+                if k in ("benchmark", "evidence", "repo_markers", "tasks", "task_contract",
+                         "assets")}
+    propose_client = StubClient([
+        json.dumps(identity),
+        json.dumps({"capabilities": declaration()["capabilities"],
+                    "optimization_space": declaration()["optimization_space"]}),
+    ])
+    scout.propose(survey(repo), [], propose_client)
+
+    for prompt in triage_client.calls + propose_client.calls:
+        assert "### METHODS" in prompt
+        assert "reference_only_not_enforced" in prompt
+        # Offered, never enforced: the reader may contradict any entry, and nothing in the
+        # declaration is checked against one.
+        assert "where-successes-come-from" in prompt
+
+
+def test_the_library_is_a_directory_of_files_not_a_list_in_code():
+    """Adding a method is adding a file, which is what keeps this from becoming rules."""
+    from autosim.research.skills import skills_reference
+    library = skills_reference()
+    names = {row["name"] for row in library["skills"]}
+    assert "where-successes-come-from" in names
+    assert all(Path(row["source"]).name == "SKILL.md" for row in library["skills"])
+    assert library["library"]["add_a_method_by"].startswith("dropping a SKILL.md")

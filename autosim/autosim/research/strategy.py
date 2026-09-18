@@ -204,7 +204,8 @@ def problems_in(raw: dict[str, Any], space: OptimizationSpace,
 
 
 def build_request(space: OptimizationSpace, capabilities: dict[str, Any], *,
-                  benchmark: str, evidence: dict[str, Any] | None = None) -> tuple[str, str]:
+                  benchmark: str, evidence: dict[str, Any] | None = None,
+                  methods: dict[str, Any] | None = None) -> tuple[str, str]:
     """The plan request: what can be varied, and what the benchmark can do."""
     payload = {
         "benchmark": benchmark,
@@ -220,14 +221,20 @@ def build_request(space: OptimizationSpace, capabilities: dict[str, Any], *,
     }
     if evidence:
         payload["benchmark_evidence"] = evidence
+    if methods:
+        # Reference, not policy. A method that says how a benchmark like this one has been
+        # researched widens what the planner can consider; nothing validates against it.
+        payload["method_library"] = methods
     return SYSTEM, json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def plan(space: OptimizationSpace, capabilities: dict[str, Any], client: Any, *,
-         benchmark: str, evidence: dict[str, Any] | None = None, output: Path | None = None,
+         benchmark: str, evidence: dict[str, Any] | None = None,
+         methods: dict[str, Any] | None = None, output: Path | None = None,
          attempts: int = 3) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Ask for a plan and refuse to accept one the benchmark cannot execute."""
-    system, user = build_request(space, capabilities, benchmark=benchmark, evidence=evidence)
+    system, user = build_request(space, capabilities, benchmark=benchmark, evidence=evidence,
+                                 methods=methods)
     log: list[dict[str, Any]] = []
     for repair in range(attempts):
         current = user if repair == 0 else user + json.dumps({
