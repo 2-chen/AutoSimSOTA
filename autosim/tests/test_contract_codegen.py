@@ -11,12 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from autosim.research.contract_codegen import (FUNCTION, differential, gold_cases,
-                                               _disagreement_summary, _offending_call, oracle)
+from autosim.research.contract_codegen import (FIELD_ORDER, _offending_call,
+                                               differential_reader, function_name, gold_cases,
+                                               oracle)
 
 PROJECT = Path(__file__).resolve().parents[1]
 FIXTURE = Path(__file__).with_name("fixtures") / "robosyn_task_contracts.json"
-CORRECT = Path(__file__).with_name("fixtures") / "task_contract_reference.py"
+CORRECT = Path(__file__).with_name("fixtures") / "task_contract_fields.py"
 pytestmark = pytest.mark.skipif(not FIXTURE.is_file(), reason="oracle fixture not captured")
 
 #: What the reference reader is given that cannot be derived from a document: a task's
@@ -31,70 +32,76 @@ def _declared(task):
             "event_families": EVENT_FAMILIES}
 
 
-def test_a_function_that_reads_no_files_cannot_be_made_to(tmp_path):
+def test_a_function_that_reads_no_files_cannot_be_made_to():
     """The boundary is the allow-list, so it is worth asserting it actually holds."""
     from autosim.research.contract_codegen import checked_function
-    for source in ('def task_contract(d):\n    import os\n    return {}\n',
-                   'def task_contract(d):\n    return open("/etc/passwd").read()\n',
-                   'def task_contract(d):\n    return d.get("x")\n',
-                   'def task_contract(d):\n    return d["x"].values()\n'):
+    for body in ('import os\n    return {}',
+                 'return open("/etc/passwd").read()',
+                 'return d.get("x")',
+                 'return d["x"].values()'):
         with pytest.raises(ValueError):
-            checked_function(source, FUNCTION)
+            checked_function(f"def field_x(d):\n    {body}\n", "field_x")
 
 
 def test_the_rejection_names_the_call_it_refused():
-    refused = _offending_call('def task_contract(d):\n    return d.get("x")\n')
+    refused = _offending_call('def field_x(d):\n    return d.get("x")\n')
     assert "d.get('x')" in refused or 'd.get("x")' in refused
 
 
 def test_the_rejection_survives_source_that_does_not_parse():
     """A candidate that does not parse is a rejected draft, not a crash."""
-    assert _offending_call("def task_contract(d):\n    return ]\n") == ""
+    assert _offending_call("def field_x(d):\n    return ]\n") == ""
 
 
-def test_the_differential_accepts_a_faithful_reader(tmp_path):
+def _cases():
     oracle_doc = oracle(FIXTURE)
     repo = _checkout()
     if repo is None:
         pytest.skip("checkout not found")
-    cases = gold_cases(repo, oracle_doc,
-                       declared={t: _declared(t) for t in oracle_doc["tasks"]})
-    report = differential(CORRECT.read_text(encoding="utf-8"), cases)
-    assert report["passed"], [r for r in report.get("rows", []) if not r["passed"]][:2]
+    return gold_cases(repo, oracle_doc,
+                      declared={t: _declared(t) for t in oracle_doc["tasks"]})
 
 
-def test_the_differential_reports_the_field_and_the_task_that_disagree(tmp_path):
-    oracle_doc = oracle(FIXTURE)
-    repo = _checkout()
-    if repo is None:
-        pytest.skip("checkout not found")
-    cases = gold_cases(repo, oracle_doc,
-                       declared={t: _declared(t) for t in oracle_doc["tasks"]})
-    # Identical to the reference except that it sorts the cameras, which the benchmark's
-    # own reader does not -- the kind of deviation that looks correct and is not.
+NAMES = [function_name(f) for f in FIELD_ORDER]
+
+
+def test_a_faithful_reader_passes_every_task():
+    report = differential_reader(CORRECT.read_text(encoding="utf-8"), NAMES, _cases())
+    assert report["passed"], [r for r in report["rows"] if not r["passed"]][:2]
+
+
+def test_a_deviation_is_localised_to_the_field_that_has_it():
+    """The property the decomposition is for: a wrong field names one function to fix."""
     source = CORRECT.read_text(encoding="utf-8").replace(
-        'cameras = [s["uid"] for s in sensors]',
-        'cameras = sorted([s["uid"] for s in sensors])')
+        'return [s["uid"] for s in d["gym"]["sensor"] if s["sensor_type"] == "Camera"]',
+        'return sorted([s["uid"] for s in d["gym"]["sensor"] if s["sensor_type"] == "Camera"])')
     assert source != CORRECT.read_text(encoding="utf-8")
-    report = differential(source, cases)
+    report = differential_reader(source, NAMES, _cases())
     assert not report["passed"]
-    failures = [row for row in report["rows"] if not row["passed"]]
-    assert failures, "a sorted camera list must disagree with an unsorted one"
-    assert all("cameras" in row["disagreements"][0] for row in failures)
-    # And the summary a retry would be given names the task and the field.
-    summary = _disagreement_summary(report)
-    assert "cameras" in summary and failures[0]["task"] in summary
+    assert list(report["field_failures"]) == ["field_cameras"]
+    # And the report names the task and the values, so a repair is specific.
+    detail = report["field_failures"]["field_cameras"][0]
+    assert "cameras" in detail and "expected" in detail
 
 
-def test_a_candidate_that_raises_is_evidence_rather_than_a_crash():
-    # `raise` is not in the allow-list, so the candidate fails the way a real one does:
-    # by reaching for a key the document does not have.
+def test_a_field_that_raises_is_blamed_on_itself():
+    """Not on whichever function happens to be examined first."""
     source = CORRECT.read_text(encoding="utf-8").replace(
-        '    gym = documents["gym"]', '    gym = documents["gym"]["absent_key"]')
-    report = differential(source, [{"task": "any", "input": {"task": "t"},
-                                    "expected": {"name": "t"}}])
-    assert not report["passed"]
-    assert "KeyError" in report["rows"][0]["disagreements"][0]
+        '    return d["task"]', '    return d["absent"]["deeper"]')
+    report = differential_reader(source, NAMES, _cases())
+    assert list(report["field_failures"]) == ["field_name"]
+    assert "KeyError" in report["field_failures"]["field_name"][0]
+
+
+def test_one_broken_field_does_not_hide_the_others():
+    """Every function is called, so a repaired field can be verified while another is not."""
+    cases = [{"task": "t", "input": {"task": "t"}, "expected": {"name": "t", "setting": "s"}}]
+    source = ("def field_name(d):\n    return d['task']\n\n"
+              "def field_setting(d):\n    return d['absent']\n")
+    report = differential_reader(source, ["field_name", "field_setting"], cases)
+    assert list(report["field_failures"]) == ["field_setting"]
+    assert report["rows"][0]["disagreements"] == [
+        "setting: raised KeyError: 'absent'"]
 
 
 def _checkout():

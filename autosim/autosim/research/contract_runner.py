@@ -20,16 +20,21 @@ def main() -> int:
     request = json.loads(sys.stdin.read())
     namespace: dict = {}
     exec(compile(request["source"], "<task-contract>", "exec"), namespace)
-    function = namespace[FUNCTION]
+    functions = request["functions"]
     results = []
     for case in request["cases"]:
-        try:
-            produced = function(case)
-            # Round-trip through JSON so the comparison is between documents, not between
-            # Python objects that happen to serialize the same way.
-            results.append({"returned": json.loads(json.dumps(produced))})
-        except BaseException as exc:
-            results.append({"raised": f"{type(exc).__name__}: {exc}"})
+        produced: dict = {}
+        errors: dict = {}
+        # Every function is called and every failure is attributed to the function that
+        # raised. Stopping at the first failure and reporting one error would leave the
+        # caller unable to tell *which* field was wrong -- and a caller that guesses blames
+        # whichever function it happens to look at first, accepting a broken one.
+        for name in functions:
+            try:
+                produced[name] = json.loads(json.dumps(namespace[name](case)))
+            except BaseException as exc:
+                errors[name] = f"{type(exc).__name__}: {exc}"
+        results.append({"returned": produced, "errors": errors})
     sys.stdout.write(json.dumps(results, ensure_ascii=False))
     return 0
 

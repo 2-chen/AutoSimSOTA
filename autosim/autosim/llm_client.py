@@ -102,8 +102,15 @@ class LLMClient:
                     "model": self.model,
                     "messages": messages,
                     "max_tokens": max_tokens,
-                    "response_format": {"type": "json_object"},
                 }
+                # `json_object` is not a hint, it is a contract: the provider rejects the
+                # request unless the prompt contains the word "json". Sending it
+                # unconditionally made the requirement invisible -- a caller whose prompt did
+                # not happen to say "json" got an opaque HTTP 400 having asked for nothing
+                # unusual, and the failure looked like the prompt being wrong rather than
+                # like this function promising something the prompt had not agreed to.
+                if "json" in (system + " " + user).lower():
+                    payload["response_format"] = {"type": "json_object"}
                 if thinking is not None:
                     if thinking not in {"enabled", "disabled"}:
                         raise ValueError("thinking must be enabled or disabled")
