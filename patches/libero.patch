@@ -1,0 +1,47 @@
+--- "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/algos/base.py.orig"	2026-09-19 01:41:34.370994294 +0800
++++ "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/algos/base.py"	2026-09-19 01:41:34.389996336 +0800
+@@ -142,7 +142,10 @@
+             batch_size=self.cfg.train.batch_size,
+             num_workers=self.cfg.train.num_workers,
+             sampler=RandomSampler(dataset),
+-            persistent_workers=True,
++            # h5py 3.x refuses to be pickled, so the dataset's file handle cannot cross a
++            # worker boundary; keeping the loader in-process is what makes num_workers=0
++            # usable, and the flag has to follow it.
++            persistent_workers=(self.cfg.train.num_workers > 0),
+         )
+ 
+         prev_success_rate = -1.0
+--- "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/metric.py.orig"	2026-09-19 01:50:10.423195726 +0800
++++ "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/metric.py"	2026-09-19 01:50:10.447197567 +0800
+@@ -104,7 +104,7 @@
+         init_states_path = os.path.join(
+             cfg.init_states_folder, task.problem_folder, task.init_states_file
+         )
+-        init_states = torch.load(init_states_path)
++        init_states = torch.load(init_states_path, weights_only=False)
+         num_success = 0
+         for i in range(eval_loop_num):
+             env.reset()
+--- "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/utils.py.orig"	2026-09-19 01:50:10.450197797 +0800
++++ "/home/wbc/\344\270\213\350\275\275/autoresearch/test/LIBERO/libero/lifelong/utils.py"	2026-09-19 01:50:10.466199024 +0800
+@@ -56,7 +56,7 @@
+ 
+ 
+ def torch_load_model(model_path, map_location=None):
+-    model_dict = torch.load(model_path, map_location=map_location)
++    model_dict = torch.load(model_path, map_location=map_location, weights_only=False)
+     cfg = None
+     if "cfg" in model_dict:
+         cfg = model_dict["cfg"]
+--- autoresearch_runs/provisioning/libero/env/lib/python3.10/site-packages/robomimic/utils/dataset.py.orig	2026-09-19 01:40:35.743548480 +0800
++++ autoresearch_runs/provisioning/libero/env/lib/python3.10/site-packages/robomimic/utils/dataset.py	2026-09-19 01:40:35.767549649 +0800
+@@ -513,7 +513,7 @@
+ 
+         seq = TensorUtils.pad_sequence(seq, padding=(seq_begin_pad, seq_end_pad), pad_same=True)
+         pad_mask = np.array([0] * seq_begin_pad + [1] * (seq_end_index - seq_begin_index) + [0] * seq_end_pad)
+-        pad_mask = pad_mask[:, None].astype(np.bool)
++        pad_mask = pad_mask[:, None].astype(bool)
+ 
+         return seq, pad_mask
+ 
