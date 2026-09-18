@@ -730,6 +730,26 @@ def _finish(output: Path, repo: Path, python: str, record: list[dict[str, Any]],
     return result
 
 
+def env_python(output: Path) -> Path | None:
+    """The interpreter a successful build produced, or None.
+
+    The join between this stage and everything after it. Every other stage needs to run
+    something, and what it runs has to come from somewhere: this is where a build that
+    passed turns into a path a command can be run with.
+    """
+    record = Path(output) / "environment.json"
+    if not record.is_file():
+        return None
+    try:
+        document = read_json(record)
+    except ValueError:
+        return None
+    if not (document.get("verdict") or {}).get("passed"):
+        return None
+    interpreter = Path(output) / "env" / "bin" / "python"
+    return interpreter if interpreter.is_file() else None
+
+
 def provision(repo: Path, *, client: Any, output: Path) -> dict[str, Any]:
     """Plan and build, writing down every step whether it worked or not."""
     repo = Path(repo).expanduser().resolve()
