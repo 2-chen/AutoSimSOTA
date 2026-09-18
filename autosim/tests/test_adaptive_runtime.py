@@ -1,3 +1,7 @@
+import tempfile
+import unittest
+from pathlib import Path
+
 from autosim.research.common import read_json
 from autosim.robosyn_data import evaluation_seed_bank
 from tests.test_runtime_sharding import ShardingTestCase, FixtureRuntime, SPEC, MASTER_SEED
@@ -31,3 +35,59 @@ class AdaptiveRuntimeTests(ShardingTestCase):
         self.assertEqual(len(FixtureRuntime.records),5)
         self.assertEqual(first["episodes"],second["episodes"])
         self.assertEqual([r["episode_seed"] for r in second["episodes"]],evaluation_seed_bank(MASTER_SEED,40))
+
+
+class ExecutionCodeDigestTest(unittest.TestCase):
+    """The digest is the identity of the code that produced a run's artifacts.
+
+    It is keyed on where code lives as well as what it says, which is why generalizing the
+    execution layer invalidates resume for runs started before it. This test exists so that
+    consequence is discovered here rather than by a resume failing months later.
+    """
+
+    def test_the_digest_covers_the_whole_package_not_just_this_module(self):
+        from autosim.research.runtime import Runtime
+        package = Path(__file__).resolve().parents[1] / "autosim"
+        files = sorted(package.rglob("*.py"))
+        runtime = Runtime(package, package / "output")
+
+        self.assertGreater(len(files), 20)
+        # A digest over runtime.py alone would not change when a method moves out of it,
+        # which is exactly the move this refactor performs.
+        covered = {str(p.relative_to(package)) for p in files}
+        self.assertIn("research/runtime.py", covered)
+        self.assertIn("research/repository_autoresearch.py", covered)
+        self.assertTrue(runtime._execution_code_digest())
+
+    def test_the_digest_is_stable_for_an_unchanged_tree(self):
+        from autosim.research.runtime import Runtime
+        package = Path(__file__).resolve().parents[1] / "autosim"
+        first = Runtime(package, package / "output")._execution_code_digest()
+        second = Runtime(package, package / "output")._execution_code_digest()
+        self.assertEqual(first, second)
+
+    def test_a_renamed_module_changes_the_digest(self):
+        """Same bytes, different path, different identity.
+
+        This is why generalizing the execution layer breaks resume: the digest is keyed on
+        where code lives. Asserted here rather than discovered by a failed resume.
+        """
+        from autosim.research.runtime import execution_code_digest
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "pkg"
+            (package / "a").mkdir(parents=True)
+            (package / "a" / "one.py").write_text("X = 1\n", encoding="utf-8")
+            before = execution_code_digest(package)
+            (package / "a" / "one.py").unlink()
+            (package / "a" / "two.py").write_text("X = 1\n", encoding="utf-8")
+            self.assertNotEqual(before, execution_code_digest(package))
+            # And moving the same file between directories changes it too.
+            (package / "a" / "two.py").unlink()
+            (package / "b").mkdir()
+            (package / "b" / "two.py").write_text("X = 1\n", encoding="utf-8")
+            self.assertNotEqual(before, execution_code_digest(package))
+
+    def test_the_digest_ignores_the_workspace(self):
+        """It is the installed package, so two runtimes in different places share one."""
+        from autosim.research.runtime import _this_package
+        self.assertEqual(_this_package().name, "autosim")

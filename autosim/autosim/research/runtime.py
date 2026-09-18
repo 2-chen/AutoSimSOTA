@@ -8,12 +8,45 @@ import shutil
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from .common import (assert_frozen, atomic_json, digest, find_benchmark, immutable_json,
                      object_digest, read_json, run_command)
 from .devices import DEFAULT_DEVICE_ENV, SimDeviceSelection, select, shard_count
 from .registry import TaskSpec
 from .native_lifecycle import retryable_startup, startup_attempt_limit
+
+
+def _this_package() -> Path:
+    """The installed package, not the runtime's workspace.
+
+    Worth knowing before relying on this digest: it does not vary with the run's
+    workspace, repo or output, so two runtimes in different directories share one identity.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def _activated_component_identity() -> str | None:
+    from .execution_activation import active_execution_identity
+    activated = active_execution_identity()
+    return activated.get("component_sha256") if activated else None
+
+
+def execution_code_digest(package: Path) -> str:
+    """Content-addressed identity of a package tree, keyed by relative path.
+
+    Extracted from the method so the property that matters can be tested directly: adding,
+    removing or *renaming* a module changes the digest even when the code is byte-identical,
+    because the paths are part of the key. That is the reason generalizing the execution
+    layer invalidates resume for runs started before it, and it is not something to
+    discover by watching a resume fail.
+    """
+    files = sorted(Path(package).rglob("*.py"))
+    identity = object_digest({str(p.relative_to(package)): digest(p) for p in files})
+    component_identity = _activated_component_identity()
+    if component_identity:
+        identity = object_digest({"package": identity, "lifecycle_component": component_identity})
+    return identity
 
 
 def retryable_evaluation_startup(directory: Path) -> bool:
@@ -114,22 +147,36 @@ class Runtime:
         return bool(self.plan and self.plan.get("unified_scheduler") and self.job is None)
 
     def _execution_code_digest(self) -> str:
+        """Identity of the code that produced a run's artifacts.
+
+        Keyed on ``{relative path: sha256}`` over every module in the package, so it is a
+        digest of *where* code lives as much as of what it says: moving a method from one
+        module to another changes the keys and therefore the digest, even though the
+        behaviour is identical.
+
+        Three consumers make that expensive. It is `HarnessArtifacts.revision`, compared on
+        resume, so a run started before such a move refuses to continue
+        (``ArtifactConflict: incomplete attempt belongs to another executor revision``). It
+        is frozen into the device probe's `probe_contract.json`. And it keys the profile
+        store behind `PhaseJob.code_digest`, whose measured percentiles decide which jobs
+        run together.
+
+        Consequence for anyone refactoring across module boundaries: a fresh run reproduces
+        the same artifact tree, and *resuming a run started beforehand does not work*. That
+        is a property of this function, not a defect to work around; `execution_activation`
+        exists to pin a run's identity when one must be continued across such a change.
+        """
         # A Runtime leaf can call adapters and data validators in other modules.
         # Hash the package once per source version, so changing one of those modules
         # cannot silently reuse a result merely because runtime.py stayed unchanged.
-        package = Path(__file__).resolve().parents[1]
+        package = _this_package()
         files = sorted(package.rglob("*.py"))
-        from .execution_activation import active_execution_identity
-        activated = active_execution_identity()
-        component_identity = activated.get("component_sha256") if activated else None
         signature = (tuple((str(p.relative_to(package)), p.stat().st_size, p.stat().st_mtime_ns)
-                          for p in files), component_identity)
+                          for p in files), _activated_component_identity())
         cached = getattr(self, "_execution_code_cache", None)
         if cached and cached[0] == signature:
             return cached[1]
-        identity = object_digest({str(p.relative_to(package)):digest(p) for p in files})
-        if component_identity:
-            identity = object_digest({"package": identity, "lifecycle_component": component_identity})
+        identity = execution_code_digest(package)
         self._execution_code_cache = (signature, identity)
         return identity
 
