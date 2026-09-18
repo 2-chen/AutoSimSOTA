@@ -60,6 +60,9 @@ SYSTEM = (
     "identifier. Declare those in `parameters`: one entry per value the invocation needs that "
     "is not a path the caller passes in, with the value you found and the evidence for it. A "
     "parameter whose value you inferred rather than read must say what you inferred it from.\n\n"
+    "A parameter's `value` is the literal the command substitutes -- one token, no "
+    "explanation. If you cannot settle on a single literal, that is a finding: say so in "
+    "`why` and mark the stage unavailable rather than writing a description into the value.\n\n"
     "Return one JSON object of the form {\"stages\": {\"<stage>\": {\"available\": true or "
     "false, \"entrypoint\": \"<path>\", \"invocation\": \"<how it is called>\", \"artifact\": "
     "\"<a path or glob, relative to the output directory, that exists only on success>\", "
@@ -117,8 +120,16 @@ ARGV_SYSTEM = (
     "Every element of the returned list must be a string. A value the caller did not supply "
     "must not be invented: if the entry point needs something outside the vocabulary, say so "
     "in the reasoning rather than guessing it.\n\n"
+    "Every value in `declared_parameters` must be read from `i` by the name given, not "
+    "written into the function as a literal -- otherwise a corrected value cannot reach the "
+    "command, and the correction will look like it had no effect.\n\n"
+    "If the command was run and refused, you may also correct `declared_parameters`: some "
+    "failures are the function's fault and some are a value's, and a program that says it "
+    "cannot load something is telling you which. Return the whole corrected set, not just "
+    "the changed entry, and say in the reasoning what told you the value was wrong.\n\n"
     "Return only {\"source\": \"<the function>\", \"reasoning\": \"<one or two "
-    "sentences, including anything the vocabulary could not express>\"}."
+    "sentences, including anything the vocabulary could not express>\", "
+    "\"parameters\": {\"<name>\": \"<corrected value>\"} (optional)}."
 )
 
 
@@ -152,8 +163,9 @@ def argv_function_name(stage: str) -> str:
 def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                   repository_files: list[str],
                   declared_parameters: dict[str, str] | None = None,
-                  verify: Any = None, attempts: int = 3
-                  ) -> tuple[str | None, list[dict[str, Any]]]:
+                  verify: Any = None, inputs_for_verify: dict[str, Any] | None = None,
+                  attempts: int = 3
+                  ) -> tuple[str | None, dict[str, str], list[dict[str, Any]]]:
     """Write the function that turns the system's inputs into this benchmark's command.
 
     Generated rather than templated because invocations differ in kind rather than in
@@ -163,17 +175,21 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
     """
     from .patch_validation import checked_function
     name = argv_function_name(stage)
-    user = json.dumps({
+    inputs_for_verify = dict(inputs_for_verify or {})
+    current_parameters = dict(declared_parameters or {})
+    def request(parameters: dict[str, str]) -> str:
+        return json.dumps({
         "stage": stage,
         "function_name": name,
         "entrypoint": entrypoint,
         "invocation_as_written_in_the_repository": invocation,
         "inputs_available": INPUT_VOCABULARY,
-        "declared_parameters": declared_parameters or {},
+        "declared_parameters": parameters,
         "files_in_the_repository": repository_files[:200],
         "note": "Values in `declared_parameters` are already settled for this repository and "
                 "must be used as given; do not ask the caller for them. Return the argv only.",
     }, ensure_ascii=False, sort_keys=True)
+    user = request(current_parameters)
     log: list[dict[str, Any]] = []
     for repair in range(attempts):
         current = user if repair == 0 else user + json.dumps({
@@ -193,23 +209,42 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
             except (ValueError, SyntaxError) as exc:
                 from .contract_codegen import _offending_call
                 raise ValueError(f"{exc}{_offending_call(source)}") from None
+            revised = {**current_parameters,
+                       **{str(k): str(v) for k, v in (payload.get("parameters") or {}).items()}}
             if verify is not None:
                 # The command is run before it is accepted. Nothing static decides whether
                 # a flag exists on a program: the generated argv passed every check and was
                 # refused by the program itself, printing the usage line that says so.
-                outcome = verify(source)
+                #
+                # The revised parameters go to the verifier, not the original ones, because
+                # some failures are a value's fault rather than the function's -- a program
+                # that cannot load something is naming the value it was handed.
+                # The verifier is handed the *command*, built here from the revised
+                # parameters, not the source. Handing it the source leaves the caller to
+                # work out how the parameters reach the argv -- and a function that
+                # hardcodes a value instead of reading it from `i` then looks like one that
+                # read it, which is precisely the difference this loop exists to find.
+                try:
+                    argv = checked_function(source, name)({**inputs_for_verify, **revised})
+                except Exception as exc:
+                    raise ValueError(f"{name} could not build a command: "
+                                     f"{type(exc).__name__}: {exc}") from None
+                outcome = verify(argv)
                 if not outcome.get("ok"):
                     raise ValueError("the command did not run. The program said:\n"
                                      + error_excerpt(str(outcome.get("error") or "")))
+                current_parameters = revised
             log.append({"stage": stage, "attempt": repair + 1, "status": "accepted",
                         "reasoning": payload.get("reasoning"),
+                        "parameters": current_parameters,
                         "response_sha256": object_digest(content)})
-            return source, log
+            return source, current_parameters, log
         except (ValueError, KeyError, SyntaxError, json.JSONDecodeError) as exc:
             log.append({"stage": stage, "attempt": repair + 1, "status": "rejected",
                         "error": redact(f"{type(exc).__name__}: {exc}"),
                         "response_sha256": object_digest(content)})
-    return None, log
+        current = user + json.dumps({"rejected": log[-1]["error"]}, ensure_ascii=False)
+    return None, current_parameters, log
 
 
 def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
@@ -278,6 +313,18 @@ def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
                     # disambiguation between several implementations is exactly a claim a
                     # repository can be asked about, and the answer shown to be checked.
                     problems.append(f"stages.{name}.parameters[{index}].{key} is required")
+            value = str(parameter.get("value", ""))
+            if " " in value.strip():
+                # A sentence is a description of several values, not a value, and it is how
+                # an unsure answer looks: the derivation wrote
+                # "pi0 (directory policy/pi0), also pi0.5 (policy/pi05)" into a parameter a
+                # command has to substitute, and the generated function then tried to parse
+                # it rather than use it. Saying a value is unsettled is a legitimate answer
+                # and a different field.
+                problems.append(
+                    f"stages.{name}.parameters[{index}].value is a description, not a value: "
+                    f"{value[:60]!r}. Give the literal the command needs, or report the "
+                    f"stage unavailable with a why")
     return problems
 
 

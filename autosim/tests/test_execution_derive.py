@@ -184,3 +184,31 @@ def test_the_error_excerpt_falls_back_to_the_tail_when_nothing_announces_itself(
     from autosim.research.execution_derive import error_excerpt
     assert error_excerpt("a\nb\nlast thing said") == "a\nb\nlast thing said"
     assert error_excerpt("") == "(no output)"
+
+
+def test_a_parameter_value_must_be_a_literal_not_a_description(repo):
+    """How an unsure answer looks, and why it is worth refusing.
+
+    A command substitutes the value. Given "pi0 (directory policy/pi0), also pi0.5
+    (policy/pi05)" the generated function tried to parse it -- with a method call the
+    validator refuses -- instead of using it. Saying the value is unsettled is a legitimate
+    answer and a different field.
+    """
+    faults = problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py --policy <name>",
+        "artifact": "checkpoints/*/model.json",
+        "parameters": [{"name": "--policy",
+                        "value": "act, or possibly dp depending on the config",
+                        "evidence": "the docs list several"}]}), repo)
+    assert any("is a description, not a value" in fault for fault in faults)
+
+
+def test_a_literal_parameter_value_is_accepted(repo):
+    assert problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py --policy <name>",
+        "artifact": "checkpoints/*/model.json",
+        "parameters": [{"name": "--policy", "value": "act",
+                        "evidence": "every shipped checkpoint is named ACT_sim_*"}]}),
+        repo) == []
