@@ -11,9 +11,13 @@ import json
 import sys
 import time
 
+#: The callable names a validated function may use. The allow-list exists to make I/O and
+#: imports impossible, not to make string building impossible -- `str` is here because
+#: building a command line out of numbers is otherwise not expressible, and it reaches
+#: nothing the others do not.
 BUILTINS = {name: getattr(builtins, name) for name in
-            ("int", "float", "len", "sum", "min", "max", "range", "enumerate", "zip", "abs",
-             "list", "dict", "tuple", "set", "sorted", "bool", "all", "any")}
+            ("int", "float", "str", "len", "sum", "min", "max", "range", "enumerate", "zip",
+             "abs", "list", "dict", "tuple", "set", "sorted", "bool", "all", "any")}
 NODES = (ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.Assign,
          ast.AugAssign, ast.AnnAssign, ast.For, ast.If, ast.Expr, ast.Pass, ast.Break,
          ast.Continue, ast.Name, ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Set,

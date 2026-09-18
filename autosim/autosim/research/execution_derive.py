@@ -53,9 +53,16 @@ SYSTEM = (
     "Name only files you have seen in the survey, the excerpts or the file contents, and "
     "give paths relative to the repository root. A file belonging to a different project "
     "that happens to be vendored inside this one is not this repository's entry point.\n\n"
+    "Every invocation needs values the caller will supply, and some need values only this "
+    "benchmark knows -- which policy implementation, which configuration, which dataset "
+    "identifier. Declare those in `parameters`: one entry per value the invocation needs that "
+    "is not a path the caller passes in, with the value you found and the evidence for it. A "
+    "parameter whose value you inferred rather than read must say what you inferred it from.\n\n"
     "Return one JSON object of the form {\"stages\": {\"<stage>\": {\"available\": true or "
     "false, \"entrypoint\": \"<path>\", \"invocation\": \"<how it is called>\", \"artifact\": "
     "\"<what appears on success>\", \"level\": \"entry point, or the path this wraps\", "
+    "\"parameters\": [{\"name\": \"<as the invocation spells it>\", \"value\": \"<the value "
+    "for this repository>\", \"evidence\": \"<where that value comes from>\"}], "
     "\"why\": \"<when unavailable>\"}}, \"reasoning\": \"<how you found them>\"}."
 )
 
@@ -69,6 +76,102 @@ TRIAGE_SYSTEM = (
     "inside it, and prefer documentation that shows an invocation. Do not ask for a file "
     "only to confirm its name."
 )
+
+
+#: What a stage function may read. The system's vocabulary, not the benchmark's: a stage is
+#: told what it is being asked to do, and it says how this particular benchmark expresses
+#: that. A benchmark needing something outside this list cannot be driven, which is a real
+#: limit and is reported as one rather than papered over with a free-form command string.
+INPUT_VOCABULARY: dict[str, str] = {
+    "python": "the interpreter to run with",
+    "repo": "absolute path to the benchmark checkout",
+    "task": "the task name this stage is for",
+    "dataset": "absolute path to training data, when the stage consumes it",
+    "checkpoint": "absolute path to a policy checkpoint, when the stage consumes one",
+    "output": "absolute directory the stage should write into",
+    "steps": "training steps, as an int",
+    "episodes": "evaluation episodes, as an int",
+    "seed": "the seed, as an int",
+    "device": "the device string this stage should use",
+    "extra": "a dict of anything the caller was told to pass through; may be empty",
+}
+
+ARGV_SYSTEM = (
+    "You write one pure Python function that returns the command line for one stage of a "
+    "research loop on a benchmark you have been shown.\n\n"
+    "The function takes one argument `i`, a dict with the keys listed in "
+    "`inputs_available`, and returns a list of strings: the argv, starting with the program "
+    "to run. Build it from the entry point and the invocation you were given, using the "
+    "arguments that invocation shows.\n\n"
+    "Constraints, enforced by a validator that rejects the draft outright:\n"
+    "* exactly one function, named for the stage, taking one positional argument\n"
+    "* no imports, no decorators, no nested functions, no recursion, no exception handling\n"
+    "* no attribute access or method calls of any kind; subscripts and comprehensions only\n"
+    "* to collect values use `xs = xs + [v]`; there is no append\n"
+    "* the only callable names are int, float, str, len, sum, min, max, range, enumerate, "
+    "zip, abs, list, dict, tuple, set, sorted, bool, all, any\n"
+    "* no f-strings; build strings with + and str()\n\n"
+    "Every element of the returned list must be a string. A value the caller did not supply "
+    "must not be invented: if the entry point needs something outside the vocabulary, say so "
+    "in the reasoning rather than guessing it.\n\n"
+    "Return only {\"source\": \"<the function>\", \"reasoning\": \"<one or two "
+    "sentences, including anything the vocabulary could not express>\"}."
+)
+
+
+def argv_function_name(stage: str) -> str:
+    return f"stage_argv_{stage}"
+
+
+def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
+                  repository_files: list[str],
+                  declared_parameters: dict[str, str] | None = None,
+                  attempts: int = 3) -> tuple[str | None, list[dict[str, Any]]]:
+    """Write the function that turns the system's inputs into this benchmark's command.
+
+    Generated rather than templated because invocations differ in kind rather than in
+    spelling: one benchmark takes flags, another a config file and a name, a third a shell
+    wrapper with positional arguments. A template language general enough to cover them
+    would be a programming language, and generating the function is the smaller thing.
+    """
+    from .patch_validation import checked_function
+    name = argv_function_name(stage)
+    user = json.dumps({
+        "stage": stage,
+        "function_name": name,
+        "entrypoint": entrypoint,
+        "invocation_as_written_in_the_repository": invocation,
+        "inputs_available": INPUT_VOCABULARY,
+        "declared_parameters": declared_parameters or {},
+        "files_in_the_repository": repository_files[:200],
+        "note": "Values in `declared_parameters` are already settled for this repository and "
+                "must be used as given; do not ask the caller for them. Return the argv only.",
+    }, ensure_ascii=False, sort_keys=True)
+    log: list[dict[str, Any]] = []
+    for repair in range(attempts):
+        current = user if repair == 0 else user + json.dumps({
+            "rejected": log[-1]["error"],
+            "instruction": f"Return only the corrected {name}, satisfying every constraint."},
+            ensure_ascii=False)
+        content, metadata = client.chat_with_metadata(ARGV_SYSTEM, current, max_tokens=3000,
+                                                      timeout=180, thinking="disabled")
+        try:
+            payload = _object(content)
+            source = str(payload["source"])
+            try:
+                checked_function(source, name)
+            except (ValueError, SyntaxError) as exc:
+                from .contract_codegen import _offending_call
+                raise ValueError(f"{exc}{_offending_call(source)}") from None
+            log.append({"stage": stage, "attempt": repair + 1, "status": "accepted",
+                        "reasoning": payload.get("reasoning"),
+                        "response_sha256": object_digest(content)})
+            return source, log
+        except (ValueError, KeyError, SyntaxError, json.JSONDecodeError) as exc:
+            log.append({"stage": stage, "attempt": repair + 1, "status": "rejected",
+                        "error": redact(f"{type(exc).__name__}: {exc}"),
+                        "response_sha256": object_digest(content)})
+    return None, log
 
 
 def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
@@ -114,6 +217,20 @@ def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
         for key in ("invocation", "artifact"):
             if not str(row.get(key, "")).strip():
                 problems.append(f"stages.{name}.{key} is required when available")
+        parameters = row.get("parameters")
+        if parameters is not None and not isinstance(parameters, list):
+            problems.append(f"stages.{name}.parameters must be a list when present")
+            continue
+        for index, parameter in enumerate(parameters or []):
+            if not isinstance(parameter, dict):
+                problems.append(f"stages.{name}.parameters[{index}] must be an object")
+                continue
+            for key in ("name", "value", "evidence"):
+                if not str(parameter.get(key, "")).strip():
+                    # A value without evidence is the guess this field exists to expose: the
+                    # disambiguation between several implementations is exactly a claim a
+                    # repository can be asked about, and the answer shown to be checked.
+                    problems.append(f"stages.{name}.parameters[{index}].{key} is required")
     return problems
 
 

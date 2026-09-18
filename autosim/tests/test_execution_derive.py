@@ -112,3 +112,42 @@ def test_the_answer_carries_that_it_is_unverified(tmp_path):
     assert result["evidence"] == "static_only"
     assert "no stage has been executed" in result["unverified"]
     assert result["stages"]["evaluate"]["entrypoint"] == "scripts/eval.py"
+
+
+def test_a_declared_parameter_must_say_where_its_value_came_from(repo):
+    """The field exists so that an inferred value is visible as inferred.
+
+    This is where a benchmark with several policy implementations gets disambiguated, and
+    the disambiguation is a claim about the repository -- which can be checked, or at least
+    read, but only if the evidence travels with the value.
+    """
+    faults = problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "parameters": [{"name": "--policy", "value": "act", "evidence": "  "}]}), repo)
+    assert any("parameters[0].evidence is required" in fault for fault in faults)
+
+
+def test_a_declared_parameter_must_have_a_value(repo):
+    faults = problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "parameters": [{"name": "--policy", "value": "", "evidence": "the shipped checkpoints"}]}),
+        repo)
+    assert any("parameters[0].value is required" in fault for fault in faults)
+
+
+def test_an_evidenced_parameter_is_accepted(repo):
+    assert problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py --policy <name>", "artifact": "a checkpoint",
+        "parameters": [{"name": "--policy", "value": "act",
+                        "evidence": "every shipped checkpoint is named ACT_sim_*"}]}),
+        repo) == []
+
+
+def test_a_stage_without_parameters_is_fine(repo):
+    """Not every invocation needs a value the caller cannot supply."""
+    assert problems_in(answer(evaluate={
+        "available": True, "entrypoint": "scripts/eval.py", "invocation": "python scripts/eval.py",
+        "artifact": "metrics.json"}), repo) == []
