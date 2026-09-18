@@ -83,9 +83,19 @@ PLAN_SYSTEM = (
     "cannot execute, which is worse than failing, because the build looks successful. Where "
     "that is so, say which pin you are departing from and why, and what the departure risks.\n\n"
     "Return one JSON object: {\"python\": \"<version, e.g. 3.9>\", \"commands\": [\"<command>\", "
-    "...], \"probe\": \"<one command using {python} that shows the environment can do the "
-    "thing this benchmark exists to do>\", \"reasoning\": \"<what you based this on, and "
-    "anything you added or could not determine>\"}."
+    "...], \"probes\": [\"<one command per stage the environment has to support, using "
+    "{python}>\"], \"reasoning\": \"<what you based this on, and anything you added or could "
+    "not determine>\"}.\n\n"
+    "There is one probe per stage, and all of them have to pass. An environment that "
+    "constructs a simulator is not an environment that trains a policy, and a single probe "
+    "for the most visible thing certifies only that thing: a build here passed by showing the "
+    "simulator could be stepped, while the training stack it would be stepped for was never "
+    "installed, because nothing asked for it.\n\n"
+    "A probe must *do* the thing, not ask about it. `torch.cuda.is_available()` is a driver "
+    "check and answers yes on hardware the installed build cannot actually execute on; a "
+    "tensor multiplication on that device answers the question that matters. A probe that "
+    "cannot fail certifies nothing, and one written as a question passes on a broken "
+    "environment -- which is worse than failing, because it is believed."
 )
 
 RESUME_SYSTEM = (
@@ -116,8 +126,12 @@ RECONSIDER_SYSTEM = (
     "targets hardware the machine does not have will install and then fail at first use; "
     "substituting a build that targets it is the fix, and the risk is that the rest of the "
     "stack was written against the old one.\n\n"
-    "You are given everything tried so far, with what each attempt reported. Do not repeat "
-    "an approach that has already failed.\n\n"
+    "You are given everything tried so far, with what each attempt reported, and "
+    "`installed_now`: what the environment actually contains, asked of it directly. Compare "
+    "that against the commands that survived -- a command can exit zero and leave the old "
+    "version in place, so what a command reported and what is present are different "
+    "questions, and the second is the one that decides what runs.\n\n"
+    "Do not repeat an approach that has already failed.\n\n"
     "Return one JSON object: {\"constraint\": \"<the requirement that cannot hold, as it was "
     "stated>\", \"substitute\": \"<what to use instead>\", \"why\": \"<what makes the "
     "original impossible here>\", \"cost\": \"<what this gives up, and what would have to "
@@ -213,8 +227,11 @@ def plan_problems(value: dict[str, Any]) -> list[str]:
         for index, command in enumerate(commands):
             if not isinstance(command, str) or not command.strip():
                 problems.append(f"commands[{index}] must be a non-empty string")
-    if not str(value.get("probe", "")).strip():
-        problems.append("probe is required: how to show the environment works")
+    probes = value.get("probes")
+    if not isinstance(probes, list) or not probes or not all(
+            isinstance(p, str) and p.strip() for p in probes):
+        problems.append("probes must be a non-empty list: one command per stage the "
+                        "environment has to support, which is what 'built' will mean")
     return problems
 
 
@@ -374,7 +391,7 @@ def conda_executable() -> str:
 def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | None = None,
           max_rounds: int = 14, step_timeout: int = 3600,
           manifests: dict[str, str] | None = None) -> dict[str, Any]:
-    """Build until the probe passes, recording only what survived.
+    """Build until every probe passes, recording only what survived.
 
     The loop is: run the next command; if it fails, ask what to change given the failure and
     the commands that already worked; when the plan runs out, probe; if the probe fails, ask
@@ -409,12 +426,13 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
 
     if python is None:
         planned = plan(client, repo, manifests=manifests)
-        python, pending, probe = planned["python"], list(planned["commands"]), planned["probe"]
+        python, pending = planned["python"], list(planned["commands"])
+        probes = list(planned["probes"])
         transcript.append({"stage": "plan", **{k: planned[k] for k in ("reasoning",)},
                            "attempts": planned.get("attempts")})
     else:
-        pending, probe = [], ""
-    atomic_json(output / "plan.json", {"python": python, "commands": pending, "probe": probe,
+        pending, probes = [], []
+    atomic_json(output / "plan.json", {"python": python, "commands": pending, "probes": probes,
                                        "manifests": sorted(manifests), "created_at": now()})
 
     values = values_for(prefix, repo, workdir, conda_executable())
@@ -452,7 +470,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             if result["failure_kind"] == "platform":
                 # Retrying cannot help and cannot terminate. The machine cannot host this,
                 # which is a finding about the platform and not about the recipe.
-                return _finish(output, repo, python, record, transcript, probe,
+                return _finish(output, repo, python, record, transcript, probes,
                                {"passed": False, "reason": "platform limit",
                                 "detail": result["excerpt"]}, client=client)
             pending = pending[:index] + resume(client, repo, record, result,
@@ -460,16 +478,36 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                                                values=values)
             break
         else:
-            outcome = probe_environment(probe, values=values, env=environment, cwd=repo,
-                                        output=output / "probe.log")
-            transcript.append({**outcome, "kind": "probe"})
+            # Every probe, because each one is a stage the environment has to support. A
+            # single probe for the most visible thing certifies only that thing: a build here
+            # passed by stepping the simulator, while the training stack it would be stepped
+            # for was never installed, because nothing asked for it.
+            outcome: dict[str, Any] = {"ok": True}
+            for probe_index, probe in enumerate(probes):
+                outcome = probe_environment(probe, values=values, env=environment, cwd=repo,
+                                            output=output / f"probe_{probe_index}.log")
+                transcript.append({**outcome, "kind": "probe", "probe": probe})
+                if not outcome["ok"]:
+                    break
             if outcome["ok"]:
-                record.append({**outcome, "kind": "probe", "round": round_index + 1})
-                return _finish(output, repo, python, record, transcript, probe,
-                               {"passed": True, "seconds": outcome.get("seconds")},
+                for probe_row in transcript[-len(probes):]:
+                    record.append({**probe_row, "kind": "probe", "round": round_index + 1})
+                # What the probes printed travels with the fact that they passed. A probe
+                # that asks rather than does can pass on an environment that does not work,
+                # and this build had one: `torch.cuda.is_available()` returned true and
+                # printed, in the same breath, that the installed torch cannot execute on
+                # this GPU. A verdict that hides its evidence is the failure mode this whole
+                # stage exists to avoid, and it costs one field to avoid.
+                return _finish(output, repo, python, record, transcript, probes,
+                               {"passed": True, "seconds": outcome.get("seconds"),
+                                "probes": len(probes),
+                                "probe_output": [
+                                    {"probe": row.get("probe"),
+                                     "said": str(row.get("excerpt"))[:600]}
+                                    for row in record if row.get("kind") == "probe"]},
                                client=client)
             if outcome["failure_kind"] == "platform":
-                return _finish(output, repo, python, record, transcript, probe,
+                return _finish(output, repo, python, record, transcript, probes,
                                {"passed": False, "reason": "platform limit",
                                 "detail": outcome["excerpt"]}, client=client)
             # A round that added nothing is a round that made no progress. Fixing one more
@@ -485,15 +523,15 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         # a build that never reached the probe because one command would not run --
         # retrying the same class of fix until the rounds ran out.
         if len(record) == before:
-            revision = reconsider(client, repo, record=record, transcript=transcript,
-                                  manifests=manifests)
+            revision = reconsider(client, repo, prefix=prefix, record=record,
+                                  transcript=transcript, manifests=manifests)
             if revision is None:
-                return _finish(output, repo, python, record, transcript, probe,
+                return _finish(output, repo, python, record, transcript, probes,
                                {"passed": False, "reason": "no approach left",
                                 "rounds": round_index + 1}, client=client)
             pending = list(revision["commands"])
             index = 0
-    return _finish(output, repo, python, record, transcript, probe,
+    return _finish(output, repo, python, record, transcript, probes,
                    {"passed": False, "reason": "rounds exhausted"}, client=client)
 
 
@@ -559,6 +597,33 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
     return []
 
 
+def installed(prefix: Path, *, timeout: int = 180) -> dict[str, str]:
+    """What the environment actually contains, asked of the environment.
+
+    A command that installs something can exit zero and leave the old version in place -- pip
+    reports success having decided an existing install satisfies the request. The record has
+    no way to tell that from an install that took, so what the environment says about itself
+    travels alongside it. This is the second time in this build that "recorded" and "present"
+    came apart, and the first time it was found by the model in its own diagnosis rather than
+    by anything the loop checks.
+    """
+    interpreter = Path(prefix) / "bin/python"
+    if not interpreter.is_file():
+        return {}
+    try:
+        out = subprocess.run([str(interpreter), "-m", "pip", "list", "--format=freeze"],
+                             text=True, capture_output=True, timeout=timeout,
+                             env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    found: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        name, _, version = line.partition("==")
+        if name.strip():
+            found[name.strip().lower()] = version.strip()
+    return found
+
+
 def brief(transcript: list[dict[str, Any]], *, limit: int = 30) -> list[dict[str, Any]]:
     """What was tried, compressed to what a reader needs to avoid repeating it."""
     rows = []
@@ -572,7 +637,7 @@ def brief(transcript: list[dict[str, Any]], *, limit: int = 30) -> list[dict[str
     return rows
 
 
-def reconsider(client: Any, repo: Path, *, record: list[dict[str, Any]],
+def reconsider(client: Any, repo: Path, *, prefix: Path, record: list[dict[str, Any]],
                transcript: list[dict[str, Any]], manifests: dict[str, str],
                attempts: int = 2) -> dict[str, Any] | None:
     """Ask what constraint to give up, rather than how to run the same command again.
@@ -587,6 +652,7 @@ def reconsider(client: Any, repo: Path, *, record: list[dict[str, Any]],
         "declared_dependencies": {k: v[:3000] for k, v in manifests.items()},
         "placeholders": PLACEHOLDERS,
         "machine": platform_facts(),
+        "installed_now": installed(prefix),
         "survived": [row["command"] for row in record],
         "everything_tried": brief(transcript),
     }, ensure_ascii=False)
@@ -612,7 +678,7 @@ def reconsider(client: Any, repo: Path, *, record: list[dict[str, Any]],
 
 
 def diagnose(client: Any, repo: Path, *, record: list[dict[str, Any]],
-             transcript: list[dict[str, Any]], probe: str,
+             transcript: list[dict[str, Any]], probes: list[str],
              verdict: dict[str, Any]) -> dict[str, Any] | None:
     """Say what is in the way, so a build that stopped is a finding rather than a failure.
 
@@ -622,7 +688,7 @@ def diagnose(client: Any, repo: Path, *, record: list[dict[str, Any]],
     matter of installing something.
     """
     payload = json.dumps({
-        "repository": str(repo), "probe": probe, "verdict": verdict,
+        "repository": str(repo), "probes": probes, "verdict": verdict,
         "machine": platform_facts(),
         "survived": [row["command"] for row in record],
         "everything_tried": brief(transcript, limit=40),
@@ -641,7 +707,7 @@ def probe_environment(probe: str, *, values: dict[str, str], env: dict[str, str]
 
 
 def _finish(output: Path, repo: Path, python: str, record: list[dict[str, Any]],
-            transcript: list[dict[str, Any]], probe: str, verdict: dict[str, Any],
+            transcript: list[dict[str, Any]], probes: list[str], verdict: dict[str, Any],
             *, client: Any = None) -> dict[str, Any]:
     """Write the result, and if the build did not succeed, write down what is in the way.
 
@@ -650,13 +716,13 @@ def _finish(output: Path, repo: Path, python: str, record: list[dict[str, Any]],
     own record of what it tried is the evidence for the answer.
     """
     result = {"schema_version": 1, "created_at": now(), "repo": str(repo), "python": python,
-              "probe": probe, "record": record, "verdict": verdict,
+              "probes": probes, "record": record, "verdict": verdict,
               "content_id": content_id(python, record, repo),
               "survived": len([r for r in record if r.get("kind") != "probe"]),
               "attempted": len(transcript)}
     if not verdict.get("passed") and client is not None:
         result["diagnosis"] = diagnose(client, repo, record=record, transcript=transcript,
-                                       probe=probe, verdict=verdict)
+                                       probes=probes, verdict=verdict)
         if result["diagnosis"]:
             transcript.append({"kind": "diagnosis", **result["diagnosis"]})
     atomic_json(output / "environment.json", result)

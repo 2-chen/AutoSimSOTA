@@ -21,9 +21,11 @@ repo = Path("/home/wbc/下载/autoresearch/test/LIBERO")
 output = PROJECT_ROOT / "autoresearch_runs/provisioning/libero"
 
 started = time.time()
-result = provision.build(repo, client=LLMClient(), prefix=output / "env", output=output)
+result = provision.build(repo, client=LLMClient(), prefix=output / "env", output=output,
+                          max_rounds=30, step_timeout=5400)
 print("elapsed:", round((time.time() - started) / 60, 1), "min", flush=True)
 print("verdict:", json.dumps(result["verdict"], ensure_ascii=False)[:500], flush=True)
+print("probes:", json.dumps(result.get("probes"), ensure_ascii=False)[:300], flush=True)
 print("diagnosis:", json.dumps(result.get("diagnosis"), ensure_ascii=False, indent=1)[:1800],
       flush=True)
 print("survived:", result["survived"], "attempted:", result["attempted"], flush=True)
