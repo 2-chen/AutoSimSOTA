@@ -138,6 +138,22 @@ ARGV_SYSTEM = (
 )
 
 
+def is_contract_error(output: str) -> bool:
+    """Did the program refuse the *shape* of the command, or fail at something else?
+
+    The distinction decides what to keep. A program that rejects its arguments has told you
+    the command is wrong and nothing about it is worth preserving. A program that accepted
+    the arguments and then failed has told you the command is right and something it needed
+    was missing -- and regenerating the command from scratch throws that away, which is what
+    happened here: one attempt got as far as loading the policy, the next was back to
+    unrecognized arguments, and the loop had no memory of which was further along.
+    """
+    lowered = output.lower()
+    return ("unrecognized arguments" in lowered or "usage:" in lowered
+            or "the following arguments are required" in lowered
+            or "invalid choice" in lowered or "expected one argument" in lowered)
+
+
 def parameter_keys(name: str) -> list[str]:
     """The keys a parameter is reachable by, however the invocation spells it.
 
@@ -219,19 +235,40 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
     }, ensure_ascii=False, sort_keys=True)
     user = request(current_parameters)
     log: list[dict[str, Any]] = []
+    #: The most recent command the program accepted the shape of. Held across attempts so a
+    #: later regression cannot undo it.
+    anchored: str | None = None
     for repair in range(attempts):
-        current = user if repair == 0 else user + json.dumps({
-            "rejected": log[-1]["error"],
-            "instruction": f"Return only the corrected {name}, satisfying every constraint. "
-                           "If the error is from running the command, the program's own "
-                           "usage line is the authority on what it accepts -- build the "
-                           "argv to match it exactly."},
-            ensure_ascii=False)
+        if repair == 0:
+            current = user
+        else:
+            failed = log[-1]["error"]
+            runtime_failure = "The arguments were accepted" in failed
+            current = user + json.dumps({
+                "rejected": failed,
+                "instruction": (
+                    # The retry instruction has to ask for the field that can fix it. Saying
+                    # only "return the corrected function" left the model regenerating a
+                    # command whose shape was already accepted, with nothing to change.
+                    f"Return the corrected object. Keep `source` exactly as it is -- the "
+                    f"program accepted its arguments -- and add to `parameters` every value "
+                    f"the program said it was missing, each with the value for this "
+                    f"repository and the evidence for it."
+                    if runtime_failure else
+                    f"Return the corrected object. The program refused the arguments, so "
+                    f"build the argv to match its usage line exactly. You may also correct "
+                    f"`parameters`.")},
+                ensure_ascii=False)
         content, metadata = client.chat_with_metadata(ARGV_SYSTEM, current, max_tokens=3000,
                                                       timeout=180, thinking="disabled")
         try:
             payload = _object(content)
             source = str(payload["source"])
+            if anchored is not None and repair > 0:
+                # A command that already parsed is kept, and only the declared values are
+                # revised. Regenerating it would discard the one thing the previous attempt
+                # established -- that its shape is acceptable.
+                source = anchored
             try:
                 checked_function(source, name)
             except (ValueError, SyntaxError) as exc:
@@ -260,8 +297,15 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                                      f"{type(exc).__name__}: {exc}") from None
                 outcome = verify(argv)
                 if not outcome.get("ok"):
-                    raise ValueError("the command did not run. The program said:\n"
-                                     + error_excerpt(str(outcome.get("error") or "")))
+                    text = str(outcome.get("error") or "")
+                    if not is_contract_error(text) and anchored is None:
+                        anchored = source
+                    raise ValueError(
+                        "the command did not run. The program said:\n" + error_excerpt(text)
+                        + ("" if is_contract_error(text) else
+                           "\nThe arguments were accepted, so the command's shape is right "
+                           "and something it needs is missing. Keep the command and give the "
+                           "value."))
                 current_parameters = revised
             log.append({"stage": stage, "attempt": repair + 1, "status": "accepted",
                         "reasoning": payload.get("reasoning"),
