@@ -61,6 +61,8 @@ SYSTEM = (
     "This is the constraint most often violated; everything must be done with subscripts, "
     "comprehensions and the builtins listed above\n"
     "* no f-strings, no lambda, no while, no augmented assignment to an attribute\n"
+    "* to collect values, use `xs = xs + [v]` and `d[k] = d[k] + [v]`. There is no append; "
+    "this is the idiom most often missed, and three of eight drafts were refused for it\n"
     "* dictionaries and lists keep their document order -- do not sort unless the expected "
     "output is sorted\n\n"
     "Return the JSON object only: {\"source\": \"<the function>\", \"reasoning\": \"<what "
@@ -92,12 +94,20 @@ def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value))
 
 
-def build_request(worked: tuple[dict[str, Any], dict[str, Any]],
+def build_request(worked: list[tuple[dict[str, Any], dict[str, Any]]],
                   blind: list[dict[str, Any]], fields: list[str]) -> tuple[str, str]:
-    """One worked example, several inputs without answers, and the output shape."""
+    """Some worked examples, several inputs without answers, and the output shape.
+
+    More than one worked example because the shape of a document is not always visible from
+    a single instance of it: a mapping keyed by one field while the document is keyed by
+    another looks identical whether you index it by the right field or the wrong one, and
+    only a second example shows the difference. One example states an answer; two state a
+    rule.
+    """
     user = json.dumps({
         "required_output_fields": fields,
-        "worked_example": {"input": worked[0], "expected_output": worked[1]},
+        "worked_examples": [{"input": given, "expected_output": expected}
+                            for given, expected in worked],
         "inputs_without_answers": blind,
         "note": "Your function must return every required field for every input, including "
                 "the ones whose answers are not shown.",
@@ -113,19 +123,24 @@ def _offending_call(source: str) -> str:
     told it wrote `d.get("key")` it stops writing method calls at all.
     """
     import ast as _ast
+    from .patch_validation import BUILTINS
     try:
         tree = _ast.parse(source)
     except SyntaxError:
         return ""
     for node in _ast.walk(tree):
-        if not isinstance(node, _ast.Call) or isinstance(node.func, _ast.Name):
+        if not isinstance(node, _ast.Call):
             continue
-        rendered = ""
+        # Two ways to be refused and both need naming: a method call, which the node set
+        # excludes outright, and a call to a name that is not one of the registered
+        # builtins. Reporting only the first left the model rewriting `str(x)` unchanged.
+        if isinstance(node.func, _ast.Name) and node.func.id in BUILTINS:
+            continue
         try:
             rendered = _ast.unparse(node)[:120]
         except Exception:
             rendered = type(node.func).__name__
-        return f" (the call it refused was `{rendered}`)"
+        return f" (the call it refused was `{rendered}`; the only callable names are "                f"{sorted(BUILTINS)})"
     return ""
 
 
@@ -144,9 +159,9 @@ def _extract_object(content: str) -> dict[str, Any]:
     return value
 
 
-def generate(client: Any, *, worked: tuple[dict[str, Any], dict[str, Any]],
+def generate(client: Any, *, worked: list[tuple[dict[str, Any], dict[str, Any]]],
              blind: list[dict[str, Any]], fields: list[str],
-             verify: Any = None, attempts: int = 4) -> tuple[str, list[dict[str, Any]]]:
+             verify: Any = None, attempts: int = 4) -> tuple[str | None, list[dict[str, Any]]]:
     """Ask for the function until it both runs and passes the differential.
 
     Two gates, and they reject different things. The validator rejects code that is not
@@ -193,7 +208,10 @@ def generate(client: Any, *, worked: tuple[dict[str, Any], dict[str, Any]],
             log.append({"attempt": repair + 1, "status": "rejected",
                         "error": redact(f"{type(exc).__name__}: {exc}"),
                         "response_sha256": object_digest(content)})
-    raise ValueError(f"no function that reproduces the contracts: {log[-1].get('error')}")
+    # Returning rather than raising: the attempts are the record of what the model tried
+    # and why each was refused, and a caller that only receives an exception loses the one
+    # thing that says whether the next attempt should change the prompt or the model.
+    return None, log
 
 
 def _disagreement_summary(report: dict[str, Any], limit: int = 6) -> str:
