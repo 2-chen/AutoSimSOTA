@@ -212,3 +212,80 @@ def test_a_literal_parameter_value_is_accepted(repo):
         "parameters": [{"name": "--policy", "value": "act",
                         "evidence": "every shipped checkpoint is named ACT_sim_*"}]}),
         repo) == []
+
+
+# -- an invocation is more than its arguments ----------------------------------------------
+
+def test_a_stage_declares_where_it_runs_and_what_it_runs_with(repo):
+    """Two things an invocation carries that are not arguments.
+
+    A package whose top level has no `__init__.py` cannot be imported from outside its
+    parent however right the arguments are, and a renderer needs telling to run headless.
+    """
+    from autosim.research.declarative_backend import (invocation_directory,
+                                                      invocation_environment)
+    row = {"working_directory": "{repo}", "environment": {"PYTHONPATH": "{repo}",
+                                                          "MUJOCO_GL": "egl"}}
+    assert invocation_environment(row, repo=repo) == {"PYTHONPATH": str(repo), "MUJOCO_GL": "egl"}
+    assert invocation_directory(row, repo=repo, default=repo / "x") == repo
+    assert invocation_directory({}, repo=repo, default=repo / "x") == repo / "x"
+
+
+def test_a_declared_directory_has_to_exist(repo):
+    faults = problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py", "artifact": "out.json",
+        "working_directory": "not/a/place"}), repo)
+    assert any("working_directory does not exist" in fault for fault in faults)
+
+
+def test_a_placeholder_directory_is_left_to_the_caller(repo):
+    """`{repo}` names the checkout, which the reader of the declaration does not know."""
+    assert problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py", "artifact": "out.json",
+        "working_directory": "{repo}"}), repo) == []
+
+
+def test_the_environment_must_be_a_map(repo):
+    faults = problems_in(answer(train={
+        "available": True, "entrypoint": "scripts/train.py",
+        "invocation": "python scripts/train.py", "artifact": "out.json",
+        "environment": ["PYTHONPATH=."]}), repo)
+    assert any("must be a map of variable to value" in fault for fault in faults)
+
+
+def test_a_revision_can_change_where_a_stage_runs(repo):
+    """The argv is a function of the invocation, so a failure the invocation caused cannot
+    be repaired by generating the argv again -- and the loop spins, which it did: five
+    attempts at an import error, each regenerating a command whose arguments were never it."""
+    import json as _json
+    from autosim.research import execution_derive
+
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            return _json.dumps({"working_directory": "{repo}",
+                                "environment": {"PYTHONPATH": "{repo}", "MUJOCO_GL": "egl"},
+                                "why": "the traceback is an import error, not an argument"}), {}
+
+    change = execution_derive.revise_invocation(
+        Client(), "evaluate", answer()["stages"]["train"], repo=repo, argv=["python", "x.py"],
+        failure="ModuleNotFoundError: No module named 'x'")
+    assert change["environment"] == {"PYTHONPATH": "{repo}", "MUJOCO_GL": "egl"}
+    assert "import error" in change["why"]
+
+
+def test_a_revision_can_say_the_invocation_is_not_the_problem(repo):
+    """Which is the answer that stops the loop guessing, and the one a reader needs."""
+    import json as _json
+    from autosim.research import execution_derive
+
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            return _json.dumps({"not_an_invocation_problem":
+                                "the script dereferences a variable it never assigns"}), {}
+
+    change = execution_derive.revise_invocation(
+        Client(), "train", answer()["stages"]["train"], repo=repo, argv=["python", "x.py"],
+        failure="UnboundLocalError: task_i_dataset")
+    assert "never assigns" in change["obstacle"]

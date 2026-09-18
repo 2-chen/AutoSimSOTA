@@ -26,6 +26,7 @@ evaluation is for.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,31 @@ from .patch_validation import checked_function
 #: the generator, so a stage cannot be asked for a value the vocabulary does not carry.
 def argv_name(stage: str) -> str:
     return f"stage_argv_{stage}"
+
+
+def resolve(value: str, *, repo: Path) -> str:
+    """A declared path or value, with `{repo}` filled in."""
+    out = str(value).replace("{repo}", str(repo))
+    return os.path.expanduser(out) if out.startswith("~") else out
+
+
+def invocation_environment(stage_row: dict[str, Any], *, repo: Path) -> dict[str, str]:
+    """The variables a stage declared, resolved.
+
+    Carried separately from the argv because they are not arguments. A command whose
+    arguments are right and whose search path is wrong fails at import, and what it prints
+    is about the import rather than about the thing being asked of it -- which is how a
+    derivation that had the right flags spent its corrections on the wrong problem.
+    """
+    return {str(name): resolve(str(value), repo=repo)
+            for name, value in (stage_row.get("environment") or {}).items()}
+
+
+def invocation_directory(stage_row: dict[str, Any], *, repo: Path,
+                         default: Path) -> Path:
+    """Where the stage declared it runs, or the checkout when it said nothing."""
+    declared = str(stage_row.get("working_directory", "") or "").strip()
+    return Path(resolve(declared, repo=repo)) if declared else default
 
 
 class DeclarativeBackend:
@@ -108,6 +134,13 @@ class DeclarativeBackend:
             char in pattern for char in "*?[") else ([target] if target.exists() else [])
         return {"checked": True, "pattern": pattern, "matched": len(matches),
                 "examples": [str(p.relative_to(output)) for p in matches[:3]]}
+
+    def environment(self, stage: str) -> dict[str, str]:
+        return invocation_environment(self.stages.get(stage) or {}, repo=self.repo)
+
+    def directory(self, stage: str) -> Path:
+        return invocation_directory(self.stages.get(stage) or {}, repo=self.repo,
+                                    default=self.repo)
 
     def run_stage(self, stage: str, runner: Any, *, inputs: dict[str, Any], output: Path,
                   timeout: int = 3600) -> dict[str, Any]:

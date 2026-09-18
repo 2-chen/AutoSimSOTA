@@ -63,8 +63,15 @@ SYSTEM = (
     "A parameter's `value` is the literal the command substitutes -- one token, no "
     "explanation. If you cannot settle on a single literal, that is a finding: say so in "
     "`why` and mark the stage unavailable rather than writing a description into the value.\n\n"
+    "An invocation is not only its arguments. Say where the command must run "
+    "(`working_directory`, usually the repository root) and what its environment must "
+    "contain (`environment`, a map of variable to value): a package whose top level has no "
+    "`__init__.py` cannot be imported from outside its parent, and a renderer has to be told "
+    "to run headless. Use {repo} for the checkout's path.\n\n"
     "Return one JSON object of the form {\"stages\": {\"<stage>\": {\"available\": true or "
-    "false, \"entrypoint\": \"<path>\", \"invocation\": \"<how it is called>\", \"artifact\": "
+    "false, \"entrypoint\": \"<path>\", \"invocation\": \"<how it is called>\", "
+    "\"working_directory\": \"<where it runs, e.g. {repo}>\", "
+    "\"environment\": {\"<VAR>\": \"<value>\"}, \"artifact\": "
     "\"<a path or glob, relative to the output directory, that exists only on success>\", "
     "\"level\": \"entry point, or the path this wraps\", "
     "\"parameters\": [{\"name\": \"<as the invocation spells it>\", \"value\": \"<the value "
@@ -315,9 +322,70 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
         except (ValueError, KeyError, SyntaxError, json.JSONDecodeError) as exc:
             log.append({"stage": stage, "attempt": repair + 1, "status": "rejected",
                         "error": redact(f"{type(exc).__name__}: {exc}"),
+                        # What the command looked like when it was refused, so a caller that
+                        # has to change the invocation rather than the command can see it.
+                        "argv": locals().get("argv") if isinstance(locals().get("argv"), list) else [],
                         "response_sha256": object_digest(content)})
         current = user + json.dumps({"rejected": log[-1]["error"]}, ensure_ascii=False)
     return None, current_parameters, log
+
+
+REVISE_SYSTEM = (
+    "A stage's command failed in a way its arguments cannot fix. You are given the stage as "
+    "it was derived, the command that was built from it, and what the program said.\n\n"
+    "Two of the things an invocation carries are not arguments, and both are read from the "
+    "outside rather than printed by the program: where it runs, and what its environment "
+    "contains. A package whose top level has no `__init__.py` cannot be imported unless its "
+    "parent is on the search path, however right the arguments are; a renderer has to be "
+    "told to run without a display; a program that reads a config relative to its own "
+    "directory has to be started there. A failure that mentions an import, a module, a "
+    "display or a missing relative path is one of those, not an argument.\n\n"
+    "Change as little as you can. Keep the entry point. Use {repo} for the checkout. Give the "
+    "whole environment the stage needs, not only the variable you are adding, and say what "
+    "the failure told you.\n\n"
+    "Return one JSON object: {\"working_directory\": \"<where it runs>\", "
+    "\"environment\": {\"<VAR>\": \"<value>\"}, \"invocation\": \"<how it is called, if "
+    "that was also wrong>\", \"parameters\": {\"<name>\": \"<value>\"}, \"why\": \"<what "
+    "the failure told you>\", \"not_an_invocation_problem\": \"<if nothing about where or in "
+    "what environment it runs can fix this, say what the real obstacle is; otherwise omit>\"}"
+)
+
+
+def revise_invocation(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
+                      argv: list[str], failure: str, attempts: int = 2
+                      ) -> dict[str, Any] | None:
+    """Change where a stage runs or what it runs with, when arguments are not the problem.
+
+    The argv is a function of the invocation, so a failure the invocation caused cannot be
+    repaired by generating the argv again -- and the loop would spin, which is what it did:
+    five attempts at an import error, each regenerating a command whose arguments were never
+    the issue.
+    """
+    payload = json.dumps({
+        "stage": stage,
+        "as_derived": {k: row.get(k) for k in
+                       ("entrypoint", "invocation", "working_directory", "environment",
+                        "artifact", "parameters")},
+        "command_built": argv,
+        "program_said": error_excerpt(failure),
+        "placeholders": {"repo": "the checkout's absolute path"},
+    }, ensure_ascii=False, default=str)
+    for repair in range(attempts):
+        content, _ = client.chat_with_metadata(
+            REVISE_SYSTEM, payload, max_tokens=2000, timeout=180, thinking="disabled")
+        try:
+            value = _object(content)
+            if str(value.get("not_an_invocation_problem", "")).strip():
+                return {"obstacle": value["not_an_invocation_problem"]}
+            if not isinstance(value.get("environment", {}), dict):
+                raise ValueError("environment must be a map of variable to value")
+            if not str(value.get("working_directory", "")).strip():
+                raise ValueError("working_directory is required")
+            return value
+        except (ValueError, KeyError, json.JSONDecodeError):
+            if repair == attempts - 1:
+                return None
+    return None
 
 
 def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
@@ -363,6 +431,13 @@ def problems_in(value: dict[str, Any], repo: Path) -> list[str]:
         for key in ("invocation",):
             if not str(row.get(key, "")).strip():
                 problems.append(f"stages.{name}.{key} is required when available")
+        workdir = str(row.get("working_directory", "") or "").strip()
+        if workdir and "{" not in workdir and not (repo / workdir).exists():
+            # A declared directory has to be one, so it is checked rather than trusted.
+            problems.append(f"stages.{name}.working_directory does not exist: {workdir}")
+        environment = row.get("environment")
+        if environment is not None and not isinstance(environment, dict):
+            problems.append(f"stages.{name}.environment must be a map of variable to value")
         artifact = str(row.get("artifact", "")).strip()
         if not artifact:
             problems.append(f"stages.{name}.artifact is required when available")
