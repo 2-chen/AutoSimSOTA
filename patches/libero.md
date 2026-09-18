@@ -123,3 +123,28 @@ which changes what is measured and should be recorded as such. Or the simulator 
 the GPU, which is what `MUJOCO_GL=egl` plus a device the renderer can reach is for -- and
 which the environment's `torch 2.7.1+cu128` on an sm_120 card now permits, since the GPU path
 was verified by running a matmul rather than by asking whether CUDA was available.
+
+## 为什么闭环跑不起来，以及那一条不是环境问题
+
+LIBERO 能跑它的训练与评测循环，**但系统的研究闭环没有跑起来**。原因是两条，都不是
+这一轮解决的那一类：
+
+**一、采集没有驱动源——这是 benchmark 的能力缺失，系统已经正确报出来了。**
+`execution_derive` 对 `collect` 的判定是 `available: false`，理由是采集脚本
+（`scripts/collect_demonstration.py`、`libero_100_collect_demonstrations.py`）走
+`DataCollectionWrapper` + 人工输入。这**不是缺陷**，是 LIBERO 的真实性质，而且系统
+自己读出来了。
+
+闭环的第一步因此不能是采集。但闭环**仍然可能**：`training_recipe`、`data_selection`、
+`evaluation_resolution` 三族都不需要新轨迹，第一轮做训练配方或数据加权是合法的。
+
+**二、没有研究执行器（runner）——这是系统的缺口。**
+`repository_autoresearch.py` 是 RoboSyn 的，`robotwin_autoresearch.py` 是 RoboTwin 的，
+**没有第三个**。闭环需要的「基线 → 提案 → 干预 → 评测 → 选择 → 再循环」这套协议，
+现在只存在于那两个里。
+
+这一轮建成的三块（`provision` 建环境、`execution_derive` 导出各阶段调用方式、
+`DeclarativeBackend` 执行它们）**正好是 runner 需要的输入**，但**没有东西把它们编排起来**。
+
+所以准确的现状是：**LIBERO 从"跑不了"变成了"跑得动"；"被研究"还差一个执行器。**
+而那个执行器是通用的——它对 RoboSyn 和 LIBERO 是同一件事，这正是下一步该做的。
