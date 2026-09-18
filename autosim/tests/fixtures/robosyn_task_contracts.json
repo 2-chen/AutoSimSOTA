@@ -1,0 +1,780 @@
+{
+  "fields": [
+    "name",
+    "env_id",
+    "setting",
+    "max_episode_steps",
+    "state_dim",
+    "action_dim",
+    "cameras",
+    "camera_shapes",
+    "control_parts",
+    "recorded_fps",
+    "instruction",
+    "event_families",
+    "roles",
+    "correction_supported",
+    "expert_adapter"
+  ],
+  "note": "Frozen output of the hand-written task reader. A generated reader must reproduce this exactly; it is the oracle that makes replacing the hand-written adapter safe.",
+  "repo_marker": "pyproject.toml names RoboSynChallenge",
+  "tasks": {
+    "click_bell": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": true,
+      "env_id": "ClickBell",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_button_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "init_button_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Click the bell",
+      "max_episode_steps": 361,
+      "name": "click_bell",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [
+          "button"
+        ],
+        "family": "press",
+        "objects": []
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "drawer_open_place": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "DrawerOpenPlace",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_duck_material",
+          "random_drawer_material",
+          "random_drawer_background_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "random_duck_pose",
+          "random_drawer_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Open the drawer, pick the tomato with the other arm then place it in the drawer.",
+      "max_episode_steps": 900,
+      "name": "drawer_open_place",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [
+          "drawer",
+          "drawer_background"
+        ],
+        "family": "articulated_place",
+        "objects": [
+          "duck"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "handle_basket": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "HandleBasket",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_basket_material",
+          "random_milk_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "init_milk_pose",
+          "init_basket_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "action_bank",
+      "instruction": "Pick the bottle then place it to the basket, carry the basket with the other arm.",
+      "max_episode_steps": 500,
+      "name": "handle_basket",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "transport",
+        "objects": [
+          "basket",
+          "milk"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "item_assembly": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "ItemAssembly",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_guijiao1_material",
+          "random_guijiao2_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "random_table_height",
+          "init_guijiao1_pose",
+          "init_guijiao2_pose",
+          "prepare_extra_attr",
+          "register_info_to_env",
+          "attach_guijiao",
+          "detach_guijiao"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick up two centrifuge tubes from the table and dock them horizontally.",
+      "max_episode_steps": 361,
+      "name": "item_assembly",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "align",
+        "objects": [
+          "guijiao1",
+          "guijiao2"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "items_handover": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "ItemsHandover",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_pen_material",
+          "random_holder_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "random_table_height",
+          "random_holder_pose",
+          "random_pen_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick up the pen, hand it over to the other arm and then place it in to the pen holder",
+      "max_episode_steps": 350,
+      "name": "items_handover",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "handover",
+        "objects": [
+          "holder",
+          "pen"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "manipulate_pipette": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "ManipulatePipette",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_pipette_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "set_beaker1_material",
+          "random_beaker1_pose",
+          "random_pipette_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Use the pipette on the table to transfer liquid from one beaker to another",
+      "max_episode_steps": 1000,
+      "name": "manipulate_pipette",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [
+          "pipette"
+        ],
+        "family": "tool_contact",
+        "objects": [
+          "beaker1"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "mixer_operating": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "MixerOperating",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_beaker_mixer_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "set_beaker_material",
+          "random_beaker_mixer_pose",
+          "random_beaker_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick the beaker, place it on the mixer, then flip the toggle switch with the other arm.",
+      "max_episode_steps": 500,
+      "name": "mixer_operating",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "place_then_contact",
+        "objects": [
+          "beaker",
+          "beaker_mixer"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "sample_loading": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "SampleLoading",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_rack_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "set_cube_material",
+          "random_cube_pose",
+          "random_rack_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick up the test tube, and it to the other arm, and insert it to the rack.",
+      "max_episode_steps": 500,
+      "name": "sample_loading",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "precise_place",
+        "objects": [
+          "cube",
+          "rack"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "table_rearrangement": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "TableRearrangement",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_fork_material",
+          "random_spoon_material",
+          "random_plate_material",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "init_fork_pose",
+          "init_spoon_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick the fork and the spoon, place them next to the plate.",
+      "max_episode_steps": 361,
+      "name": "table_rearrangement",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "place_multiple",
+        "objects": [
+          "fork",
+          "plate",
+          "spoon"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    },
+    "water_pouring": {
+      "action_dim": 14,
+      "camera_shapes": {
+        "cam_high": [
+          480,
+          640,
+          3
+        ],
+        "cam_left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "cam_right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "cameras": [
+        "cam_high",
+        "cam_right_wrist",
+        "cam_left_wrist"
+      ],
+      "control_parts": [
+        "left_arm",
+        "left_eef",
+        "right_arm",
+        "right_eef"
+      ],
+      "correction_supported": false,
+      "env_id": "WaterPouring",
+      "event_families": {
+        "appearance": [
+          "random_light",
+          "random_material",
+          "random_robot_material",
+          "random_plane_material",
+          "random_cup_material",
+          "random_bottle_material"
+        ],
+        "camera": [
+          "random_camera_high_intrinsics",
+          "random_camera_high_extrinsics"
+        ],
+        "clutter": [
+          "randomize_distractor_slots"
+        ],
+        "robot_pose": [
+          "random_robot_init_eef_pose",
+          "random_robot_qpos"
+        ],
+        "task_semantics": [
+          "init_cup_pose",
+          "init_bottle_pose",
+          "prepare_extra_attr",
+          "register_info_to_env"
+        ]
+      },
+      "expert_adapter": "official",
+      "instruction": "Pick the cup and the bottle with the other arm, pour the water from bottle to cup",
+      "max_episode_steps": 500,
+      "name": "water_pouring",
+      "recorded_fps": 25.0,
+      "roles": {
+        "articulations": [],
+        "family": "pour",
+        "objects": [
+          "bottle",
+          "cup"
+        ]
+      },
+      "setting": "random",
+      "state_dim": 14
+    }
+  }
+}

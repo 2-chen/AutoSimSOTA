@@ -38,52 +38,28 @@ from .strategy import executable_first_step, plan
 from .survey import peek_many, summarise, survey
 
 
-SYSTEM = (
+#: The task and the shape of the answer. How to *read* a repository -- where a task's
+#: numbers live, what a path field is for, how ownership of an outside file is decided, when
+#: to answer `unknown` -- is method knowledge and lives in the skill library, offered
+#: alongside this. Keeping it there means it can be extended without touching this string,
+#: and that the same reading applies whether a scout, a planner or a person is doing it.
+SYSTEM = (chr(10) + chr(10)).join([
     "You are onboarding an unfamiliar robotics simulation benchmark into a research "
-    "system, by reading its repository. You have no prior knowledge of this project, and "
-    "anything you assert will be checked against the filesystem, so assert only what the "
-    "supplied facts support. When the facts do not settle a question, answer `unknown` and "
-    "say what would settle it -- an honest unknown costs one experiment, a confident guess "
-    "costs a run.\n\n"
+    "system, by reading its repository. You have no prior knowledge of this project. "
+    "Everything you assert may be checked against the filesystem, and what you write down "
+    "becomes the shape of every experiment that follows -- so assert only what the "
+    "supplied facts support, and read the method library you were given before answering.",
     "The system needs seven things from a benchmark, described in `capabilities_needed`. "
-    "Answer every one of them, including by saying `unsupported`. Two are worth reading "
-    "especially carefully:\n\n"
-    "* `new_trajectory_generation` asks whether the benchmark can produce successful "
-    "trajectories *without a person in the loop*. A script that collects demonstrations "
-    "and a script that waits for someone to drive the robot are not the same thing, and "
-    "which one you are looking at is decided by what the source does, not by what it is "
-    "named. The survey reports which phrases appear in which file for exactly this reason.\n"
-    "* `targeted_generation` asks whether that production can be aimed at a chosen part of "
-    "the initial-state or failure distribution. Producing demonstrations from randomly "
-    "sampled initial states is not targeting.\n\n"
-    "`survey.dataset_structure` is the structure of a representative recorded trajectory, "
-    "read out of the file itself. Observation and action dimensions, camera names and "
-    "camera resolutions are properties of the data rather than of the code that wrote it, "
-    "so take them from there, and prefer a task list derived from a glob over names you "
-    "have only seen listed -- the system can count a glob and check it against the "
-    "filesystem, and it cannot check a list you typed. When `tree_extensions` shows an "
-    "extension that appears roughly once per task, that extension *is* the task list, and "
-    "a glob over it is the answer. Use `module_registry` only when the tasks genuinely "
-    "exist nowhere but in code, and then say so in `evidence`; a list of suites where the "
-    "tasks underneath them are plain files is not a task list.\n\n"
+    "Answer every one of them, including by saying `unsupported` or `unknown`.",
+    "`benchmark`, `evidence`, `repo_markers`, `tasks` and `task_contract` are answered in "
+    "one pass; `capabilities` and `optimization_space` in a second.",
     "For `optimization_space` you declare what the system may vary within this benchmark's "
     "own implementation -- training parameters its trainer accepts, and any collection "
     "setting its collector accepts. Declare only settings the source shows are implemented; "
     "the ranges are what the system will later be allowed to explore, so a range wider than "
-    "the code supports becomes a run that dies at the trainer.\n\n"
-    "Ownership of a file that sits outside the checkout is decided by evidence, not by "
-    "proximity: a neighbour's checkpoints are on the same disk and look identical. It is "
-    "this benchmark's if a script or config in the repository names that location "
-    "(`asset_provenance.repository_mentions`), or if the provenance the file records about "
-    "itself resolves inside the checkout (`dataset_structure.*.groups.*.attrs`). Absent "
-    "both, answer `unsupported` and say what would settle it -- do not treat a nearby "
-    "project's artifact as this benchmark's, and do not deny a real one merely because it "
-    "was downloaded to a directory the repository happens to leave to the user.\n\n"
-    "Fields named `path` or `entrypoint` hold a path: a repository-relative path, or a "
-    "glob when the answer is a set of files. Remarks go in `evidence`, `why` or `note` -- a "
-    "sentence in a path field fails every existence check while looking like it should pass.\n\n"
-    "Return exactly one JSON object and nothing else."
-)
+    "the code supports becomes a run that dies at the trainer.",
+    "Return exactly one JSON object and nothing else.",
+]) + chr(10)
 
 
 def _capability_lines() -> dict[str, str]:
