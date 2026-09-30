@@ -155,6 +155,20 @@ def _nest(axes: Sequence[Axis]) -> dict[str, Any]:
 def check_space(space: OptimizationSpace) -> list[str]:
     """Structural problems with a declared space, as messages (empty is good)."""
     problems = []
+    if not any(space.sections().values()):
+        # A space with nothing in it is not a space. A proposal names settings the space
+        # contains; with none, the controller has nothing to vary and the loop can only
+        # measure the same thing repeatedly -- which is what RoboTwin's first declaration
+        # did, and it was accepted, and a run was driven by it while a good one sat beside it.
+        #
+        # This is the fault the survey caused and the declaration could not report: a scout
+        # that read the wrong directories found no settings to declare and declared none, and
+        # an empty space is indistinguishable from a benchmark with nothing to vary.
+        problems.append(
+            "the space has no axes at all: a proposal names settings the space declares, so "
+            "there is nothing the controller could vary. Either the declaration is missing "
+            "what this benchmark's trainer and collector accept, or the survey did not read "
+            "the files that show them.")
     for group, axes in space.sections().items():
         seen = set()
         for axis in axes:
@@ -170,6 +184,22 @@ def check_space(space: OptimizationSpace) -> list[str]:
                 problems.append(f"{group}.{axis.name}: needs low < high")
             if axis.default is not None and not axis.accepts(axis.default):
                 problems.append(f"{group}.{axis.name}: default {axis.default!r} is not accepted")
+            # `accepts(None)` rather than a kind test: a structure axis with no validator
+            # accepts null as a value, and one with a validator accepts it only if the
+            # validator says so. The fault is "nothing it would accept is available", and
+            # that is a question the axis can answer.
+            if axis.default is None and not axis.optional and not axis.accepts(None):
+                # Required and unfillable. A proposal must name a required axis, and there is
+                # no value it can name: the skeleton the controller is shown carries `null`
+                # there, and `null` is not an integer. Measured on RoboTwin, whose scout
+                # declared `seed_start` and `seed` this way -- the starting point handed to
+                # the controller was refused when the controller used it, and nothing said so
+                # at the time the declaration was written.
+                problems.append(
+                    f"{group}.{axis.name}: has no default and is not optional, so a proposal "
+                    f"must name it and there is no value to name. Give it a default, or mark "
+                    f"it optional -- optional means leaving it out uses the benchmark's own "
+                    f"value, which is what an axis with no default does anyway.")
     return problems
 
 
@@ -217,7 +247,9 @@ def check_adapter(adapter: Any, *, known_tasks: Sequence[str] | None = None) -> 
         space = adapter.optimization_space(sample)
     except Exception as exc:
         return problems + [f"optimization_space({sample!r}) raised {type(exc).__name__}: {exc}"]
+    # `check_space` reports an empty space, and this used to report it a second time in
+    # different words -- narrowly, over `collection` and `training` only, so a space whose
+    # every axis lived in a third section was empty here and non-empty there. Two checks for
+    # one property is how they come to disagree; the property belongs to the space.
     problems.extend(f"{sample}: {message}" for message in check_space(space))
-    if not space.collection and not space.training:
-        problems.append(f"{sample}: declares nothing the controller may vary")
     return problems

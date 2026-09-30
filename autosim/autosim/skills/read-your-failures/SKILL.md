@@ -1,37 +1,17 @@
 ---
 name: read-your-failures
-description: A configuration that crashed the run is a result. Read the error before proposing parameters again.
+description: 失败后先读稳定证据并判断根因与可复验修复；区分瞬时错误、配置错误、资源上限和未知崩溃。
 scope: general
-confidence: observed twice on one machine; the specific ceiling is hardware-dependent and deliberately not encoded as a bound
-evidence: |
-  An action-chunk/optimiser configuration aborted the training process twice in one run
-  — once as a native abort, once as a dataloader worker connection reset — while every
-  other parameter stayed legal. The controller proposed the same value a second time,
-  because the failure was not visible to it. A separate run was terminated outright by a
-  parameter the system had published as legal but the trainer rejected.
+confidence: methodological — requires current source and runtime verification
+evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
-# Read your failures
+# 让失败改变下一次决策
 
-A round that could not execute is evidence about your proposal. It costs you the round
-either way; reading it is free.
+方法性指引。先读取原 attempt 的 stable evidence ID、命令/配置、日志尾部与因果链、退出码或信号、资源/阶段遥测。不能把进程死亡直接诊断为显存上限，也不能从截断摘要猜根因。
 
-## How to apply
+已知配置错误按源码与 consumer 修复；明确资源不足时在本机约束内调整；网络等瞬时故障可作有界重试；未知崩溃先增加最小诊断，必要时重放以验证可重复性，而不是随机改一个参数。
 
-Before re-proposing after a failed round, read what failed. Distinguish:
+把问题、证据、已尝试修复与待验证条件交 Scheduler/Fix。修补后复验原失败操作，只有新回执能说明恢复；候选评分仍走原生评测和身份链。
 
-- **A parameter the system rejected** — you have a bound wrong; stay clear of it.
-- **A resource ceiling** — the process died rather than complained. This is usually
-  hardware-specific: a batch size that works on one machine may abort on another. Prefer
-  values known to work *here* before exploring outward, and record the ceiling you found.
-- **A crash you cannot attribute** — do not retry the identical configuration hoping for
-  a different outcome. Change one thing, and say which.
-
-Crashes that are not your fault happen — native libraries abort, workers die. If the
-same configuration crashed twice, stop treating it as bad luck.
-
-## What it does not mean
-
-It does not mean shrinking your search space permanently. A configuration that failed on
-this machine may be correct on another; record the observation with its machine attached
-rather than deleting the option.
+相同错误反复出现且无新信息时改调查方向或说明具体边界，不无限重试。暂时失败不应永久删掉模型家族/参数：记录平台、版本、资源与失败条件，条件改变后可以重新研究。

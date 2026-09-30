@@ -55,4 +55,4 @@ PYTHONPATH=autosim .venv/bin/autosim research RoboSynChallenge --gpu 0
 
 验证入口不调用完整 AutoResearch。它检查实际卡数、固定 CUDA 工作队列、原生评测并发、固定 16 episode 合并、采集、数据审计、ACT 短训练、恢复与进程回收，以及真实 API 参数应用。失败组件保留日志与失败状态。四种规格必须有各自独立分配；一个八卡容器的掩码不能替代该矩阵。
 
-当前执行状态与已知限制以外层 `plan/adaptive_compute_execution_20260914.md` 和 `compute_validation/report_20260914/compute_report.md` 为准。第二 GPU 类型实机、生产 SCO backend、多节点和完整研究闭环仍属于后续范围。
+当前执行状态与已知限制以 [执行进度](../plan/EXECUTION_STATUS.md) 为准，目标与验收见 [总规划](../plan/MASTER_PLAN.md)。`compute_validation/report_20260914/compute_report.md` 为历史计算验证记录，不代表当前通用研究闭环已通过验收。第二 GPU 类型实机、生产 SCO backend、多节点和完整研究闭环仍属于后续范围。

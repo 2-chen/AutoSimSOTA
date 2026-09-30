@@ -1,45 +1,17 @@
 ---
 name: quality-needs-reweighting
-description: A dataset of mixed quality is not usable as-is by plain behaviour cloning; the quality has to be handled, not just included.
+description: 混合质量或来源的数据表现不稳定时，比较原样训练、过滤与重加权；质量标签和收益都必须验证。
 scope: general
-confidence: high — a controlled robomimic study plus two independent replication and curation results
-evidence: |
-  robomimic (arXiv:2108.03298, and the study page): offline RL (CQL, IRIS) beats behaviour
-  cloning *only* on Machine-Generated data; on Proficient-Human and Mixed-Human data
-  history-conditioned BC wins. The authors read this as BC being bounded by its data. A
-  replication on robomimic's combined mixture concluded that "removing the low-quality
-  data allows for expert performance, as in original robomimic" — the failure was caused
-  by the low-quality portion, not by data volume.
-
-  Curation results in the same direction: SAL filtering reached +16% on Transport using 50
-  of 300 demonstrations; TED reached +20% on real Push Block with half the data.
-
-  And human data specifically has a documented pathology: it is non-Markovian (teleop
-  device plus action history), which is why offline RL methods that work on
-  machine-generated data scored ~20-70% on human data where BC variants exceeded 96%.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Quality needs reweighting
+# 验证质量干预，而非默认必须重加权
 
-Mixed-quality data is a different problem from same-quality data, not a bigger version of
-it. Concatenating it and training as usual lets the weakest portion set the ceiling.
+robomimic 研究了不同质量的人类演示与算法选择的关系，提示质量和设计选择都会影响结果；不支持“混合质量数据不能用于普通 BC”的绝对结论。[原始研究](https://arxiv.org/abs/2108.03298v2)
 
-## How to apply
+先检查质量依据：任务成功不等于轨迹没有停顿/错位，短轨迹不必更好，稀有难例不必更差。把损坏或语义不兼容与可学习但次优的数据分开。
 
-When a corpus has more than one quality tier, decide *per tier* what happens to it:
-excluded, down-weighted, filtered by some criterion, or fed to a method that can use it
-(a return-conditioned or offline-RL objective). "It is in the mixture" is not a decision.
+最小对照是同训练预算的原样混合与一种过滤/权重策略，保留纯原数据参照。有条件时控制来源、数量和覆盖，避免过滤掉全部难场景后仅在简单开发集上变好。权重设计依据训练/开发数据，不能来自最终留出分数。
 
-The diagnostics are cheap. If a small curated subset outperforms the full mixture, you
-have the robomimic result. If dropping a tier improves the number, the tier was net
-negative — see `adding-more-can-subtract`.
-
-Watch for the non-Markovian case as well: data collected with a teleoperation device
-carries action history the observation does not contain, and methods that assume the
-Markov property will underperform on it while looking fine on machine-generated data.
-
-## What it does not mean
-
-It does not mean low-quality data is useless — it means it cannot be treated as
-interchangeable with high-quality data at equal weight. The offline-RL result is that
-there *are* methods that extract value from it; plain BC is not one of them.
+优先尝试可解释的来源/质量分组；昂贵的数据价值模型需要额外训练与验证预算，不能仅因论文有效就默认部署。无稳定质量依据或没有改善时，保留简单 BC 路线。记录被删样本、有效曝光、旧任务保持和不确定性。

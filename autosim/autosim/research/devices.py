@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from .common import atomic_json, object_digest, read_json
+from .common import atomic_json, bounded_run, object_digest, read_json
 
 NVIDIA_SMI = "nvidia-smi"
 GPU_QUERY = "index,uuid,name,memory.total,memory.used,utilization.gpu,driver_version,compute_cap"
@@ -47,6 +47,10 @@ _ABSENT = {"", "n/a", "[n/a]", "unknown", "[unknown]", "not supported", "none"}
 
 class NoCompatibleDevice(RuntimeError):
     """No device may be used for GPU work; the reason is in ``device_plan.json``."""
+
+    def __init__(self, message: str, *, evidence: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.evidence = dict(evidence or {})
 
 
 def _int_or_none(value: str) -> int | None:
@@ -247,8 +251,9 @@ def run_text(command: Sequence[str], *, env: Mapping[str, str] | None = None,
              timeout: int = 30) -> str:
     """Run a read-only query; a missing/failing tool is reported, never raised."""
     try:
-        completed = subprocess.run(list(command), capture_output=True, text=True,
-                                   env=dict(env) if env is not None else None, timeout=timeout)
+        completed = bounded_run(list(command), cwd=Path.cwd(),
+                                env=dict(env) if env is not None else dict(os.environ),
+                                timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"__error__: {type(exc).__name__}: {exc}"
     return completed.stdout if completed.returncode == 0 else f"__error__: rc={completed.returncode}"
@@ -331,28 +336,6 @@ def cuda_child_env(environ: Mapping[str, str], outer: Mapping[str, Any]) -> dict
     else:
         child.pop("CUDA_VISIBLE_DEVICES", None)
     return child
-
-
-def legacy_index_lock_held(index: int) -> bool:
-    """A legacy single-GPU run holds ``/tmp/autosim-robosyn-gpu-<i>.lock`` while working.
-
-    The old ``robosyn_mvp.gpu_lock`` is keyed by index, so it cannot be consulted through
-    the UUID lease layer; it is read here as *evidence of occupancy* only.
-    """
-    import fcntl
-    path = Path(f"/tmp/autosim-robosyn-gpu-{index}.lock")
-    if not path.is_file():
-        return False
-    try:
-        with path.open("a+") as stream:
-            try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        return True
-    return False
 
 
 def discover(*, runner: Callable[..., str] = run_text,
@@ -451,7 +434,9 @@ def apply_capability(report: dict, receipt: dict | None, *,
     (lease, plan, accounting) is keyed by.
     """
     per_uuid = normalize_uuid_mapping((receipt or {}).get("devices", {}))
-    lock_held = index_lock_held or legacy_index_lock_held
+    # No lock source of its own. A caller that knows of an index-keyed lock hands one in;
+    # nothing here reads a lock file, because the runner that wrote them is not part of this
+    # system any more and a file whose writer is gone can only report the past.
     for gpu in report["gpus"]:
         # Without a UUID the device cannot be leased (the lock is keyed by it), cannot be
         # matched to a receipt, and cannot be named in a receipt of our own: unusable.
@@ -466,8 +451,9 @@ def apply_capability(report: dict, receipt: dict | None, *,
             evidence.append(f"{gpu['memory_used_mib']} MiB in use")
         if gpu.get("compute_pids"):
             evidence.append(f"compute pids {gpu['compute_pids']}")
-        if gpu.get("index") is not None and lock_held(int(gpu["index"])):
-            evidence.append("legacy index lock held")
+        if index_lock_held is not None and gpu.get("index") is not None \
+                and index_lock_held(int(gpu["index"])):
+            evidence.append("an index lock is held")
         if evidence:
             gpu["capability"], gpu["busy_evidence"] = "busy", evidence
             continue

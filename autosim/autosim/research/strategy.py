@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter_protocol import OptimizationSpace
-from .common import object_digest, redact
+from .common import object_digest, redact, sanitize_model_text
 
 #: The intervention families the loop knows how to execute. Each needs a way to be carried
 #: out and a way to be measured; naming them here is what lets a plan be checked against
@@ -242,7 +242,8 @@ def plan(space: OptimizationSpace, capabilities: dict[str, Any], client: Any, *,
             "instruction": "Return the full corrected plan. Cite only axes that appear in "
                            "what_you_may_vary, and mark a family available only if the "
                            "capability it needs is not reported unsupported."}, ensure_ascii=False)
-        content, metadata = client.chat_with_metadata(system, current, max_tokens=4096,
+        content, metadata = client.chat_with_metadata(
+            sanitize_model_text(system), sanitize_model_text(current), max_tokens=4096,
                                                       timeout=180, thinking="disabled")
         if output is not None:
             (output / f"strategy_draft_{repair + 1}.json").write_text(
@@ -255,10 +256,12 @@ def plan(space: OptimizationSpace, capabilities: dict[str, Any], client: Any, *,
             if faults:
                 raise ValueError("; ".join(faults[:6]))
             log.append({"attempt": repair + 1, "status": "accepted",
+                        "method_selection": (methods or {}).get("selection", []),
                         "response_sha256": object_digest(content)})
             return value, log
         except (ValueError, json.JSONDecodeError) as exc:
             log.append({"attempt": repair + 1, "status": "rejected",
+                        "method_selection": (methods or {}).get("selection", []),
                         "error": redact(f"{type(exc).__name__}: {exc}"),
                         "response_sha256": object_digest(content)})
     raise ValueError(f"no executable plan: {log[-1].get('error')}")

@@ -1,41 +1,17 @@
 ---
 name: progress-beats-binary
-description: A graded progress score separates policies with far fewer rollouts than a pass/fail verdict.
+description: 正式成功率过于稀疏时，使用合法的分阶段进度辅助诊断和筛选；不能保证更少样本，也不能替换官方指标。
 scope: general
-confidence: high — a statistical result, benchmark-independent, validated at scale
-evidence: |
-  N-SCORE / "Beyond Binary Success" (RSS 2026, arXiv:2603.13616): a sequential
-  anytime-valid test over paired progress scores reduced evaluation burden by roughly 70%
-  versus batch testing (>50% better than STEP) on simulation, ~45% on hardware. On
-  RoboArena it recovered a full ranking of four policies at α=0.05 using 1,420 of ~2,560
-  evaluations. The paper states partial-credit metrics "consistently separate competing
-  policies faster than binary success".
-
-  RoboArena (arXiv:2506.18123) builds its protocol on a continuous 0-100 progress score
-  alongside pairwise preference, rather than success alone.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Progress beats binary
+# 用进度解释失败，保留正式指标
 
-Two policies that both fail a task can have failed by very different amounts, and a
-pass/fail verdict throws that information away. Keeping it makes every rollout more
-informative.
+方法性建议，不保留旧版“统计上普遍更省 rollout”的绝对结论。子目标完成、接触阶段、距离等可能帮助区分失败，也可能与最终成功反向或受奖励投机影响。
 
-## How to apply
+先查原生定义和使用权限；验证信号的稳定性与对目标的相关性。仿真内部状态可被协议允许的 evaluator 用于计分/诊断，但不能因此传入 policy；“内部状态指标一律无效”也是错误的。
 
-Where the task admits a graded measure — how far through a sequence it got, how close to
-the goal state, how many of N sub-goals completed — record it alongside the binary
-outcome. Compare on both. The graded score answers "is this policy better" with fewer
-rollouts; the binary score answers "does it work", which is what a reader ultimately
-wants and what the benchmark's own metric reports.
+在开发实验中同时报告正式指标与辅助进度，明确后者仅作诊断还是已校准的筛选信号。进度提高不等于任务成功率提高。不得据此改官方 success、horizon、任务权重或跳过最终确认。
 
-This matters most when rollouts are expensive and effects are small, which is the usual
-situation.
-
-## What it does not mean
-
-It does not replace the benchmark's own success criterion. The headline number must stay
-the native one — a graded score is an *additional* instrument for ranking under noise,
-not a substitute metric. And a progress score is only worth having if it is measurable
-without privileged access the policy itself could not have; a score computed from
-simulator internals is a diagnostic, not an evaluation.
+记录样本数、来源和失败切片，有真实数据时画进度图并说明局限。信号不稳定或与最终目标不一致时，停止用它排名而非硬调新指标。

@@ -1,37 +1,15 @@
 ---
 name: make-your-prior-earn-it
-description: A reasoned choice must be shown to beat an arbitrary legal one before you credit the reasoning.
+description: 要声称 LLM 推理、针对性采集或启发式优于普通搜索时，加入合法的随机/简单对照；不是每轮增分的前置门槛。
 scope: general
-confidence: methodological — this is an epistemics rule, not a measurement
-evidence: |
-  Measured on RoboSynChallenge click_bell, n=100 per arm, paired seeds: a collection
-  profile chosen from failure analysis scored 67%, and two independently drawn legal
-  profiles scored 64% and 63%. Against the analyst's choice the exact paired p-values
-  were 0.55 and 0.34; pooled, 0.73 with the random draws numerically higher. The
-  reasoned profile was genuinely different — telemetry confirmed it randomised robot
-  pose across all 14 dimensions and camera intrinsics, while the drawn profile varied
-  neither — and it still bought nothing.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Make your prior earn it
+# 验证启发式是否真的带来额外价值
 
-Your reasoning produced a choice. Before treating the *reasoning* as the thing that
-worked, check that the choice beat an arbitrary legal alternative at matched cost.
+方法性建议。针对失败选择一个方向并获得提升，只支持该候选优于所用基线；未必证明“选择得聪明”优于任何合理改动。
 
-## How to apply
+预算允许且研究目标包含推理价值时，以同成本的合法随机/简单策略作为对照，配对开发条件并报告不确定性。随机对照也要遵守所有协议与资源限制。
 
-When you are about to credit a specific decision — which distribution to sample, which
-failure mode to target, which hyperparameter to move — ask what an arbitrary legal
-choice would have scored. If you cannot answer, you do not yet know that your reasoning
-did any work. You may be measuring "we did something in-domain" and attributing it to
-"we did the *right* thing in-domain".
-
-This does not mean the reasoning was wasted. A reasoned choice and a random one often
-cost the same to execute, so there is no reason to prefer the random one. It means the
-*credit* belongs to the coarser mechanism until you can separate them.
-
-## What it does not mean
-
-It is not an argument for choosing arbitrarily. It is an argument for not claiming a
-mechanism you have not isolated. If you have the budget, spend it on isolating the
-mechanism rather than on a third variation of the same reasoned choice.
+差异不显著不等于等效或推理无价值；小样本只能支持有限结论。没有该对照仍可继续优化，但不要声称已证明 LLM 选法优于普通搜索。历史某次 p 值不能作为新任务放弃推理的依据。

@@ -31,12 +31,13 @@ fails on the others rather than passing on one.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from .common import object_digest, read_json, redact
+from .common import bounded_run, object_digest, read_json, redact
 from .patch_validation import checked_function
 
 #: The name the generated function must have. `checked_function` requires exactly one
@@ -130,28 +131,42 @@ def _offending_call(source: str) -> str:
 
     The validator's message is accurate and says nothing about *where*. A model told only
     "only registered numeric builtins may be called" rewrites the same call a different way;
-    told it wrote `d.get("key")` it stops writing method calls at all.
+    told it wrote `d["x"].__class__` it stops reaching for that at all.
     """
     import ast as _ast
-    from .patch_validation import BUILTINS
+    from .patch_validation import BUILTINS, PURE_METHODS
     try:
         tree = _ast.parse(source)
     except SyntaxError:
         return ""
     for node in _ast.walk(tree):
-        if not isinstance(node, _ast.Call):
-            continue
-        # Two ways to be refused and both need naming: a method call, which the node set
-        # excludes outright, and a call to a name that is not one of the registered
-        # builtins. Reporting only the first left the model rewriting `str(x)` unchanged.
-        if isinstance(node.func, _ast.Name) and node.func.id in BUILTINS:
-            continue
+        rendered = ""
         try:
             rendered = _ast.unparse(node)[:120]
         except Exception:
-            rendered = type(node.func).__name__
-        return f" (the call it refused was `{rendered}`; the only callable names are " \
-               f"{sorted(BUILTINS)})"
+            rendered = type(getattr(node, "func", node)).__name__
+        if isinstance(node, _ast.Attribute) and node.attr.startswith("_"):
+            return f" (the attribute it refused was `{rendered}`; private attributes are " \
+                   f"how a function would reach the interpreter it runs in)"
+        if not isinstance(node, _ast.Call):
+            continue
+        # Three ways to be refused, and a message naming none of them is a message the model
+        # answers by rewriting the same construct: a call to a name that is not registered,
+        # a method that is not one of the pure ones, and a method reached off a private
+        # attribute -- which is refused above, before the call is reached.
+        if isinstance(node.func, _ast.Name):
+            if node.func.id in BUILTINS:
+                continue
+            return f" (the call it refused was `{rendered}`; the only callable names are " \
+                   f"{sorted(BUILTINS)})"
+        if isinstance(node.func, _ast.Attribute):
+            if node.func.attr in PURE_METHODS:
+                continue
+            return f" (the method it refused was `{rendered}`; the methods a validated " \
+                   f"function may call are {sorted(PURE_METHODS)})"
+        return f" (the call it refused was `{rendered}`; only registered builtin names " \
+               f"may be called)"
+    return ""
     return ""
 
 
@@ -293,8 +308,8 @@ def differential_reader(source: str, functions: list[str], cases: list[dict[str,
                           "cases": [case["input"] for case in cases]})
     runner = Path(__file__).with_name("contract_runner.py")
     try:
-        result = subprocess.run([sys.executable, "-I", str(runner)], input=payload, text=True,
-                                capture_output=True, timeout=timeout)
+        result = bounded_run([sys.executable, "-I", str(runner)], input=payload,
+                             cwd=runner.parent, env=dict(os.environ), timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"passed": False, "error": f"the reader did not finish within {timeout}s",
                 "rows": [], "field_failures": {name: ["did not finish"] for name in functions}}
@@ -421,118 +436,6 @@ def _assemble(sources: dict[str, str]) -> str:
     return "\n\n".join(sources[field].rstrip() + "\n" for field in sorted(sources))
 
 
-def _merge(node: dict, value: Any, depth: int, max_depth: int) -> None:
-    """Fold one value into a structural node, recording types and optional keys."""
-    kind = ("null" if value is None else "bool" if isinstance(value, bool) else
-            "int" if isinstance(value, int) else "float" if isinstance(value, float) else
-            "str" if isinstance(value, str) else "list" if isinstance(value, list) else
-            "dict" if isinstance(value, dict) else type(value).__name__)
-    node.setdefault("types", set()).add(kind)
-    if depth >= max_depth:
-        return
-    if isinstance(value, dict):
-        node.setdefault("keys", {})
-        for key in value:
-            _merge(node["keys"].setdefault(key, {}), value[key], depth + 1, max_depth)
-    elif isinstance(value, list) and value:
-        node.setdefault("items", {})
-        for item in value:
-            _merge(node["items"], item, depth + 1, max_depth)
-
-
-def _walk(node: dict, prefix: str, out: list[tuple[str, str]], depth: int,
-          max_depth: int) -> None:
-    kinds = sorted(node.get("types", ()))
-    if prefix:
-        out.append((prefix, kinds[0] if len(kinds) == 1 else "|".join(kinds)))
-    if depth >= max_depth:
-        return
-    for key, child in sorted(node.get("keys", {}).items()):
-        _walk(child, f"{prefix}.{key}" if prefix else key, out, depth + 1, max_depth)
-    if "items" in node:
-        _walk(node["items"], f"{prefix}[]", out, depth + 1, max_depth)
-
-
-def structure_schema(documents: list[dict[str, Any]], *, max_depth: int = 12) -> dict[str, Any]:
-    """The shape of the input documents, merged across examples into one navigable tree.
-
-    Inferring structure from whole documents is the part of writing a reader that has
-    nothing to do with the benchmark -- which keys exist, at what depth, of what type -- and
-    a program does it perfectly where a model does it approximately.
-
-    It is returned as a tree rather than a flattened listing because flattening does not
-    compress: a benchmark's configuration is mostly machinery the contract never looks at
-    (one action graph here is 1,874 of 3,123 paths), so a complete listing is as large as
-    the documents it summarises. What compresses is *asking* -- the model names the subtrees
-    it wants and gets those, which is how a person reads an unfamiliar config too.
-    """
-    root: dict[str, Any] = {}
-    key_counts: dict[str, int] = {}
-    for document in documents:
-        _merge(root, document, 0, max_depth)
-        for key in document:
-            key_counts[key] = key_counts.get(key, 0) + 1
-    return {"tree": root, "documents_examined": len(documents),
-            "top_level_optional": sorted(k for k, n in key_counts.items()
-                                         if n < len(documents))}
-
-
-def index_of(schema: dict[str, Any], *, depth: int = 1) -> list[tuple[str, str]]:
-    """The top of the tree: enough to choose what to ask for, not enough to drown in."""
-    out: list[tuple[str, str]] = []
-    _walk(schema["tree"], "", out, 0, depth)
-    return out
-
-
-def paths_under(schema: dict[str, Any], prefixes: list[str], *,
-                depth: int = 3, limit: int = 400) -> dict[str, Any]:
-    """The schema restricted to the requested subtrees, plus which requests found nothing.
-
-    Naming a subtree that does not exist is reported rather than ignored: it is the
-    difference between a model that has understood the shape and one that is guessing at
-    key names, and it costs one line to say so.
-    """
-    found: list[tuple[str, str]] = []
-    _walk(schema["tree"], "", found, 0, 64)
-    by_path = dict(found)
-    kept: dict[str, str] = {}
-    missing: list[str] = []
-    for prefix in prefixes:
-        selected = {path: kind for path, kind in by_path.items()
-                    if path == prefix or path.startswith(prefix + ".") or
-                    path.startswith(prefix + "[]")}
-        if not selected:
-            missing.append(prefix)
-            continue
-        for path in sorted(selected)[:limit]:
-            kept[path] = selected[path]
-    return {"paths": kept, "not_found": missing}
-
-
-def document_roles(setting: str = "random") -> dict[str, str]:
-    """Which documents a task's contract is read from, as role -> repository-relative path.
-
-    A role name rather than a path, so the declaration can say where each document lives
-    without the generated function needing to know the layout.
-    """
-    return {"gym": f"configs/{{task}}/{setting}/gym_config.json",
-            "action": "configs/{task}/action_config.json"}
-
-
-def documents_for(repo: Path, task: str, *, declared: dict[str, Any] | None = None,
-                  setting: str = "random") -> dict[str, Any]:
-    """The parsed documents for one task, keyed by role, plus its name and declarations."""
-    documents: dict[str, Any] = {"task": task}
-    for role, template in document_roles(setting).items():
-        documents[role] = read_json(Path(repo) / template.format(task=task))
-    documents["declared"] = dict(declared or {})
-    return documents
-
-
-def json_safe(value: Any) -> Any:
-    return json.loads(json.dumps(value))
-
-
 def build_request(worked: list[tuple[dict[str, Any], dict[str, Any]]],
                   blind: list[dict[str, Any]], fields: list[str]) -> tuple[str, str]:
     """Some worked examples, several inputs without answers, and the output shape.
@@ -554,48 +457,7 @@ def build_request(worked: list[tuple[dict[str, Any], dict[str, Any]]],
     return SYSTEM, user
 
 
-def _offending_call(source: str) -> str:
-    """Name the construct the validator refused, so a retry can fix it.
-
-    The validator's message is accurate and says nothing about *where*. A model told only
-    "only registered numeric builtins may be called" rewrites the same call a different way;
-    told it wrote `d.get("key")` it stops writing method calls at all.
-    """
-    import ast as _ast
-    from .patch_validation import BUILTINS
-    try:
-        tree = _ast.parse(source)
-    except SyntaxError:
-        return ""
-    for node in _ast.walk(tree):
-        if not isinstance(node, _ast.Call):
-            continue
-        # Two ways to be refused and both need naming: a method call, which the node set
-        # excludes outright, and a call to a name that is not one of the registered
-        # builtins. Reporting only the first left the model rewriting `str(x)` unchanged.
-        if isinstance(node.func, _ast.Name) and node.func.id in BUILTINS:
-            continue
-        try:
-            rendered = _ast.unparse(node)[:120]
-        except Exception:
-            rendered = type(node.func).__name__
-        return f" (the call it refused was `{rendered}`; the only callable names are "                f"{sorted(BUILTINS)})"
     return ""
-
-
-def _extract_object(content: str) -> dict[str, Any]:
-    text = content.strip()
-    for opener in ("```json", "```"):
-        if text.startswith(opener):
-            text = text[len(opener):]
-    text = text.removesuffix("```").strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("no JSON object in the response")
-    value = json.loads(text[start:end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("response is not one JSON object")
-    return value
 
 
 def generate(client: Any, *, worked: list[tuple[dict[str, Any], dict[str, Any]]],
@@ -653,26 +515,14 @@ def generate(client: Any, *, worked: list[tuple[dict[str, Any], dict[str, Any]]]
     return None, log
 
 
-def _disagreement_summary(report: dict[str, Any], limit: int = 6) -> str:
-    """The first few concrete disagreements, so a retry knows what to change."""
-    lines = []
-    for row in report.get("rows", []):
-        if row["passed"]:
-            continue
-        lines.append(f"{row['task']}: " + "; ".join(row["disagreements"][:2]))
-        if len(lines) >= limit:
-            break
-    return " | ".join(lines) if lines else (report.get("error") or "no rows")
-
-
 def differential(source: str, cases: list[dict[str, Any]], *,
                  timeout: float = 60.0) -> dict[str, Any]:
     """Run the function against the frozen contracts and report every disagreement."""
     checked_function(source, FUNCTION)
     payload = json.dumps({"source": source, "cases": [case["input"] for case in cases]})
     runner = Path(__file__).with_name("contract_runner.py")
-    result = subprocess.run([sys.executable, "-I", str(runner)],
-                            input=payload, text=True, capture_output=True, timeout=timeout)
+    result = bounded_run([sys.executable, "-I", str(runner)], input=payload,
+                         cwd=runner.parent, env=dict(os.environ), timeout=timeout)
     if result.returncode:
         return {"passed": False, "error": (result.stderr or "").strip()[-2000:], "rows": []}
     produced = json.loads(result.stdout)
@@ -701,5 +551,4 @@ def gold_cases(repo: Path, oracle: dict[str, Any], *,
 
 def oracle(path: Path) -> dict[str, Any]:
     return read_json(path)
-
 

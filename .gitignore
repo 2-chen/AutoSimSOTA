@@ -19,6 +19,7 @@ dist/
 /RoboSynChallenge_eval_clean/
 /RoboTwin/
 /EmbodiChain/
+/.mplib_src/
 
 # Assets, datasets, experimental outputs, historical local plans
 /embodichain_data/

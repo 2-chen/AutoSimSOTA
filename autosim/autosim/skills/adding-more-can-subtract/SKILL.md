@@ -1,45 +1,17 @@
 ---
 name: adding-more-can-subtract
-description: Adding lower-quality data on top of a curated corpus can make generalisation worse, not better.
+description: 新增数据后退步时检查质量、分布、采样和训练预算；更多数据可能有害也可能有益，需同口径对照。
 scope: general
-confidence: medium-high — a clean controlled table plus several consistent results in the same direction, all in the "add-to-an-already-strong-base" regime
-evidence: |
-  RoboCasa365 (arXiv:2603.04356), §4.4, verbatim: "Compared to training on all pretraining
-  data (Human300 + MG60), we find that training on just the human data (Human300) yields
-  better downstream learning results." Averages: Human300 40.0 vs Human300+MG60 35.9 —
-  and the loss is concentrated on Composite-Unseen, 32.3 -> 22.7. The synthetic data hurt
-  generalisation, not in-distribution fit.
-
-  Consistent results: arXiv:2606.20999 finds MimicGen additions give no improvement to
-  inductive generalisation on RoboCasa; DataMIL (arXiv:2505.09603) finds "selecting data
-  naively may actually harm downstream performance"; LIBERO (arXiv:2306.03310) reports
-  that "naive supervised pretraining can have a negative impact"; Ambient Diffusion
-  Policy (arXiv:2606.12365) finds co-training plateaus as suboptimal data is scaled.
-
-  A sign-change worth knowing: the earlier RoboCasa (RSS 2024) reported the opposite —
-  MimicGen data beating human-only substantially. Both can hold: synthetic data wins when
-  the human corpus is small, and stops winning once it is large and diverse.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Adding more can subtract
+# 新增数据可能降低效果
 
-More data is not a monotone improvement. Past some point, adding a lower-quality block to
-a good corpus reduces what the model learns, and it shows up worst on the cases you care
-about most — the unseen ones.
+借鉴证据：[RoboCasa365 v1 表 4](https://arxiv.org/html/2603.04356v1) 中，10% 目标数据条件下，Human300 的平均成功率为 40.0%，加 MG60 后为 35.9%。这是特定预训练混合与下游协议的结果，不证明合成数据普遍有害，也不独立证明退步由质量导致。
 
-## How to apply
+比较原数据继续训练与加入新数据；明确采样、训练更新量、归一化、模型和评测是否同时改变。检查成功判定、动作/观测一致性、重复度、分布偏移与旧任务遗忘。
 
-Treat "include this block of data" as a claim that needs a control, exactly like a
-parameter change. The control is the same training without the block. Where the block is
-synthetic or machine-generated, expect it to help when the curated corpus is thin and to
-stop helping once it is not.
+最小试验先隔离一种因素：原数据、同成本的新数据混合；如需解释机制，再增加过滤或比例对照。保留新数据身份及 loader 消费证据。若效果不明确，报告不确定性，不把单次下降写成因果结论。
 
-If you do include it, the evidence says to reweight or filter rather than dump it in —
-see `quality-needs-reweighting`. Mixing ratio is a real variable, and pushing it toward
-the larger but weaker source degrades results.
-
-## What it does not mean
-
-It is not an argument against synthetic data in general, and the effect is
-scale-conditional: the sign flips depending on how good the base corpus already is. It is
-an argument against assuming that a larger mixture is a better one.
+本技能回答“为何混合后退步”；quality-needs-reweighting 处理质量干预，weight-the-small-set 处理实际曝光，不要三者自动叠加。

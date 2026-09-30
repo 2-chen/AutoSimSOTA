@@ -1,41 +1,17 @@
 ---
 name: diversity-before-volume
-description: Generalisation scales with the number of distinct environments and objects, not with the number of demonstrations.
+description: 采集预算有限时比较新场景、物体、初态或任务覆盖与重复演示；适用于允许改变训练分布的协议。
 scope: general
-confidence: high — a controlled ablation plus a dedicated scaling study across two independent groups
-evidence: |
-  RoboCasa365 pretraining ablation (ICLR 2026, arXiv:2603.04356): Human50 34.7 average vs
-  Human300 40.0, with the gain concentrated on Composite-Unseen (23.8 -> 32.3) rather than
-  in-distribution. Scene-count scaling reported in the same work: 29.6 -> 39.6 -> 44.7.
-
-  Lin et al., "Data Scaling Laws in Imitation Learning" (ICLR 2025, arXiv:2410.18647),
-  40k+ demos and 15k+ real rollouts: generalisation follows a power law in the number of
-  training environments and objects, and once demonstrations-per-environment pass a
-  threshold "additional demonstrations have minimal effect". Their recipe — 32
-  environments x 1 object x 50 demos — reached ~90% on novel environments with unseen
-  objects, collected by four people in an afternoon.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Diversity before volume
+# 比较覆盖与重复数量
 
-When you have budget for more data, the first question is not "how much" but "how many
-distinct situations".
+借鉴证据：[Data Scaling Laws v4](https://arxiv.org/abs/2410.18647v4) 在真实机器人模仿学习中研究环境/物体多样性及每配置演示数量，观察到增加后者的边际收益递减。它不是所有仿真任务的最优配额证明；RoboCasa365 的仿真任务多样性研究见 [调研](../choosing-simulation-improvements/references/literature-review.md)。
 
-## How to apply
+先定义实际覆盖维度和训练许可范围：物体/布局、初态、目标组合、接触/恢复状态。seed 数量不是覆盖度本身，同 seed 或不同 seed 的效果由环境实现决定。不能以测试集失败作为采集分布标签。
 
-Count the distinct scenes/objects/configurations your data covers before you count the
-episodes. If two demonstrations come from the same initial configuration with a
-different seed, you have one situation observed twice, not two situations. Adding more
-of those saturates fast.
+在相近采集与训练预算下比较“重复已有配置”和“扩展一种覆盖”。同时记录成功产出率、质量、有效样本和各开发切片得分，避免把难配置低产出误认为低价值。
 
-This changes what a collection round should ask for. A targeted profile that varies
-appearance, camera and pose is purchasing diversity; a profile that varies nothing but
-the seed is purchasing volume, and volume is the axis that saturates.
-
-## What it does not mean
-
-It is not a licence to ignore per-configuration demonstration count — Lin et al. found a
-threshold below which more demos *do* help. And "diverse" is not automatically "useful":
-RoboCasa365 found that adding a large batch of lower-quality generated trajectories to a
-curated corpus made generalisation worse, not better (see `adding-more-can-subtract`).
-Diversity of *situations* is what scales; volume of *items* is what saturates.
+如果已有数据不足以学会基本动作，增加同分布演示仍合理；如果新随机化超出任务定义、改变动力学或使专家失效，缩小范围。没有统一的场景数、每场景演示数或必胜顺序。

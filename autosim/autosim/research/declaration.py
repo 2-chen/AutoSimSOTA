@@ -28,14 +28,52 @@ contain an expert" has a definite answer and is the wrong question.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from .adapter_protocol import Axis, OptimizationSpace, check_space
-from .common import digest, read_json
+from .common import digest, object_digest, read_json
 from .contracts import CapabilityRecord
-from .registry import TaskSpec
+
+
+@dataclass
+class TaskSpec:
+    """One task of a benchmark, as the benchmark states it.
+
+    Moved here from a module that held one benchmark's task table. It was the one thing in
+    that table a general reader needed, and it is general: the fields above `gym_config` are
+    the ones every benchmark's task has some form of, and everything below is how *this* one
+    states its setup -- a benchmark that states it differently has nothing to put there, so
+    they default to empty rather than being required.
+    """
+
+    name: str
+    env_id: str
+    setting: str
+    max_episode_steps: int
+    state_dim: int
+    action_dim: int
+    cameras: tuple[str, ...]
+    camera_shapes: dict[str, list[int]]
+    control_parts: tuple[str, ...]
+    recorded_fps: float
+    instruction: str
+    gym_config: str = ""
+    action_config: str = ""
+    config_hashes: dict[str, str] = field(default_factory=dict)
+    event_families: dict[str, list[str]] = field(default_factory=dict)
+    roles: dict[str, Any] = field(default_factory=dict)
+    correction_supported: bool = False
+    expert_adapter: str = "official"
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def signature(self) -> str:
+        return object_digest(self.as_dict())
 
 
 #: What the system needs from any benchmark, in its own words. A declaration must answer
@@ -103,6 +141,16 @@ def problems_in(declaration: dict[str, Any],
     if problems:
         return problems
     absent = set(REQUIRED_KEYS) - set(declaration)
+    goal = declaration.get("research_goal")
+    if goal is not None:
+        if not isinstance(goal, dict):
+            problems.append("research_goal must be an object")
+        else:
+            try:
+                from .metric_guardrails import specifications
+                specifications(declaration)
+            except (ValueError, TypeError, KeyError) as exc:
+                problems.append(f"research_goal.guardrail_metrics is invalid: {exc}")
 
     if not str(declaration["benchmark"]).strip():
         problems.append("benchmark must name the project")
@@ -139,16 +187,40 @@ def problems_in(declaration: dict[str, Any],
     elif not isinstance(contract, dict):
         problems.append("task_contract must be an object")
     else:
-        for key in ("state_dim", "action_dim", "cameras", "max_episode_steps"):
-            if contract.get(key) in (None, "", {}, []):
-                problems.append(f"task_contract.{key} is required")
-        if not isinstance(contract.get("cameras", {}), dict):
+        # A field it could not determine is left out or null, and that is a finding rather
+        # than a fault. It used to be required and required to be positive, which left a
+        # model that did not know with no way to say so -- and it wrote zeros, which read as
+        # a value and were rejected as one, three times, until the run raised. RoboTwin is
+        # where this showed: its demonstrations are six directories deep and the survey
+        # looked three, so nothing in the material said what `state_dim` is, and the honest
+        # answer was unavailable. What the contract *does* carry is still checked.
+        undetermined = [key for key in ("state_dim", "action_dim", "cameras",
+                                        "max_episode_steps")
+                        if contract.get(key) in (None, "", {}, [])]
+        if undetermined:
+            declaration.setdefault("contract_undetermined", sorted(undetermined))
+        if contract.get("cameras") not in (None, "", {}, []) \
+                and not isinstance(contract.get("cameras"), dict):
             problems.append("task_contract.cameras must map a camera name to its shape")
         for key in ("state_dim", "action_dim", "max_episode_steps"):
             value = contract.get(key)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int)
                                       or value < 1):
-                problems.append(f"task_contract.{key} must be a positive integer")
+                problems.append(f"task_contract.{key} must be a positive integer, or left "
+                                f"out when it could not be determined")
+        representation = contract.get("policy_representation")
+        if representation not in (None, "artifact", "source"):
+            problems.append("task_contract.policy_representation must be artifact, source "
+                            "or null when not established")
+        if contract.get("primary_metric") is not None:
+            if not isinstance(contract["primary_metric"], dict):
+                problems.append("task_contract.primary_metric must be an object or null")
+            else:
+                try:
+                    from .metric_contract import MetricSpec
+                    MetricSpec.from_declaration({"task_contract": contract})
+                except (ValueError, TypeError) as exc:
+                    problems.append(f"task_contract.primary_metric is invalid: {exc}")
 
     caps = declaration.get("capabilities")
     if caps is None:
@@ -221,6 +293,16 @@ def problems_in(declaration: dict[str, Any],
     if len(set(named.values())) < len(named):
         problems.append(f"assets name the same file more than once: {named}")
 
+    telemetry_spec = declaration.get("telemetry_spec")
+    if telemetry_spec is None and isinstance(declaration.get("task_contract"), dict):
+        telemetry_spec = declaration["task_contract"].get("telemetry_spec")
+    if telemetry_spec is not None:
+        try:
+            from .telemetry import TelemetrySpec
+            TelemetrySpec.from_value(telemetry_spec)
+        except (TypeError, ValueError) as exc:
+            problems.append(f"telemetry_spec is invalid: {exc}")
+
     if "optimization_space" not in declaration:
         return problems
     problems.extend(_space_problems(declaration["optimization_space"]))
@@ -234,24 +316,114 @@ def problems_in(declaration: dict[str, Any],
     return problems
 
 
+#: A field in a configuration the program printed: `'policy_type': 'BCTransformerPolicy',`
+#: or `policy_type: BCTransformerPolicy`. Quoted or bare, first or nested.
+_PRINTED_FIELD = re.compile(
+    r"""['"]?([A-Za-z_][A-Za-z0-9_]*?)['"]?\s*:\s*['"]?([^,'"\n}]{1,80}?)['"]?\s*,?\s*$""")
+
+
+def values_the_program_contradicts(space: OptimizationSpace,
+                                   printed_config: str) -> list[dict[str, Any]]:
+    """Declared choice values that the program's own configuration says are not its.
+
+    A declaration is verified for the *existence* of its axes and not for their values, and
+    the two are different claims. LIBERO's declared space offers
+    `policy.policy_type ∈ (bc_rnn_policy, bc_transformer_policy, bc_vilt_policy)` -- the yaml
+    file names, which is what a reader of the repository sees. The field wants the *class*
+    name, and the registry is keyed by that: setting the field to any declared value raises
+    `ValueError: Policy class with name bc_transformer_policy not found in registry`. Every
+    value of that axis produces a command that cannot run, and nothing checked.
+
+    A program that composes a configuration prints it, and that print is the authority on
+    what its fields hold. Where a declared choice axis names a field the program printed with
+    a value that is not among the declared ones, the declaration is wrong about that axis.
+    Reported as a disagreement with the evidence, not as a repair: which side to change is
+    not something this can know.
+    """
+    if space is None:
+        # A caller that has no declared space -- a controlled experiment driving the verified
+        # commands directly -- has nothing for this to be about. Raising here took down a
+        # measurement that had already screened two candidates successfully.
+        return []
+    printed: dict[str, str] = {}
+    for line in (printed_config or "").splitlines():
+        match = _PRINTED_FIELD.match(line.strip())
+        if match:
+            printed.setdefault(match.group(1), match.group(2).strip())
+    if not printed:
+        return []
+    found: list[dict[str, Any]] = []
+    for section in space.sections():
+        for axis in space.axes(section):
+            if axis.kind != "choice":
+                continue
+            name = str(axis.name)
+            field = name.split(".")[-1]
+            observed = printed.get(field)
+            declared = [str(value) for value in (axis.values or ())]
+            if observed and declared and observed not in declared:
+                found.append({
+                    "axis": name, "declared_values": declared,
+                    "the_program_says": observed,
+                    "why": f"the program composed {field}={observed!r}, which is not one of "
+                           f"the values this axis offers; varying it to any of them would set "
+                           f"a field to a name the program does not have"})
+    return found
+
+
 def _space_problems(raw: Any) -> list[str]:
     if not isinstance(raw, dict):
         return ["optimization_space must be an object"]
     problems: list[str] = []
     for section in ("collection", "training"):
         if not isinstance(raw.get(section), list):
-            problems.append(f"optimization_space.{section} must be a list of axes")
+            problems.append(f"optimization_space.{section} must be a list of axes, "
+                            f"and it is {_described(raw.get(section))}")
     extra = raw.get("extra", {})
     if not isinstance(extra, dict):
-        problems.append("optimization_space.extra must map a section name to a list of axes")
+        problems.append("optimization_space.extra must map a section name to a list of axes "
+                        f"(or be {{}} when there is no third section), and it is "
+                        f"{_described(extra)}")
+    else:
+        for name, axes in extra.items():
+            # A section with no axes is written as an empty list. A model that is unsure
+            # whether the section exists writes `null` -- which its instructions explicitly
+            # permit as an answer -- and this used to report that as "each axis must be an
+            # object", six times, without saying which section or what to write instead.
+            if axes is not None and not isinstance(axes, list):
+                problems.append(
+                    f"optimization_space.extra.{name} must be a list of axis objects, and it "
+                    f"is {_described(axes)}. Remove the key if this benchmark has no such "
+                    f"section.")
     return problems
+
+
+def _described(value: Any) -> str:
+    """What a value is, for a message that has to be actable on.
+
+    A type name alone is sometimes not enough to find the value in a long reply -- there are
+    several objects in a declaration -- so a short rendering is included. Bounded, because
+    this ends up in a prompt.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, (str, int, float, bool)):
+        return f"{value!r}"
+    if isinstance(value, list):
+        return f"a list of {len(value)}"
+    if isinstance(value, dict):
+        return f"an object with keys {sorted(value)[:6]}"
+    return f"a {type(value).__name__}"
 
 
 def _axes(raw: Sequence[dict[str, Any]], section: str, problems: list[str]) -> tuple[Axis, ...]:
     built = []
-    for row in raw:
+    for row in raw if isinstance(raw, list) else []:
         if not isinstance(row, dict):
-            problems.append(f"{section}: each axis must be an object")
+            # The value is named, not just described: a reply holds several lists and
+            # "each axis must be an object" does not say which one, or what was in it.
+            problems.append(f"{section}: every entry must be an axis object with a `name` and "
+                            f"a `kind`, and one entry is {_described(row)}")
             continue
         name, kind = row.get("name"), row.get("kind")
         if not str(name or "").strip():
@@ -287,6 +459,37 @@ def _axes(raw: Sequence[dict[str, Any]], section: str, problems: list[str]) -> t
     return tuple(built)
 
 
+def usable_declarations(scouting: Path, name: str, *,
+                        build: Any = None) -> tuple[list[tuple[float, str, dict]],
+                                                          list[tuple[str, str]]]:
+    """Every declaration for this benchmark that builds a space, newest first, and the ones
+    that do not with the reason.
+
+    Several scouts may have run against one benchmark, and an older one is not merely older.
+    A scout that ran before the survey could read the checkout produced an *empty*
+    optimisation space -- RoboTwin's did -- and this took the first name match in alphabetical
+    order, so a run was driven by a declaration with nothing in it while a good one sat in the
+    next directory. A declaration that does not build is not a candidate, and saying which
+    ones were skipped and why is what makes the choice checkable rather than silent.
+    """
+    usable: list[tuple[float, str, dict]] = []
+    rejected: list[tuple[str, str]] = []
+    for candidate in sorted(scouting.glob("*/declaration.json")):
+        try:
+            document = read_json(candidate)["declaration"]
+        except (OSError, ValueError, KeyError):
+            continue
+        if name not in str(document.get("benchmark", "")).lower():
+            continue
+        try:
+            (build or space_from)(document)
+        except ValueError as exc:
+            rejected.append((candidate.parent.name, str(exc)[:200]))
+            continue
+        usable.append((candidate.stat().st_mtime, candidate.parent.name, document))
+    return sorted(usable, key=lambda row: -row[0]), rejected
+
+
 def space_from(declaration: dict[str, Any]) -> OptimizationSpace:
     """The declared optimization space, or a ValueError naming what is wrong with it."""
     raw = declaration.get("optimization_space")
@@ -297,8 +500,12 @@ def space_from(declaration: dict[str, Any]) -> OptimizationSpace:
     # merely absent from the space -- it is a knob the controller was told it had and does
     # not, so the declaration says one thing and the run does another unless this raises.
     faults: list[str] = []
-    extra = tuple((str(name), _axes(axes, f"extra.{name}", faults))
-                  for name, axes in (raw.get("extra") or {}).items())
+    # A section declared with no axes is dropped rather than carried as an empty one: the
+    # space's `sections()` is what the controller is shown, and an empty section there reads
+    # as a knob it has that turns out to have nothing on it.
+    extra = tuple((str(name), built)
+                  for name, axes in (raw.get("extra") or {}).items()
+                  for built in [_axes(axes, f"extra.{name}", faults)] if built)
     space = OptimizationSpace(
         collection=_axes(raw["collection"], "optimization_space.collection", faults),
         training=_axes(raw["training"], "optimization_space.training", faults),
@@ -306,6 +513,14 @@ def space_from(declaration: dict[str, Any]) -> OptimizationSpace:
     if faults:
         raise ValueError("; ".join(faults))
     structural = check_space(space)
+    # A source-defined controller can be improved by editing code rather than by changing
+    # a declared numeric/config axis. Its empty parameter section is an explicit contract,
+    # not evidence that the survey missed a trainer's knobs. The four-stage parameter
+    # proposal path still cannot use this as a non-empty optimization space.
+    if (not any(space.sections().values()) and
+            (declaration.get("task_contract") or {}).get("policy_representation") == "source"):
+        structural = [problem for problem in structural
+                      if not problem.startswith("the space has no axes at all")]
     if structural:
         raise ValueError("; ".join(structural))
     return space
@@ -627,6 +842,99 @@ def _agree(declaration: dict[str, Any], repo: Path, surveyed: set[str]) -> dict[
     return out
 
 
+#: Named nodes in a recorded trajectory, matched by what the name means rather than by where
+#: it sits. LIBERO writes `data/demo_0/actions` and `obs/<camera>_rgb`; RoboTwin writes
+#: top-level `action`, `state` and `vision` groups whose members are the parts. Both are
+#: saying the same three things, and a reader that only understands the first reports that
+#: the second has no contract at all -- which is what it did.
+_ACTION_NODE = re.compile(r"^actions?$|action.*(dim|joint|pose|vec)|^act$", re.IGNORECASE)
+_STATE_NODE = re.compile(r"^states?$|state.*(dim|joint)|proprio|^obs$", re.IGNORECASE)
+_CAMERA_NODE = re.compile(r"cam|rgb|image|vision|depth", re.IGNORECASE)
+_FPS_NODE = re.compile(r"freq|fps|rate", re.IGNORECASE)
+
+
+def _dimension_of(node: dict[str, Any]) -> int | None:
+    """How wide the thing inside this node is.
+
+    A dataset states it: the last axis is the width. A group states it differently -- its
+    members are the parts, so the width is how many there are. RoboTwin's `action` holds six
+    datasets, one per joint group, and each is `[129, 6]`: six parts of six, and either
+    reading gives six.
+    """
+    shape = node.get("shape")
+    if isinstance(shape, list) and shape and isinstance(shape[-1], int):
+        return int(shape[-1])
+    members = node.get("examples")
+    if isinstance(members, list) and members and node.get("count"):
+        return int(node["count"])
+    return None
+
+
+#: The keys a *structure report* uses, which are not names of anything inside the file. A
+#: reader that walks the report has to tell the two apart: `action` is a group in RoboTwin's
+#: file, while `shape` and `first` describe the report itself, and a walk that yields both
+#: produces a list of the report's own field names.
+_REPORT_FIELDS = frozenset({"shape", "dtype", "count", "examples", "attrs", "group",
+                            "first", "value", "colors", "root_attrs", "root_keys"})
+
+
+def _named_nodes(groups: Any, prefix: str = "", depth: int = 0,
+                 limit: int = 400) -> list[tuple[str, dict[str, Any]]]:
+    """Every node the file actually has, by name, down to a bound.
+
+    The camera in LIBERO sits at `obs.<name>_rgb` and in RoboTwin at `vision.<name>` -- two
+    levels apart. A reader that looks one level down finds one of them and never the other.
+    """
+    out: list[tuple[str, dict[str, Any]]] = []
+    if depth > 4 or not isinstance(groups, dict) or limit <= 0:
+        return out
+    for name, node in groups.items():
+        if name in _REPORT_FIELDS or not isinstance(node, dict):
+            continue
+        out.append((f"{prefix}{name}", node))
+        for key in ("group", "first"):
+            child = node.get(key)
+            if isinstance(child, dict):
+                out.extend(_named_nodes(child, f"{prefix}{name}.", depth + 1, limit - len(out)))
+        # A node that describes nothing is a map of names, and its keys are nodes. LIBERO's
+        # `obs` holds the cameras directly -- `{agentview_rgb: {...}, eye_in_hand_rgb: {...}}`
+        # -- with no key of its own to recurse through, so a walk that only followed `group`
+        # and `first` reached `obs` and stopped, and the cameras were never seen.
+        if not any(field in node for field in ("shape", "dtype", "count", "examples")):
+            out.extend(_named_nodes(node, f"{prefix}{name}.", depth + 1, limit - len(out)))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _cameras_in(nodes: list[tuple[str, dict[str, Any]]]) -> dict[str, list[int]]:
+    """Nodes that look like cameras, by name, with whatever shape was recorded.
+
+    Shapes are passed through as found rather than interpreted: LIBERO records
+    `[1, 128, 128, 3]` and RoboTwin records `[3]`, and which of those is the image is the
+    reader's business. A group whose *members* are cameras counts too -- naming them as a
+    group's children says as much as naming them as datasets.
+    """
+    out: dict[str, list[int]] = {}
+    for name, node in nodes:
+        leaf = name.split(".")[-1]
+        if _CAMERA_NODE.search(leaf):
+            shape = node.get("shape")
+            if isinstance(shape, list) and shape:
+                out[leaf] = list(shape)
+            else:
+                out.setdefault(leaf, [])
+        for member in (node.get("examples") or []):
+            if _CAMERA_NODE.search(str(member)):
+                out.setdefault(str(member), [])
+    # A group that merely *contains* cameras is not itself one.
+    containers = {name.split(".")[-1] for name, node in nodes
+                  if isinstance(node.get("examples"), list)
+                  and any(_CAMERA_NODE.search(str(m)) for m in node["examples"])
+                  and not isinstance(node.get("shape"), list)}
+    return {name: shape for name, shape in out.items() if name not in containers} or out
+
+
 def observed_contract(survey_report: dict[str, Any]) -> dict[str, Any]:
     """The task contract as the *data* states it, where the survey could read it.
 
@@ -634,25 +942,48 @@ def observed_contract(survey_report: dict[str, Any]) -> dict[str, Any]:
     moves on. This reads the real one out of the recorded trajectories, so the two can be
     compared -- the disagreement is the useful part, and it is invisible to any check that
     only asks whether a field is present and positive.
+
+    Names, not positions. The first version looked for a key spelled `actions` inside a group
+    spelled `obs`, which is what LIBERO writes, and returned `{}` for RoboTwin -- whose file
+    says `action` and `vision` and states the same three facts. An empty contract is not a
+    neutral answer: it is what left the model with nothing to read, writing zeros, and the
+    scout failing.
     """
     for row in survey_report.get("dataset_structure", []):
         groups = row.get("groups") or {}
-        for group in groups.values():
-            first = (group.get("first") or {})
-            if not isinstance(first, dict):
+        action_dim = state_dim = None
+        cameras: dict[str, list[int]] = {}
+        fps = None
+        for name, group in groups.items():
+            if not isinstance(group, dict):
                 continue
-            actions = first.get("actions")
-            observation = (first.get("obs") or {}).get("group")
-            if not isinstance(actions, dict) or not isinstance(observation, dict):
-                continue
-            cameras = {name: shape for name, value in observation.items()
-                       if name.endswith("_rgb") and (shape := value.get("shape"))
-                       and len(shape) == 4}
-            return {"source": row["path"],
-                    "action_dim": actions["shape"][-1],
-                    "cameras": {name: shape[1:] for name, shape in cameras.items()},
-                    "observed_keys": sorted(observation),
-                    "episodes_in_file": group.get("count")}
+            first = group.get("first")
+            # The top-level node itself, and everything one level inside it: the two places
+            # the same three facts are written in the two layouts.
+            nodes = _named_nodes({name: group})
+            for node_name, node in nodes:
+                leaf = node_name.split(".")[-1]
+                if action_dim is None and _ACTION_NODE.search(leaf):
+                    action_dim = _dimension_of(node)
+                elif state_dim is None and _STATE_NODE.search(leaf):
+                    state_dim = _dimension_of(node)
+                if fps is None and _FPS_NODE.search(leaf):
+                    for key in ("value", "shape"):
+                        if isinstance(node.get(key), (int, float)):
+                            fps = node[key]
+            for camera, shape in _cameras_in(nodes).items():
+                cameras.setdefault(camera, shape)
+        if action_dim or state_dim or cameras:
+            found = {"source": row.get("path"), "observed_keys": sorted(groups)}
+            if action_dim:
+                found["action_dim"] = action_dim
+            if state_dim:
+                found["state_dim"] = state_dim
+            if cameras:
+                found["cameras"] = cameras
+            if fps:
+                found["recorded_fps"] = fps
+            return found
     return {}
 
 

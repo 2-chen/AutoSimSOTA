@@ -6,8 +6,7 @@ from pathlib import Path
 from autosim.research.devices import (DEFAULT_DEVICE_ENV, NoCompatibleDevice,
                                       align_process_defaults, apply_capability, build_plan,
                                       default_device_index, describe, discover, gpu_class,
-                                      identity_is_safe, legacy_index_lock_held,
-                                      normalize_uuid, ordinal_of, parse_compute_apps,
+                                      identity_is_safe,                                       normalize_uuid, ordinal_of, parse_compute_apps,
                                       parse_gpu_csv, probe_receipt_key, renderer_for, select,
                                       shard_count, shard_plan)
 
@@ -139,10 +138,12 @@ class CapabilityTests(unittest.TestCase):
         self.assertNotIn(0, [g["index"] for g in report["usable"]])
         self.assertIn("index 0 busy", describe(report))
 
-    def test_a_legacy_index_lock_counts_as_occupancy_evidence(self):
+    def test_an_index_lock_handed_in_counts_as_occupancy_evidence(self):
+        """The lock source is the caller's. Nothing here reads a lock file of its own -- the
+        runner that wrote the `/tmp` locks this used to read is not part of the system."""
         report = apply_capability(make_report(), ALL_VERIFIED,
                                   index_lock_held=lambda index: index == 1)
-        self.assertEqual(report["gpus"][1]["busy_evidence"], ["legacy index lock held"])
+        self.assertEqual(report["gpus"][1]["busy_evidence"], ["an index lock is held"])
         self.assertNotIn(1, [g["index"] for g in report["usable"]])
 
     def test_incompatible_device_keeps_its_verdict_and_stays_out(self):
@@ -151,16 +152,6 @@ class CapabilityTests(unittest.TestCase):
         report = apply_capability(make_report(), receipt, index_lock_held=NO_LOCK)
         self.assertEqual(report["gpus"][1]["capability"], "incompatible")
         self.assertNotIn(1, [g["index"] for g in report["usable"]])
-
-    def test_legacy_index_lock_probe_answers_for_a_real_lock_file(self):
-        import fcntl
-        path = Path("/tmp/autosim-robosyn-gpu-99.lock")
-        self.addCleanup(path.unlink, missing_ok=True)
-        self.assertFalse(legacy_index_lock_held(99))
-        with path.open("w") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertTrue(legacy_index_lock_held(99))
-
 
 class SelectionTests(unittest.TestCase):
     def test_pinned_index_addresses_the_engine_by_physical_index(self):

@@ -1,36 +1,17 @@
 ---
 name: weight-the-small-set
-description: A small in-domain set carries weight only if the sampler is told to lean on it; volume alone does nothing.
+description: 少量新增数据混入大数据集后无效果时，检查实际抽样曝光，再比较合法采样比例；不预设固定混合权重。
 scope: general
-confidence: measured, paired, two benchmarks — but the exact mass that works is benchmark-specific
-evidence: |
-  Measured on RoboSynChallenge click_bell, n=100 per arm with paired per-episode seeds.
-  Adding 62 locally collected episodes to a 1000-episode original dataset and giving them
-  0.5 sampling mass moved success from 51% to 63-67% (exact paired p from 0.0024 to
-  0.0001). The same kind of data left at its natural mass — 32 episodes at 3.1% — moved
-  it by exactly nothing: 58/100 against 58/100, p=1.0000.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Weight the small set
+# 检查小数据集的真实曝光
 
-Your own collected data is a handful of episodes next to a large original dataset. In
-frame terms it is a rounding error. It only affects training if the sampler is told to
-pick it disproportionately often.
+方法性指导；过去 RoboSyn 的数值不作为通用比例建议。历史材料仅保留在 benchmark-scoped 的 robosynchallenge-measurements 中，复用数值前需核对原始回执。
 
-## How to apply
+按实际采样单位计算比例：episode、frame、sequence 或 source。自然频率不一定等于 episode 数量占比；长度、过滤、replacement、distributed sampler 和 horizon weighting 都会改变它。读取 loader 的样本身份/计数验证，而不是只看 manifest。
 
-Treat "how much did you collect" and "how often does training see it" as two separate
-decisions. Collecting without up-weighting is close to collecting nothing, and it is an
-easy mistake to make because the data *is* in the mixture and the run does look
-different.
+比较原数据、自然混合和一个有理由的增强曝光候选，尽量保持 sampler 的其余行为与训练成本一致。不能统一设 0.5，也不能在协议不允许时新增权重机制。
 
-When you up-weight, say what mass you chose and why. When you do not, say why you expect
-the data to matter at its natural frequency — usually you should not.
-
-## What it does not mean
-
-The mass is not free. Up-weighting a small set to a large fraction means training spends
-most of its samples on a few episodes and sees the original distribution rarely. The
-right mass depends on how far the original distribution is from what the evaluation
-actually presents, which is why the useful value is something to measure rather than
-assume.
+曝光太少可能没有可测影响，曝光太多可能过拟合新集合、降低覆盖或遗忘旧任务。报告开发效果、实际比例、训练更新量与不确定性。无收益时先排除未消费/欠训练，再考虑比例是否值得继续搜索。

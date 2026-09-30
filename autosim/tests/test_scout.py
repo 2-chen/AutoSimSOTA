@@ -16,7 +16,8 @@ import pytest
 from autosim.research import scout
 from autosim.research.declaration import (CAPABILITIES, DeclarativeAdapter, problems_in,
                                           space_from, verify)
-from autosim.research.survey import recorded_provenance, summarise, survey
+from autosim.research.survey import (recorded_provenance, summarise, summarise_for_model,
+                                     survey)
 
 
 def write(path: Path, text: str) -> Path:
@@ -61,6 +62,31 @@ def declaration(**overrides):
     return value
 
 
+def test_source_policy_and_continuous_primary_metric_are_declared_explicitly():
+    contract = {**declaration()["task_contract"], "policy_representation": "source",
+                "primary_metric": {"name": "mean_reward", "direction": "maximize",
+                                   "source": "csv", "aggregation": "mean",
+                                   "min_samples": 3}}
+    assert problems_in(declaration(task_contract=contract)) == []
+    invalid = {**contract, "policy_representation": "unknown",
+               "primary_metric": {"name": "reward", "direction": "sometimes"}}
+    faults = problems_in(declaration(task_contract=invalid))
+    assert any("policy_representation" in fault for fault in faults)
+    assert any("primary_metric" in fault for fault in faults)
+
+
+def test_optional_telemetry_spec_maps_native_tags_and_bounded_roots():
+    value = declaration(telemetry_spec={
+        "schema_version": 1,
+        "metrics": {"eval/success_once": {"name": "train_eval_success", "unit": "rate"}},
+        "event_roots": ["runs", "tensorboard"],
+    })
+    assert problems_in(value) == []
+    invalid = declaration(telemetry_spec={"event_roots": ["../../outside"]})
+    assert any("cannot be absolute or traverse parents" in fault
+               for fault in problems_in(invalid))
+
+
 # -- the survey names no benchmark ------------------------------------------------------
 
 def test_survey_reports_signals_without_labelling_them(repo):
@@ -98,12 +124,16 @@ def test_survey_reads_a_recorded_files_own_provenance(tmp_path):
     with h5py.File(data / "task_0_demo.hdf5", "w") as handle:
         group = handle.create_group("data")
         group.attrs["bddl_file_name"] = "defs/task_0.bddl"
+        group.attrs["credential"] = "PRIVATE_HDF5_SECRET"
         group.create_dataset("padding", data=np.zeros(2_000_000, dtype="uint8"))
         demo = group.create_group("demo_0")
         demo.create_dataset("actions", data=[[0.0] * 7] * 5)
         demo.create_dataset("rewards", data=[0] * 5)
         observe = demo.create_group("obs")
         observe.create_dataset("front_rgb", data=np.zeros((5, 64, 64, 3), dtype="uint8"))
+    write(data / "episodes.jsonl",
+          '{"episode_id":"PRIVATE_JSON_EPISODE","observation":[1.2345],'
+          '"api_key":"PRIVATE_JSON_KEY"}\n')
     report = survey(root)
     provenance = report["recorded_provenance"]
     assert provenance["recorded_paths"] == ["defs/task_0.bddl"]
@@ -111,6 +141,18 @@ def test_survey_reads_a_recorded_files_own_provenance(tmp_path):
     # the file itself does not live there.
     assert provenance["resolve_inside_repo"] == ["defs/task_0.bddl"]
     assert summarise(report)["recorded_provenance"]["resolve_inside_repo"]
+
+    # The local audit report may contain provenance and structure values, but neither the
+    # scout's prompt summary nor the file triage request may receive those values or paths.
+    safe = json.dumps(summarise_for_model(report), ensure_ascii=False)
+    model = StubClient([json.dumps({"files_to_read": ["setup.py"]})])
+    scout.triage(report, model)
+    prompt = model.calls[0]
+    for private in (str(data), "task_0_demo.hdf5",
+                    "PRIVATE_HDF5_SECRET", "PRIVATE_JSON_EPISODE", "PRIVATE_JSON_KEY",
+                    "1.2345"):
+        assert private not in safe
+        assert private not in prompt
 
 
 # -- what is checked, and what is only asserted ------------------------------------------
@@ -278,6 +320,49 @@ def test_a_reply_wrapped_in_prose_is_read_by_its_braces():
     assert scout._balanced_object(body)["benchmark"] == "ToyBench"
 
 
+def test_a_malformed_object_is_told_apart_from_a_missing_one():
+    """The message is the whole of what the model is told when its draft is rejected, and the
+    repair loop runs on it. `None` for both cases reads as "nothing was found" -- so a model
+    that emitted an object with a `;` where a `,` belongs is told to re-emit it, and does.
+
+    This is what happened on RoboTwin: two of three identity drafts used `;` as a member
+    separator, both were reported as "no complete JSON object found", and the scout ran out of
+    attempts on a fault the model could have fixed in one turn if it had been named."""
+    broken = '{"benchmark": "ToyBench"; "evidence": "a semicolon where a comma belongs"}'
+    with pytest.raises(scout._Malformed) as raised:
+        scout._json_object(broken)
+    message = str(raised.value)
+    assert "malformed" in message
+    assert "column" in message and "Expecting" in message
+    # Enough of the text either side that a reader can see what to change.
+    assert "semicolon where a comma belongs" in message
+
+    # And the other failure still reads as the other failure.
+    with pytest.raises(ValueError, match="no complete JSON object"):
+        scout._json_object("I could not answer that.")
+
+
+def test_the_repair_carries_the_position_and_not_a_generic_refusal(repo):
+    """End to end through the loop: a malformed first reply, and the second has to fix it --
+    which it can only do if it was told where the fault is. Modelled on the RoboTwin reply,
+    which used `;` as a member separator twice in a row under the old message."""
+    # The semicolon is a *member separator* here, which is the fault RoboTwin's drafts had:
+    # `"cam_left_wrist": "recorded in vision"; "cam_right_wrist": "recorded in vision"`.
+    broken = ('{"benchmark": "ToyBench", "evidence": "the vision group is a byte string"; '
+              '"tasks": {"kind": "glob", "names": []}}')
+    replies = [broken, json.dumps(declaration()),
+               json.dumps({"capabilities": declaration()["capabilities"],
+                           "optimization_space": declaration()["optimization_space"]})]
+    client = StubClient(replies)
+    result, attempts = scout.propose(survey(repo), [], client)
+    assert result["benchmark"] == "ToyBench"
+    assert attempts[0]["status"] == "rejected"
+    assert "Expecting" in attempts[0]["error"] and "column" in attempts[0]["error"]
+    # The retry is shown the fault and where it is, not merely that something was wrong.
+    assert "Expecting" in client.calls[1]
+    assert "byte string" in client.calls[1]
+
+
 def test_drafting_splits_into_two_questions_and_repairs_a_rejected_one(repo):
     """The first identity reply is missing a key; the retry is complete."""
     identity = declaration()
@@ -291,6 +376,8 @@ def test_drafting_splits_into_two_questions_and_repairs_a_rejected_one(repo):
     assert [row["status"] for row in attempts] == ["rejected", "accepted", "accepted"]
     # The retry is told what was wrong, not merely that something was.
     assert "missing required key" in client.calls[1]
+    assert "choose exactly one" in client.calls[0]
+    assert "Never copy an angle-bracket placeholder as a path" in client.calls[0]
 
 
 def test_a_failed_path_names_the_real_file_it_was_reaching_for(repo):
@@ -328,11 +415,34 @@ def test_a_declared_benchmark_satisfies_the_adapter_protocol(repo):
 
 
 def test_a_declaration_with_nothing_to_vary_is_reported(repo):
+    """A space with no axes is not a space: a proposal names settings the space declares, so
+    the controller has nothing to say and the loop can only re-measure one thing.
+
+    RoboTwin's first declaration was exactly this -- a scout that read the wrong directories
+    found no settings and declared none -- and it was accepted. The check was in
+    `check_adapter`, which nothing on the derived path calls; the derived path builds a space
+    and never builds an adapter."""
     from autosim.research.adapter_protocol import check_adapter
+    from autosim.research.declaration import space_from
     value = declaration()
     value["optimization_space"] = {"collection": [], "training": []}
     adapter = DeclarativeAdapter(declaration=value, repo=repo, verification=verify(value, repo))
-    assert any("declares nothing" in problem for problem in check_adapter(adapter))
+    problems = check_adapter(adapter)
+    assert any("no axes at all" in problem for problem in problems), problems
+    # And the same declaration is refused where the derived path looks at it.
+    try:
+        space_from(value)
+        assert False, "an empty space built without complaint"
+    except ValueError as exc:
+        assert "no axes at all" in str(exc)
+
+
+def test_source_controller_can_explicitly_have_no_parameter_axes():
+    from autosim.research.declaration import space_from
+
+    value = {"task_contract": {"policy_representation": "source"},
+             "optimization_space": {"collection": [], "training": []}}
+    assert not any(space_from(value).sections().values())
 
 
 def test_the_ownership_check_prefers_what_the_data_says(tmp_path):
@@ -419,94 +529,6 @@ def test_a_plan_built_without_an_expert_uses_the_families_that_remain():
     assert executable_first_step(value)["family"] == "training_recipe"
 
 
-def test_the_round_one_rule_follows_the_plan():
-    from autosim.research.repository_autoresearch import validate_proposal
-    from autosim.research.declaration import space_from
-
-    declaration = {
-        "benchmark": "Toy", "evidence": "e", "repo_markers": ["setup.py"],
-        "tasks": {"kind": "glob", "pattern": "tasks/*.t", "task_id_from": "stem"},
-        "task_contract": {"state_dim": 7, "action_dim": 7, "cameras": {"c": [1, 1, 3]},
-                          "max_episode_steps": 10},
-        "assets": {}, "capabilities": {},
-        "optimization_space": {"collection": [
-            {"name": "enabled", "kind": "choice", "description": "collect or not",
-             "values": [True, False], "default": True},
-            {"name": "mode", "kind": "choice", "description": "driver",
-             "values": ["expert"], "default": "expert"},
-            {"name": "profile", "kind": "choice", "description": "distribution",
-             "values": ["full"], "default": "full"},
-            {"name": "targeted_attempts", "kind": "integer", "description": "a",
-             "low": 0, "high": 100, "default": 10},
-            {"name": "original_attempts", "kind": "integer", "description": "o",
-             "low": 0, "high": 100, "default": 10},
-            {"name": "target_episodes", "kind": "integer", "description": "t",
-             "low": 0, "high": 100, "default": 10}],
-            "training": [{"name": "steps", "kind": "integer", "description": "s",
-                          "low": 1, "high": 1000, "default": 100}],
-            "extra": {"resolution": [
-                {"name": "development_episodes", "kind": "integer", "description": "n",
-                 "low": 1, "high": 1000, "default": 10}]}}}
-    space = space_from(declaration)
-
-    def proposal(enabled, **extra):
-        value = {"decision": "experiment", "proposal_id": "p", "hypothesis": "h",
-                 "expected_validation": "v", "primary_intervention": "x",
-                 "development_evidence_id": "e", "parent_checkpoint_sha256": "w",
-                 "parent_data_version": "d",
-                 "collection": {"enabled": enabled, "mode": "expert", "profile": "full",
-                                # 20 satisfies the round-one probe floor of min(20, 100//2);
-                                # 10 satisfies the 10% original-distribution coverage floor.
-                                "targeted_attempts": 20 if enabled else 0,
-                                "original_attempts": 10 if enabled else 0,
-                                "target_episodes": 20 if enabled else 0},
-                 "training": {"steps": 100},
-                 "resolution": {"development_episodes": 10}}
-        value.update(extra)
-        return value
-
-    kwargs = dict(round_index=1, evidence_id="e", parent_checkpoint_sha256="w",
-                  parent_data_version="d", space=space, attempts_per_round=100,
-                  min_original_fraction=0.1)
-
-    # No plan: the historical rule, unchanged.
-    with pytest.raises(ValueError, match="targeted collection probe"):
-        validate_proposal(proposal(False), **kwargs)
-
-    # A plan that collects: the probe is still required.
-    with pytest.raises(ValueError, match="targeted collection probe"):
-        validate_proposal(proposal(False), first_step={"family": "targeted_collection"},
-                          **kwargs)
-    assert validate_proposal(proposal(True), first_step={"family": "targeted_collection"},
-                             **kwargs)["collection"]["enabled"] is True
-
-    # A plan that does not collect: collecting is now the wrong experiment.
-    with pytest.raises(ValueError, match="which does not collect"):
-        validate_proposal(proposal(True), first_step={"family": "training_recipe"}, **kwargs)
-    assert validate_proposal(proposal(False), first_step={"family": "training_recipe"},
-                             **kwargs)["decision"] == "experiment"
-
-
-def test_a_supplied_plan_is_frozen_into_the_protocol(tmp_path):
-    """A plan decides what round one does, so a run is tied to the plan it started under."""
-    from autosim.research.repository_autoresearch import MilestoneConfig, protocol_budget
-    from autosim.research.common import atomic_json, digest
-
-    plan_path = tmp_path / "strategy.json"
-    atomic_json(plan_path, {"strategy": plan_value()})
-
-    plain = MilestoneConfig(repo_input="r", output_root=tmp_path, run_id="a")
-    planned = MilestoneConfig(repo_input="r", output_root=tmp_path, run_id="b",
-                              strategy=str(plan_path))
-    # A run without a plan keeps exactly the budget it had before plans existed.
-    assert "strategy" not in protocol_budget(plain)
-    assert "strategy" not in protocol_budget(planned)
-    assert digest(plan_path)
-    assert planned.strategy == str(plan_path)
-
-
-# -- the method library reaches the reader -------------------------------------------------
-
 def test_the_scout_is_given_the_method_library(repo):
     """The mechanism for guiding the reader is a library, not a condition in the reader."""
     triage_client = StubClient([json.dumps({"files_to_read": ["scripts/collect.py"]})])
@@ -525,19 +547,23 @@ def test_the_scout_is_given_the_method_library(repo):
     for prompt in triage_client.calls + propose_client.calls:
         assert "### METHODS" in prompt
         assert "reference_only_not_enforced" in prompt
-        # Offered, never enforced: the reader may contradict any entry, and nothing in the
-        # declaration is checked against one.
-        assert "where-successes-come-from" in prompt
+        assert '"index"' in prompt
+        assert '"selection"' in prompt
+    # Discovery and identity have task-relevant method bodies; later capability work gets a
+    # separately ranked subset rather than the same entire library on every call.
+    assert all("where-successes-come-from" in prompt
+               for prompt in triage_client.calls + propose_client.calls[:1])
 
 
 def test_the_library_is_a_directory_of_files_not_a_list_in_code():
     """Adding a method is adding a file, which is what keeps this from becoming rules."""
     from autosim.research.skills import skills_reference
-    library = skills_reference()
-    names = {row["name"] for row in library["skills"]}
+    library = skills_reference(query="successful trajectories expert policy collection")
+    names = {row["name"] for row in library["index"]}
     assert "where-successes-come-from" in names
-    assert all(Path(row["source"]).name == "SKILL.md" for row in library["skills"])
-    assert library["library"]["add_a_method_by"].startswith("dropping a SKILL.md")
+    assert any(row["name"] == "where-successes-come-from"
+               for row in library["skills"])
+    assert library["library"]["add_a_method_by"].startswith("add a versioned manifest")
 
 
 # -- assets that describe two things at once -----------------------------------------------

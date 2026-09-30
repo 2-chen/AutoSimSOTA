@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import requests
 
@@ -18,6 +19,52 @@ import requests
 DEFAULT_LLM_BASE_URL = "http://10.1.21.21:3000/v1"
 DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 DEFAULT_LLM_API_KEY = ""  # Explicit environment/credential configuration required.
+
+#: The checkout this system lives in. Moved here when the research entry point stopped being
+#: one benchmark's runner: a path to the project is not any benchmark's business.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_credential_file(*, project_root: Path | None = None) -> dict[str, Any]:
+    """Load the project's own dotenv, and never return a value from it.
+
+    A dotenv file is not an operating-system environment, so this reads exactly one: the
+    project's `.env`, or the file `AUTOSIM_ENV_FILE` names. It does not search parent
+    directories, and it refuses a file that other users can read -- a credential in a
+    world-readable file is a credential already disclosed.
+
+    Only the three variables this client reads are taken. The return value names what was
+    loaded and whether a key is present; it never carries the key.
+    """
+    root = (project_root or PROJECT_ROOT).absolute()
+    explicit = os.environ.get("AUTOSIM_ENV_FILE")
+    candidates = [Path(explicit).absolute()] if explicit else [root / ".env"]
+    source = next((path.absolute() for path in candidates if path.is_file()), None)
+    loaded: list[str] = []
+    if source is not None:
+        if source.stat().st_mode & 0o077:
+            raise PermissionError(
+                f"credential file must not be group/world accessible: {source}")
+        for line in source.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.removeprefix("export ").split("=", 1)
+            key, value = key.strip(), value.strip()
+            if key not in {"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"}:
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            if key not in os.environ and value:
+                os.environ[key] = value
+                loaded.append(key)
+    os.environ.setdefault("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    os.environ.setdefault("DEEPSEEK_MODEL", "deepseek-flash")
+    return {"source": str(source) if source else "process_environment_only",
+            "loaded_variable_names": sorted(loaded),
+            "model": os.environ["DEEPSEEK_MODEL"],
+            "base_url": os.environ["DEEPSEEK_BASE_URL"],
+            "api_key_available": bool(os.environ.get("DEEPSEEK_API_KEY"))}
 
 
 class LLMClient:
@@ -88,6 +135,15 @@ class LLMClient:
             url = base_url
         else:
             url = f"{base_url}/chat/completions"
+
+        # Every production request crosses this boundary, even when it originated in a
+        # newly added controller path. This is defense in depth for credentials and
+        # machine-local home/temp paths; callers still must project structured data (for
+        # example demonstration records) before it reaches this text-only API.
+        from .research.common import sanitize_model_text
+
+        system = sanitize_model_text(system)
+        user = sanitize_model_text(user)
 
         messages = []
         if system:

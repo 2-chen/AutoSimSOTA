@@ -177,7 +177,17 @@ def validate_proposal(raw: dict[str, Any], *, space: OptimizationSpace,
         if unknown:
             raise ValueError(f"{section} has no such axis here: {unknown}; "
                              f"available: {sorted(allowed)}")
-        required = {a.name for a in axes if not a.optional and not a.group} | set(grouped)
+        # An axis is required when leaving it out would leave nothing valid behind. Not
+        # merely `not optional`: a `structure` axis with no validator accepts null, so
+        # omitting it means null and null is a value it takes. Written as `not optional`
+        # alone this demanded an entry that `check_space` had already certified as fine to
+        # leave out -- two rules about one property, disagreeing, so RoboTwin's
+        # `task_selection.task_name` was required here and unfillable everywhere else, and
+        # every idea that did not happen to name it was refused with a message about a
+        # missing entry that had no value to supply.
+        required = {a.name for a in axes
+                    if not a.optional and not a.group
+                    and (a.default is not None or not a.accepts(None))} | set(grouped)
         absent = sorted(required - set(supplied))
         if absent:
             raise ValueError(f"{section} is missing required entries: {absent}")
@@ -193,7 +203,9 @@ def validate_proposal(raw: dict[str, Any], *, space: OptimizationSpace,
             if sub_unknown:
                 raise ValueError(f"{section}.{name} has no such axis: {sub_unknown}; "
                                  f"available: {sorted(members)}")
-            sub_absent = sorted(k for k, a in members.items() if not a.optional and k not in value)
+            sub_absent = sorted(k for k, a in members.items()
+                                if not a.optional and k not in value
+                                and (a.default is not None or not a.accepts(None)))
             if sub_absent:
                 raise ValueError(f"{section}.{name} is missing required axes: {sub_absent}")
             for sub_name, sub_value in value.items():

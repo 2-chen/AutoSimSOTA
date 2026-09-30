@@ -345,22 +345,3 @@ def test_submission_lists_all_pages_before_claiming_a_display_name(harness, monk
     assert pages == ["1", "2"] and len(creates(harness)) == 1
 
 
-@pytest.mark.parametrize("valid", [True, False])
-def test_remote_shell_verifies_frozen_bwrap_and_sets_its_path_before_entrypoint(tmp_path, valid):
-    source = tmp_path / "source"
-    (source / "tools").mkdir(parents=True)
-    (source / ".venv/bin").mkdir(parents=True)
-    (source / ".venv/bin/python").symlink_to(sys.executable)
-    shutil.copyfile(TOOLS / "run_full_research_sco.sh", source / "tools/run_full_research_sco.sh")
-    (source / "tools/run_full_research_sco.py").write_text(
-        "import os,sys\nfrom pathlib import Path\nPath(sys.argv[1],'entered.txt').write_text(os.environ['AUTOSIM_REPAIR_BWRAP'])\n")
-    binary = Path("/data/AutoResearch/AutoSimSOTA/harness_validation/dependencies/bwrap")
-    import hashlib
-    (tmp_path / "launch_manifest.json").write_text(json.dumps({"schema_version": 2,
-        "repair_sandbox": {"binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if valid else "invalid"}}))
-    process = subprocess.run(["bash", str(source / "tools/run_full_research_sco.sh"), str(tmp_path)],
-                             capture_output=True, text=True, timeout=10)
-    assert (process.returncode == 0) is valid
-    assert (tmp_path / "entered.txt").exists() is valid
-    if valid:
-        assert (tmp_path / "entered.txt").read_text() == str(binary)

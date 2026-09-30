@@ -1,0 +1,309 @@
+schema_version: 1
+defaults: &defaults
+  version: "1.1.0"
+  inputs:
+    - Current repository/run evidence relevant to the described decision.
+  outputs:
+    - A bounded recommendation with applicability rationale and a checkable prediction.
+  verification:
+    - Check applicability against current source, protocol, and receipts; record support or contradiction.
+  permissions:
+    - Advisory only; this skill grants no tool, filesystem, network, or process permission.
+  resources:
+    - No direct compute; any proposed experiment must reserve resources through the execution kernel.
+
+skills:
+  - <<: *defaults
+    id: autosimsota.choosing-simulation-improvements
+    file: choosing-simulation-improvements/SKILL.md
+    capabilities: [research.direction, experiment.design, skill.routing]
+    keywords: [SOTA, improve, optimization, hypothesis, policy, research, 提分, 优化, 假设, 方法, 研究方向]
+    preconditions: [A research direction must be selected using current protocol and resource evidence.]
+    invalid_when: [Used as a guaranteed recipe or as a substitute for comparable measured results.]
+    outputs: [Evidence-linked candidate priorities and a bounded experiment with a justified stopping condition.]
+
+  - <<: *defaults
+    id: autosimsota.aligning-policy-inputs-and-actions
+    file: aligning-policy-inputs-and-actions/SKILL.md
+    capabilities: [policy.interface, data.consumer_validation, control.validation]
+    keywords: [normalization, action, observation, gripper, coordinate, deployment, 动作, 归一化, 接口, 控制]
+    preconditions: [A policy and its training and deployment input/output paths can be inspected.]
+    invalid_when: [Used to alter frozen controller or evaluation semantics.]
+    verification: [Trace an actual batch and bounded native inference to the real action consumer.]
+
+  - <<: *defaults
+    id: autosimsota.tuning-action-chunks-and-feedback
+    file: tuning-action-chunks-and-feedback/SKILL.md
+    capabilities: [policy.control, inference.efficiency, experiment.design]
+    keywords: [chunk, horizon, temporal, latency, replan, diffusion, 分块, 抖动, 时序, 推理延迟]
+    preconditions: [Current policy supports or can legally implement the proposed temporal change.]
+    invalid_when: [The change modifies frozen environment timing or requires incompatible unloaded weights.]
+    verification: [Measure native development outcomes and latency with verified policy and temporal settings.]
+
+  - <<: *defaults
+    id: autosimsota.validating-policy-training
+    file: validating-policy-training/SKILL.md
+    capabilities: [training.diagnosis, policy.identity, checkpoint.selection]
+    keywords: [training, checkpoint, optimizer, loss, update, resume, EMA, 训练, 权重, 长作业, 加载]
+    preconditions: [Training progress or the relation between an artifact and scored policy needs verification.]
+    invalid_when: [Used to claim convergence from a smoke test or bypass formal scoring.]
+    verification: [Bind actual data and training updates to saved artifact and evaluator loading and metric receipts.]
+
+  - <<: *defaults
+    id: autosimsota.improving-observations-and-memory
+    file: improving-observations-and-memory/SKILL.md
+    capabilities: [policy.perception, policy.memory, experiment.design]
+    keywords: [augmentation, crop, camera, depth, pointcloud, history, RNN, 视觉, 记忆, 增强, 点云, 遮挡]
+    preconditions: [Development evidence suggests a perception or partial-observability limitation.]
+    invalid_when: [Input changes violate sensor permissions or require missing calibration and resources.]
+    verification: [Inspect actual transformed inputs and compare outcomes at a declared training budget.]
+
+  - <<: *defaults
+    id: autosimsota.adapting-pretrained-policies
+    file: adapting-pretrained-policies/SKILL.md
+    capabilities: [policy.transfer, asset.discovery, resource.budget]
+    keywords: [pretrained, LoRA, VLA, OFT, finetune, weights, 预训练, 微调, 权重, 下载, 大模型]
+    preconditions: [A compatible policy family or released resource is being considered within the allowed data protocol.]
+    invalid_when: [Resources or permissions are absent or a compute estimate exceeds the run hard limits.]
+    verification: [Check resource provenance and real loading and training throughput before committing a large job.]
+
+  - <<: *defaults
+    id: autosimsota.learning-from-policy-failures
+    file: learning-from-policy-failures/SKILL.md
+    capabilities: [data.correction, policy.online_learning, experiment.design]
+    keywords: [DAgger, DPPO, recovery, expert, online, reward, 纠错, 恢复, 强化学习, 奖励, 策略失败]
+    preconditions: [Legal training feedback and an applicable expert or native online learning path exist.]
+    invalid_when: [Uses held-out feedback or treats failed policy actions as expert labels without justification.]
+    verification: [Verify labels or rewards and actual training consumption then compare against the preserved policy.]
+
+  - <<: *defaults
+    id: autosimsota.connecting-native-data-collection
+    file: connecting-native-data-collection/SKILL.md
+    capabilities: [data.collection, workflow.mapping, data.consumer_validation, experiment.design]
+    keywords: [collect, collector, collection, expert, planner, demonstrations, data root, loader, 采集, 专家, 数据根目录, 训练数据]
+    inputs: [Current producer source and configuration, native stage receipts, trainer loader and data protocol.]
+    outputs: [Evidence-backed collection feasibility and producer-to-loader mapping, small-probe proposal and early data intervention or justified deferral.]
+    preconditions: [Training data supply is uncertain or an allowed data improvement is being considered.]
+    verification: [Check native collection output and actual loader consumption before attributing an evaluation change to new data.]
+    invalid_when: [Used as evidence that collection already ran or as permission to modify a frozen evaluation protocol.]
+
+  - <<: *defaults
+    id: autosimsota.adapting-an-unfamiliar-benchmark
+    file: adapting-an-unfamiliar-benchmark/SKILL.md
+    capabilities: [repository.discovery, evidence.validation, capability.mapping]
+    keywords: [repository, unfamiliar, survey, source, evidence, task, asset, declaration]
+    preconditions: [A benchmark checkout or bounded source snapshot is available to inspect.]
+    invalid_when: [The cited source is from another revision or current runtime evidence contradicts the claim.]
+
+  - <<: *defaults
+    id: autosimsota.adding-more-can-subtract
+    file: adding-more-can-subtract/SKILL.md
+    capabilities: [research.data_selection, data.quality, generalization]
+    keywords: [data, dataset, quality, low-quality, augmentation, generalization, curated]
+    preconditions: [A candidate data addition and meaningful quality or coverage distinction exist.]
+    invalid_when: [The data regimes or target split differ from the cited evidence.]
+
+  - <<: *defaults
+    id: autosimsota.benchmark-shapes
+    file: benchmark-shapes/SKILL.md
+    capabilities: [repository.discovery, benchmark.contract, metric.selection]
+    keywords: [task, metric, success, asset, simulator, workflow, benchmark, contract]
+    preconditions: [The repository's task, evaluator, and data sources can be inspected.]
+    invalid_when: [A proposed default is not supported by the current repository's native contract.]
+
+  - <<: *defaults
+    id: autosimsota.budget-attempts-not-episodes
+    file: budget-attempts-not-episodes/SKILL.md
+    capabilities: [data.collection, resource.budget, yield.analysis]
+    keywords: [collect, collection, attempts, episodes, yield, partial, filtering]
+    preconditions: [A producer may reject, filter, or fail to complete requested attempts.]
+    invalid_when: [The producer guarantees one accepted artifact per attempt or has no attempt notion.]
+
+  - <<: *defaults
+    id: autosimsota.building-an-environment-that-runs
+    file: building-an-environment-that-runs/SKILL.md
+    capabilities: [environment.provision, dependency.diagnosis, runtime.validation]
+    keywords: [environment, dependency, package, version, install, build, import, runtime]
+    preconditions: [A bounded environment probe or command produced a concrete dependency failure.]
+    invalid_when: [The failure is unrelated to dependencies/runtime or the version claim lacks evidence.]
+
+  - <<: *defaults
+    id: autosimsota.control-same-budget
+    file: control-same-budget/SKILL.md
+    capabilities: [experiment.comparison, budget.control, causal.attribution]
+    keywords: [baseline, control, budget, steps, compute, comparison, intervention]
+    preconditions: [A candidate is compared with a baseline and consumes additional compute or data.]
+    invalid_when: [The research question is descriptive and does not attribute a change to an intervention.]
+
+  - <<: *defaults
+    id: autosimsota.diversity-before-volume
+    file: diversity-before-volume/SKILL.md
+    capabilities: [data.coverage, research.data_selection, generalization]
+    keywords: [diversity, volume, environments, objects, scenes, demonstrations, coverage]
+    preconditions: [Data can be grouped by distinct environments, objects, or task configurations.]
+    invalid_when: [The dataset has no meaningful coverage variation or the target is not generalization.]
+
+  - <<: *defaults
+    id: autosimsota.finding-how-a-benchmark-runs
+    file: finding-how-a-benchmark-runs/SKILL.md
+    capabilities: [repository.discovery, execution.entrypoints, workflow.mapping]
+    keywords: [train, evaluate, collect, entrypoint, command, cli, invocation, source]
+    preconditions: [Native source, CLI help, or repository documentation is available.]
+    invalid_when: [The question is about a runtime result rather than locating an executable path.]
+
+  - <<: *defaults
+    id: autosimsota.generator-success-is-not-data-value
+    file: generator-success-is-not-data-value/SKILL.md
+    capabilities: [data.quality, data.collection, outcome.analysis]
+    keywords: [generator, success, collection, data value, usefulness, quality]
+    preconditions: [Generated episodes can be evaluated for downstream policy value separately from yield.]
+    invalid_when: [No generated data or downstream evaluation is part of the research question.]
+
+  - <<: *defaults
+    id: autosimsota.hold-one-variable
+    file: hold-one-variable/SKILL.md
+    capabilities: [experiment.design, confound.diagnosis, harness.audit]
+    keywords: [confound, harness, sampler, mixture, data, variable, ablation]
+    preconditions: [An intervention changes multiple components of the training/evaluation pipeline.]
+    invalid_when: [No alternative setting can isolate the suspected confound.]
+
+  - <<: *defaults
+    id: autosimsota.make-your-prior-earn-it
+    file: make-your-prior-earn-it/SKILL.md
+    capabilities: [experiment.design, prior.validation, causal.attribution]
+    keywords: [prior, heuristic, arbitrary, baseline, legal, comparison, justification]
+    preconditions: [A preferred strategy is justified by prior belief rather than direct comparison.]
+    invalid_when: [The method is mandated by protocol or no legal comparator exists.]
+
+  - <<: *defaults
+    id: autosimsota.making-a-stage-run
+    file: making-a-stage-run/SKILL.md
+    capabilities: [execution.command_derivation, failure.diagnosis, runtime.validation]
+    keywords: [stage, command, error, invocation, argv, run, failure, retry]
+    preconditions: [A native stage invocation has been located and a bounded attempt produced output.]
+    invalid_when: [The entrypoint lacks source support or the failure is unrelated to command execution.]
+
+  - <<: *defaults
+    id: autosimsota.more-of-the-same-saturates
+    file: more-of-the-same-saturates/SKILL.md
+    capabilities: [research.data_selection, sample.efficiency, generalization]
+    keywords: [saturation, scaling, more data, same distribution, diminishing returns]
+    preconditions: [The proposed data addition resembles an already-covered distribution.]
+    invalid_when: [The addition changes task coverage or quality enough to be a different regime.]
+
+  - <<: *defaults
+    id: autosimsota.progress-beats-binary
+    file: progress-beats-binary/SKILL.md
+    capabilities: [evaluation.metric, sample.efficiency, progress.measurement]
+    keywords: [progress, binary, success, metric, partial credit, evaluation]
+    preconditions: [A task has a source-supported graded progress signal in addition to binary outcome.]
+    invalid_when: [The progress signal is invalid, unstable, or policy-dependent in a confounding way.]
+
+  - <<: *defaults
+    id: autosimsota.quality-needs-reweighting
+    file: quality-needs-reweighting/SKILL.md
+    capabilities: [data.quality, training.design, mixture]
+    keywords: [quality, reweighting, mixture, behavior cloning, curation, demonstrations]
+    preconditions: [Training combines data with distinguishable quality or provenance.]
+    invalid_when: [The trainer cannot express filtering/weighting or quality labels lack evidence.]
+
+  - <<: *defaults
+    id: autosimsota.read-your-failures
+    file: read-your-failures/SKILL.md
+    capabilities: [failure.diagnosis, experiment.adaptation, retry.control]
+    keywords: [failure, crash, retry, error, configuration, resource ceiling]
+    preconditions: [A completed/interrupted attempt has an attributable receipt, log, or signature.]
+    invalid_when: [Failure identity is unknown or current evidence does not match the prior failure.]
+
+  - <<: *defaults
+    id: autosimsota.report-paired-and-intervaled
+    file: report-paired-and-intervaled/SKILL.md
+    capabilities: [evaluation.statistics, uncertainty.reporting, experiment.comparison]
+    keywords: [paired, confidence interval, uncertainty, sample size, statistical significance]
+    preconditions: [Comparable sample identities or a justified sampling model are available.]
+    invalid_when: [Samples are not comparable or the metric's statistical assumptions are violated.]
+
+  - <<: *defaults
+    id: autosimsota.resolution-before-repetition
+    file: resolution-before-repetition/SKILL.md
+    capabilities: [evaluation.design, measurement.power, experiment.adaptation]
+    keywords: [resolution, overlap, repetition, measurement, signal, sample size]
+    preconditions: [Current measurements can be inspected for signal overlap or limited resolution.]
+    invalid_when: [The metric is invalid or repetition would change the underlying protocol.]
+
+  - <<: *defaults
+    id: autosimsota.robosynchallenge-measurements
+    file: robosynchallenge-measurements/SKILL.md
+    capabilities: [benchmark.evidence, result.interpretation]
+    keywords: [RoboSynChallenge, measured values, click_bell, sampling mass]
+    preconditions: [The active benchmark and protocol match the declared RoboSynChallenge scope.]
+    invalid_when: [The benchmark is not RoboSynChallenge or its task/data/protocol differs.]
+
+  - <<: *defaults
+    id: autosimsota.spending-a-budget-across-ideas
+    file: spending-a-budget-across-ideas/SKILL.md
+    capabilities: [experiment.screening, resource.budget, multi.fidelity]
+    keywords: [budget, ideas, screening, successive halving, fidelity, promotion]
+    preconditions: [A cheap early signal is available and evidence suggests it predicts the final objective.]
+    invalid_when: [Early signals are unvalidated, noisy, or rank candidates differently from the target.]
+
+  - <<: *defaults
+    id: autosimsota.the-declaration-is-a-claim
+    file: the-declaration-is-a-claim/SKILL.md
+    capabilities: [interface.validation, search_space.audit, evidence.validation]
+    keywords: [declaration, parameter, axis, search space, validation, unsupported value]
+    preconditions: [A proposed parameter space/capability declaration will control later execution.]
+    invalid_when: [No corresponding native parameter, capability, or consumer contract exists.]
+
+  - <<: *defaults
+    id: autosimsota.using-the-method-library
+    version: "1.1.0"
+    file: using-the-method-library/SKILL.md
+    capabilities: [skill.library_orientation, evidence.weighting]
+    keywords: [skill, method, evidence, confidence, scope, library]
+    preconditions: [The method library contains at least one candidate entry.]
+    invalid_when: [Never as an execution method; this entry only explains how to read the library.]
+
+  - <<: *defaults
+    id: autosimsota.weight-the-small-set
+    file: weight-the-small-set/SKILL.md
+    capabilities: [data.mixture, training.design, intervention.analysis]
+    keywords: [small dataset, sampling weight, mixture, local data, mass]
+    preconditions: [A small additional dataset is mixed with a larger base and sampling mass is controllable.]
+    invalid_when: [The trainer exposes no sampling weights or the added set is not small relative to the base.]
+
+  - <<: *defaults
+    id: autosimsota.what-the-benchmark-does-not-ship
+    file: what-the-benchmark-does-not-ship/SKILL.md
+    capabilities: [asset.discovery, environment.provision, dependency.audit]
+    keywords: [asset, dataset, checkpoint, missing, external dependency, download]
+    preconditions: [A required asset/dependency is named by source, configuration, or runtime failure.]
+    invalid_when: [No native consumer or source/error evidence establishes that the asset is needed.]
+
+  - <<: *defaults
+    id: autosimsota.where-successes-come-from
+    file: where-successes-come-from/SKILL.md
+    capabilities: [data.collection, capability.mapping, trajectory.provenance]
+    keywords: [successful trajectories, expert, policy rollout, teleoperation, collection]
+    preconditions: [A workflow needs trajectories and their producer or success criterion is uncertain.]
+    invalid_when: [The selected workflow does not consume newly produced trajectories.]
+
+  - <<: *defaults
+    id: autosimsota.writing-research-updates
+    file: writing-research-updates/SKILL.md
+    capabilities: [reporting.narrative, research.synthesis, evidence.communication]
+    keywords: [RUN.md, recorder, report, summary, narrative, 中文, 研究记录, 实验总结, 可读性]
+    preconditions: [A human-facing research update is needed and current run evidence is available.]
+    invalid_when: [The assignment is to decide or execute experiments rather than explain their recorded evidence.]
+    outputs: [Readable Chinese research prose with attributable conclusions and explicit unknowns.]
+    verification: [Check the latest evidence and whether a reader can identify status, findings, blockers and next steps without decoding internal fields.]
+
+  - <<: *defaults
+    id: autosimsota.presenting-simulation-demos
+    file: presenting-simulation-demos/SKILL.md
+    capabilities: [reporting.media, media.provenance, evidence.communication]
+    keywords: [demo, video, recording, preview, chart, recorder, 视频, 可视化, 图表, 仿真演示]
+    preconditions: [A report needs simulation media or data visualization, or an explanation of missing media.]
+    invalid_when: [The requested action changes the evaluation protocol or requires an unauthorised simulation job.]
+    outputs: [Evidence-linked media choices and Chinese captions, or a bounded request and explanation of missing media.]
+    verification: [Check producer and policy identities, actual media availability, selection rules and the scope of the visual claim.]

@@ -1,38 +1,17 @@
 ---
 name: resolution-before-repetition
-description: If your success and failure groups overlap on every measurement, more episodes of the same measurement will not separate them.
+description: 测量差异不明确时区分噪声、样本不足、错误指标和真实小效应；分布重叠不代表增加样本无用。
 scope: general
-confidence: observed once, with a caveat — the reasoning was sound but the conclusion was also consistent with simply having too few episodes
-evidence: |
-  A controller facing overlapping displacement and joint-change distributions between
-  its success and failure cohorts declined to propose another intervention, reasoning
-  that no legal experiment was justified. At the episode counts in use, a few-point
-  difference was one or two episodes, so the observation was genuinely uninformative.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Resolution before repetition
+# 判断下一次测量能回答什么
 
-Two cohorts that overlap on every quantity you measure cannot tell you which of them a
-change moved. Collecting more of the same measurement does not fix that — it makes the
-same blurrier picture more precise.
+方法性建议。旧版“分布重叠则更多样本无用”不成立；重叠分布仍可能有可检出的均值或成功率差异。
 
-## How to apply
+先检查指标是否真的对应问题、样本是否独立/可配对、实际模型是否加载，再估计当前差值与不确定性。预期效应小而样本少时，更多独立 episode 或训练 seed 可能有价值；指标饱和或错误时，扩大同一种测量可能无效。
 
-Before proposing an intervention, check whether your current evidence could detect the
-effect you expect at all:
+输出预算内下一测量的目的：提高差值精度、增加独立训练重复、按预定义开发切片定位失败，或添加合法辅助信号。没有明确效果也可报告“当前证据无法区分”，不等于没有合法实验或应结束研究。
 
-- Do the cohorts separate on any measured quantity? If yes, you have a target.
-- If they separate, by how much, and how many episodes would you need for that gap to
-  be visible above noise?
-- If they do not separate, the problem is the measurement, not the sample size. Change
-  what you measure, or state the resolution you need and why it can test the claim.
-
-Say which of these you are doing in your resolution note. "More episodes so the number
-is less noisy" is not a reason; "more episodes because the gap I expect is 3 points and
-20 episodes cannot resolve 3 points" is.
-
-## What it does not mean
-
-It is not a reason to stop early. A saturated measurement at low resolution and a real
-absence of any further useful experiment look identical from the inside; prefer saying
-which one you believe you are in, and why.
+不要改正式评分来制造分辨率；任何低成本代理先验证与目标关系，最终仍按冻结协议确认。

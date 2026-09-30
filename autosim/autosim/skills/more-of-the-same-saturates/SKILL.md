@@ -1,44 +1,17 @@
 ---
 name: more-of-the-same-saturates
-description: Adding more data of the same distribution stops paying long before you run out of budget.
+description: 增加同分布数据收益趋缓时，区分数据饱和、欠训练、采样稀释与评测噪声，再决定是否扩采。
 scope: general
-confidence: high — stated by the authors of two separate data generators about their own systems, plus an independent scaling study
-evidence: |
-  MimicGen (arXiv:2310.17596), about its own generated data: "There is a large jump in
-  performance from 200 to 1000, but not much from 1000 to 5000", with the figure caption
-  reading "there are diminishing returns".
-
-  DemoGen (RSS 2025) reports "performance saturation as more synthetic demos are added",
-  attributed to visual mismatch — an independent system reaching the same conclusion on
-  different tasks.
-
-  Lin et al. (arXiv:2410.18647): generalisation saturates in demonstrations-per-environment.
-
-  "The Curse of Precision" (arXiv:2607.23108, ManiSkill3 + Diffusion Policy): for a fixed
-  target success rate the required data scales super-exponentially as task precision
-  approaches the system's mechanical limit — so on high-precision tasks the saturating
-  axis arrives much earlier.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# More of the same saturates
+# 判断是否真的出现数据收益递减
 
-The first few hundred episodes of a new distribution move the number a lot. The next few
-thousand move it very little.
+借鉴的是数据规模研究中的条件性现象，不是“几百条就饱和”的规律。来源及真实/仿真范围见 [文献调研](../choosing-simulation-improvements/references/literature-review.md)。
 
-## How to apply
+先核对新增样本是否被读取、曝光是否足够、训练量是否随数据扩展而不足。固定 steps 与固定 epochs 回答不同问题，都应报告累计计算量。
 
-Before asking for a larger collection, ask what the previous one bought. If round N
-added data and round N+1 added more of the same and the number barely moved, the
-distribution is saturated — more of it is the wrong purchase. The productive moves are
-then to change *what* you collect (see `diversity-before-volume`), change *how it is
-weighted*, or accept the plateau and report it.
+用少量递增数据规模与足够训练的对照估计开发集收益/成本，并附不确定性。一次平坦结果可能是低分辨率、欠训练或随机波动；不能据此宣布更多数据永远无用。
 
-Precision matters here: a task whose success hinges on millimetre clearance saturates far
-earlier than a coarse one, so the same episode budget buys much less.
-
-## What it does not mean
-
-It does not mean additional data is worthless — it means equal-distribution additional
-data is. It also does not tell you where the plateau is for *your* task; the numbers above
-are other systems' tasks. Treat the plateau as something to detect from your own curve
-rather than assume at a particular episode count.
+如果边际收益相对成本很小，可优先改变覆盖、质量、控制或表征；如果仍欠拟合，则考虑延长训练。输出下一批数据或下一轮训练的预计信息价值及停止依据，而不是绝对样本阈值。

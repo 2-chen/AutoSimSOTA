@@ -1,73 +1,19 @@
 ---
 name: finding-how-a-benchmark-runs
-description: Locate the entry points that train, evaluate and collect, from a repository you have not seen, without guessing from filenames.
+description: 查找当前版本原生采集、转换、训练与评测入口，并核对 wrapper、模型家族与实际调用；不从文件名猜命令。
 scope: general
-confidence: methodological — a way to read a repository, not a measurement on one
-evidence: |
-  Measured on RoboSynChallenge, asking for four entry points from a survey alone and then
-  from a survey plus chosen file contents. From the survey alone, two of four were right:
-  the evaluator was found, and the trainer was not — the repository ships six policy
-  implementations and the wrong one was named. With the files read, three of four matched
-  the entry points the system's hand-written backend uses, and the fourth was not wrong but
-  higher level: `launch/run_task.sh`, which the repository's own README documents and which
-  calls `scripts/run_env.py` — the very script the hand-written backend names.
+confidence: methodological — requires current source and runtime verification
+evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
-# Finding how a benchmark runs
+# 找到实际运行入口
 
-You are looking for the commands that train a policy, evaluate one, and produce new
-trajectories. What makes this hard is not scarcity — a benchmark of any size has several
-files that could plausibly be any of the three — but telling the one that runs from the ones
-that merely mention running.
+方法性指引。优先读 README/指南、脚本说明、配置和 wrapper；文档可能过时，最终要追当前源码与小试。一个仓库有多个 train.py，文件名不能决定哪个匹配当前任务和权重。
 
-## Read the documentation before the filenames
+逐一记录入口、解释器/cwd、参数/配置解析、必要资源、动作提供者、输入产物与输出位置。wrapper 可能同时采集、转换和清理；说明覆盖的阶段，避免重复转换或误删资源。
 
-The strongest evidence is a repository documenting its own invocation. A README that shows
-`./launch/run_task.sh click_bell clear 2_1 --max_episodes 100` has told you the entry point,
-its arguments and the order they go in — more than any amount of reading source will, and
-it cannot be wrong about itself. Look there first, then in the script headers, which
-frequently carry a usage line for the same reason.
+对 vendored 代码沿调用链判断是否真正参与当前运行，既不能仅因在仓库内就认作入口，也不能仅因第三方名字就排除其用途。检查发布模型/数据属于哪个策略家族，但不将发布内容当唯一允许研究的模型。
 
-A filename is the weakest evidence there is. `train_pytorch.py` is a trainer; so is
-`train.py` in three other directories; which one this benchmark uses is not a fact about
-names.
+输出具体文件与可验证的调用，不只给目录；CLI help 若会初始化设备也须按受控操作执行。少量前向/加载/rollout 验证支持程度，完整训练另行预算。
 
-## When several implementations exist, ask what the repository ships
-
-A benchmark that supports six policy families will contain six trainers, and nothing in the
-source says which is *the* one. What settles it is what the repository actually publishes: a
-suite of checkpoints named for one family is the benchmark telling you which family its own
-results use. The same holds for datasets — a shipped collection in one format says which
-loader is real.
-
-Read what is present before deciding what is meant.
-
-## A wrapper is a finding, not an error
-
-A script that calls the real entry point is a legitimate answer, and often a better one —
-it may chain stages, supply defaults the bare script needs, and be the invocation the
-benchmark's authors actually intend. But say which level you are naming. A wrapper that
-runs collection and then converts the result is one answer to two stages, and a caller who
-does not know that will convert twice.
-
-## Third-party code inside a repository is not that repository's
-
-Projects vendor other projects: a checkout can contain an entire copy of a different
-benchmark, with its own collector and its own trainer, under a directory named after a
-policy family or a dependency. Those files are inside the tree and are not this
-repository's entry points. When a path contains a segment naming another project, treat it
-as evidence about that project.
-
-## Prefer the specific file to the directory
-
-`policy/act/scripts/train.py` is an answer. `policy/` is not, and neither is
-`scripts/`. If you can only name a directory, you have found where to look rather than what
-to run, and the honest answer says so.
-
-## Say when a stage is absent
-
-A benchmark that cannot produce new trajectories without a person has no collection entry
-point, and reporting that is a finding rather than a gap. The distinction worth keeping: a
-stage with no entry point because the benchmark does not have that capability is different
-from a stage whose entry point you could not find. Say which one you mean, and say what
-would settle it — see `where-successes-come-from` for the second case.
+需要人工遥操作可记为“有人参与的采集能力”，不能写成“没有采集入口”；没有无人专家时说明缺口。unknown 与 unsupported 分开，下一步调查由主 Agent 决定。

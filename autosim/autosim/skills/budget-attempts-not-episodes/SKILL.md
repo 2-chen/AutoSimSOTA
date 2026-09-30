@@ -1,33 +1,17 @@
 ---
 name: budget-attempts-not-episodes
-description: Collection yields partial results; ask for attempts and expect a fraction to be rejected.
+description: 采集有失败、过滤或内部重试时，分别限制尝试数、接受数和实际时间，估计可承担的有效数据产出。
 scope: general
-confidence: observed — consistent across roughly ten collection runs
-evidence: |
-  On RoboSynChallenge, targeted collection admitted 44-67% of attempts (4 accepted from
-  9 attempts; 30 from 50 on a larger budget). Rejections were quality-filtered
-  trajectories, not process failures. Zero-yield rounds also occurred and were legitimate
-  outcomes rather than crashes.
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Budget attempts, not episodes
+# 预算不能只数成功 episode
 
-A collection request is a request for *attempts*. What survives filtering is a fraction
-of it, and you do not control that fraction directly.
+方法性指引，不使用过去某仓库的产出率作为默认值。读取原生命令：请求 N 表示尝试次数、成功条数、seed 数还是任务数？内部是否一直规划直到凑够成功数？
 
-## How to apply
+先做有墙钟/资源边界的试采，记录尝试、接受、失败类别和总成本。用本次产出率及波动估计下一批，而不是统一乘 1.5 或 2。零成功时先诊断专家/配置/资源，不能无限重试。
 
-Ask for more attempts than episodes you need — roughly 1.5-2x is a reasonable opening
-estimate, and revise it from your own observed yield. Treat the yield itself as
-information: a profile that admits very few trajectories is telling you something about
-how rare the behaviour you asked for actually is.
+约束应包含接受目标、失败尝试上限、墙钟/GPU 等总资源和可取消条件；原生参数表达不了的边界交受控执行器/主 Agent 处理，不凭空发明 flags。CPU 规划也耗时，GPU 小时不覆盖全部成本。
 
-A round that collected less than requested is not a failed round. Record the yield and
-decide from it.
-
-## What it does not mean
-
-It does not license retrying a low-yield collection unchanged until it hits the target.
-If the yield is poor, either the profile is asking for something rare — which may be
-exactly what you want — or the collection parameters are wrong. Those have different
-responses.
+训练、转换、存储与评测同样计入实验估算。超局部额度可以申请调整，但不能超仓库总硬限；小批有效产物可否续用取决于协议与数据完整性，不把部分完成默认为全量成功。

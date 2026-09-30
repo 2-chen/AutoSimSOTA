@@ -31,11 +31,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .common import atomic_json, event, now, object_digest, redact
+from .common import (atomic_json, event, now, object_digest, redact,
+                     sanitize_model_text)
 from .declaration import CAPABILITIES, STATUSES, DeclarativeAdapter, problems_in, space_from, verify
 from .skills import skills_reference
 from .strategy import executable_first_step, plan
-from .survey import peek_many, summarise, survey
+from .survey import peek_many, summarise, summarise_for_model, survey
 
 
 #: The task and the shape of the answer. How to *read* a repository -- where a task's
@@ -51,13 +52,47 @@ SYSTEM = (chr(10) + chr(10)).join([
     "supplied facts support, and read the method library you were given before answering.",
     "The system needs seven things from a benchmark, described in `capabilities_needed`. "
     "Answer every one of them, including by saying `unsupported` or `unknown`.",
+    "A field you cannot determine from the material is left as null, and a null is an "
+    "answer: it says the material did not state it. Do not fill one in with a plausible "
+    "number, and do not copy a placeholder. In `task_contract` every dimension is stated by "
+    "`dataset_structure` in the survey, which is a recording of the actual file -- read the "
+    "shapes there rather than inferring one.\n\n"
     "`benchmark`, `evidence`, `repo_markers`, `tasks` and `task_contract` are answered in "
     "one pass; `capabilities` and `optimization_space` in a second.",
     "For `optimization_space` you declare what the system may vary within this benchmark's "
     "own implementation -- training parameters its trainer accepts, and any collection "
     "setting its collector accepts. Declare only settings the source shows are implemented; "
     "the ranges are what the system will later be allowed to explore, so a range wider than "
-    "the code supports becomes a run that dies at the trainer.",
+    "the code supports becomes a run that dies at the trainer. Keep this executable core "
+    "small: at most six training axes and four collection axes. Every numeric axis needs "
+    "finite low and high bounds with low < high and a default inside them; omit a knob if "
+    "you cannot justify safe bounds. Use an empty list, not null, for a section with no "
+    "supported axes; omit `extra` unless a real third section exists. Every capability "
+    "status must be `declared`, `unsupported` or `unknown`, never null. A declared "
+    "capability needs a source-backed entrypoint and evidence; when unsure, use unknown "
+    "with a reason rather than a guess.",
+    "Investigate data acquisition before the optimization space is frozen. Trace the native "
+    "collector's action provider (expert/planner, policy, or human), asset requirements, "
+    "output/converter and actual trainer loader. Missing resources mean a conditional or "
+    "unverified path, not proof that no collector exists. Include source-supported collection "
+    "axes when the protocol permits data changes; do not silently omit them because shipped "
+    "data already suffices for a baseline. Source discovery is not a successful runtime probe.",
+    "In `task_contract.policy_representation`, answer `source` only when the native "
+    "evaluator runs a source-defined controller or planner without loading trained weights; "
+    "answer `artifact` when it loads a policy artifact; otherwise use null. This changes "
+    "whether an evaluation with no training stage can be a measurement.",
+    "If the repository establishes an official primary score, describe it in "
+    "`task_contract.primary_metric` with name, maximize/minimize direction, unit and "
+    "source (`log`, `json` or `csv`); otherwise leave it null. Do not assume every "
+    "benchmark uses success rate. If a native CSV contains one row per completed episode, "
+    "state its metric column, aggregation, task/episode identity columns, and optionally "
+    "an initial-state SHA-256 column only when repository code shows where those bytes "
+    "come from. A shared seed or invented hash is not proof of paired initial states.",
+    "If repository source and experiment constraints establish important secondary "
+    "objectives, optionally supply research_goal.guardrail_metrics with explicit name, "
+    "direction, unit, source, source-backed evidence and max_regression in native units. "
+    "Use the primary result artifact or an exact native log label. Do not guess tolerances; "
+    "secondary mappings are rechecked before binding and frozen before optimization.",
     "Return exactly one JSON object and nothing else.",
 ]) + chr(10)
 
@@ -114,17 +149,22 @@ def _envelope(instruction: str, keys: tuple[str, ...], **sections: Any) -> str:
 
 def triage(report: dict[str, Any], client: Any, *, limit: int = 12) -> dict[str, Any]:
     """Ask which files to read. A model that has not read anything yet is guessing."""
+    methods = skills_reference(
+        query="repository discovery benchmark workflow train evaluate collect entrypoint "
+              "task assets source successful trajectories expert policy teleoperation")
+    user = _envelope("List the files worth reading.", ("files_to_read",),
+                     METHODS=methods,
+                     SURVEY=summarise_for_model(report))
     content, metadata = client.chat_with_metadata(
-        TRIAGE_SYSTEM,
-        _envelope("List the files worth reading.", ("files_to_read",),
-                  METHODS=skills_reference(),
-                  SURVEY=summarise(report)),
+        sanitize_model_text(TRIAGE_SYSTEM),
+        sanitize_model_text(user, local_roots=(Path(report["repo"]),)),
         max_tokens=1200, timeout=120, thinking="disabled")
     try:
         chosen = _json_object(content).get("files_to_read") or []
     except ValueError:
         chosen = []
     return {"files_to_read": [str(p) for p in chosen if isinstance(p, str)][:limit],
+            "method_selection": methods["selection"],
             "provider": metadata, "response_sha256": object_digest(content)}
 
 
@@ -152,18 +192,25 @@ def skeleton(capabilities: bool = True) -> dict[str, Any]:
             "names": ["<only when kind is explicit or module_registry>"],
             "instruction_source": "<where a task's natural-language instruction lives>",
         },
+        # Nulls, not zeros. This block used to be filled with zeros as placeholders, which
+        # taught the model to answer zero: a number it did not know came back as the number
+        # it was shown, and the validator -- which requires a positive integer, because a
+        # dimension of zero is not a dimension -- rejected it three times and ended the run.
+        # The placeholders were the fault, not the model.
         "task_contract": {
-            "state_dim": 0,
-            "action_dim": 0,
-            "cameras": {"<camera_name>": [0, 0, 0]},
-            "max_episode_steps": 0,
+            "state_dim": None,
+            "action_dim": None,
+            "cameras": {"<camera_name>": "<the shape recorded in the trajectory>"},
+            "max_episode_steps": None,
             "control_parts": ["<arm/gripper groups the action vector drives>"],
-            "recorded_fps": 0.0,
+            "recorded_fps": None,
             "instruction": "<a sentence, or {\"from\": \"<path to a catalogue>\"}>",
+            "policy_representation": None,
+            "primary_metric": None,
         },
         "assets": {
             "dataset": {"path": "<path within the checkout>", "format": "<what it is>"},
-            "checkpoint": {"path": "<path, or omit and give why>", "why": "<if none>"},
+            "checkpoint": {"path": "<path, or omit and give why>"},
         },
     }
     if not capabilities:
@@ -183,7 +230,17 @@ def skeleton(capabilities: bool = True) -> dict[str, Any]:
             "training": [{"name": "<parameter>", "kind": "choice | integer | number",
                           "description": "<what it does>", "values": ["<choice options>"],
                           "low": 0, "high": 1, "default": None, "group": "<optional nesting>"}],
-            "extra": {},
+            # Written out because `{}` said nothing, and a model looking for somewhere to put
+            # a fact that was not a collection knob and not a training knob put a *capability*
+            # name here. The shape is the same as the other two: a section the controller can
+            # see, holding axes. It is for a knob that belongs to neither half -- how many
+            # episodes this round is judged on, say -- and it stays `{}` when there is none.
+            "extra": {
+                "<a third section's name, if this benchmark needs one>": [
+                    {"name": "<setting>", "kind": "choice | integer | number | structure",
+                     "description": "<what it does>", "values": ["<choice options>"],
+                     "low": 0, "high": 1, "default": None}],
+            },
         },
     }
 
@@ -197,6 +254,13 @@ def _balanced_object(text: str) -> dict[str, Any] | None:
     stack and trying again. That last repair is safe because nothing downstream trusts the
     parse: the declaration it yields still has to satisfy `problems_in`, so a reply that was
     genuinely cut off mid-value fails there instead of being accepted here.
+
+    **Raises when it found an object and the object is malformed.** Returning `None` for that
+    case -- which this did -- reports "nothing was found" when the truth is "an object was
+    found and it has a `;` where a `,` belongs". The distinction is not cosmetic: the message
+    is the whole of what the model is told when its draft is rejected, and the repair loop
+    runs on that message. A model told "no complete JSON object found" re-emits the same
+    object; a model told "Expecting ',' delimiter at column 2569" fixes it.
     """
     body = text.strip()
     for opener in ("```json", "```"):
@@ -232,17 +296,41 @@ def _balanced_object(text: str) -> dict[str, Any] | None:
                 candidate = body[start:index + 1]
                 try:
                     return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
+                except json.JSONDecodeError as exc:
+                    raise _Malformed(candidate, exc) from None
     if in_string or not stack:
         return None
     try:
         return json.loads(body[start:] + "".join(reversed(stack)))
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise _Malformed(body[start:], exc) from None
+
+
+class _Malformed(ValueError):
+    """A JSON object was found and does not parse, with enough of it to act on.
+
+    Carries the fault, its position, and the text either side of it. The surrounding text is
+    the part that makes the message usable: a column number alone does not say what to change,
+    and the characters around the fault usually do.
+    """
+
+    def __init__(self, candidate: str, error: json.JSONDecodeError):
+        position = error.pos
+        window = candidate[max(0, position - 120):position + 120]
+        super().__init__(
+            f"the JSON object is malformed: {error.msg} at line {error.lineno} "
+            f"column {error.colno}. Around the fault: ...{window}...")
+        self.candidate = candidate
+        self.error = error
 
 
 def _json_object(content: str) -> dict[str, Any]:
+    """The object in a reply, or a message saying what is wrong with it.
+
+    The message is the model's only feedback, so the two failures are kept apart: nothing
+    that looks like an object was found at all, versus an object was found and it is
+    malformed at a named place. The second is the common one and it is fixable in one turn.
+    """
     value = _balanced_object(content)
     if value is None:
         raise ValueError("no complete JSON object found in the response")
@@ -272,14 +360,16 @@ def _ask(system: str, payload: dict[str, Any], client: Any, *, keys: tuple[str, 
             + "Return one JSON object with exactly " + json.dumps(list(keys)) + " as its "
             "top-level keys and nothing else. Do not repeat the survey, the file contents or "
             "any other input back to me. Do not wrap the object in prose.")
-        content, metadata = client.chat_with_metadata(system, current, max_tokens=8192,
+        content, metadata = client.chat_with_metadata(
+            sanitize_model_text(system),
+            sanitize_model_text(current), max_tokens=8192,
                                                       timeout=300, thinking="disabled")
         if output is not None:
             atomic_json(output / f"draft_{stage}_{repair + 1}.json",
                         {"stage": stage, "attempt": repair + 1, "content": content,
                          "provider": metadata, "prompt_chars": len(current),
                          "response_chars": len(content),
-                         "prompt": current if repair == 0
+                         "prompt": sanitize_model_text(current) if repair == 0
                          or attempts[-1]["status"] == "rejected" else None})
         try:
             draft = _json_object(content)
@@ -300,9 +390,30 @@ def _ask(system: str, payload: dict[str, Any], client: Any, *, keys: tuple[str, 
     raise ValueError(f"no usable {stage} draft: {attempts[-1].get('error')}")
 
 
+def declared_content(declaration: dict[str, Any]) -> tuple[int, int]:
+    """How much a declaration claims: axes it offers, capabilities it settles.
+
+    A repair is meant to change a claim, not to remove it, and the two look the same to a
+    check that only counts what is wrong: deleting the thing that failed also reduces the
+    faults. RoboTwin is exactly that case. A repair replaced thirty-seven declared axes --
+    twenty-five collection knobs and twelve training ones, each citing the file it was read
+    from -- with none at all, and it was accepted, because the only thing compared was the
+    number of path faults and a shorter document has fewer of those.
+
+    Nothing here is specific to a benchmark: a declaration claims axes and capability
+    statuses, and this counts both.
+    """
+    space = declaration.get("optimization_space") or {}
+    axes = sum(len(rows) for rows in space.values() if isinstance(rows, list))
+    capabilities = declaration.get("capabilities") or {}
+    settled = sum(1 for row in capabilities.values()
+                  if isinstance(row, dict) and str(row.get("status")) != "unknown")
+    return axes, settled
+
+
 def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
             output: Path | None = None, feedback: dict[str, Any] | None = None,
-            repair_attempts: int = 3) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            repair_attempts: int = 5) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Draft a declaration in two passes and check it as one document.
 
     Every attempt is written to disk as it happens, including the raw response. A rejected
@@ -312,38 +423,60 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
     """
     attempts: list[dict[str, Any]] = []
 
+    coding_runtime = bool(getattr(client, "supports_main_agent", False))
+    identity_methods = skills_reference(
+        query="benchmark contract task repository assets dataset checkpoint metric success "
+              "trajectories expert policy source evidence",
+        include_index=not coding_runtime,
+        max_selected=2 if coding_runtime else 3)
     identity = _ask(SYSTEM, {"__prompt__": _envelope(
         "Identify this project and describe one of its tasks. Answer from the survey, the "
-        "file contents and the recorded trajectory structure.",
+        "file contents and the recorded trajectory structure. For each assets.dataset and "
+        "assets.checkpoint, choose exactly one: provide a real repository-relative path and "
+        "omit why, or provide why and omit path. Never copy an angle-bracket placeholder as "
+        "a path. If the workflow needs no such asset, explain that under why instead of "
+        "inventing a location.",
         IDENTITY_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
-        METHODS=skills_reference(),
-        SURVEY=summarise(report),
+        METHODS=identity_methods,
+        SURVEY=summarise_for_model(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
         FAILED_CHECKS_ON_YOUR_PREVIOUS_ANSWER=feedback,
         REQUIRED_SHAPE=skeleton(capabilities=False))},
         client, keys=IDENTITY_KEYS, stage="identity", output=output,
         attempts=attempts, repair_attempts=repair_attempts,
         validate=lambda draft: _faults(problems_in(draft, required=IDENTITY_KEYS)))
+    for attempt in attempts:
+        if attempt.get("stage") == "identity":
+            attempt["method_selection"] = identity_methods["selection"]
     def assembled(draft: dict[str, Any]) -> None:
         """Validate as the whole document, because that is how it will be consumed."""
         whole = {**identity, **draft}
         _faults(problems_in(whole))
         space_from(whole)
 
+    capability_methods = skills_reference(
+        benchmark=identity.get("benchmark"),
+        query="capability mapping optimization space available interventions data collection "
+              "training evaluation parameter source evidence",
+        include_index=not coding_runtime,
+        max_selected=2 if coding_runtime else 3)
     decision = _ask(SYSTEM, {"__prompt__": _envelope(
         "Answer what this benchmark can and cannot do, and declare what the system may "
         "vary when it works with it.",
         DECISION_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
-        METHODS=skills_reference(benchmark=identity.get("benchmark")),
+        METHODS=capability_methods,
         ALREADY_ESTABLISHED=identity,
-        SURVEY=summarise(report),
+        SURVEY=summarise_for_model(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
         REQUIRED_SHAPE=skeleton(capabilities=True))},
         client, keys=DECISION_KEYS, stage="capabilities", output=output,
         attempts=attempts, repair_attempts=repair_attempts,
         validate=assembled)
+    for attempt in attempts:
+        if attempt.get("stage") == "capabilities":
+            attempt["method_selection"] = capability_methods["selection"]
 
     declaration = {**identity, **decision}
     assembled(decision)
@@ -421,10 +554,10 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
     triage_result = triage(report, client, limit=read_limit)
     atomic_json(output / "triage.json", triage_result)
     requested = [path for path in triage_result["files_to_read"]]
-    files = peek_many([str(Path(report["repo"]) / path) for path in requested],
+    files = peek_many(requested, repo=Path(report["repo"]),
                       lines=peek_lines, limit=read_limit)
-    for row, path in zip(files, requested):
-        row["requested_as"] = path
+    for row in files:
+        row["requested_as"] = row.get("path", "[withheld-path]")
     atomic_json(output / "file_contents.json",
                 {"requested": requested,
                  "read": [row for row in files if row.get("readable")]})
@@ -460,9 +593,20 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
         repaired["task_pattern_neighbours"] = _neighbours(
             repo, repair["tasks"].get("pattern", ""))
         atomic_json(output / f"verification_repair_{round_index + 1}.json", repaired)
-        if len(path_faults(repaired)) < len(faults):
+        # Fewer faults is necessary and not sufficient. A repair that reduces the faults by
+        # claiming less has not repaired anything -- it has deleted the part that was
+        # checked -- so a repair is taken only when it does not shrink what the declaration
+        # declares. Either way the attempt is recorded, because a repair that was refused is
+        # the most informative thing about why the round happened twice.
+        before, after = declared_content(declaration), declared_content(repair)
+        improved = len(path_faults(repaired)) < len(faults)
+        kept_its_claims = all(new >= old for new, old in zip(after, before))
+        if improved and kept_its_claims:
             declaration, result = repair, repaired
         else:
+            event(output / "scout_events.jsonl", "verification_repair_refused",
+                  round=round_index + 1, fewer_faults=improved, kept_its_claims=kept_its_claims,
+                  claims_before=list(before), claims_after=list(after))
             break
 
     atomic_json(output / "declaration.json",
@@ -491,7 +635,10 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
             research_plan, plan_log = plan(
                 adapter.optimization_space(adapter.select_task("auto")),
                 result["capabilities"], client, benchmark=declaration["benchmark"],
-                methods=skills_reference(benchmark=declaration["benchmark"]),
+                methods=skills_reference(
+                    benchmark=declaration["benchmark"],
+                    query="research strategy experiment design intervention family comparison "
+                          "metric resource budget control causal attribution"),
                 evidence={"declaration_reasoning": declaration["evidence"],
                           "capability_notes": {name: row.get("limitation") for name, row
                                                in result["capabilities"].items()}},
@@ -593,8 +740,11 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
-    from autosim.llm_client import LLMClient
-    from autosim.research.repository_autoresearch import load_deepseek_environment, PROJECT_ROOT
+    # One line, and it used to reach a whole parallel world: this borrowed two general
+    # helpers from a module that carried one benchmark's task table, its epoch counts and a
+    # finished research loop, so importing the scout imported all of it. The helpers live
+    # beside the client that needs them now, and the scout's closure is its own business.
+    from autosim.llm_client import LLMClient, PROJECT_ROOT, load_credential_file
 
     if args.report_only:
         from .survey import survey as take_survey
@@ -602,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summarise(report), ensure_ascii=False, indent=2))
         return 0
 
-    environment = load_deepseek_environment(project_root=PROJECT_ROOT)
+    environment = load_credential_file(project_root=PROJECT_ROOT)
     client = LLMClient()
     if not client.available:
         raise SystemExit("DEEPSEEK_API_KEY is not set; the scout has no model to ask")

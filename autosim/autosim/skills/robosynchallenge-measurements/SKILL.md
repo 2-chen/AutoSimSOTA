@@ -2,7 +2,7 @@
 name: robosynchallenge-measurements
 description: Concrete numbers measured on RoboSynChallenge. Scoped to this benchmark — do not carry them to another one.
 scope: benchmark:RoboSynChallenge
-confidence: measured — paired per-episode seeds, n=100 per arm, official evaluation entry point
+confidence: historical report — original receipts were not re-audited in the 2026-09-29 library review
 evidence: |
   All figures from controlled arms run through policy/act/eval.sh with 100 episodes,
   the random setting and paired seeds, on one machine. The machine does not reproduce
@@ -12,6 +12,11 @@ evidence: |
 ---
 
 # RoboSynChallenge: measured numbers
+
+2026-09-29 审计标注：下文为保留的历史记录，不是本轮重新验证的测量。原 run、代码版本、
+逐 episode 回执与统计计算未在本次审计中复核；复用任何数值或能力声明前须找回这些证据。
+尤其不能把“不显著”解释成“没有效果”，也不能把不同新增样本数的自然比例混为同一实验。
+下文的固定适配器/合法模式描述仅对应当时实现，不代表当前系统的能力边界。
 
 Scoped to this benchmark. These are the effects of specific levers as measured here.
 

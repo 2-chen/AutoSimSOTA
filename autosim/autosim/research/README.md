@@ -1,5 +1,11 @@
 # AutoSimSOTA Repository AutoResearch
 
+## DeepSeek 模型费用口径（2026-09-29）
+
+正式 `autosota_sim_v1` 使用 `deepseek-flash` 时，Coding Agent 仍由 Claude Code CLI 执行，但 CLI 的 `total_cost_usd` **只作为诊断值**，不再用于模型预算扣减，也不再传入 CLI `--max-budget-usd`。请求经 run-local loopback 网关转发到配置的 DeepSeek Anthropic 端点；网关在发送前按请求字节数、`max_tokens` 和峰时价格保守预留，收到逐请求 token 用量后按固定的 DeepSeek V4.1 Flash 价格表结算。未知用量保留整轮预算，不按零费用释放。每轮在 `agent/pricing/<turn_id>.json` 保存脱敏用量/计价回执；`agent/cost_ledger.json` 标识 `deepseek_official_estimate_v1`，老 CLI 口径账本不能被静默重算或继续作为新口径。
+
+此数字是依据 [DeepSeek 官方模型定价](https://api-docs.deepseek.com/quick_start/pricing/)和 API 用量的**本地估算**，不是平台账单；定价卡于 2026-10-10 UTC 过期并拒绝继续使用，需核价更新。当前只为精确的 `deepseek-flash` 文本消息提供该计价；未知 DeepSeek 模型、多模态消息、缺用量和超出价格表的请求均拒绝或保留预算。非 DeepSeek 测试模型维持旧 CLI 口径，以便历史 fixture 兼容；不要将其视为 DeepSeek 正式费用。网关需要本机能监听 `127.0.0.1`，某些外层工具沙箱会禁止 socket。
+
 统一入口接收一个官方 benchmark 仓库，输出带 checkpoint、manifest 和完整研究账本的衍生仓库。RoboSynChallenge执行器已通过多次原生运行；RoboTwin ACT执行器现已接入同一入口，依次执行官方数据基线、clean/randomized失败证据、API/对照决策、有界专家采集、硬链接混合数据、候选训练、同seed原生评测和导出。RoboTwin已有 API 决策的单轮闭环运行：clean 库 +30 pp（7:1，p=0.035）、randomized 库 +15 pp（3:0，p=0.125），每库 20 局，属方向性证据。RoboSynChallenge/water_pouring 的 200 局同种子配对确认见仓库根 README。
 
 ```bash
@@ -73,8 +79,9 @@ RoboSyn的DexSim会在真实解析仓库路径过深时于材质创建阶段触�
 
 证据层同样不按任务分支：`task_evidence()` 输出原始测量（逐实体轨迹、成功/失败队列对比、任务自身
 `is_task_success` 的源码文本）而不命名类别，阈值与因果判断由控制器自己给出。
-`autosim/autosim/skills/*/SKILL.md` 是可增删的方法库，作为参考注入提示词——不参与校验，
-控制器可以推翻其中任何一条。
+`autosim/autosim/skills/*/SKILL.md` 是可增删的方法库，不参与执行校验。主 Agent
+先看仅含元数据的短目录，再自行返回最多三个要读的技能 ID 及理由；系统只读取这些正文，
+并将选择理由、版本和正文哈希写入决策记录。关键词排序仅作推荐，控制器可以不用或推翻任何方法。
 
 ## 公平性与结论边界
 
@@ -82,7 +89,7 @@ RoboSyn的DexSim会在真实解析仓库路径过深时于材质创建阶段触�
 - 最终集合在候选冻结前不提供给 controller；开发、选型、最终及采集 seed 由 SQLite 账本隔离。
 - 新采集是 benchmark 允许的训练数据优化，不修改官方 success judge、随机化、时限或评测观测；是否符合某个官方提交赛道仍需按该赛道规则确认。
 - `completed`、`performance_improved`、`hypothesis_supported` 和 `export_runtime_verified` 分开记录。管线跑完不等于提升，更不自动等于官方 SOTA。
-- 当前多 backend、第二 learner、未知仓库自动适配及同预算多研究 seed 的论文级验证仍按唯一计划文件 `plan/autoresearch_progress_feasibility_plan_20260907.md` 推进。
+- 当前多 backend、第二 learner、未知仓库自动适配及同预算多研究 seed 的论文级验证按 [总规划](../../../plan/MASTER_PLAN.md) 推进；已验证能力与缺口以 [执行进度](../../../plan/EXECUTION_STATUS.md) 为准。
 
 CPU 回归：
 

@@ -46,6 +46,18 @@ def test_a_declared_parameter_reaches_the_function(tmp_path):
     assert value.argv("train", {}) == ["random"]
 
 
+def test_runtime_refuses_a_generated_command_with_conflicting_settings(tmp_path):
+    source = ('def stage_argv_train(i):\n'
+              '    return ["python", "train.py", "--steps=1024", "--steps=10000000"]\n')
+    value = DeclarativeBackend(
+        repo=tmp_path,
+        answer={"stages": {"train": {"available": True, "entrypoint": "train.py",
+                                     "invocation": "python train.py", "artifact": "policy.pt"}}},
+        sources={"train": source})
+    with pytest.raises(ValueError, match="conflicting values"):
+        value.argv("train", {})
+
+
 def test_a_stage_with_no_derived_command_says_why(tmp_path):
     value = backend(tmp_path)
     value.stages["collect"] = {"available": False, "why": "no automated producer here"}
@@ -66,6 +78,45 @@ def test_a_glob_is_what_makes_an_artifact_findable(tmp_path):
     (out / "nested" / "run_done.json").write_text("{}", encoding="utf-8")
     check = backend(tmp_path, artifact="**/*_done.json").check_artifact("train", out)
     assert check["matched"] == 1 and check["examples"] == ["nested/run_done.json"]
+
+
+def test_malformed_recursive_glob_is_reported_without_raising(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    value = backend(tmp_path, artifact="runs/**final_ckpt.pt")
+    checked = value.check_artifact("train", out)
+    beside = value.artifact_beside("train", tmp_path, since=0)
+    for result in (checked, beside):
+        assert result["checked"] is True
+        assert result["matched"] == 0
+        assert result["invalid_pattern"] is True
+        assert "complete path component" in result["why"]
+
+
+def test_relative_artifact_pattern_is_checked_beside_command(tmp_path):
+    run = tmp_path / "runs" / "one"
+    run.mkdir(parents=True)
+    (run / "final_ckpt.pt").write_bytes(b"weights")
+    check = backend(tmp_path, artifact="runs/*/final_ckpt.pt").artifact_beside(
+        "train", tmp_path, since=0)
+    assert check["matched"] == 1
+    assert check["examples"] == ["runs/one/final_ckpt.pt"]
+
+
+def test_alternate_output_search_keeps_concrete_parent_directory(tmp_path):
+    unexpected = tmp_path / "runs" / "one" / "test_videos"
+    unexpected.mkdir(parents=True)
+    (unexpected / "0.mp4").write_bytes(b"video")
+    actual = tmp_path / "runs" / "one" / "videos"
+    check = backend(tmp_path, artifact="runs/*/videos/*.mp4").artifact_beside(
+        "train", tmp_path, since=0)
+    assert check["matched"] == 0
+    actual.mkdir()
+    (actual / "0.mp4").write_bytes(b"video")
+    check = backend(tmp_path, artifact="runs/*/videos/*.mp4").artifact_beside(
+        "train", tmp_path, since=0)
+    assert check["matched"] == 1
+    assert check["examples"] == ["runs/one/videos/0.mp4"]
 
 
 def test_a_stage_that_promised_nothing_is_unverifiable_rather_than_passed(tmp_path):

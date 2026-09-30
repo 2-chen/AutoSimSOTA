@@ -2,17 +2,126 @@
 
 面向具身仿真 benchmark 的可审计自动研究系统。
 
-一条指令接收 benchmark 仓库路径，系统自己完成：识别任务与能力 → 构建证据 → 由 LLM 研究控制器提出实验 →
-定向采集数据 → 质检准入 → 训练 policy → 原生评测 → 候选选择 → 冻结确认 → 导出可运行的优化后仓库。
-DeepSeek 负责研究提案，不负责执行 GPU 训练。
+当前入口由通用仓库调查、声明、环境准备、命令推导和研究循环组成。并非任意仓库都已能完成
+训练、确认和导出；运行结果按实际证据分层，缺失资产或不支持的工作流应明确记录边界。
+目标与验收见 [总规划](plan/MASTER_PLAN.md)，当前证据、缺口和下一步见 [执行进度](plan/EXECUTION_STATUS.md)。
+
+AutoSOTA 模型预算（2026-09-30，追加翻倍）：新运行默认初始回合额度 `$4`、整次费用上限 `$60`。
+DeepSeek 按官方用量估算计费，局部额度可自动从剩余总预算扩展，扩展记录保存在费用账本。
+可用 `--agent-turn-budget-usd` / `--agent-total-budget-usd` 配置；整次费用上限仍是硬边界，
+未知用量保留预留，不将其当零费用。旧运行保留已冻结额度，默认值变化不会改写旧账本。
+本地额度拒绝不再作为限流重试，局部失败交回恢复流程，不直接等同整次费用耗尽。
+安装操作逐条封存完整证据与部分进度，RUN.md 展示实际执行记录；安装成功不等于仿真核验通过。
+
+### 调度与并发（2026-09-30）
+
+新 AutoSOTA run 自动生成 `scheduler_policy.json`：主 Agent 负责选择/采纳研究，最多两个
+只读调查异步运行；Recorder 后台更新中文 RUN.md/RUN.html，模型费用共用总账本。
+`wait_for_jobs` 用状态事件等待，不反复调用模型；纯等待不消耗 Scheduler 续段次数。
+
+已核验的任意原生阶段均可提交后台作业；Agent 请求 CPU、内存、GPU、优先级与局部窗口。
+同阶段输出独占，活跃作业阻止源码/环境变更。跨 run CPU/内存 admission、CPU affinity 与
+物理 GPU 排他租约防止默认超卖；内存仍是合作式预留，不是 RSS 硬隔离。
+依赖图显式声明独立性和资源后可并发，默认串行。单张 GPU 不默认并发多个重训练。
+
+可信 baseline 后可用 `configure_screening / run_screening_trial / inspect_screening`
+做 Agent 声明训练预算轴的多保真参数候选筛选；筛选结果单独存放，不能直接成为正式 best。
+代码/算法候选保持原来的审核与源码事务。所有执行仍受同一 24 GPU 小时/墙钟/费用总边界约束。
+`scheduling_metrics.json` 和 RUN.md 展示调度耗时、排队及筛选表；旧 run 不自动开启新调度。
+详细接口和边界见 [最新规划](plan/MASTER_PLAN.md)。
+
+### 环境复用（2026-09-30）
+
+新 `autosota_sim_v1` 运行默认启用跨运行环境池，位置为
+`autoresearch_cache/environments`。它复用依赖，不把数据、任务配置和训练权重当成环境已就绪的证明。
+
+- 成功安装产生的 pip wheel（包括可识别的 HTTP 缓存对象）由控制器校验、按内容哈希发布；
+  后续运行通过只读 `PIP_FIND_LINKS` / `UV_FIND_LINKS` 使用，HOME、安装 prefix 和下载缓存仍各自独立。
+- 从本机 conda、已登记环境和近期运行环境读取静态包信息；Agent 只见短目录与不透明 ID，
+  自主决定是否复用并记录理由。不会按 LIBERO/RoboTwin 等仓库名自动选环境。
+- 安全 conda 基础环境用 `--offline --copy --clone` 复制到运行自己的 `env`，基础 prefix 与
+  原包缓存只读。拒绝可编辑源码引用、外部 site-packages 和无法独立搬迁的 venv。
+  缺少 conda 原包缓存时保留具体故障证据，交回 Fix；不声称所有现有环境都能离线复制。
+- 环境 probes 通过后才尝试发布快照；后续复用先检查内容哈希，复制后仍须执行当前仓库的
+  原生探针。包缓存/复制成功不能代替 GPU、reset/step、渲染、策略加载与 rollout 核验。
+- `RUN.md` 展示可用 wheel 数、选择理由、复制与快照状态；可用数不是实际命中数。
+  池默认容量上界 64 GiB，空间不足或缓存失败不推翻已经通过的环境；未完成副本保留供检查，不自动清理。
 
 ```bash
-.venv/bin/autosim research /path/to/RoboSynChallenge \
-  --task water_pouring --controller api --allow-api-egress --gpu 0 \
-  --rounds 2 --attempts-per-round 100 --training-steps 20000 \
-  --development-episodes 40 --selection-episodes 100 --final-episodes 200 \
-  --train-seed 1000 --min-original-fraction 0.25 --hours 24
+.venv/bin/autosim environments list
+.venv/bin/autosim environments register --prefix /absolute/path/to/safe-conda-base
+.venv/bin/autosim research /absolute/repo /absolute/new-run 2 '{}' \
+  --framework autosota_sim_v1 --environment-store /absolute/shared-environments
+# 完全禁用复用：为新运行添加 --no-environment-reuse
 ```
+
+公共池不能与源仓库或输出目录互相包含；同一次续跑不能静默切换池或启停复用。
+内置 Python/PyTorch/MuJoCo/SAPIEN 条目目前是能力说明，不是已经下载、通过 RTX 5090 核验的
+预装镜像。真实小型 conda 离线复制、快照再复制与离线 wheel 安装已验收；具身仓库的加速收益仍须实测。
+
+当前命令形式（仓库和输出目录均为必填）：
+
+```bash
+.venv/bin/autosim research /absolute/path/to/benchmark /absolute/path/to/run 2 '{"steps": 100, "episodes": 10}' --wall-seconds 3600
+.venv/bin/autosim research /absolute/path/to/benchmark /absolute/path/to/run 2 '{}' --wall-seconds 3600 --isolated-copy
+.venv/bin/autosim research /absolute/path/to/benchmark /absolute/path/to/run 0 '{}' --wall-seconds 600 --isolated-copy --tracked-copy
+.venv/bin/autosim research /absolute/path/to/benchmark /absolute/path/to/run 2 '{}' --keep-only
+.venv/bin/python tools/record.py /absolute/path/to/run
+```
+
+`--keep-only` 只使用输出目录已记录的声明、环境和命令，不重新调查或派生；
+当所需记录齐全时会直接运行，不再为选步骤调用外部模型。新运行默认隔离（`--isolated-copy`），仅复制 Git
+已跟踪的当前工作树文件（保留未提交的源码修改），`--tracked-copy` 是显式同义选项。
+没有 Git 索引时拒绝自动猜测源码范围；确实需要完整副本时使用 `--full-copy`，仍受复制上限约束。
+续跑默认沿用原先复制模式和资源连接，不迁移旧运行。
+旧 legacy 原地运行必须显式传 `--in-place`（这会允许修改源仓库）；正式 `autosota_sim_v1` 禁止该选项。
+输出目录必须与源仓库互不包含，检查在创建输出或环境之前执行。
+新研究输出默认使用独立的 `task` 预算：每项研究最多 24 GPU 小时，同输出目录的续跑和长期作业共享账本。
+`task_gpu_budget.json` 记录受控原生 GPU 阶段持有物理设备锁的时长，包含设备占用期间的准备/清理，
+不是 GPU 内核利用率积分；LLM 等待和控制器 CPU 时间不计入。启动 GPU 阶段时预留额度，结束按占用时长结算，
+异常崩溃遗留预留需核对进程后处理，不自动清零。GPU 总限会约束原生作业硬超时，局部延长不能越过它。
+既有运行继续沿用旧的跨仓库历史账本，不将旧墙钟消耗伪装为实测 GPU 时间；
+新任务可显式用 `--budget-scope repository` 选择旧的累计墙钟上界政策。运行中不能切换计量口径。
+未指定 `--wall-seconds` 时，新 AutoSOTA 运行默认 48 小时墙钟（给安装/LLM/CPU 工作留空间），
+legacy 运行仍为一小时；24 GPU 小时的独立硬上限不变，旧运行沿用记录的期限。
+`--rederive` 会丢弃该输出目录中已保存的派生记录，应只在明确要重新推导时使用。
+不传 `settings-json` 时沿用 benchmark 自身默认配置，系统不再暗中注入 epoch/episode 数量。
+`--wall-seconds` 是可选的整次运行墙钟上限；恢复同一运行时不能静默改小或改大。
+墙钟期限与 GPU/模型费用分别管理；当前暂停期间墙钟期限继续流逝，记录为 `deadline_continues`。
+AutoSOTA 入口先检查本机代理监听、Claude Code 和进程隔离能力，记录 `runtime_preflight.json`；
+失败时生成中文启动报告并退出，不调用 Agent 重试。控制器需要允许模型联网/本机监听和设备访问的运行环境；
+仓库命令仍由系统自己的隔离执行器约束。启动后的代理权限失败也会封存脱敏堆栈、结束进程记录，
+并以 `infrastructure_blocked` 返回，不空转 Scheduler/Monitor/Fix。
+`--isolated-copy` 在输出目录创建有字节上限的独立源码副本，避免研究补丁直接改原 checkout；
+默认上限 4 GiB，可用 `--copy-limit-bytes` 调整。它不是容器沙箱，绝对路径、外部服务和资产仍需审计。
+
+代码副本与已有资源分开输入，例如（路径仅作示例）：
+
+```bash
+.venv/bin/autosim research /absolute/repo /absolute/new-run 1 '{}' \
+  --framework autosota_sim_v1 --isolated-copy \
+  --resource data=/absolute/datasets/task-data \
+  --resource pretrained=/absolute/checkpoints/policy
+```
+
+`--resource` 可重复，格式是 `运行内相对路径=已有资源绝对路径`。系统不复制资源、不创建指向源仓库
+的软链接或硬链接；在受控诊断/实验进程内只读挂载，宿主文件浏览器只会看到空挂载占位路径。
+位于源仓库内、被显式声明为资源的文件/目录，即使被 Git 跟踪，也会从代码复制范围排除。
+资源目标不得覆盖其余已复制的源码或互相重叠；系统不按仓库名或扩展名猜测资源范围。
+训练输出、数据预处理结果、缓存和新权重必须写到其他
+run-local 路径；需要原地修改数据的脚本应调整输出位置，不能把原始资源改成可写。
+`workspace_snapshot.json` 记录连接、源身份与最多 128 个被省略路径候选；RUN.md 和主 Agent 显示摘要。
+未连接的资源不自动授权访问，也不因为未复制就判定原仓库不存在资源。连接只证明访问路径存在，
+原生 loader、任务匹配、权重实际加载、内容哈希和评测仍须验证。
+资源是实时只读视图，不是冻结副本：其他宿主进程仍能修改资源内容；当前身份校验检测路径替换，
+不宣称完整数据不可变。续跑拒绝资源消失、替换或连接变更。资源不随代码导出，搬迁需重新连接并核验。
+资源目录应是自包含的数据/资产树，不应包含指向宿主其他位置的依赖链接。
+
+对已经产生的测量，可另开进程运行 `PYTHONPATH=autosim .venv/bin/python -m autosim.research.receipt_verifier <run-dir> <measurement-label>`，从原始评测日志或冻结的 JSON/CSV 结果重读指标，并核对 attempt 回执与记载的数值。`consistent` 只表示这些记录内部一致；它不是原生策略加载、独立复评或统计显著性结论。
+接入记录可显式声明 `execution_graph`：节点使用仓库自己的阶段名，`depends_on` 指定顺序，`bindings` 把上游产物传给下游输入，`score_target` 指定评测节点。图会在执行前校验并冻结；研究循环可从图的评测节点读主指标。图节点运行完成仍不等于独立确认或 SOTA。
+运行时从一开始生成 `RUN.md` 与 `feasibility.json`；原生长阶段每 45 秒刷新 Markdown 状态。
+显式主指标支持日志、JSON 和 CSV 读取，但这仍不是任务/种子/样本协议的完整确认。
+下方结果来自较早的专用实验路径，是历史证据，**不是当前通用入口的验收结果**。
 
 ## 阶段性成果
 
@@ -119,7 +228,10 @@ DeepSeek 负责研究提案，不负责执行 GPU 训练。
 LIBERO 因此可以走进一条真实路径：官方 50 条演示训 ACT 基线 → 在「选哪些演示 / 怎么加权 / 怎么训」上干预
 → 用它自己的 50 个固定初始状态评测。全程不需要专家。
 
-## 复现
+## 历史实验复现说明（旧专用管线）
+
+本节描述 2026-09-17 的历史记录；其中旧旗标如 `--probe-only`、`--task`、`--gpu`
+已不是当前 `autosim research` 的参数。请用文首当前命令形式启动新运行。
 
 上面的命令已用 `--dry-run` 逐字段比对过 `full_run_20260917` 记录的 `protocol.json`，
 除 `dry_run` 标志本身外**零差异**——即这条命令就是当时跑出上表的命令。
@@ -134,7 +246,7 @@ LIBERO 因此可以走进一条真实路径：官方 50 条演示训 ACT 基线 
 产物落在 `autoresearch_runs/<benchmark>/<run_id>/`，包含逐轮提案、证据、评测、选择、
 确认报告与导出验证。中途中断可用同一 `--run-id` 加 `--continue-run` 续跑。
 
-想先确认环境而不动 API/GPU：
+历史入口曾提供以下探针模式；当前通用入口尚未提供等价旗标，不能直接运行：
 
 ```bash
 .venv/bin/autosim research /absolute/path/to/RoboSynChallenge --probe-only

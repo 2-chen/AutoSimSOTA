@@ -1,51 +1,19 @@
 ---
 name: report-paired-and-intervaled
-description: Report paired outcomes and intervals; small-n aggregates cannot support small deltas.
+description: 比较候选成功率时保留 episode 对应关系、报告差值不确定性，并区分开发选优与独立确认。
 scope: general
-confidence: high — an audit of the benchmarks themselves, plus a statistical method validated on thousands of rollouts
-evidence: |
-  "What Are We Actually Benchmarking in Robot Manipulation?" (arXiv:2606.04233) audited
-  LIBERO, CALVIN, SimplerEnv, RoboCasa and RoboTwin 2.0 and found that only 19.8% of
-  LIBERO and 19.7% of SimplerEnv headline gains are provably statistically significant.
-  Between the rejection-feasibility and rejection-guarantee thresholds, the same published
-  aggregates are consistent with both significant and insignificant outcomes.
-
-  Arithmetic: at ~90% success, 10 episodes gives a 95% interval spanning roughly ±19
-  percentage points and 100 episodes still ~±6. Typical evaluation is 10-60 trials.
-
-  N-SCORE (RSS 2026, arXiv:2603.13616), validated on 4,500+ hardware and 2,000 simulation
-  rollouts: sequential testing over paired progress scores cut evaluation burden by ~70%
-  versus batch testing, and on RoboArena recovered a full 4-policy ranking at α=0.05 using
-  1,420 of ~2,560 evaluations. Partial-credit metrics separated policies faster than binary
-  success.
-
-  Reporting practice: success rate appears in ~98% of surveyed papers while confidence
-  intervals have not improved (33.3% in 2023, 11.0% in 2025, 19.5% in 2026 YTD).
+confidence: methodological-or-borrowed — applicability must be verified in the current run
+evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
-# Report paired and intervaled
+# 报告配对结果与不确定性
 
-A success rate without an interval is not a measurement, it is a number. Two policies
-evaluated on the same seeds can be compared far more sharply than two evaluated
-independently — and most of the field does not do this.
+方法性统计指引，具体方法的假设需要核对。相同 seed 不必然产生相同状态；固定初态、任务、环境版本与随机源控制须有证据。配对可降低部分方差，不会消除全部初态或策略随机性。
 
-## How to apply
+保存每 episode 的样本身份、结果与失败/截断原因。成功率注明成功数/有效总数；异常退出不能无依据记失败或剔除。聚合要遵守任务权重，并区分 episode 不确定性、训练 seed 变化和跨任务差异。
 
-Three things, in order of how much they buy:
+单臂二项比例可用适用的 Wilson/精确区间；比较时关注差值区间。配对二元结果可用不一致配对表及适当的配对检验，或按实验独立单位构造 bootstrap。存在任务/训练 seed 聚类时，不能把所有帧或相关 episode 当独立样本。
 
-1. **Share the seeds.** Evaluate every arm on the same initial states and compare
-   *per episode*, not in aggregate. This turns an unpaired comparison into a paired one
-   and removes the initial-state variance entirely.
-2. **Say the interval, not just the mean.** At the episode counts in common use the
-   interval is wide enough to swallow most reported deltas. If your delta is inside the
-   interval, say so — that is a result, and it is more useful than a point estimate.
-3. **Prefer a graded score to a binary one.** Partial-credit measures separate policies
-   with fewer rollouts than pass/fail, which matters directly when each rollout is
-   expensive.
+两条单臂区间重叠不等于差异不显著；p 值不显著也不证明没有效果。多轮搜索和反复查看结果会增加选择偏差，预定确认规则或采用有效的序贯方法，不反复运行固定样本检验直到过线。
 
-## What it does not mean
-
-It does not mean a small experiment is worthless — it means naming its resolution. "28/40
-against 31/40, interval overlapping" is honest and useful; "70% against 77.5%, improved"
-is the reporting failure the audit measured. And a wide interval on a real effect is a
-reason to run more episodes, not a reason to claim nothing.
+开发集用于研究；最终留出只按协议作独立确认。没有能力估计可靠区间时，报告原始计数、比较口径与局限，不制造精确显著性或声称 SOTA。
