@@ -35,6 +35,7 @@ dist/
 *.h5
 *.parquet
 *.mp4
+!/docs/assets/autosimsota-intro.mp4
 *.zip
 *.tar
 *.tar.gz

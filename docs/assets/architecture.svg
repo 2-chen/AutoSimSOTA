@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
+  <title id="title">AutoSimSOTA 研究流程</title>
+  <desc id="desc">已有仓库与只读资源进入隔离运行，主 Agent 调度研究职责，在执行和证据之间循环。技能按需读取，报告与可信产物作为输出。图示职责，不保证所有仓库已通过闭环验收。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#79c9ff"/></marker></defs>
+  <rect width="1280" height="560" rx="20" fill="#0e182b"/>
+  <g font-family="'Noto Sans CJK SC','Microsoft YaHei',sans-serif">
+    <text x="36" y="45" font-size="14" fill="#73e2c6" letter-spacing="2">THE RESEARCH LOOP</text>
+    <text x="36" y="82" font-size="26" font-weight="700" fill="#ecf2ff">Agent 决策，执行器核验，证据驱动下一步。</text>
+    <rect x="32" y="128" width="246" height="132" rx="14" fill="#18263d" stroke="#334565"/>
+    <text x="52" y="163" font-size="19" fill="#ecf2ff">已有 benchmark 仓库</text>
+    <text x="52" y="195" font-size="14" fill="#a6b5ce">当前工作树 → 隔离源码副本</text>
+    <text x="52" y="225" font-size="14" fill="#a6b5ce">数据 / 资产 / 权重 → 只读连接</text>
+    <path d="M278 194H318" stroke="#79c9ff" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="330" y="128" width="544" height="292" rx="16" fill="#142c38" stroke="#73e2c6" stroke-opacity=".7"/>
+    <text x="352" y="164" font-size="22" font-weight="700" fill="#73e2c6">Main Agent · 全局研究上下文</text>
+    <text x="352" y="194" font-size="14" fill="#afc5d1">阅读代码 · 选择技能 · 安排作业 · 采纳证据 · 恢复研究</text>
+    <rect x="352" y="222" width="232" height="67" rx="10" fill="#192943"/>
+    <text x="367" y="248" font-size="15" fill="#ecf2ff">资源 / 目标 / 环境</text>
+    <text x="367" y="271" font-size="11" fill="#9baac4">Resource · Objective · Init</text>
+    <rect x="610" y="222" width="240" height="67" rx="10" fill="#192943"/>
+    <text x="626" y="248" font-size="15" fill="#ecf2ff">假设 / 实验 / 评测</text>
+    <text x="626" y="271" font-size="11" fill="#9baac4">Ideator · Scheduler</text>
+    <path d="M585 254H604" stroke="#79c9ff" marker-end="url(#arrow)"/>
+    <rect x="352" y="320" width="232" height="67" rx="10" fill="#192943"/>
+    <text x="367" y="346" font-size="15" fill="#ecf2ff">监控 / 故障修复</text>
+    <text x="367" y="369" font-size="11" fill="#9baac4">Monitor · Fix → 复验原操作</text>
+    <rect x="610" y="320" width="240" height="67" rx="10" fill="#192943"/>
+    <text x="626" y="346" font-size="15" fill="#ecf2ff">有效性监督 / 证据</text>
+    <text x="626" y="369" font-size="11" fill="#9baac4">Supervisor · 协议与身份核验</text>
+    <path d="M730 290V313" fill="none" stroke="#79c9ff" marker-end="url(#arrow)"/>
+    <path d="M608 353H591" fill="none" stroke="#79c9ff" marker-end="url(#arrow)"/>
+    <path d="M468 319V297" fill="none" stroke="#79c9ff" marker-end="url(#arrow)"/>
+    <rect x="32" y="292" width="246" height="128" rx="14" fill="#211f3b" stroke="#b5a4ff" stroke-opacity=".5"/>
+    <text x="52" y="327" font-size="19" fill="#b5a4ff">技能 / Ideas / 运行记忆</text>
+    <text x="52" y="359" font-size="14" fill="#a6b5ce">短目录 → Agent 主动读取</text>
+    <text x="52" y="387" font-size="14" fill="#a6b5ce">方法建议 ≠ 硬编码决策</text>
+    <path d="M278 355H318" stroke="#79c9ff" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M875 260H907" stroke="#79c9ff" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="922" y="128" width="326" height="292" rx="14" fill="#18263d" stroke="#334565"/>
+    <text x="944" y="164" font-size="20" fill="#ecf2ff">可追溯的研究输出</text>
+    <text x="944" y="207" font-size="16" fill="#79c9ff">RUN.md / RUN.html</text>
+    <text x="944" y="235" font-size="14" fill="#a6b5ce">进度 · 对比 · demo · 失败与修复</text>
+    <path d="M944 258H1223" stroke="#334565"/>
+    <text x="944" y="292" font-size="16" fill="#73e2c6">指标 / 产物 / 操作证据</text>
+    <text x="944" y="320" font-size="14" fill="#a6b5ce">实际策略 → rollout → 正式计分</text>
+    <text x="944" y="367" font-size="14" fill="#f3b86b">无提升、缺资源同样如实记录</text>
+    <rect x="32" y="448" width="1216" height="74" rx="12" fill="#19233a"/>
+    <text x="53" y="478" font-size="16" fill="#ecf2ff">执行边界</text>
+    <text x="53" y="505" font-size="14" fill="#a6b5ce">保护源仓库 · 显式资源访问 · 长期作业调度 · 总预算约束 · 冻结评测协议 · 不伪造结果</text>
+  </g>
+</svg>
