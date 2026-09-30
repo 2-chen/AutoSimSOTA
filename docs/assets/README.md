@@ -4,13 +4,23 @@
 
 | 文件 | 用途 |
 | :--- | :--- |
-| `hero.svg` | 项目横幅 |
-| `architecture.svg` | 研究职责与证据流概念图 |
-| `run-preview.svg` | 人类可读研究记录的界面示意，非真实运行截图 |
+| `hero.png` / `hero.svg` | 项目横幅：PNG 展示，SVG 编辑源 |
+| `architecture.png` / `architecture.svg` | 研究职责与证据流概念图 |
+| `run-preview.png` / `run-preview.svg` | 人类可读研究记录的界面示意，非真实运行截图 |
 | `intro.gif` | GitHub README 可直接展示的循环预览 |
 | `autosimsota-intro.mp4` | 24 秒无声流程介绍视频，非仿真录像 |
 
-动画全部由代码绘制，不使用模型生成的仿真画面，不含实测分数、真实轨迹、密钥或 run 内数据。GitHub Markdown 不保证内嵌 `<video>` 播放，因此首页采用 GIF 预览加 MP4 链接。
+动画全部由代码绘制，不使用模型生成的仿真画面，不含实测分数、真实轨迹、密钥或 run 内数据。首页使用 PNG 配图与 GIF 动画，避免依赖 SVG 文件预览器；图像采用绝对原始文件 URL，兼容不解析仓库相对路径的 Markdown 阅读器。MP4 链接仅提供下载后播放，不承诺 GitHub 文件页在线播放。
+
+## 重新生成 PNG 配图
+
+系统 Python 需要 PyGObject 与 Rsvg 2.0（Linux 常见包为 `python3-gi`、`gir1.2-rsvg-2.0`），并准备中文字体。示例使用系统 Python，不改动研究任务环境：
+
+```bash
+/usr/bin/python3 tools/render_readme_images.py
+```
+
+脚本将本目录三个 SVG 编辑源重新渲染为同名 PNG；仅使用 CPU。
 
 ## 重新生成动画
 
