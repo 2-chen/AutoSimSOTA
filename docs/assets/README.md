@@ -9,8 +9,8 @@
 | `hero.svg` / `hero.png` | 插画与代码排版组成的项目封面 |
 | `architecture.svg` / `architecture.png` | 原生可编辑概念图：主 Agent、资源、技能、实验与证据 |
 | `run-preview.svg` / `run-preview.png` | 中文研究笔记设计示意，指标均标待评测，非运行截图 |
-| `intro-poster.png` / `intro.gif` | 视频静态封面 / README 可播放预览 |
-| `autosimsota-intro.mp4` | 24 秒、1280×720、24fps、无声 H.264 项目短片 |
+| `intro-poster.png` / `intro.gif` | 视频静态封面 / 20fps、640×360 备用预览 |
+| `autosimsota-intro.mp4` | 24 秒、1280×720、60fps、无声 H.264 Baseline 项目短片 |
 | `IMAGE_PROMPT.md` | 生图最终提示词、来源和视觉边界 |
 
 ## 图片重渲染
@@ -31,6 +31,7 @@ python tools/render_intro.py --output docs/assets
 
 需要 Pillow、FFmpeg（libx264）、中文字体及保存在仓库中的概念插画。
 Python 绘制独立字体/几何动画层；FFmpeg 为插画添加平缓镜头移动并合成。
+视频使用固定帧率、每秒一个关键帧、无 B 帧及 faststart；章节直接交叉淡化，避免闪回背景。
 仅用 CPU，两条编码线程，不修改研究环境，不使用实验 GPU，不重新调用生图模型。
 可用 `--font`、`--ffmpeg`、`--art` 指定资源。`--poster-only` 仅生成预览封面。
 
@@ -39,9 +40,9 @@ Python 绘制独立字体/几何动画层；FFmpeg 为插画添加平缓镜头�
 
 README 主视频使用 GitHub 附件地址，以独立段落呈现原生播放器，无需下载：
 
-https://github.com/user-attachments/assets/1f9d0d5b-4012-4151-b350-6d19e78a0578
+https://github.com/user-attachments/assets/65446eae-3ae1-4b80-a300-0b5fbb4994ed
 
-该附件对应本目录的 `autosimsota-intro.mp4`（2026-10-03 Editorial Robotics 版）。
+该附件对应本目录的 `autosimsota-intro.mp4`（2026-10-03 Editorial Robotics 60fps 版）。
 更新视频文件不会同步更新已上传的附件；重做视频后须重新上传并替换 README 地址。
 PNG 使用原始文件 URL，GIF / MP4 下载链接保留作其他 Markdown 阅读器的备用方式。
 所有生成素材都保存在项目目录，不能只依赖模型工具的个人缓存路径。

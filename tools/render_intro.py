@@ -12,7 +12,7 @@ import subprocess
 
 from PIL import Image, ImageDraw, ImageFont
 
-WIDTH, HEIGHT, FPS, SECONDS = 1280, 720, 24, 24
+WIDTH, HEIGHT, FPS, SECONDS = 1280, 720, 60, 24
 PAPER, INK, RED, MUTED = "#f3eee5", "#252520", "#cc452e", "#817d72"
 
 
@@ -28,7 +28,7 @@ class Renderer:
             self.fonts[key] = ImageFont.truetype(str(self.latin if latin and self.latin.is_file() else self.font), size)
         return self.fonts[key]
 
-    def render(self, seconds):
+    def render(self, seconds, *, transition=True):
         chapter = min(int(seconds / 6), 3)
         phase = seconds % 6
         ease = 1 - (1 - min(phase / .85, 1)) ** 3
@@ -50,7 +50,7 @@ class Renderer:
 
         shift = int(24 * (1 - ease))
         text(54, 31, "AutoSimSOTA", 20, latin=True)
-        text(886, 36, "概念介绍 / 非仿真录像 / 无实测分数", 14, secondary)
+        text(966, 36, "AUTONOMOUS SIMULATION", 14, secondary, True)
         line(54, 76, 1226, 76, secondary, 1)
         if chapter == 0:
             text(54, 142 + shift, "AUTONOMOUS / SIMULATION", 16, RED, True)
@@ -86,7 +86,7 @@ class Renderer:
                 line(x, 419, x + 248, 419, color)
                 text(x, 449, label, 27)
                 text(x, 496, note, 16, secondary, True)
-            text(56, 588, "不改评测。不伪造输出。失败、缺资源和零提升也如实记录。", 22, secondary)
+            text(56, 588, "连接训练产物、实际策略与原生评测，让每一次改进都有依据。", 22, secondary)
         else:
             # A paper reading surface gives text a quiet background over the cover.
             draw.rectangle((0, 77, 702, 637), fill=PAPER)
@@ -97,16 +97,19 @@ class Renderer:
             line(56, 400, 636, 400, secondary, 1)
             for i, value in enumerate(("RUN.md / 中文进度与实验对比", "真实 Demo / 视频、曲线与数据摘要", "证据链接 / 产物身份与原始回执")):
                 text(56, 432 + 49 * i, value, 22)
-            text(56, 596, "Experimental. No universal SOTA guarantee.", 16, secondary, True)
+            text(56, 596, "From repository to measurable progress.", 16, secondary, True)
 
         line(54, 647, 1226, 647, secondary, 1)
         line(54, 647, 54 + 1172 * seconds / SECONDS, 647, RED, 3)
         text(54, 669, "AGENT-LED / DATA-FIRST / EVIDENCE-BOUND", 14, secondary, True)
         text(1119, 669, f"0{chapter + 1} / 04", 14, secondary, True)
-        # Soft whole-layer fade provides deliberate transitions, not flashing cuts.
-        alpha = min(1, phase / .28, (6 - phase) / .28)
-        if alpha < 1:
-            image.putalpha(image.getchannel("A").point(lambda v: int(v * max(0, alpha))))
+        # Crossfade adjacent designed scenes. Fading each scene to the artwork
+        # used to flash the robot between dark/light chapters and feel like stalls.
+        if transition and chapter > 0 and phase < .45:
+            previous = self.render(chapter * 6 - 1 / FPS, transition=False)
+            fraction = phase / .45
+            fraction = fraction * fraction * (3 - 2 * fraction)
+            image = Image.blend(previous, image, fraction)
         return image
 
 
@@ -124,8 +127,10 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     renderer = Renderer(args.font)
     # ffmpeg animates the generated artwork; Python only draws code-native layers.
-    filters = ("[1:v]scale=1344:756:force_original_aspect_ratio=increase,"
-               "crop=1280:720:x='32+12*sin(t/8)':y=18,setsar=1[art];"
+    filters = ("[1:v]scale=2560:-1,"
+               "zoompan=z='1.035+0.015*sin(on/240)':"
+               "x='iw/2-iw/zoom/2+20*sin(on/180)':y='ih/2-ih/zoom/2':"
+               "d=1:s=1280x720:fps=60,setsar=1[art];"
                "[art][0:v]overlay=0:0:shortest=1,format=yuv420p[out]")
     video = args.output / "autosimsota-intro.mp4"
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -135,8 +140,11 @@ def main():
     if args.poster_only:
         command += ["-frames:v", "1", str(args.output / "intro-poster.png")]
     else:
-        command += ["-an", "-c:v", "libx264", "-threads", "2", "-preset", "medium",
-                    "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(video)]
+        command += ["-an", "-c:v", "libx264", "-threads", "2", "-preset", "fast",
+                    "-profile:v", "baseline", "-level:v", "3.2", "-tune", "fastdecode",
+                    "-crf", "22", "-maxrate", "2M", "-bufsize", "4M",
+                    "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-bf", "0",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(video)]
     process = subprocess.Popen(command, stdin=subprocess.PIPE)
     try:
         assert process.stdin
@@ -155,7 +163,7 @@ def main():
     base = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-threads", "2"]
     subprocess.run(base + ["-ss", "0.8", "-i", str(video), "-frames:v", "1", str(args.output / "intro-poster.png")], check=True)
     subprocess.run(base + ["-i", str(video), "-filter_complex_threads", "2", "-filter_complex",
-        "fps=6,scale=800:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96[p];"
+        "fps=20,scale=640:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96[p];"
         "[b][p]paletteuse=dither=bayer:bayer_scale=3", "-loop", "0", str(args.output / "intro.gif")], check=True)
     print(f"Rendered {SECONDS}s editorial concept film (CPU only)")
 

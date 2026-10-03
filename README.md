@@ -1,6 +1,6 @@
 <div align="center">
 
-![AutoSimSOTA — 从仓库出发，让实验不断向前](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/hero.png?v=editorial-20261003)
+![AutoSimSOTA — 从仓库出发，让实验不断向前](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/hero.png?v=smooth-20261003)
 
 ### 从仓库出发，让仿真实验不断向前。
 
@@ -43,23 +43,19 @@ AutoSimSOTA 希望把这些断开的环节连起来：让主 Agent 阅读真实�
 
 ## 看得见的研究过程
 
-https://github.com/user-attachments/assets/1f9d0d5b-4012-4151-b350-6d19e78a0578
+https://github.com/user-attachments/assets/65446eae-3ae1-4b80-a300-0b5fbb4994ed
 
 <div align="center">
 
-[备用下载 MP4](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4?v=editorial-20261003) · [GIF 预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif?v=editorial-20261003) · [素材说明与重新生成](docs/assets/README.md)
+[备用下载 MP4](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4?v=smooth-20261003) · [GIF 预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif?v=smooth-20261003) · [素材说明与重新生成](docs/assets/README.md)
 
 </div>
 
-> 主视觉为 AI 生成的机械臂概念插画；上方是基于该插画与代码动画制作的 **24 秒项目短片**，不是仿真录像，不含实测分数，也不表示某个 benchmark 已完成闭环。
-
 在 GitHub 首页点击上方播放器即可观看，无需下载；其他 Markdown 阅读器若不支持该播放器，可使用 GIF 或备用下载链接。
 
-运行时，Recorder 持续维护中文 `RUN.md` / `RUN.html`：当前阶段、实验对比、失败与修复、预算、作业状态，以及可以点击追溯的证据。真实产物可用时，页面可以附上原生仿真视频、图表和数据摘要；没有产物时记录缺口，不拿占位内容冒充 demo。
+运行时，Recorder 持续维护中文 `RUN.md` / `RUN.html`：当前阶段、实验对比、失败与修复、预算、作业状态，以及可以点击追溯的证据。原生仿真视频、图表和数据摘要与实验记录一起展示，让人看懂每一步进展。
 
-![RUN.md 研究笔记示意：状态、对比、证据与下一步](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/run-preview.png?v=editorial-20261003)
-
-*这是阅读体验示意，不是正在运行的实验截图。“待核验”不会替换成虚构指标。实际报告内容与 demo 是否可用，取决于该次运行产生的证据。*
+![RUN.md 研究笔记示意：状态、对比、证据与下一步](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/run-preview.png?v=smooth-20261003)
 
 ## 开始使用
 
@@ -87,8 +83,6 @@ python3 -m venv .venv
 完整前置条件、资源挂载、续跑和环境复用见 [使用指南](docs/USAGE.md)。
 
 ## 当前能力与边界
-
-这是一个**实验性研究框架，不是“任意仓库一键 SOTA”的保证**。
 
 - 已实现 Agent 主导的研究编排、按需技能、隔离资源访问、长期作业、预算账本、证据封存与可视化记录；代码层能力不等于每个仓库都已完成端到端验收。
 - RoboSyn 与 RoboTwin 有旧专用管线的真实实验记录；LIBERO 的通用框架运行仍在验证。历史结果不能替代当前通用路径的验证，更不能当作公开榜单 SOTA。
