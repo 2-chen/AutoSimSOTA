@@ -37,5 +37,11 @@ Python 绘制独立字体/几何动画层；FFmpeg 为插画添加平缓镜头�
 四章依次介绍仓库驱动、数据优先、产物身份与评测证据链、中文研究记录。
 流程线的动画是概念说明，不是训练进度、性能曲线或机械臂运动仿真。
 
-README 使用原始文件 URL；GIF 可内嵌，MP4 提供下载播放链接，不依赖 GitHub 文件页视频预览。
+README 主视频使用 GitHub 附件地址，以独立段落呈现原生播放器，无需下载：
+
+https://github.com/user-attachments/assets/1f9d0d5b-4012-4151-b350-6d19e78a0578
+
+该附件对应本目录的 `autosimsota-intro.mp4`（2026-10-03 Editorial Robotics 版）。
+更新视频文件不会同步更新已上传的附件；重做视频后须重新上传并替换 README 地址。
+PNG 使用原始文件 URL，GIF / MP4 下载链接保留作其他 Markdown 阅读器的备用方式。
 所有生成素材都保存在项目目录，不能只依赖模型工具的个人缓存路径。

@@ -43,17 +43,17 @@ AutoSimSOTA 希望把这些断开的环节连起来：让主 Agent 阅读真实�
 
 ## 看得见的研究过程
 
-![AutoSimSOTA 项目介绍短片](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif?v=editorial-20261003)
+https://github.com/user-attachments/assets/1f9d0d5b-4012-4151-b350-6d19e78a0578
 
 <div align="center">
 
-[↓ 下载 24 秒 MP4 介绍视频](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4?v=editorial-20261003) · [静态预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro-poster.png?v=editorial-20261003) · [素材说明与重新生成](docs/assets/README.md)
+[备用下载 MP4](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4?v=editorial-20261003) · [GIF 预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif?v=editorial-20261003) · [素材说明与重新生成](docs/assets/README.md)
 
 </div>
 
 > 主视觉为 AI 生成的机械臂概念插画；上方是基于该插画与代码动画制作的 **24 秒项目短片**，不是仿真录像，不含实测分数，也不表示某个 benchmark 已完成闭环。
 
-GIF 可直接预览；MP4 请下载后播放，不依赖 GitHub 的文件预览器。
+在 GitHub 首页点击上方播放器即可观看，无需下载；其他 Markdown 阅读器若不支持该播放器，可使用 GIF 或备用下载链接。
 
 运行时，Recorder 持续维护中文 `RUN.md` / `RUN.html`：当前阶段、实验对比、失败与修复、预算、作业状态，以及可以点击追溯的证据。真实产物可用时，页面可以附上原生仿真视频、图表和数据摘要；没有产物时记录缺口，不拿占位内容冒充 demo。
 
