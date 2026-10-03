@@ -1,41 +1,41 @@
-# 首页展示素材
+# Editorial Robotics / 展示素材
 
-本目录素材用于解释项目，不是实验成果。
+暖纸白、炭黑与朱红。用机械臂雕塑感、编辑式大字和留白替代默认蓝色 dashboard。
+所有素材用于项目介绍，不是实验成果；不含真实轨迹、实测分数、密钥或 run 数据。
 
-| 文件 | 用途 |
+| 文件 | 来源与用途 |
 | :--- | :--- |
-| `hero.png` / `hero.svg` | 项目横幅：PNG 展示，SVG 编辑源 |
-| `architecture.png` / `architecture.svg` | 研究职责与证据流概念图 |
-| `run-preview.png` / `run-preview.svg` | 人类可读研究记录的界面示意，非真实运行截图 |
-| `intro.gif` | GitHub README 可直接展示的循环预览 |
-| `autosimsota-intro.mp4` | 24 秒无声流程介绍视频，非仿真录像 |
+| `robotics-cover.png` | 内置 imagegen 生成的机械臂概念插画，原始输出保留，不是仿真截图 |
+| `hero.svg` / `hero.png` | 插画与代码排版组成的项目封面 |
+| `architecture.svg` / `architecture.png` | 原生可编辑概念图：主 Agent、资源、技能、实验与证据 |
+| `run-preview.svg` / `run-preview.png` | 中文研究笔记设计示意，指标均标待评测，非运行截图 |
+| `intro-poster.png` / `intro.gif` | 视频静态封面 / README 可播放预览 |
+| `autosimsota-intro.mp4` | 24 秒、1280×720、24fps、无声 H.264 项目短片 |
+| `IMAGE_PROMPT.md` | 生图最终提示词、来源和视觉边界 |
 
-动画全部由代码绘制，不使用模型生成的仿真画面，不含实测分数、真实轨迹、密钥或 run 内数据。首页使用 PNG 配图与 GIF 动画，避免依赖 SVG 文件预览器；图像采用绝对原始文件 URL，兼容不解析仓库相对路径的 Markdown 阅读器。MP4 链接仅提供下载后播放，不承诺 GitHub 文件页在线播放。
-
-## 重新生成 PNG 配图
-
-系统 Python 需要 PyGObject 与 Rsvg 2.0（Linux 常见包为 `python3-gi`、`gir1.2-rsvg-2.0`），并准备中文字体。示例使用系统 Python，不改动研究任务环境：
+## 图片重渲染
 
 ```bash
 /usr/bin/python3 tools/render_readme_images.py
 ```
 
-脚本将本目录三个 SVG 编辑源重新渲染为同名 PNG；仅使用 CPU。
+需要 PyGObject、Rsvg 2.0、Lato 与 Noto Sans CJK 字体。`hero.svg` 相对引用原始
+`robotics-cover.png`，须保留在同一目录；架构图与预览不依赖生成模型。
+首页使用最终 PNG 而不是 SVG，避免不同 Markdown 阅读器的 SVG 限制。
 
-## 重新生成动画
-
-在独立的素材工具环境安装 Pillow，准备 FFmpeg（含 libx264 编码器）和中文字体；不要为生成素材更改正在运行研究任务的环境。脚本仅使用 CPU，默认编码线程为 2，不调用模型 API 或 GPU。
-
-```bash
-python tools/render_intro.py --font /absolute/NotoSansCJK-Regular.ttc \
-  --ffmpeg /absolute/ffmpeg --output docs/assets
-```
-
-输出 MP4、GIF 和用于检查的首帧 `intro-poster.png`。可以仅生成一帧来检查中文与排版：
+## 视频重渲染
 
 ```bash
-python tools/render_intro.py --font /absolute/NotoSansCJK-Regular.ttc \
-  --output /tmp/autosim-intro-preview --poster-only
+python tools/render_intro.py --output docs/assets
 ```
 
-静态 SVG 无脚本、无外部素材依赖，可直接编辑与审阅。
+需要 Pillow、FFmpeg（libx264）、中文字体及保存在仓库中的概念插画。
+Python 绘制独立字体/几何动画层；FFmpeg 为插画添加平缓镜头移动并合成。
+仅用 CPU，两条编码线程，不修改研究环境，不使用实验 GPU，不重新调用生图模型。
+可用 `--font`、`--ffmpeg`、`--art` 指定资源。`--poster-only` 仅生成预览封面。
+
+四章依次介绍仓库驱动、数据优先、产物身份与评测证据链、中文研究记录。
+流程线的动画是概念说明，不是训练进度、性能曲线或机械臂运动仿真。
+
+README 使用原始文件 URL；GIF 可内嵌，MP4 提供下载播放链接，不依赖 GitHub 文件页视频预览。
+所有生成素材都保存在项目目录，不能只依赖模型工具的个人缓存路径。

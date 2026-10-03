@@ -1,33 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="440" viewBox="0 0 1280 440" role="img" aria-labelledby="title desc">
-  <title id="title">AutoSimSOTA — 从仓库出发，让研究形成闭环</title>
-  <desc id="desc">深色项目横幅：Agent、Skills、Evidence 连接形成研究循环。此为概念图，不是实验截图。</desc>
-  <defs>
-    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1628"/><stop offset="1" stop-color="#151d38"/></linearGradient>
-    <linearGradient id="accent"><stop stop-color="#73e2c6"/><stop offset="1" stop-color="#79c9ff"/></linearGradient>
-    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity=".035"/></pattern>
-  </defs>
-  <rect width="1280" height="440" rx="24" fill="url(#bg)"/>
-  <rect width="1280" height="440" rx="24" fill="url(#grid)"/>
-  <g font-family="'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif">
-    <rect x="58" y="48" width="322" height="32" rx="16" fill="#73e2c6" fill-opacity=".1"/>
-    <circle cx="78" cy="64" r="4" fill="#73e2c6"/>
-    <text x="93" y="70" font-size="12" letter-spacing="1.8" fill="#73e2c6">AUTONOMOUS SIMULATION RESEARCH</text>
-    <text x="56" y="166" font-size="64" font-weight="700" fill="#f1f5ff">AutoSimSOTA<tspan fill="#73e2c6">.</tspan></text>
-    <text x="60" y="222" font-size="28" fill="#e1e9f6">从仓库出发，让研究形成闭环。</text>
-    <text x="60" y="271" font-size="17" fill="#9baac4">理解代码 · 原生实验 · 自主修复 · 可信评测</text>
-    <rect x="60" y="331" width="146" height="38" rx="9" fill="#73e2c6" fill-opacity=".1" stroke="#73e2c6" stroke-opacity=".35"/>
-    <text x="133" y="356" text-anchor="middle" font-size="14" fill="#73e2c6">AGENT-LED</text>
-    <rect x="218" y="331" width="172" height="38" rx="9" fill="#79c9ff" fill-opacity=".08" stroke="#79c9ff" stroke-opacity=".35"/>
-    <text x="304" y="356" text-anchor="middle" font-size="14" fill="#79c9ff">EVIDENCE-FIRST</text>
-    <text x="60" y="410" font-size="12" fill="#7f90ae">Experimental framework · No universal SOTA guarantee</text>
-    <circle cx="986" cy="217" r="133" fill="none" stroke="#475373" stroke-width="1" stroke-dasharray="5 9"/>
-    <path d="M915 109L1082 169L985 327Z" fill="none" stroke="url(#accent)" stroke-width="2" stroke-opacity=".55"/>
-    <rect x="846" y="74" width="137" height="66" rx="13" fill="#192943" stroke="#73e2c6" stroke-opacity=".6"/>
-    <text x="914" y="114" text-anchor="middle" font-size="20" fill="#73e2c6">Skills</text>
-    <rect x="1001" y="149" width="165" height="74" rx="13" fill="#192943" stroke="#79c9ff" stroke-opacity=".6"/>
-    <text x="1083" y="195" text-anchor="middle" font-size="22" fill="#79c9ff">Main Agent</text>
-    <rect x="903" y="296" width="165" height="66" rx="13" fill="#192943" stroke="#b5a4ff" stroke-opacity=".6"/>
-    <text x="985" y="336" text-anchor="middle" font-size="20" fill="#b5a4ff">Evidence</text>
-    <text x="986" y="256" text-anchor="middle" font-size="13" fill="#9baac4">reason → act → verify</text>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+<title id="title">AutoSimSOTA — Autonomous simulation, grounded in evidence</title><desc id="desc">机械臂为 AI 生成概念插画，不是实验画面。</desc>
+<rect width="1600" height="900" fill="#f3eee5"/><image href="robotics-cover.png" width="1600" height="900" preserveAspectRatio="xMidYMid slice"/>
+<g font-family="Lato, Noto Sans CJK SC, sans-serif" fill="#252520">
+<path d="M72 76h48" stroke="#cc452e" stroke-width="5"/><text x="136" y="82" font-size="18" letter-spacing="3">AUTONOMOUS SIMULATION RESEARCH</text>
+<text x="68" y="326" font-size="116" font-weight="900" letter-spacing="-5">AutoSim</text><text x="68" y="446" font-size="116" font-weight="900" letter-spacing="-5">SOTA<tspan fill="#cc452e">.</tspan></text>
+<text x="76" y="520" font-size="29">从仓库出发。让实验不断向前。</text><text x="76" y="564" font-size="19" fill="#68675f">读代码 · 采数据 · 训策略 · 验证提升</text>
+<path d="M76 775h1448" stroke="#817d72" stroke-opacity=".4"/><text x="76" y="816" font-size="16" letter-spacing="2">AGENT-LED / DATA-FIRST / EVIDENCE-BOUND</text><text x="1524" y="816" text-anchor="end" font-size="15" fill="#68675f">CONCEPT ART · NOT EXPERIMENT FOOTAGE</text>
+</g></svg>

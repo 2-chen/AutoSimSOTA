@@ -1,13 +1,14 @@
 <div align="center">
 
-![AutoSimSOTA — 从仓库出发，让研究形成闭环](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/hero.png)
+![AutoSimSOTA — 从仓库出发，让实验不断向前](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/hero.png?v=editorial-20261003)
 
-### 让 Agent 做研究，让证据说话。
+### 从仓库出发，让仿真实验不断向前。
 
-面向具身仿真 benchmark 的自主研究系统。<br>
-从已有仓库出发，理解环境与资源、复现基线、提出改进、运行实验，并留下可追溯的研究记录。
+面向具身仿真 benchmark 的 Agent 驱动指标优化系统。<br>
+理解代码与资源、连接原生采集、训练策略、运行评测；每一次尝试，都留下可追溯的依据。
 
-**Experimental · Python 3.10+ · Agent-led · Evidence-first**
+**Agent-led / Data-first / Evidence-bound**<br>
+Experimental · Python 3.10+
 
 [项目理念](#为什么做-autosimsota) · [工作流程](#它如何开展研究) · [可视化预览](#看得见的研究过程) · [开始使用](#开始使用) · [更新日志](CHANGELOG.md)
 
@@ -30,7 +31,7 @@ AutoSimSOTA 希望把这些断开的环节连起来：让主 Agent 阅读真实�
 
 ## 它如何开展研究
 
-![仓库输入、主 Agent 研究循环与证据输出](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/architecture.png)
+![仓库输入、主 Agent 研究循环与证据输出](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/architecture.png?v=editorial-20261003)
 
 **主 Agent 掌握研究上下文。** 它决定读什么、调用哪些技能、安排调查与实验，以及继续修复、换方向还是声明资源不足。Resource、Objective、Init、Monitor、Fix、Ideator、Scheduler、Supervisor 是研究职责，不意味着固定启动八个独立模型进程。
 
@@ -42,21 +43,21 @@ AutoSimSOTA 希望把这些断开的环节连起来：让主 Agent 阅读真实�
 
 ## 看得见的研究过程
 
-![AutoSimSOTA 研究流程介绍动画](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif)
+![AutoSimSOTA 项目介绍短片](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro.gif?v=editorial-20261003)
 
 <div align="center">
 
-[↓ 下载 24 秒 MP4 介绍视频](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4) · [静态预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro-poster.png) · [素材说明与重新生成](docs/assets/README.md)
+[↓ 下载 24 秒 MP4 介绍视频](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/autosimsota-intro.mp4?v=editorial-20261003) · [静态预览](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/intro-poster.png?v=editorial-20261003) · [素材说明与重新生成](docs/assets/README.md)
 
 </div>
 
-> 上方是代码生成的**流程介绍动画**，不是仿真录像，不包含实测分数，也不表示某个 benchmark 已完成闭环。
+> 主视觉为 AI 生成的机械臂概念插画；上方是基于该插画与代码动画制作的 **24 秒项目短片**，不是仿真录像，不含实测分数，也不表示某个 benchmark 已完成闭环。
 
 GIF 可直接预览；MP4 请下载后播放，不依赖 GitHub 的文件预览器。
 
 运行时，Recorder 持续维护中文 `RUN.md` / `RUN.html`：当前阶段、实验对比、失败与修复、预算、作业状态，以及可以点击追溯的证据。真实产物可用时，页面可以附上原生仿真视频、图表和数据摘要；没有产物时记录缺口，不拿占位内容冒充 demo。
 
-![RUN.md 研究工作台示意：状态、对比、证据与下一步](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/run-preview.png)
+![RUN.md 研究笔记示意：状态、对比、证据与下一步](https://raw.githubusercontent.com/2-chen/AutoSimSOTA/main/docs/assets/run-preview.png?v=editorial-20261003)
 
 *这是阅读体验示意，不是正在运行的实验截图。“待核验”不会替换成虚构指标。实际报告内容与 demo 是否可用，取决于该次运行产生的证据。*
 

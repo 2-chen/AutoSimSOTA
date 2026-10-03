@@ -1,37 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="660" viewBox="0 0 1280 660" role="img" aria-labelledby="title desc">
-  <title id="title">RUN.md 人类可读研究工作台示意</title>
-  <desc id="desc">概念界面，不是真实运行截图。展示中文进展、baseline 与候选对比、证据链接及 demo 位置；不含实测指标。</desc>
-  <rect width="1280" height="660" rx="20" fill="#0e182b"/>
-  <g font-family="'Noto Sans CJK SC','Microsoft YaHei',sans-serif">
-    <circle cx="30" cy="28" r="5" fill="#f58b9b"/><circle cx="48" cy="28" r="5" fill="#f3b86b"/><circle cx="66" cy="28" r="5" fill="#73e2c6"/>
-    <text x="92" y="34" font-size="13" fill="#9baac4">RUN.md / 研究工作台</text>
-    <rect x="1010" y="15" width="237" height="27" rx="13" fill="#f3b86b" fill-opacity=".12"/>
-    <text x="1128" y="34" text-anchor="middle" font-size="12" fill="#f3b86b">界面示意 · 非真实运行 · 无实测数值</text>
-    <path d="M0 55H1280" stroke="#283954"/>
-    <text x="36" y="104" font-size="28" font-weight="700" fill="#ecf2ff">这次实验，进行到哪里了？</text>
-    <text x="36" y="137" font-size="15" fill="#a6b5ce">先讲结论，再给原因与证据。让人读懂研究，而不只是读懂日志。</text>
-    <rect x="36" y="169" width="780" height="116" rx="12" fill="#142c38" stroke="#73e2c6" stroke-opacity=".3"/>
-    <text x="56" y="200" font-size="16" fill="#73e2c6">发生了什么</text>
-    <text x="56" y="233" font-size="16" fill="#ecf2ff">报告应说明：当前阶段、已核验事实、阻碍及下一步。</text>
-    <text x="56" y="260" font-size="13" fill="#a6b5ce">为什么这样做 → 引用操作证据 → 明确尚未证实的推断</text>
-    <rect x="844" y="169" width="400" height="116" rx="12" fill="#192943"/>
-    <text x="865" y="200" font-size="16" fill="#79c9ff">预算与作业</text>
-    <text x="865" y="233" font-size="14" fill="#ecf2ff">GPU / 墙钟 / 模型费用：读取真实账本</text>
-    <text x="865" y="260" font-size="13" fill="#a6b5ce">排队、运行、修复、停止：不混成一个状态</text>
-    <text x="36" y="327" font-size="20" fill="#ecf2ff">实验对比</text>
-    <rect x="36" y="345" width="1208" height="137" rx="10" fill="#18263d"/>
-    <rect x="36" y="345" width="1208" height="38" rx="10" fill="#23344e"/>
-    <g font-size="14"><text x="56" y="370" fill="#a6b5ce">实验</text><text x="370" y="370" fill="#a6b5ce">正式指标</text><text x="611" y="370" fill="#a6b5ce">策略身份</text><text x="890" y="370" fill="#a6b5ce">原生 rollout / 证据</text>
-    <text x="56" y="410" fill="#ecf2ff">Baseline · 官方原生路径</text><text x="370" y="410" fill="#f3b86b">待评测</text><text x="611" y="410" fill="#ecf2ff">待核验</text><text x="890" y="410" fill="#a6b5ce">须引用实际产物</text>
-    <path d="M55 430H1225" stroke="#334565"/>
-    <text x="56" y="462" fill="#ecf2ff">Candidate · Agent 提出的假设</text><text x="370" y="462" fill="#f3b86b">未确认</text><text x="611" y="462" fill="#ecf2ff">待核验</text><text x="890" y="462" fill="#a6b5ce">筛选分数 ≠ 正式提升</text></g>
-    <rect x="36" y="506" width="584" height="114" rx="12" fill="#211f3b"/>
-    <text x="56" y="538" font-size="17" fill="#b5a4ff">Demo 与可视化</text>
-    <text x="56" y="571" font-size="14" fill="#ecf2ff">原生仿真视频 · 训练曲线 · 数据摘要</text>
-    <text x="56" y="597" font-size="13" fill="#a6b5ce">仅展示真实产物；不可用时说明原因，不填假图。</text>
-    <rect x="642" y="506" width="602" height="114" rx="12" fill="#192943"/>
-    <text x="662" y="538" font-size="17" fill="#79c9ff">下一步与证据入口</text>
-    <text x="662" y="571" font-size="14" fill="#ecf2ff">操作证据 ID → 错误诊断 → 修复 → 复验</text>
-    <text x="662" y="597" font-size="13" fill="#a6b5ce">结论能点回日志、配置、策略和评测，而非模型自述。</text>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="970" viewBox="0 0 1600 970" role="img" aria-labelledby="title desc">
+<title id="title">RUN.md：人类可读的研究笔记</title><desc id="desc">报告设计示意，所有指标待评测，没有虚构结果。</desc><rect width="1600" height="970" fill="#f3eee5"/>
+<g font-family="Lato, Noto Sans CJK SC, sans-serif" fill="#252520">
+<text x="72" y="67" font-size="16" letter-spacing="3" fill="#cc452e">02 / THE RESEARCH JOURNAL</text><text x="72" y="139" font-size="48" font-weight="700">RUN.md<tspan font-weight="400" fill="#a69e90"> / </tspan>每一步，都留下依据。</text><text x="72" y="185" font-size="20" fill="#68675f">可读的进展说明，可信的实验对比，以及可以追溯的原生产物。</text><path d="M72 228h1456M934 269v566" stroke="#b8b0a2"/>
+<text x="72" y="289" font-size="15" letter-spacing="2" fill="#cc452e">LIVE NOTES</text><text x="72" y="347" font-size="29" font-weight="700">现在在做什么？</text><text x="72" y="395" font-size="21">先验证数据与策略入口，再运行同协议基线。</text><text x="72" y="433" font-size="19" fill="#68675f">安装完成不是验收通过；原生执行回执才是依据。</text><path d="M72 474h802" stroke="#d7cfc1"/>
+<text x="72" y="526" font-size="29" font-weight="700">这次实验改变了什么？</text><text x="72" y="573" font-size="21">候选、数据版本、训练产物和加载身份一起记录。</text><text x="72" y="611" font-size="19" fill="#68675f">指标缺失就说明缺口，不把占位内容写成研究成果。</text><path d="M72 652h802" stroke="#d7cfc1"/>
+<text x="72" y="704" font-size="29" font-weight="700">下一步，为什么？</text><text x="72" y="751" font-size="21">修复有证据的问题，或继续评测已完成的候选。</text><text x="72" y="789" font-size="19" fill="#68675f">失败保留原始原因，恢复后复验，不用重跑掩盖问题。</text>
+<text x="987" y="289" font-size="15" letter-spacing="2" fill="#cc452e">COMPARISON / SAME PROTOCOL</text><text x="987" y="345" font-size="19" fill="#68675f">实验</text><text x="1236" y="345" font-size="19" fill="#68675f">指标</text><text x="1390" y="345" font-size="19" fill="#68675f">身份</text><path d="M987 366h541" stroke="#b8b0a2"/>
+<text x="987" y="413" font-size="23" font-weight="700">Baseline</text><text x="1236" y="413" font-size="20">待评测</text><text x="1390" y="413" font-size="20">待核验</text><text x="987" y="468" font-size="23" font-weight="700">Candidate</text><text x="1236" y="468" font-size="20">待评测</text><text x="1390" y="468" font-size="20">待核验</text><path d="M987 501h541" stroke="#b8b0a2"/>
+<text x="987" y="556" font-size="25" font-weight="700">Show the work.</text><circle cx="1001" cy="612" r="10" fill="#cc452e"/><path d="M1029 612h454" stroke="#cc452e" stroke-width="2"/><text x="987" y="658" font-size="20">原生视频 / 训练曲线 / 数据摘要</text><text x="987" y="696" font-size="18" fill="#68675f">真实产物可用时展示；没有就说明原因。</text><text x="987" y="769" font-size="16" letter-spacing="1" fill="#68675f">FACTS → INTERPRETATION → NEXT ACTION</text>
+<rect x="0" y="855" width="1600" height="115" fill="#252520"/><text x="72" y="920" font-size="21" fill="#f3eee5">阅读体验示意 · 非真实运行截图 · 不含实测分数</text><text x="1528" y="920" text-anchor="end" font-size="16" letter-spacing="2" fill="#f3eee5">EVIDENCE FIRST. ALWAYS.</text>
+</g></svg>
