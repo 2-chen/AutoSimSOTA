@@ -55,7 +55,7 @@ def capture_attempt_evidence(output: Path, *, attempt_id: str, log: Path,
 
 
 def read_attempt_evidence(output: Path, evidence_id: str, *, offset: int = 0,
-                          limit: int = 8000) -> dict[str, Any]:
+                          limit: int = 8000, path_encoder=None) -> dict[str, Any]:
     """Read a verified log slice by ID, never by a model-supplied filesystem path."""
     if not isinstance(evidence_id, str) or not _ID.fullmatch(evidence_id):
         raise ValueError("unsafe evidence id")
@@ -81,6 +81,9 @@ def read_attempt_evidence(output: Path, evidence_id: str, *, offset: int = 0,
     if (len(data) != record.get("log_bytes") or
             hashlib.sha256(data).hexdigest() != record.get("log_sha256")):
         raise ValueError("evidence log changed after capture")
+    excerpt = data[offset:offset + limit].decode('utf-8', 'replace')
+    if path_encoder is not None:
+        excerpt = path_encoder(excerpt)
     return {"evidence_id": evidence_id, "status": record.get("status"),
             "returncode": record.get("returncode"),
             "termination_reason": record.get("termination_reason"),
@@ -89,5 +92,4 @@ def read_attempt_evidence(output: Path, evidence_id: str, *, offset: int = 0,
             "metric_artifact": record.get("metric_artifact"),
             "log_bytes": len(data), "offset": offset,
             "next_offset": min(len(data), offset + limit),
-            "text": sanitize_model_text(data[offset:offset + limit].decode(
-                "utf-8", "replace"))}
+            "text": sanitize_model_text(excerpt)}

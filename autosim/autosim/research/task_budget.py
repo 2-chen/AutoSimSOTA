@@ -32,18 +32,22 @@ class TaskGPUBudget:
                 raise ValueError("GPU task budget identity changed")
             yield record
 
-    def initialize(self, repo: Path, cap_seconds: float = 86400):
-        if not math.isfinite(cap_seconds) or not 0 < cap_seconds <= 86400:
+    def initialize(self, repo: Path, cap_seconds: float | None = None):
+        if cap_seconds is not None and (not math.isfinite(cap_seconds) or not 0 < cap_seconds <= 86400):
             raise ValueError("task GPU cap must be within 24 hours")
         with self.locked() as record:
             if record is not None:
-                if record["repository"] != str(Path(repo).resolve()) or record["cap_seconds"] != cap_seconds:
+                saved_cap = record.get('cap_seconds')
+                if (not isinstance(saved_cap, (int, float)) or isinstance(saved_cap, bool)
+                        or not math.isfinite(saved_cap) or not 0 < saved_cap <= 86400):
+                    raise ValueError('saved task GPU cap must remain within 24 hours')
+                if record["repository"] != str(Path(repo).resolve()) or (cap_seconds is not None and record["cap_seconds"] != cap_seconds):
                     raise ValueError("cannot change a task's repository or GPU cap")
                 return
             atomic_json(self.path, {
                 "schema_version": 1, "task_id": uuid.uuid4().hex,
                 "output": str(self.output), "repository": str(Path(repo).resolve()),
-                "cap_seconds": cap_seconds, "charged_seconds": 0.0, "leases": {},
+                "cap_seconds": 86400 if cap_seconds is None else cap_seconds, "charged_seconds": 0.0, "leases": {},
                 "accounting": "physical-device exclusive lease occupancy; not kernel utilization"})
 
     @staticmethod

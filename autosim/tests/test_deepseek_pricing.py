@@ -62,7 +62,7 @@ def test_provider_usage_shapes_and_unknowns_fail_closed():
                                  at=dt.datetime(2026, 10, 11, tzinfo=dt.timezone.utc))
 
 
-def test_request_gate_reserves_before_forwarding_and_locks_unknown_usage():
+def test_request_gate_reserves_before_forwarding_and_retains_unknown_ceiling():
     ceiling = request_cost_ceiling_usd("deepseek-flash", 100, at=PEAK)
     gate = TurnCostGate(limit_usd=ceiling * 1.1, model="deepseek-flash")
     first = gate.reserve(model="deepseek-flash", max_tokens=100, at=PEAK)
@@ -73,7 +73,7 @@ def test_request_gate_reserves_before_forwarding_and_locks_unknown_usage():
     second = gate.reserve(model="deepseek-flash", max_tokens=100, at=PEAK)
     gate.settle(second, None)
     assert gate.snapshot()["unknown"]
-    with pytest.raises(DeepSeekGatewayError, match="unknown"):
+    with pytest.raises(DeepSeekGatewayError, match="cannot reserve"):
         gate.reserve(model="deepseek-flash", max_tokens=100, at=PEAK)
 
 
@@ -111,6 +111,12 @@ def test_loopback_gateway_forwards_with_upstream_key_and_accounts_usage(monkeypa
     with DeepSeekTurnGateway(upstream_base_url="https://api.deepseek.com/anthropic",
                              upstream_key="upstream-secret", model="deepseek-flash",
                              limit_usd=.05) as gateway:
+        import time
+        original_settle = gateway.gate.settle
+        def delayed_settle(*args, **kwargs):
+            time.sleep(.03)
+            return original_settle(*args, **kwargs)
+        monkeypatch.setattr(gateway.gate, 'settle', delayed_settle)
         url = urlparse(gateway.base_url)
         conn = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
         body = json.dumps({"model": "deepseek-flash", "max_tokens": 100,

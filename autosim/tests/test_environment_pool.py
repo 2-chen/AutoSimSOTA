@@ -258,7 +258,7 @@ def test_snapshot_contains_no_repository_or_task_assets_and_requires_reprobe(tmp
         return {"ok": True}
 
     monkeypatch.setattr(pool, "clone", copy_clone)
-    monkeypatch.setattr(pool, "discover", lambda *_: [])
+    monkeypatch.setattr(pool, "discover", lambda *_, **kw: [])
     manifests, machine = {"requirements.txt": "torch==2.7.1"}, {"os": "Linux"}
     result = pool.publish_snapshot(output, interpreter=source / "bin/python",
                                    manifests=manifests, machine=machine)

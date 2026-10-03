@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 import shutil
 import threading
@@ -10,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .common import atomic_json, digest, now, read_json
+from .common import atomic_json, digest, now, read_json, object_digest
 from .main_agent import READ_ONLY_ROLES, TASK_SYSTEM, validate_report, validate_task
 from .native_jobs import source_identity
 from .scheduling import locked, note, policy
@@ -18,17 +19,65 @@ from .scheduling import locked, note, policy
 _pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="autosim-reader")
 _futures = {}
 _guard = threading.Lock()
+MAX_READER_BYTES = 64 * 1024**2
+PUBLIC_SOURCE_SUFFIXES = {".py", ".toml", ".md", ".rst", ".sh", ".yaml", ".yml", ".ini", ".cfg", ".lock", ".txt"}
 
 
-def snapshot(output: Path, repo: Path, task_id: str, *, empty: bool = False) -> tuple[Path, Path]:
+def _materialized_source_files(repo: Path, scope: Path) -> list[Path]:
+    from .source_tracking import materialized_files
+    return materialized_files(repo, scope)
+
+
+
+def _scope_identity(repo: Path, names: list[str]) -> str:
+    rows = []
+    for name in names:
+        relative = Path(name); path = repo / relative
+        if (relative.is_absolute() or ".." in relative.parts or path.is_symlink()
+                or not path.resolve().is_relative_to(repo.resolve()) or not path.is_file()):
+            raise ValueError("reader source changed or escaped")
+        rows.append((name, digest(path)))
+    return object_digest(rows)
+
+
+def snapshot(output: Path, repo: Path, task_id: str, *, empty: bool = False,
+             source_paths: list[str] | None = None) -> tuple[Path, Path]:
     root = Path(output) / "agent_workers" / task_id
     checkout = root / "checkout"
     checkout.mkdir(parents=True)
     if not empty:
         before = source_identity(output, repo)
         manifest = read_json(Path(output) / "workspace_snapshot.json")
+        scopes = [Path(item) for item in source_paths] if source_paths is not None else None
+        if scopes is not None and (not scopes or len(scopes) > 64 or any(
+                path.is_absolute() or ".." in path.parts for path in scopes)):
+            raise ValueError("unsafe reader source scope")
+        selected = [entry for entry in manifest.get("source_entries") or []
+                    if entry[0] == "file" and (scopes is None or any(
+                        Path(entry[1]).is_relative_to(scope) for scope in scopes))]
+        if scopes is not None:
+            for scope in scopes:
+                additional = _materialized_source_files(repo, scope)
+                if not additional and not any(Path(row[1]).is_relative_to(scope) for row in selected):
+                    raise ValueError("source scope contains no public files; use actual checkout-relative source paths")
+                selected.extend(("file", str(name)) for name in additional)
+        else:
+            from .source_tracking import materialized_files
+            selected.extend(("file", str(name)) for name in materialized_files(repo))
+        selected = list({row[1]: row for row in selected}.values())
         total = 0
-        for entry in manifest.get("source_entries") or []:
+        for entry in selected:
+            relative = Path(entry[1])
+            source = repo / relative
+            if (relative.is_absolute() or ".." in relative.parts or source.is_symlink()
+                    or not source.resolve().is_relative_to(repo.resolve())):
+                raise ValueError("unsafe reader source inventory")
+            total += source.stat().st_size
+        if total > MAX_READER_BYTES:
+            raise ValueError("reader source snapshot exceeds 64 MiB; supply narrower source_paths (files/directories), not just narrower prose")
+        source_names = sorted(row[1] for row in selected)
+        scope_identity = _scope_identity(repo, source_names)
+        for entry in selected:
             if entry[0] != "file":
                 continue
             relative = Path(entry[1])
@@ -38,17 +87,19 @@ def snapshot(output: Path, repo: Path, task_id: str, *, empty: bool = False) -> 
                 raise ValueError("unsafe reader source inventory")
             if not source.is_file():
                 continue
-            total += source.stat().st_size
-            if total > 64 * 1024**2:
-                raise ValueError("reader source snapshot exceeds 64 MiB; narrow the assignment")
             target = checkout / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-        if before != source_identity(output, repo):
+        if (before != source_identity(output, repo) or scope_identity != _scope_identity(repo, source_names)
+                or scope_identity != _scope_identity(checkout, source_names)):
             raise ValueError("source changed while making reader snapshot; retry when stable")
     atomic_json(root / "workspace_snapshot.json", {"schema_version": 2,
         "source": str(repo), "destination": str(checkout),
         "reader_source_identity": before if not empty else None,
+        "reader_source_files": source_names if not empty else [],
+        "reader_scope_identity": scope_identity if not empty else None,
+        "source_paths": source_paths, "source_bytes": total if not empty else 0,
+        "snapshot_scope": "selected inventoried files" if source_paths else "all inventoried files",
         "note": "read-only inventoried-source snapshot, not a runnable benchmark copy"})
     atomic_json(root / "worker_parent.json", {"output": str(Path(output).resolve()),
         "read_only": True})
@@ -66,7 +117,7 @@ def records(output: Path) -> list[dict]:
 def submit(output: Path, repo: Path, client, assignment: dict, facts: dict, timeout: float) -> dict:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("read-only task needs positive remaining wall time")
-    task = validate_task(assignment)
+    task = validate_task(assignment, allow_source_paths=True)
     if task["role"] not in READ_ONLY_ROLES:
         raise ValueError("parallel tasks are read-only; edits require exclusive Scheduler operations")
     if not hasattr(client, "fork_readonly") or not policy(output):
@@ -76,13 +127,16 @@ def submit(output: Path, repo: Path, client, assignment: dict, facts: dict, time
         if len(active) >= int(policy(output)["readonly_workers"]):
             raise ValueError("read-only worker slots are occupied")
         task_id = uuid.uuid4().hex
-        root, checkout = snapshot(output, repo, task_id)
+        root, checkout = snapshot(output, repo, task_id, source_paths=task.get("source_paths"))
         identity = source_identity(output, repo)
         if not identity or read_json(root / "workspace_snapshot.json")["reader_source_identity"] != identity:
             raise ValueError("read-only worker needs a stable inventoried source snapshot")
         record = {"id": task_id, **task, "status": "submitted", "submitted_at": now(),
                   "source_identity": identity, "input_state_revision": facts.get("state_revision"),
                   "worker_ref": str(root.relative_to(output)), "cancel_requested": False}
+        reader = read_json(root / "workspace_snapshot.json")
+        record["reader_source_files"] = reader.get("reader_source_files") or []
+        record["reader_scope_identity"] = reader.get("reader_scope_identity")
         path = Path(output) / "agent_tasks" / task_id / "task.json"
         atomic_json(path, record)
         child = client.fork_readonly(output=root, workspace=checkout, role=task["role"])
@@ -103,7 +157,9 @@ def submit(output: Path, repo: Path, client, assignment: dict, facts: dict, time
                         "snapshot_scope": "inventoried source only; read native errors by evidence ID"},
                         ensure_ascii=False, default=str), timeout=timeout, read_only=True,
                     include_research_context=False)
-                report = validate_report(json.loads(content))
+                from .main_agent import receive_report
+                report = receive_report(content, client=child, output=root, workspace=checkout,
+                    timeout=max(1, timeout - (time.monotonic()-start)), metadata=metadata)
                 changes = {"status": "completed", "report": report, "runtime": metadata}
             except Exception as exc:
                 changes = {"status": "failed", "error": type(exc).__name__ + ": " + str(exc)[:300]}
@@ -161,6 +217,11 @@ def collect(output: Path, repo: Path) -> list[dict]:
         if row["status"] == "completed" and not row.get("collected_at"):
             identity = identity or source_identity(output, repo)
             row.update(stale=row["source_identity"] != identity)
+            if row.get("reader_scope_identity"):
+                try:
+                    row["stale"] |= row["reader_scope_identity"] != _scope_identity(repo, row["reader_source_files"])
+                except (OSError, ValueError):
+                    row["stale"] = True
             ready.append(row)
     return ready
 

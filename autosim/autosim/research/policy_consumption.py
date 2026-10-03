@@ -20,6 +20,98 @@ ROLLOUT_MARKER = "AUTOSIM_ROLLOUT_COMPLETED "
 METRIC_MARKER = "AUTOSIM_METRIC_REPORTED "
 
 
+def identity_contract() -> dict[str, Any]:
+    """Publish exact verifier syntax, not expected hashes or fabricated evidence."""
+    return {
+        "authority": "executor interface only; not native loading or score evidence",
+        "loaded_marker": MARKER,
+        "loaded_fields": {"path": "absolute path actually consumed by native loader",
+                          "file": "content_sha256", "directory": "sha256"},
+        "rollout_marker": ROLLOUT_MARKER,
+        "rollout_fields": ["episode_id", "policy_sha256"],
+        "metric_marker": METRIC_MARKER,
+        "metric_fields": ["policy_sha256", "episode_ids", "value"],
+        "instruction": (
+            "Emit at the real successful loader, completed episode and metric aggregation sites. "
+            "Use the exact field names: episode_index is NOT episode_id or episode_ids. "
+            "Completed IDs must be nonempty strings, unique in this evaluation. "
+            "Directory hash is the canonical JSON manifest below, NOT a custom concatenation "
+            "of paths and hashes. All three witnesses use the same digest. Recompute from "
+            "actual loaded bytes; never echo a supplied expected digest. CPU-test syntax and "
+            "digest recipe before a minimal native smoke; preserve actions and scoring."),
+        "identity_recipe_python": '''def loaded_artifact_identity(path):
+    import hashlib, json
+    from pathlib import Path
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError("symbolic policy artifact")
+    def file_sha256(file):
+        hasher = hashlib.sha256()
+        with file.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+    if path.is_file():
+        return "content_sha256", file_sha256(path)
+    if not path.is_dir() or any(p.is_symlink() for p in path.rglob("*")):
+        raise ValueError("missing directory or symbolic entry")
+    files = sorted(p for p in path.rglob("*") if p.is_file())
+    if not files:
+        raise ValueError("empty artifact directory")
+    manifest = [(str(p.relative_to(path)), file_sha256(p)) for p in files]
+    return "sha256", hashlib.sha256(json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+''',
+    }
+
+
+def audit_identity_schema(text: str, *, policy_kind: str | None = None) -> dict[str, Any]:
+    """Pre-freeze interface feedback only; never certify loading or performance."""
+    records = {MARKER: [], ROLLOUT_MARKER: [], METRIC_MARKER: []}
+    issues = []
+    for line in text.splitlines():
+        for marker in records:
+            if not line.startswith(marker):
+                continue
+            try:
+                row = json.loads(line[len(marker):])
+                if not isinstance(row, dict):
+                    raise ValueError('expected JSON object')
+                records[marker].append(row)
+            except (ValueError, TypeError):
+                issues.append(marker.strip() + ' must contain a JSON object')
+    if not any(records.values()) and not issues:
+        return {'status':'unavailable', 'issues':[],
+                'authority':'schema inspection only; not consumption or scoring evidence'}
+    loaded, rollouts, metrics = records[MARKER], records[ROLLOUT_MARKER], records[METRIC_MARKER]
+    for row in loaded:
+        fields = ['sha256'] if policy_kind == 'directory' else ['content_sha256'] if policy_kind == 'file' else ['sha256', 'content_sha256']
+        if not isinstance(row.get('path'), str) or not row['path']:
+            issues.append('AUTOSIM_POLICY_LOADED requires the actual loaded path')
+        if not any(isinstance(row.get(field), str) and len(row[field]) == 64
+                   and all(c in '0123456789abcdef' for c in row[field]) for field in fields):
+            issues.append('AUTOSIM_POLICY_LOADED requires ' + ' or '.join(fields)
+                          + '; use native_identity_contract directory recipe, not a custom serialization')
+    for row in rollouts:
+        episode = row.get('episode_id')
+        if not isinstance(episode, str) or not episode or len(episode) > 160:
+            issues.append('AUTOSIM_ROLLOUT_COMPLETED requires a nonempty episode_id string; episode_index is not that field')
+        if not isinstance(row.get('policy_sha256'), str):
+            issues.append('AUTOSIM_ROLLOUT_COMPLETED requires policy_sha256')
+    for row in metrics:
+        ids = row.get('episode_ids')
+        if (not isinstance(ids, list) or not ids or
+                not all(isinstance(item, str) and item for item in ids)):
+            issues.append('AUTOSIM_METRIC_REPORTED requires episode_ids as a nonempty list of strings; episode_index is not that field')
+        value = row.get('value')
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            issues.append('AUTOSIM_METRIC_REPORTED requires a finite numeric value')
+    return {'status':'incompatible' if issues else 'schema_observed',
+            'issues':list(dict.fromkeys(issues))[:8],
+            'authority':'schema inspection only; not consumption or scoring evidence',
+            'instruction':'Repair logging at real native sites using native_identity_contract before freezing a new research session; do not alter actions, episodes, success or scoring. A compatible schema still requires independent byte/rollout/metric verification.'}
+
+
 def verify_policy_consumption(log: Path, policy: Path) -> dict[str, Any]:
     """Accept one exact native loader event, or return an explicit unverified reason."""
     policy = Path(policy).resolve(strict=True)

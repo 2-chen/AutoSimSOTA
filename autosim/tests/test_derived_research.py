@@ -750,11 +750,11 @@ def test_protocol_controls_are_not_forwarded_as_hyperparameter_flags(tmp_path):
     assert inputs["settings"] == {"train.learning_rate": 0.001}
 
 
-def test_missing_training_budget_uses_bounded_verification_budget(tmp_path):
-    from autosim.research.execution_derive import TRAINING_VERIFICATION_STEPS
-
+def test_missing_training_budget_does_not_use_verification_budget(tmp_path):
     real = research(tmp_path)
-    assert real._inputs("train", settings={})["steps"] == TRAINING_VERIFICATION_STEPS
+    assert real._inputs("train", settings={})["steps"] == 0
+    assert real._inputs("train", settings={'train.n_epochs':2})['steps'] == 0
+    assert real._inputs("train", settings={'steps':8192})['steps'] == 8192
     # An explicit zero remains explicit so the native-progress guard can reject it; it is
     # not silently rewritten into a run the caller did not request.
     assert real._inputs("train", settings={"steps": 0})["steps"] == 0
@@ -785,9 +785,369 @@ def test_measurement_archives_the_policy_before_a_later_round_overwrites_it(tmp_
     archive = Path(first["policy_artifact"]["path"])
     assert first["evaluated_policy_path"] == str(archive)
     assert archive.read_text(encoding="utf-8") == "checkpoint"
-    stage_policy = real.stage_directory("train") / "models" / "model.pth"
+    receipt = json.loads((real.run_root/'attempts'/first['train']['attempt_id']/'receipt.json').read_text())
+    stage_policy = Path(receipt["output_directory"]) / "models" / "model.pth"
     stage_policy.write_text("overwritten", encoding="utf-8")
     assert archive.read_text(encoding="utf-8") == "checkpoint"
+
+
+@pytest.mark.parametrize("non_ascii", [False, True])
+def test_native_producer_gets_absent_output_leaf_on_every_attempt(tmp_path, monkeypatch, non_ascii):
+    repo = tmp_path / "中文仓库" if non_ascii else tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOSIM_STAGE_ROOT", str(tmp_path / "ascii-alias"))
+    real = research(repo)
+    code = ("import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+            "assert not p.exists(), 'refusing to overwrite existing native output'; "
+            "(p/'models').mkdir(parents=True); "
+            "(p/'models'/'model.pth').write_text('checkpoint')")
+    real.backend.sources["train"] = (
+        "def stage_argv_train(i):\n"
+        f"    return [i['python'], '-c', {code!r}, i['output']]\n")
+    real.backend = DeclarativeBackend(repo=repo, answer=real.backend.answer,
+        sources=real.backend.sources, parameters={})
+    first = real.run_stage("train", settings={})
+    second = real.run_stage("train", settings={})
+    assert first["status"] == second["status"] == "completed"
+    a, b = Path(first["output_directory"]), Path(second["output_directory"])
+    assert a != b
+    assert (a/'models'/'model.pth').read_text() == 'checkpoint'
+    assert (b/'models'/'model.pth').read_text() == 'checkpoint'
+    for record, root in ((first, a), (second, b)):
+        receipt = json.loads((real.run_root/'attempts'/record['attempt_id']/'receipt.json').read_text())
+        assert receipt['output_directory'] == str(root.resolve())
+        log = real.stage_directory('train')/'attempts'/record['attempt_id']/'output.log'
+        assert log.is_file() and not log.resolve().is_relative_to(root.resolve())
+
+
+@pytest.mark.parametrize('fault', ['', 'duplicate', 'changed_specimen', 'changed_producer', 'outside_producer', 'different_name', 'stale', 'symlink', 'changed_metric', 'exact_ambiguous'])
+def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_producer(tmp_path, fault):
+    from autosim.research.common import atomic_json, digest
+    real = research(tmp_path)
+    producer = 'results/**/*.json'
+    original_pattern = 'results/old-timestamp/score.json'
+    spec = MetricSpec.from_declaration({'research_goal': {'primary_metric': {
+        'name': 'return', 'direction': 'maximize', 'source': 'json',
+        'json_key': 'reward', 'artifact_root': 'output',
+        'artifact_pattern': original_pattern}}})
+    real.metric_spec = spec
+    real.backend.stages['evaluate']['artifact'] = producer
+    specimen = real.output/'verification_outputs'/original_pattern
+    specimen.parent.mkdir(parents=True)
+    specimen.write_text('{"reward": 0}')
+    declaration = {'name': 'return', 'direction': 'maximize', 'source': 'json',
+                   'json_key': 'reward', 'artifact_root': 'output',
+                   'artifact_pattern': original_pattern}
+    binding = {'primary_metric': declaration, 'evidence': 'source emits this scored product',
+               'verified_artifact': {'path': str(specimen), 'sha256': digest(specimen),
+                                     'root': 'output', 'pattern': original_pattern}}
+    atomic_json(real.output/'metric_binding.json', binding)
+    protocol = {'metric': spec.as_dict(), 'evaluator_stage': {'artifact': producer}}
+    atomic_json(real.run_root/'comparison_protocol.json', protocol)
+    output = real.run_root/'evaluate'/'native_outputs'/'attempt'
+    new = output/'results'/'new-timestamp'/'score.json'
+    new.parent.mkdir(parents=True)
+    new.write_text('{"reward": 1}')
+    started = new.stat().st_mtime - 1
+    if fault == 'duplicate':
+        other = output/'results'/'another'/'score.json'
+        other.parent.mkdir(); other.write_text('{"reward": 2}')
+    elif fault == 'changed_specimen':
+        specimen.write_text('{"reward": 3}')
+    elif fault == 'changed_producer':
+        real.backend.stages['evaluate']['artifact'] = '**/*.json'
+    elif fault == 'outside_producer':
+        new.rename(output/'score.json')
+    elif fault == 'different_name':
+        new.rename(new.with_name('other.json'))
+    elif fault == 'stale':
+        started = new.stat().st_mtime + 1
+    elif fault == 'symlink':
+        new.unlink(); new.symlink_to(specimen)
+    elif fault == 'changed_metric':
+        protocol['metric']['json_key'] = 'other'
+        atomic_json(real.run_root/'comparison_protocol.json', protocol)
+    elif fault == 'exact_ambiguous':
+        # Exact existing products do not fall through to producer-based relocation.
+        exact = output/original_pattern
+        exact.parent.mkdir(parents=True); exact.write_text('{"reward": 4}')
+    result = real._resolve_bound_metric_artifact(spec, roots={'output': output},
+        started_at=started, allowed_roots=[real.run_root])
+    if not fault:
+        assert result['status'] == 'matched'
+        assert result['path'] == str(new.resolve())
+        assert result['pattern'] == original_pattern
+        assert result['producer_pattern'] == producer
+        assert result['metric_mapping_unchanged'] is True
+        assert spec.read(said='', artifact=new)['value'] == 1
+    elif fault == 'exact_ambiguous':
+        assert result['status'] == 'matched'
+        assert 'producer_pattern' not in result
+        assert result['path'] == str(exact.resolve())
+    else:
+        assert result['status'] != 'matched'
+
+
+@pytest.mark.parametrize('native_exit', [0, 1])
+@pytest.mark.parametrize('verdict', ['observed', 'unknown'])
+def test_formal_quiet_trainer_reuses_sealed_source_backed_progress_audit(tmp_path, monkeypatch, native_exit, verdict):
+    from types import SimpleNamespace
+    from autosim.research.evidence_store import read_attempt_evidence
+    real = research(tmp_path)
+    real.require_training_progress = True
+    real.client = SimpleNamespace(supports_native_progress_audit=True)
+    code = ("import pathlib,sys; p=pathlib.Path(sys.argv[1])/'models'; "
+            "p.mkdir(parents=True); (p/'model.pth').write_text('checkpoint'); "
+            f"sys.exit({native_exit})")
+    real.backend.sources['train'] = (
+        'def stage_argv_train(i):\n'
+        f"    return [i['python'], '-c', {code!r}, i['output']]\n")
+    real.backend = DeclarativeBackend(repo=tmp_path, answer=real.backend.answer,
+        sources=real.backend.sources, parameters={})
+    calls = []
+    def audit(client, **kwargs):
+        calls.append(kwargs)
+        proof = read_attempt_evidence(real.output, Path(kwargs['native_evidence_ref']).stem, limit=1)
+        assert proof['status'] == 'completed'
+        return {'status': verdict, 'audit_ref': 'training_progress_audits/receipt.json'}
+    monkeypatch.setattr('autosim.research.training_progress_audit.audit', audit)
+    record = real.run_stage('train', settings={})
+    assert len(calls) == (1 if native_exit == 0 else 0)
+    assert record['training_progress']['status'] == (verdict if native_exit == 0 else 'unknown')
+    if calls:
+        assert calls[0]['output'] == Path(record['output_directory'])
+        receipt = json.loads((real.run_root/'attempts'/record['attempt_id']/'receipt.json').read_text())
+        assert receipt['training_progress']['audit_ref'] == 'training_progress_audits/receipt.json'
+
+
+@pytest.mark.parametrize('fault', ['', 'counter', 'audit', 'receipt', 'log'])
+def test_parent_reviews_detached_progress_without_rewriting_native_receipt(tmp_path, monkeypatch, fault):
+    from autosim.research import training_progress_audit as pa
+    from autosim.research.common import atomic_json, digest
+    real = research(tmp_path)
+    real.require_training_progress = True
+    real._comparison_protocol_violation({}, target='evaluate', freeze=True)
+    code = ("import pathlib,json,sys; p=pathlib.Path(sys.argv[1]); "
+            "(p/'models').mkdir(parents=True); (p/'models'/'model.pth').write_text('checkpoint'); "
+            "(p/'work.json').write_text(json.dumps({'done': {'updates': 17}}))")
+    real.backend.sources['train'] = 'def stage_argv_train(i):\n' + f"    return [i['python'], '-c', {code!r}, i['output']]\n"
+    real.backend = DeclarativeBackend(repo=tmp_path, answer=real.backend.answer, sources=real.backend.sources, parameters={})
+    record = real.run_stage('train', settings={})
+    attempt = record['attempt_id']
+    receipt_path = real.run_root/'attempts'/attempt/'receipt.json'
+    original_bytes = receipt_path.read_bytes()
+    assert record['training_progress']['status'] == 'unknown'
+    assert real._verified_training_receipt(attempt, {}) is None
+    producer = tmp_path/'producer.py'
+    producer.write_text('optimizer.step()\nstep += 1\nsave(step)\n')
+    source = {'id': 'source-0', 'path': producer, 'sha256': digest(producer),
+              'content': producer.read_text(), 'excerpt': producer.read_text()}
+    monkeypatch.setattr(pa, 'sources', lambda *args: [source])
+    class Client:
+        supports_native_progress_audit = True
+        calls = 0
+        def chat_with_metadata(self, *args, **kwargs):
+            self.calls += 1
+            return json.dumps({'verdict': 'verified',
+                'counter': {'path': 'work.json', 'field': ['done', 'updates'], 'value': 17},
+                'source_evidence': [{'source_id': 'source-0', 'quote': producer.read_text()}],
+                'why': 'completed native updates'}), {}
+    real.client = Client()
+    reviewed = real._verified_training_receipt(attempt, {}, audit_progress=True)
+    assert reviewed is not None and reviewed['training_progress']['status'] == 'observed'
+    assert receipt_path.read_bytes() == original_bytes
+    assert real._verified_training_receipt(attempt, {}) is not None
+    assert real.client.calls == 1
+    if fault == 'counter':
+        (Path(record['output_directory'])/'work.json').write_text('{"done": {"updates": 18}}')
+    elif fault == 'audit':
+        audit_path = real.output/reviewed['training_progress']['audit_ref']
+        v=json.loads(audit_path.read_text()); v['extra']='changed'; atomic_json(audit_path, v)
+    elif fault == 'receipt':
+        v=json.loads(receipt_path.read_text()); v['extra']='changed'; atomic_json(receipt_path, v)
+    elif fault == 'log':
+        log=real.stage_directory('train')/'attempts'/attempt/'output.log'; log.write_text('changed')
+    if fault:
+        assert real._verified_training_receipt(attempt, {}) is None
+        assert real.client.calls == 1
+
+
+@pytest.mark.parametrize('fault', ['', 'unbound', 'changed_proof'])
+def test_quiet_policy_selection_accepts_only_verified_metadata_association(tmp_path, monkeypatch, fault):
+    real=ambiguous_policy_research(tmp_path)
+    record=real.run_stage('train',settings={})
+    record['said']='quiet native trainer'
+    count=[0]
+    def proof(*args):
+        count[0]+=1
+        return ({'candidate_2':{'completed_work':17}} if fault!='unbound' else {}, [],
+                'changed' if fault=='changed_proof' and count[0]>1 else 'proof')
+    monkeypatch.setattr(real,'_policy_work_evidence',proof)
+    original=real.client.chat_with_metadata
+    def choose(system,user,**kwargs):
+        content,metadata=original(system,user,**kwargs)
+        answer=json.loads(content);answer['selection_basis']='verified_completed_work_container'
+        answer['candidate_trace']=''
+        return json.dumps(answer),metadata
+    real.client.chat_with_metadata=choose
+    selected=real._select_policy_artifact(record)
+    assert selected['artifact_selection']['status']==('selected' if not fault else 'abstained')
+
+
+@pytest.mark.parametrize('fault', ['', 'counter', 'source'])
+def test_policy_work_association_is_native_counter_container_not_filename(tmp_path, monkeypatch, fault):
+    from autosim.research import training_progress_audit as pa
+    from autosim.research.common import digest
+    real=research(tmp_path);real.require_training_progress=True
+    real._comparison_protocol_violation({},target='evaluate',freeze=True)
+    real.backend.stages['train']['artifact']='*/policy_bundle'
+    code=("import pathlib,json,sys; p=pathlib.Path(sys.argv[1]); "
+          "(p/'areaA'/'policy_bundle').mkdir(parents=True); "
+          "(p/'areaB'/'policy_bundle').mkdir(parents=True); "
+          "(p/'areaAlias').symlink_to('areaA',target_is_directory=True); "
+          "(p/'areaA'/'proof').mkdir(); "
+          "(p/'areaA'/'proof'/'work.json').write_text(json.dumps({'done':{'updates':17}}))")
+    real.backend.sources['train']='def stage_argv_train(i):\n'+f"    return [i['python'],'-c',{code!r},i['output']]\n"
+    real.backend=DeclarativeBackend(repo=tmp_path,answer=real.backend.answer,sources=real.backend.sources,parameters={})
+    record=real.run_stage('train',settings={})
+    producer=tmp_path/'producer.py';producer.write_text('optimizer.step()\nstep += 1\nsave_checkpoint(model, step)\n')
+    row={'id':'source-0','path':producer,'sha256':digest(producer),'content':producer.read_text(),'excerpt':producer.read_text()}
+    monkeypatch.setattr(pa,'sources',lambda *args:[row])
+    class Client:
+        supports_native_progress_audit=True
+        def chat_with_metadata(self,*args,**kwargs):
+            return json.dumps({'verdict':'verified','counter':{'path':'areaA/proof/work.json',
+                'field':['done','updates'],'value':17},'source_evidence':[{
+                'source_id':'source-0','quote':producer.read_text()}]}),{}
+    real.client=Client()
+    reviewed=real._verified_training_receipt(record['attempt_id'],{},audit_progress=True)
+    assert reviewed is not None
+    if fault=='counter':(Path(record['output_directory'])/'areaA/proof/work.json').write_text('{"done":{"updates":18}}')
+    if fault=='source':producer.write_text('different producer')
+    bindings,sources,proof=real._policy_work_evidence(reviewed,{
+        'candidate_1':'areaA/policy_bundle','candidate_2':'areaB/policy_bundle',
+        'candidate_3':'areaAlias/policy_bundle'})
+    if fault:
+        assert not bindings and not proof
+    else:
+        assert set(bindings)=={'candidate_1','candidate_3'}
+        assert bindings['candidate_1']['completed_work']==17
+        assert bindings['candidate_1']['equivalent_candidate_ids']==['candidate_1','candidate_3']
+        assert bindings['candidate_3']['equivalent_candidate_ids']==['candidate_1','candidate_3']
+        assert sources[0]['path']=='native_source_source-0' and proof
+
+
+@pytest.mark.parametrize('fault', ['', 'changed_inputs', 'later_score', 'settings'])
+def test_failed_baseline_can_evaluate_exact_completed_replacement_without_retraining(tmp_path, monkeypatch, fault):
+    real = research(tmp_path)
+    real.require_training_progress = True
+    code = ("import pathlib,sys; marker=pathlib.Path(sys.argv[2])/'first-attempt'; "
+            "seen=marker.exists(); marker.write_text('seen'); "
+            "sys.exit(1) if not seen else None; "
+            "p=pathlib.Path(sys.argv[1])/'models'; p.mkdir(parents=True); "
+            "(p/'model.pth').write_text('checkpoint'); print('global_step=17')")
+    source = 'def stage_argv_train(i):\n'+f"    return [i['python'], '-c', {code!r}, i['output'], i['repo']]\n"
+    real.sources['train'] = source
+    real.backend.sources['train'] = source
+    real.backend = DeclarativeBackend(repo=tmp_path, answer=real.backend.answer, sources=real.backend.sources, parameters={})
+    report=real.run(rounds=1, yield_after_action=True)
+    assert report['run_status']=='paused'
+    baseline_path=real.run_root/'measurements/baseline.json'
+    original=json.loads(baseline_path.read_text())
+    assert original['where']=='train' and not original['ok']
+    replacement=real.run_stage('train', settings={'train.n_epochs': 2} if fault=='settings' else {})
+    assert replacement['status']=='completed' and replacement['training_progress']['status']=='observed'
+    if fault=='changed_inputs':
+        real.sources['train'] += '\n'
+    elif fault=='later_score':
+        session_path=real.run_root/'controller_session.json'; s=json.loads(session_path.read_text())
+        s['history'].append({'label':'round_1', 'measured':True, 'metric_value':0.75})
+        session_path.write_text(json.dumps(s))
+    old=real.run_stage
+    calls=[]
+    def score_only(stage, **kwargs):
+        calls.append(stage)
+        assert stage=='evaluate', 'completed replacement must never be retrained'
+        return old(stage, **kwargs)
+    monkeypatch.setattr(real, 'run_stage', score_only)
+    result=real.recover_unscored_baseline(replacement_training_attempt_id=replacement['attempt_id'])
+    if fault:
+        assert result['ok'] is False and not calls
+        assert json.loads(baseline_path.read_text())==original
+    else:
+        assert result['ok'] is True and calls==['evaluate']
+        assert result['recovery']['training_reused'] is True
+        assert result['recovery']['superseded_training_attempt_id']==original['attempt_id']
+        backup=real.run_root/result['recovery']['original_measurement_ref']
+        assert json.loads(backup.read_text())==original
+
+
+@pytest.mark.parametrize('fault', ['', 'candidate', 'source', 'same_proof', 'scored', 'evaluated', 'receipt', 'used'])
+@pytest.mark.parametrize('prior_additive', [False, True])
+def test_baseline_selection_retry_requires_new_additive_evidence_once(tmp_path, monkeypatch, fault, prior_additive):
+    from autosim.research.common import atomic_json
+    real=ambiguous_policy_research(tmp_path)
+    record=real.run_stage('train',settings={})
+    paths,_=real._selection_candidates(record)
+    sources,_=real._policy_selection_sources('train')
+    hashes={row['path']:row['sha256'] for row in sources}
+    directory=real.run_root/'attempts'/record['attempt_id']
+    selection_path=directory/'artifact_selection.json'
+    prior={'status':'abstained','candidate_paths_sha256':object_digest(paths),
+           'source_hashes':hashes, 'completed_work_proof_sha256':''}
+    measurement={'where':'policy_artifact','status':'unscored','ok':False,'settings':{},
+                 'recovery':{'training_attempt_id':record['attempt_id']},
+                 'artifact_selection':{'selection_ref':str(selection_path.relative_to(real.output))}}
+    if fault=='candidate':prior['candidate_paths_sha256']='changed'
+    if fault=='source':prior['source_hashes']={**hashes,'missing.py':'changed'}
+    if fault=='same_proof':prior['completed_work_proof_sha256']='new-proof'
+    if fault=='scored':measurement['ok']=True
+    if fault=='evaluated':measurement['evaluate']={'attempt_id':'executed'}
+    atomic_json(selection_path,prior)
+    recovery_path=directory/'baseline_recovery.json'
+    if prior_additive:
+        backup=directory/('baseline_unscored_additive_'+('a'*64)+'.json')
+        atomic_json(backup,{'old_failure':True})
+        measurement['recovery']['original_measurement_ref']=str(backup.relative_to(real.run_root))
+        recovery_path=directory/('baseline_recovery_additive_'+('a'*64)+'.json')
+    atomic_json(recovery_path,{'status':'failed',
+        'training_attempt_id':record['attempt_id'],'measurement_sha256':object_digest(measurement)})
+    monkeypatch.setattr(real,'_verified_training_receipt',lambda *args:None if fault=='receipt' else record)
+    monkeypatch.setattr(real,'_policy_work_evidence',lambda *args:({'candidate_2':{}},[], 'new-proof'))
+    before=selection_path.read_bytes()
+    plan=real.baseline_selection_retry_plan(measurement)
+    if fault=='used':
+        assert plan['available']
+        atomic_json(Path(plan['state_path']),{'status':'running'})
+        plan=real.baseline_selection_retry_plan(measurement)
+    assert plan['available']==(not fault)
+    assert selection_path.read_bytes()==before
+    if not fault:
+        assert Path(plan['backup_path']).parent==directory
+        assert not Path(plan['state_path']).exists()
+        assert real.baseline_selection_retry_plan(measurement)==plan
+
+
+def test_quiet_selection_adds_evidence_without_overwriting_abstention(tmp_path, monkeypatch):
+    real=ambiguous_policy_research(tmp_path)
+    record=real.run_stage('train',settings={});record['said']='quiet trainer'
+    first=real._select_policy_artifact(dict(record))
+    assert first['artifact_selection']['status']=='abstained'
+    old_path=real.output/first['artifact_selection']['selection_ref'];old_bytes=old_path.read_bytes()
+    monkeypatch.setattr(real,'_policy_work_evidence',lambda *args:({'candidate_2':{'completed_work':17}},[], 'proof'))
+    original=real.client.chat_with_metadata
+    def choose(*args,**kwargs):
+        content,metadata=original(*args,**kwargs);answer=json.loads(content)
+        answer['selection_basis']='verified_completed_work_container';answer['candidate_trace']=''
+        return json.dumps(answer),metadata
+    real.client.chat_with_metadata=choose
+    selected=real._select_policy_artifact(dict(record),revalidate_abstained=True)
+    assert selected['artifact_selection']['status']=='selected'
+    assert selected['artifact_selection']['selection_ref']!=first['artifact_selection']['selection_ref']
+    assert old_path.read_bytes()==old_bytes
+    calls=real.client.calls
+    again=real._select_policy_artifact(dict(record),revalidate_abstained=True)
+    assert again['artifact_selection']['status']=='selected' and real.client.calls==calls
 
 
 def test_comparison_protocol_rejects_eval_changes_before_training(tmp_path):
@@ -894,7 +1254,7 @@ def test_native_json_result_can_supply_the_primary_metric(tmp_path):
     real.backend.answer["stages"]["evaluate"]["artifact"] = "result.json"
     real.backend.sources["evaluate"] = (
         "def stage_argv_evaluate(i):\n"
-        "    return [i['python'], '-c', 'import pathlib,json,sys; pathlib.Path(sys.argv[1],\"result.json\").write_text(json.dumps({\"summary\":{\"reward\":2.25}}))', i['output']]\n")
+        "    return [i['python'], '-c', 'import pathlib,json,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True); (p/\"result.json\").write_text(json.dumps({\"summary\":{\"reward\":2.25}}))', i['output']]\n")
     real.backend = DeclarativeBackend(
         repo=tmp_path, answer=real.backend.answer, sources=real.backend.sources,
         parameters=real.backend.parameters)
@@ -985,7 +1345,7 @@ def test_native_episode_csv_counts_completed_rows_not_requested_rows(tmp_path):
         "aggregation": "mean", "episode_id_column": "episode_id",
         "task_column": "task"}}})
     real.backend.answer["stages"]["evaluate"]["artifact"] = "episodes.csv"
-    code = ("import pathlib,sys; pathlib.Path(sys.argv[1], 'episodes.csv').write_text("
+    code = ("import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True); (p/'episodes.csv').write_text("
             "'task,episode_id,success_rate\\nlift,0,1\\nlift,1,0\\n')")
     real.backend.sources["evaluate"] = (
         "def stage_argv_evaluate(i):\n"
@@ -1672,7 +2032,7 @@ def test_legacy_ambiguous_receipt_candidates_are_reconstructed_only_when_consist
     assert error == ""
     assert candidates == ["models/one.pth", "models/two.pth"]
 
-    extra = real.stage_directory("train") / "models" / "late.pth"
+    extra = Path(record["output_directory"]) / "models" / "late.pth"
     extra.write_text("not from this attempt", encoding="utf-8")
     legacy_changed = {**record, "artifact": {
         key: value for key, value in record["artifact"].items()
@@ -1686,7 +2046,7 @@ def test_recovered_legacy_selection_appends_a_new_record_instead_of_overwriting(
         tmp_path):
     real = ambiguous_policy_research(tmp_path)
     record = real.run_stage("train", settings={})
-    late = real.stage_directory("train") / "models" / "late.pth"
+    late = Path(record["output_directory"]) / "models" / "late.pth"
     late.write_text("later file", encoding="utf-8")
     record["artifact"].pop("candidate_paths", None)
     record["artifact"].pop("candidate_paths_truncated", None)
@@ -2220,11 +2580,11 @@ def test_a_proposal_that_asks_for_data_gets_it_and_measures_on_it(tmp_path):
             ""]),
         "evaluate": "\n".join([
             "def stage_argv_evaluate(i):",
-                "    return [i['python'], '-c', \"import pathlib,sys;pathlib.Path(sys.argv[1],'made.bin').write_text('score');print('succ: 0.50')\", i['output']]",
+                "    return [i['python'], '-c', \"import pathlib,sys;p=pathlib.Path(sys.argv[1]);p.mkdir(parents=True);(p/'made.bin').write_text('score');print('succ: 0.50')\", i['output']]",
             ""]),
         "collect": "\n".join([
             "def stage_argv_collect(i):",
-                f"    return [i['python'], '-c', \"import pathlib,sys;pathlib.Path(sys.argv[1],'made.bin').write_text('data');print('collected')\", i['output']]",
+                f"    return [i['python'], '-c', \"import pathlib,sys;p=pathlib.Path(sys.argv[1]);p.mkdir(parents=True);(p/'made.bin').write_text('data');print('collected')\", i['output']]",
             ""]),
     }
     real = DerivedResearch(
@@ -2416,7 +2776,8 @@ def test_real_evaluation_media_is_linked_only_to_its_scored_attempt(
     assert row["capture_seconds"] >= row["stage_seconds"]
 
     # A later byte change breaks the lineage even though the filename is unchanged.
-    (real.stage_directory("evaluate") / "eval_result" / "rollout.gif").write_bytes(b"changed")
+    receipt = json.loads((real.run_root/'attempts'/measured['evaluate']['attempt_id']/'receipt.json').read_text())
+    (Path(receipt["output_directory"]) / "eval_result" / "rollout.gif").write_bytes(b"changed")
     run_record.generate(real.run_root)
     changed = json.loads((real.run_root / "media" / "manifest.json").read_text())
     assert changed["recordings"][0]["same_scored_evaluation"] is None

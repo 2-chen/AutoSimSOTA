@@ -20,6 +20,10 @@ class RoleProfile:
     responsibility: str
 
     @property
+    def can_inspect_native(self) -> bool:
+        return self.can_execute_diagnostics or self.name in {"scheduler", "fix", "init"}
+
+    @property
     def builtin_tools(self) -> tuple[str, ...]:
         if self.name == "recorder":
             return ()
@@ -33,11 +37,11 @@ class RoleProfile:
         if self.name == "recorder":
             return ()
         evidence = ("mcp__autosim_exec__read_evidence", "mcp__autosim_exec__search_public_sources",
-                    "mcp__autosim_exec__read_public_source")
+                    "mcp__autosim_exec__read_public_source", "mcp__autosim_exec__inspect_workspace_resources")
         return (*evidence, "mcp__autosim_exec__run_command", "mcp__autosim_exec__inspect_native_environment") \
             if self.can_execute_diagnostics else (
                 (*evidence, "mcp__autosim_exec__inspect_native_environment")
-                if self.name == "scheduler" else evidence)
+                if self.can_inspect_native else evidence)
 
     @property
     def instruction(self) -> str:
@@ -46,7 +50,7 @@ class RoleProfile:
             limits.append("you are read-only and must not propose that you applied a patch")
         if not self.can_execute_diagnostics:
             limits.append("you cannot execute commands; cite existing receipts or request a probe")
-            if self.name == "scheduler":
+            if self.can_inspect_native:
                 limits.append("exception: inspect_native_environment performs bounded read-only CPU inspection of the actual selected environment; it cannot edit, use GPU or access network")
         constraint = "; ".join(limits) or (
             "you may patch only the isolated checkout and run bounded CPU diagnostics; "
@@ -57,8 +61,15 @@ class RoleProfile:
                 "Use /tmp/diagnostics for CPU diagnostic venvs and scratch files through "
                 "the execution tool; never create them inside the source checkout. "
                 "For noninteractive native setup, inspect repository config initialization, "
-                "Use inspect_native_environment for the actual selected interpreter and "
-                "run-local configuration, not system Python or a new diagnostic venv. "
+                + ("Use inspect_native_environment for the actual selected interpreter and "
+                   "run-local configuration, not system Python or a new diagnostic venv. "
+                   if self.can_inspect_native else
+                   "Request a sealed native inspection from Scheduler/Init/Fix; this role has no native inspection tool. ") +
+                "If native context is not published, request environment preparation; "
+                "do not keep retrying native inspection. inspect_workspace_resources "
+                "lists the actual explicitly bound resource names/sizes; builtin Read/Glob "
+                "may only see empty mount placeholders. Empty placeholders do not mean "
+                "missing data. Use that metadata tool before reporting a resource gap. "
                 "For unknown public resources/methods, search_public_sources then "
                 "read_public_source; cite sealed sources. Search hits are not verified "
                 "papers/resources. Never submit secrets, private paths or raw data in queries. "
@@ -66,7 +77,9 @@ class RoleProfile:
                 "the resource does not exist. Binary downloads use a native acquisition plan. "
                 "prepare run-local config and use the same config context in every probe "
                 "and stage. An EOF/input prompt is not proof the repository cannot run. "
-                "After repair revalidate the original failed operation, not a weaker substitute.")
+                "After repair revalidate the failed native capability, not a weaker substitute. "
+                "An evidence-reviewed installation route may replace an obsolete command; "
+                "consumer probes and scientific protocol remain binding.")
 
 
 ROLE_PROFILES = {
@@ -79,7 +92,16 @@ ROLE_PROFILES = {
     "init": RoleProfile("init", "AgentInit", True, True, True,
                          "Prepare the reproducible baseline and verify producer-to-consumer "
                          "data paths; request bounded native collection/loader probes from "
-                         "Scheduler without changing evaluation rules."),
+                         "Scheduler without changing evaluation rules. Reuse unchanged source-backed "
+                         "workflow and handoff memory; probe an existing compatible interpreter first, "
+                         "then install only dependencies demonstrated missing or incompatible. "
+                         "A pending handoff is not an environment failure: validate bounded native "
+                         "consumers first, inspect external SDK save/load after it is available, "
+                         "and require actual artifact loading and rollout before scoring. "
+                         "Do not train or demand future checkpoint files during environment setup. "
+                         "Separate bounded command verification from formal learning: hand off the "
+                         "native learning units, source defaults and measured cost, never declare "
+                         "a probe checkpoint converged or silently reuse probe work as the baseline."),
     "monitor": RoleProfile("monitor", "AgentMonitor", False, False, True,
                              "Assess progress, errors, time/resource budgets and whether to resume or stop."),
     "fix": RoleProfile("fix", "AgentFix", True, True, True,
@@ -88,7 +110,12 @@ ROLE_PROFILES = {
     "ideator": RoleProfile("ideator", "AgentIdeator", False, False, True,
                             "Propose falsifiable optimization ideas from source and verified "
                             "results; consider an early data intervention when autonomous "
-                            "collection is legal, feasible and usable by the trainer."),
+                            "collection is legal, feasible and usable by the trainer. Distinguish "
+                            "metric-improving hypotheses from diagnostic or throughput work; give "
+                            "a causal metric expectation. Use current formal development evidence, "
+                            "not smoke scores. At a floor score check adequate training, expert/data "
+                            "and deployment semantics; code patches must cite actual literal source, "
+                            "not descriptions of a block to replace."),
     "scheduler": RoleProfile("scheduler", "AgentScheduler", True, True, True,
                               "Own the global research plan and unresolved questions; inspect "
                               "evidence, investigate with tools, assign specialist tasks and "

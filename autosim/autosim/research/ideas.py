@@ -99,7 +99,7 @@ class Idea:
                 "outcome_event_ids": list(self.outcome_event_ids)}
 
 
-def execution_compatibility(idea: Any, *, stage_parameters: Any
+def execution_compatibility(idea: Any, *, stage_parameters: Any, repo: Any = None
                             ) -> tuple[bool, str]:
     """Check a candidate against the selected run's verified stage interface."""
     granularity = str(getattr(idea, "granularity", "") or "")
@@ -111,6 +111,23 @@ def execution_compatibility(idea: Any, *, stage_parameters: Any
         if not any(isinstance(row, dict) and row.get("find") != row.get("replace")
                    for row in patches):
             return False, "code candidate has no effective source change"
+        if repo is not None:
+            from pathlib import Path
+            root = Path(repo).resolve()
+            for patch in patches:
+                if not isinstance(patch, dict) or not isinstance(patch.get('find'), str):
+                    return False, 'code candidate requires an exact source find string'
+                target = root/str(patch.get('file') or '')
+                try:
+                    if (not target.resolve().is_relative_to(root) or target.is_symlink()
+                            or not target.is_file() or target.stat().st_size>4*1024*1024):
+                        return False, 'code candidate source file is missing or unsafe'
+                    find = patch['find']
+                    if not find or target.read_text().count(find)!=1:
+                        return False, ('code candidate must cite one exact unique source block; '
+                                       'read the file and propose a literal patch before consuming a round')
+                except (OSError, UnicodeError):
+                    return False, 'code candidate source is unreadable'
         return True, ""
     if granularity not in {"param", "algo"}:
         return False, "candidate has an unsupported granularity"

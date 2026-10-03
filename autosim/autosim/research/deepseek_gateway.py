@@ -40,6 +40,7 @@ class TurnCostGate:
         self._holds: dict[str, tuple[float, dt.datetime]] = {}
         self.spent_usd = 0.0
         self.unknown = False
+        self.unsafe_bound = False
         self.denied_count = 0
         self.receipts: list[dict[str, Any]] = []
 
@@ -48,13 +49,14 @@ class TurnCostGate:
         ceiling = request_cost_ceiling_usd(model, max_tokens, at=at,
                                            input_bytes=input_bytes)
         with self._lock:
-            if model != self.model or self.unknown:
+            if model != self.model or self.unsafe_bound:
                 self.denied_count += 1
-                raise DeepSeekGatewayError("unpriced model or unknown prior request usage")
+                raise DeepSeekGatewayError("unpriced model or unsafe usage bound")
             if len(self.receipts) + len(self._holds) >= self.MAX_REQUESTS:
                 self.denied_count += 1
                 raise DeepSeekGatewayError("turn DeepSeek request-count bound reached")
-            held = sum(row[0] for row in self._holds.values())
+            held = sum(row[0] for row in self._holds.values()) + sum(
+                row["reserved_usd"] for row in self.receipts if row["status"] == "unknown")
             required = self.spent_usd + held + ceiling
             if required > self.limit_usd + 1e-9 and self.extend_budget is not None:
                 try:
@@ -74,7 +76,8 @@ class TurnCostGate:
             self._holds[identity] = (ceiling, at)
             return identity
 
-    def settle(self, identity: str, usage: dict[str, Any] | None) -> None:
+    def settle(self, identity: str, usage: dict[str, Any] | None,
+               diagnostics: dict[str, Any] | None = None) -> None:
         with self._lock:
             if identity not in self._holds:
                 raise DeepSeekGatewayError("request reservation was not found")
@@ -84,11 +87,14 @@ class TurnCostGate:
                     raise ValueError("provider usage is missing")
                 cost, counts, tier = official_cost_usd(self.model, usage, at=at)
                 if cost > ceiling + 1e-9:
+                    self.unsafe_bound = True
                     raise ValueError("provider usage exceeded reserved cost ceiling")
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as exc:
                 self.unknown = True
                 self.receipts.append({"status": "unknown", "reserved_usd": ceiling,
                                       "price_card": PRICE_CARD_ID,
+                                      "reason": str(exc)[:180],
+                                      "diagnostics": diagnostics or {},
                                       "at": at.isoformat()})
                 return
             self.spent_usd += cost
@@ -98,11 +104,16 @@ class TurnCostGate:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            unknown_hold = sum(row["reserved_usd"] for row in self.receipts
+                               if row["status"] == "unknown")
+            inflight = sum(row[0] for row in self._holds.values())
             return {"cost_usd": self.spent_usd, "unknown": self.unknown or bool(self._holds),
                     "requests": len(self.receipts), "receipts": list(self.receipts),
                     "denied_count": self.denied_count,
                     "denials": list(self.denials), "limit_usd": self.limit_usd,
-                    "held_usd": sum(row[0] for row in self._holds.values())}
+                    "held_usd": inflight, "unknown_reserved_usd": unknown_hold,
+                    "accounting_ceiling_usd": self.spent_usd + unknown_hold + inflight,
+                    "bound_valid": not self.unsafe_bound}
 
 
 def _has_nontext(value: Any) -> bool:
@@ -227,6 +238,9 @@ class DeepSeekTurnGateway:
                     return
 
                 usage: dict[str, Any] = {}
+                diagnostics: dict[str, Any] = {"phase": "upstream_connect"}
+                stream_complete = False
+                settled = False
                 upstream = urllib.request.Request(
                     gateway.upstream_base_url + "/v1/messages" +
                     ("?" + parsed.query if parsed.query else ""), data=raw,
@@ -239,6 +253,7 @@ class DeepSeekTurnGateway:
                              "x-api-key": gateway._upstream_key}, method="POST")
                 try:
                     with urllib.request.urlopen(upstream, timeout=900) as response:
+                        diagnostics.update(http_status=response.status, phase="response_read")
                         content_type = response.headers.get("Content-Type", "")
                         if request.get("stream") is True:
                             self.send_response(response.status)
@@ -252,12 +267,19 @@ class DeepSeekTurnGateway:
                                 line = response.readline(2 * 1024 * 1024)
                                 if not line:
                                     break
-                                if line.startswith(b"data: "):
+                                if line.startswith(b"data:"):
                                     try:
-                                        event = json.loads(line[6:])
+                                        event = json.loads(line[5:].lstrip())
+                                        if event.get("type") == "message_stop":
+                                            stream_complete = True
                                         _merge_usage(usage, event.get("usage") or {})
                                         _merge_usage(usage, (event.get("message") or {}).get(
                                             "usage") or {})
+                                        if stream_complete and not settled:
+                                            # Seal known usage before exposing the terminal
+                                            # event. The CLI may exit as soon as it sees it.
+                                            gateway.gate.settle(identity, usage or None, diagnostics=diagnostics)
+                                            settled = True
                                     except (ValueError, TypeError, AttributeError):
                                         pass
                                 if client_open:
@@ -276,6 +298,8 @@ class DeepSeekTurnGateway:
                                 raise ValueError("provider response exceeded gateway bound")
                             result = json.loads(body)
                             _merge_usage(usage, result.get("usage") or {})
+                            gateway.gate.settle(identity, usage or None, diagnostics=diagnostics)
+                            settled = True
                             self.send_response(response.status)
                             self.send_header("Content-Type", content_type or "application/json")
                             self.send_header("Content-Length", str(len(body)))
@@ -283,14 +307,21 @@ class DeepSeekTurnGateway:
                             self.end_headers()
                             self.wfile.write(body)
                 except urllib.error.HTTPError as exc:
+                    diagnostics.update(http_status=exc.code, error_type="HTTPError")
                     self._error(exc.code, "upstream rejected the request; usage is unknown")
                 except (OSError, ValueError, TypeError) as exc:
+                    diagnostics.update(error_type=type(exc).__name__, errno=getattr(exc, "errno", None))
                     try:
                         self._error(502, "upstream response failed; usage is unknown")
                     except (OSError, ValueError):
                         pass
                 finally:
-                    gateway.gate.settle(identity, usage or None)
+                    if request.get("stream") is True and not stream_complete:
+                        diagnostics.setdefault("error_type", "IncompleteStream")
+                        # Initial input usage is not a receipt for all generated output.
+                        usage = {}
+                    if not settled:
+                        gateway.gate.settle(identity, usage or None, diagnostics=diagnostics)
 
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
                 gateway._note_incoming("GET", self.path)

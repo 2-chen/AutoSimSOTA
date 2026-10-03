@@ -122,6 +122,44 @@ def test_invalid_delegation_never_calls_model(tmp_path):
     assert not real.client.calls
 
 
+def test_task_rejection_names_optional_and_unexpected_fields():
+    with pytest.raises(ValueError) as error:
+        validate_task({'role':'init', 'task':'Inspect native sources',
+                       'expected_result':'source-backed findings', 'mode':'edit',
+                       'timeout_seconds':900, 'source_paths':['eval.py']})
+    assert "unexpected=['source_paths']" in str(error.value)
+    assert 'mode, timeout_seconds' in str(error.value)
+    assert "missing=[]" in str(error.value)
+
+
+def test_new_research_freeze_refuses_known_identity_schema_mismatch(tmp_path, monkeypatch):
+    real = make(tmp_path)
+    original = real.state
+    monkeypatch.setattr(real, 'state', lambda: {**original(), 'research_progress':None,
+        'native_identity_schema':{'status':'incompatible','issues':['episode_id missing']}})
+    result = real.do('run_the_loop')
+    assert result['outcome'] == 'not attempted'
+    assert 'before protocol freeze' in result['because']
+    assert not real.client.calls
+
+
+def test_main_agent_observes_native_schema_before_freeze(tmp_path):
+    from autosim.research.common import atomic_json
+    real = make(tmp_path)
+    directory = real.output/'producer'/'policy'
+    directory.mkdir(parents=True)
+    (directory/'weights.bin').write_bytes(b'policy')
+    said = 'AUTOSIM_POLICY_LOADED ' + json.dumps({'path':str(directory),'content_sha256':'a'*64})+'\n'
+    said += 'AUTOSIM_ROLLOUT_COMPLETED ' + json.dumps({'episode_index':'0','policy_sha256':'a'*64})+'\n'
+    said += 'AUTOSIM_METRIC_REPORTED ' + json.dumps({'episode_index':['0'],'value':0})+'\n'
+    atomic_json(real.output/'derivation_attempts/evaluate.json',{'attempts':[
+        {'status':'accepted','said':said,'native_evidence_ref':'evidence/example.json'}]})
+    view = real._native_identity_schema_view('evaluate')
+    assert view['status'] == 'incompatible' and len(view['issues']) == 3
+    assert view['native_evidence_ref'] == 'evidence/example.json'
+    assert 'not consumption or scoring' in view['authority']
+
+
 def test_editable_task_invalidates_commands_even_on_model_failure(tmp_path, monkeypatch):
     real = make(tmp_path)
     real.stages = {"train": "old source"}

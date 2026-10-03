@@ -43,7 +43,8 @@ def test_read_only_mcp_can_read_evidence_but_not_execute(tmp_path):
     names = [row["name"] for row in handle_mcp_message(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         executor)["result"]["tools"]]
-    assert set(names) == {"read_evidence", "search_public_sources", "read_public_source"}
+    assert set(names) == {"read_evidence", "search_public_sources", "read_public_source",
+                          "inspect_workspace_resources"}
     answer = handle_mcp_message({"jsonrpc": "2.0", "id": 2,
                                  "method": "tools/call", "params": {
                                      "name": "read_evidence", "arguments": {

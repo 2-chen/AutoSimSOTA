@@ -27,6 +27,49 @@ def test_report_includes_partial_build_facts_and_separate_model_budget(tmp_path)
     assert "$0.24000" in result and "$29.76000" in result
 
 
+def test_native_verification_is_displayed_without_claiming_scored_experiment(tmp_path):
+    from autosim.research.evidence_store import capture_attempt_evidence
+    identity = 'd'*32
+    log = tmp_path/f'derivation_native/{identity}/native.log'
+    log.parent.mkdir(parents=True)
+    log.write_text('\x1b[31mValueError: unsupported native device\n\x1b[0m\n')
+    original_bytes = log.read_bytes()
+    sealed = capture_attempt_evidence(tmp_path, attempt_id=identity, log=log,
+        receipt_ref=f'derivation_native/{identity}/receipt.json', status='failed',
+        returncode=1,termination_reason='failed')
+    atomic_json(log.parent/'receipt.json', {**sealed,'id':identity,'stage':'train',
+        'status':'failed','seconds':4.2})
+    view = run_record.build_report_view(tmp_path,'derived',status='running')
+    snapshot = recorder.make_snapshot(tmp_path,view,{'actions':[],'plan':{}})
+    document = recorder.render(tmp_path,snapshot,{})
+    assert '最近的原生试跑（不计分）' in document
+    assert 'unsupported native device' in document
+    assert '\x1b' not in document
+    assert log.read_bytes() == original_bytes
+    assert f'evidence/{identity}.json' in document
+    assert '已记录 0 项开发实验' in document
+    assert snapshot['measurements'] == []
+
+
+def test_live_native_panel_advances_during_action_without_model_or_narrative_rewrite(tmp_path, monkeypatch):
+    from autosim.research.stage_verification import recent_attempts
+    path = tmp_path / 'RUN.md'
+    path.write_text('# Run\n' + recorder.START + '\n人类叙述保持\n' + recorder.END + '\n技术详情保持')
+    identity = 'c' * 32
+    directory = tmp_path / 'derivation_native' / identity
+    directory.mkdir(parents=True)
+    atomic_json(directory / 'receipt.json', {'id': identity, 'stage': 'evaluate', 'status': 'running'})
+    monkeypatch.setattr(recorder, 'refresh', lambda *args, **kwargs: pytest.fail('heartbeat cannot narrate'))
+    run_record.refresh_live_status(tmp_path, fallback_status='running')
+    content = path.read_text()
+    assert 'cccccccccc' in content and '运行记录待核验' in content
+    assert '人类叙述保持' in content and '技术详情保持' in content
+    assert content.count(recorder.NATIVE_START) == 1
+    assert recent_attempts(tmp_path)[0]['status'] == 'running_unverified'
+    assert not (tmp_path / 'report/recorder_trigger.json').exists()
+    assert 'SOTA' not in content
+
+
 def test_report_distinguishes_environment_availability_from_readiness(tmp_path):
     atomic_json(tmp_path / "environment_pool.json", {"enabled": True})
     atomic_json(tmp_path / "environment_selection.json", {
@@ -63,6 +106,17 @@ def measurement(root, label, value, protocol="a" * 64, *, direction="maximize", 
 def snapshot(root):
     return recorder.make_snapshot(root, run_record.build_report_view(root, "derived", status="running"),
                                   {"actions": [{"step": "train", "outcome": "done"}], "plan": {}})
+
+
+def test_reference_is_not_candidate_gain_and_baseline_meaning_is_chinese(tmp_path):
+    measurement(tmp_path,'baseline',0)
+    measurement(tmp_path,'reference_published',0.51)
+    held = snapshot(tmp_path)
+    row = next(r for r in held['measurements'] if r['label']=='reference_published')
+    assert not row['comparable'] and row['delta'] is None
+    document = recorder.render(tmp_path,held,{})
+    assert '本地 baseline 的有效测量不等于官方性能复现' in document
+    assert '已发布基线：尚未核验' in document
 
 
 class Writer:
@@ -168,6 +222,39 @@ def test_new_research_event_stales_narration_and_generates_a_new_turn(tmp_path):
     assert "上一份叙述已过期" in recorder.render(tmp_path, second, narrative)
     recorder.narrate(tmp_path, second, client=writer)
     assert len(writer.calls) == 4
+
+
+def test_recorder_coalesces_routine_prose_but_new_failure_bypasses(tmp_path):
+    import copy
+    held = snapshot(tmp_path)
+    writer = Writer()
+    original = recorder.narrate(tmp_path, held, client=writer)
+    assert "evidence" not in writer.calls[0][0]
+    assert "task_outline" in writer.calls[0][0]
+    assert "evidence" in writer.calls[1][0]
+    routine = copy.deepcopy(held)
+    routine["event_revision"] = "routine-change"
+    routine["actions"] = [{"step": "inspect", "outcome": "completed"}]
+    assert recorder.narrate(tmp_path, routine, client=writer) == original
+    assert len(writer.calls) == 2
+    routine["runtime_failure"] = {"category": "new_failure"}
+    routine["event_revision"] = "new-failure"
+    recorder.narrate(tmp_path, routine, client=writer)
+    assert len(writer.calls) == 4
+
+
+def test_writer_sees_recent_environment_facts_not_whole_install_inventory(tmp_path):
+    held = snapshot(tmp_path)
+    attempts = [{"ok": i > 5, "attempt_id": str(i)} for i in range(30)]
+    held["provisioning"] = {"status": "completed", "attempts": attempts}
+    held["installation_recovery_inventory"] = {"local_wheels": list(range(100)),
+                                                "scan_complete": True}
+    evidence = recorder._evidence(held)
+    assert evidence["provisioning"]["attempt_count"] == 30
+    assert evidence["provisioning"]["failed_attempt_count"] == 6
+    assert evidence["provisioning"]["attempts"] == attempts[-8:]
+    assert evidence["installation_recovery_inventory"]["local_wheel_count"] == 100
+    assert held["provisioning"]["attempts"] == attempts
 
 
 def test_recorder_has_no_tools_or_mcp_and_cannot_execute(tmp_path):

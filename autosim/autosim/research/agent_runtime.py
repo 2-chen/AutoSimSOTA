@@ -43,6 +43,7 @@ _MCP_SERVER_NAME = "autosim_exec"
 _MCP_TOOL_NAME = "run_command"
 _EVIDENCE_TOOL_NAME = "read_evidence"
 _NATIVE_TOOL_NAME = "inspect_native_environment"
+_RESOURCE_TOOL_NAME = "inspect_workspace_resources"
 _PUBLIC_TOOLS = {"search_public_sources", "read_public_source"}
 _SESSION_SCHEMA = 1
 _MAX_TOOL_CALLS = 48
@@ -256,6 +257,8 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
     command.extend(mounts)
     if native:
         prefix = Path(native["interpreter"]).parent.parent
+        for root in native.get('dependency_roots', []):
+            command.extend(("--ro-bind", root, root))
         command.extend(("--ro-bind", str(prefix), str(prefix),
                         "--ro-bind", str(workspace), str(workspace)))
         for key, value in native["paths"].items():
@@ -287,6 +290,8 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
     if native:
         for key, value in native["paths"].items():
             command.extend(("--setenv", key, value))
+        if native.get('runtime_library_dirs'):
+            command.extend(("--setenv", "LD_LIBRARY_PATH", ':'.join(native['runtime_library_dirs'])))
         command.extend(("--setenv", "PYTHONDONTWRITEBYTECODE", "1",
                         "--chdir", str(cwd)))
     command.extend(("--", *argv))
@@ -308,6 +313,18 @@ def _safe_tool_result(attempt: ProcessAttempt, *, workspace: Path) -> dict[str, 
         "stdout": stdout[-_MAX_TOOL_OUTPUT:],
         "stderr": stderr[-_MAX_TOOL_OUTPUT:],
     }
+
+
+def _missing_resume_session(attempt: ProcessAttempt, session_id: str,
+                            final_result: dict[str, Any] | None, *, resume: bool) -> bool:
+    """A precise CLI pre-execution refusal, not an error guessed from tool output."""
+    return bool(resume and attempt.launched and not attempt.timed_out and not attempt.error
+                and attempt.returncode not in (None, 0) and final_result
+                and final_result.get("is_error") is True
+                and final_result.get("num_turns") == 0
+                and final_result.get("session_id") == session_id
+                and any(line.strip() == f"No conversation found with session ID: {session_id}"
+                        for line in str(attempt.stderr or "").splitlines()))
 
 
 def _turn_status(attempt: ProcessAttempt, final_result: dict[str, Any] | None,
@@ -417,6 +434,16 @@ def _role_skill_context(role: str, task: str) -> tuple[dict[str, Any], str]:
                "current source/receipts, and do not treat a skill as permission or proof.\n\n" +
                "\n\n".join(body_sections))
     return metadata, context
+
+
+def _critical_stream_line(line: str) -> bool:
+    """Keep errors, results and unknown records; exclude only known progress telemetry."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return True
+    return not (isinstance(event, dict) and event.get("type") == "system"
+                and event.get("subtype") == "thinking_tokens")
 
 
 def _project_claude_event(event: dict[str, Any],
@@ -653,6 +680,15 @@ class _McpExecutor:
             _worker_evidence_root(self.output), arguments.get("evidence_id"),
             offset=arguments.get("offset", 0), limit=arguments.get("limit", 8000))
 
+    def inspect_resources(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        from .resource_inventory import inspect
+        if set(arguments) - {"target", "directory", "limit"}:
+            raise ValueError("resource inventory accepts target, directory and limit only")
+        if self.calls >= _MAX_TOOL_CALLS:
+            raise AgentRuntimeError("resource inventory turn allowance exhausted")
+        self.calls += 1
+        return inspect(_worker_evidence_root(self.output), **arguments)
+
     def native_probe(self, arguments: dict[str, Any]) -> dict[str, Any]:
         from .native_context import load_context
         from .common import atomic_text
@@ -760,6 +796,19 @@ def _native_tool_schema() -> dict[str, Any]:
                 "required": ["code", "purpose"], "additionalProperties": False}}
 
 
+def _resource_tool_schema() -> dict[str, Any]:
+    return {"name": _RESOURCE_TOOL_NAME,
+            "description": "List actual names/sizes under an explicit read-only resource "
+                "binding before native environment setup. Builtin Glob/Read see empty "
+                "mount placeholders, not actual datasets/checkpoints. No file contents, "
+                "host paths or execution access. Inspect a subdirectory if truncated.",
+            "inputSchema": {"type": "object", "properties": {
+                "target": {"type": "string", "maxLength": 512},
+                "directory": {"type": "string", "maxLength": 512},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "required": ["target"], "additionalProperties": False}}
+
+
 def _public_tool_schemas():
     return [{"name": name, "description": "Retrieve public research sources over bounded HTTPS; "
              "no secrets/private paths/data in queries. Search hits must be fetched before "
@@ -786,10 +835,10 @@ def handle_mcp_message(message: dict[str, Any], executor: _McpExecutor) -> dict[
     elif method == "tools/list":
         result = {"tools": ([_tool_schema()] if executor.allow_commands else []) +
                   ([_native_tool_schema()] if executor.allow_native else []) +
-                  [_evidence_tool_schema(), *_public_tool_schemas()]}
+                  [_evidence_tool_schema(), _resource_tool_schema(), *_public_tool_schemas()]}
     elif method == "tools/call":
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
-        if params.get("name") not in {_MCP_TOOL_NAME, _EVIDENCE_TOOL_NAME, _NATIVE_TOOL_NAME, *_PUBLIC_TOOLS}:
+        if params.get("name") not in {_MCP_TOOL_NAME, _EVIDENCE_TOOL_NAME, _NATIVE_TOOL_NAME, _RESOURCE_TOOL_NAME, *_PUBLIC_TOOLS}:
             return {"jsonrpc": "2.0", "id": message_id,
                     "error": {"code": -32602, "message": "unknown tool"}}
         try:
@@ -801,6 +850,8 @@ def handle_mcp_message(message: dict[str, Any], executor: _McpExecutor) -> dict[
                          executor.call(params.get("arguments") or {}))
             elif params.get("name") in _PUBLIC_TOOLS:
                 value = executor.public_source(params["name"], params.get("arguments") or {})
+            elif params.get("name") == _RESOURCE_TOOL_NAME:
+                value = executor.inspect_resources(params.get("arguments") or {})
             else:
                 value = executor.read_evidence(params.get("arguments") or {})
             result = {"content": [{"type": "text", "text": json.dumps(
@@ -865,20 +916,24 @@ def _claude_configuration(*, workspace: Path, output: Path,
 
 
 def _role_cli_args(profile: Any, *, workspace: Path, output: Path,
-                   python: str, model: str, max_budget_usd: float | None) -> list[str]:
+                   python: str, model: str, max_budget_usd: float | None,
+                   decision_only: bool = False, output_format: str = "stream-json") -> list[str]:
     """Translate one role's capability profile into the actual CLI/MCP allowlist."""
     config = _claude_configuration(workspace=workspace, output=output, python=python,
                                    include_executor=profile.can_execute_diagnostics,
-                                   native_readonly=profile.name == "scheduler")
+                                   native_readonly=profile.can_inspect_native)
     authorized_tools = [*profile.builtin_tools, *profile.mcp_tools]
-    if profile.name == "recorder":
+    if profile.name == "recorder" or decision_only:
         config = {"mcpServers": {}}
-    return ["--print", "--verbose", "--output-format", "stream-json",
+    if decision_only:
+        authorized_tools = []
+    return ["--print", *(["--verbose"] if output_format == "stream-json" else []),
+            "--output-format", output_format,
             # Complete assistant/tool/result records remain live; partial provider deltas
             # have produced unterminated JSON records with the current provider bridge.
             "--permission-prompts", "none",
             "--permission-mode", "acceptEdits", "--restricted",
-            "--tools", ",".join(profile.builtin_tools),
+            "--tools", "" if decision_only else ",".join(profile.builtin_tools),
             *(["--allowedTools", *authorized_tools] if authorized_tools else []),
             "--strict-mcp-config", "--mcp-config",
             json.dumps(config, separators=(",", ":")),
@@ -991,10 +1046,75 @@ def _persist_agent_session(output: Path, session: dict[str, Any]) -> None:
     atomic_json(root / "session.json", session)
 
 
+def unreserved_prelaunch_proof(*, output: Path, workspace: Path,
+                              session: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """Prove interruption before mandatory capped admission, not merely absent PID.
+
+    The launcher must reserve in the ledger and persist that reservation before creating
+    the provider process. A matching initial session with no ledger entry cannot have
+    reached launch. Starting receipts/uncapped sessions remain deliberately unknown.
+    Call only while holding the run's agent turn lock.
+    """
+    if (session.get('status') != 'running' or session.get('run_id') != run_id or
+            session.get('workspace_identity') != str(workspace.resolve()) or
+            any(session.get(k) for k in ('budget_reservation_id', 'process_identity',
+                'process_ref', 'process_attempt_id'))):
+        return {}
+    try:
+        limit = float(session['max_total_budget_usd'])
+        if not math.isfinite(limit) or limit <= 0:
+            return {}
+        session_id = str(uuid.UUID(session['session_id']))
+        key = str(session['agent_session_key'])
+        if not re.fullmatch(r'[0-9a-f]{32}', key):
+            return {}
+        budget_root = Path(session.get('budget_output') or output).resolve(strict=True)
+        if not output.resolve().is_relative_to(budget_root):
+            return {}
+        ledger_path = budget_root/'agent/cost_ledger.json'
+        if ledger_path.is_symlink() or ledger_path.parent.is_symlink():
+            return {}
+        ledger = json.loads(ledger_path.read_text())
+        if ledger.get('run_id') != run_id or not isinstance(ledger.get('entries'), list):
+            return {}
+        if any(not isinstance(row, dict) or row.get('session_id') == session_id
+               for row in ledger['entries']):
+            return {}
+        for path in (output/'agent/processes').glob('*.json'):
+            if path.is_symlink():
+                return {}
+            record = json.loads(path.read_text())
+            if not isinstance(record, dict):
+                return {}
+            if record.get('session_id') == session_id or record.get('agent_session_key') == key:
+                return {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    return {'status':'not_launched', 'session_id':session_id,
+            'session_key':key, 'authority':'mandatory_capped_admission_not_reached',
+            'ledger_ref':str(ledger_path.relative_to(budget_root)),
+            'ledger_entries_preserved':len(ledger['entries'])}
+
+
 def _reconcile_abandoned_agent_session(*, output: Path, workspace: Path,
                                       session: dict[str, Any], run_id: str) -> dict[str, Any]:
     """Stop only the exact agent process left by a dead runtime and mark its turn unknown."""
     if session.get("status") != "running":
+        return session
+    if (session.get('run_id') != run_id or
+            session.get('workspace_identity') != str(Path(workspace).resolve(strict=True))):
+        raise AgentRuntimeError('running coding-agent session belongs to another run/workspace')
+    proof = unreserved_prelaunch_proof(output=output, workspace=workspace,
+                                      session=session, run_id=run_id)
+    if proof:
+        session.update(status='interrupted', finished_at=time.time(),
+            failure_category='coding_agent_prelaunch_interrupted', process_reconciliation=proof)
+        _persist_agent_session(output, session)
+        ResearchStateStore(output, run_id=run_id, repository=workspace).record(
+            'agent_runtime', 'agent_prelaunch_reconciled', status='interrupted', details=proof,
+            phase_state={'current_action':{}, 'process_identity':None,
+                         'parent_action':session.get('parent_action'),
+                         'role':session.get('role')}, decision_relevant=False)
         return session
     identity = session.get("process_identity")
     attempt_id = str(session.get("process_attempt_id") or "")
@@ -1003,16 +1123,6 @@ def _reconcile_abandoned_agent_session(*, output: Path, workspace: Path,
             process_ref != f"agent/processes/{attempt_id}.json"):
         raise AgentRuntimeError(
             "running coding-agent session lacks a safe process identity; manual reconciliation is required")
-    observed = inspect_process_identity(identity)
-    process_status = str(observed.get("status") or "unverifiable")
-    if process_status == "matching_running":
-        observed = terminate_recorded_process(identity)
-        process_status = str(observed.get("status") or "unverifiable")
-    if process_status not in {"terminated", "not_running"}:
-        raise AgentRuntimeError(
-            "abandoned coding-agent process cannot be safely reconciled: "
-            f"{observed.get('why') or process_status}")
-
     receipt_path = Path(output) / process_ref
     receipt_dir = receipt_path.parent
     if receipt_dir.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file():
@@ -1025,6 +1135,16 @@ def _reconcile_abandoned_agent_session(*, output: Path, workspace: Path,
             receipt.get("attempt_id") != attempt_id or
             receipt.get("process_identity") != identity):
         raise AgentRuntimeError("abandoned coding-agent process receipt identity changed")
+    # Validate ownership before any signal, not after terminating a matching PID.
+    observed = inspect_process_identity(identity)
+    process_status = str(observed.get("status") or "unverifiable")
+    if process_status == "matching_running":
+        observed = terminate_recorded_process(identity)
+        process_status = str(observed.get("status") or "unverifiable")
+    if process_status not in {"terminated", "not_running"}:
+        raise AgentRuntimeError(
+            "abandoned coding-agent process cannot be safely reconciled: "
+            f"{observed.get('why') or process_status}")
     receipt.update(status="interrupted", finished_at=time.time(),
                    termination_reason="coding_agent_runtime_restart",
                    process_reconciliation=observed)
@@ -1084,7 +1204,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                            auto_skills: bool = True,
                            decision_attempt_id: str | None = None,
                            on_event: Callable[[dict[str, Any]], None] | None = None,
-                           budget_output: Path | None = None
+                           budget_output: Path | None = None,
+                           decision_only: bool = False, output_format: str = "stream-json"
                            ) -> dict[str, Any]:
     """Run one real, streamed Claude Code turn against the configured DeepSeek endpoint."""
     from ..llm_client import PROJECT_ROOT, load_credential_file
@@ -1092,6 +1213,15 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     workspace = Path(workspace).expanduser().resolve(strict=True)
     output = Path(output).expanduser().resolve(strict=True)
     profile = role_profile(role, read_only=read_only)
+    if output_format not in {"json", "stream-json"}:
+        raise ValueError("unsupported agent output format")
+    if decision_only and role not in {"objective", "supervisor", "monitor", "recorder"}:
+        raise ValueError("decision-only mode is restricted to read-only review roles")
+    if output_format == "json" and not decision_only:
+        raise ValueError("nonstream mode requires decision-only review")
+    if decision_only:
+        resume = False
+        auto_skills = False
     if decision_attempt_id is not None and not re.fullmatch(
             r"[0-9a-f]{32}", str(decision_attempt_id)):
         raise ValueError("decision attempt id must be a lowercase UUID hex value")
@@ -1141,7 +1271,11 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             max_total_budget_usd = float(saved_total)
         elif not math.isclose(float(saved_total), float(max_total_budget_usd),
                               rel_tol=0, abs_tol=1e-9):
-            raise AgentRuntimeError("cannot silently change a run's total model budget")
+            from .budget_amendment import authorizes_transition
+            amendment_root = Path(budget_output).resolve(strict=True) if budget_output else output
+            if not authorizes_transition(amendment_root, old_limit=float(saved_total),
+                    new_limit=float(max_total_budget_usd), run_id=run_id):
+                raise AgentRuntimeError("cannot silently change a run's total model budget")
     elif latest_run_session and max_total_budget_usd is not None:
         raise AgentRuntimeError("cannot add a total model budget after an uncapped turn; "
                                 "start a fresh run")
@@ -1170,6 +1304,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     ledger = (AgentCostLedger(budget_root, run_id=run_id, limit_usd=max_total_budget_usd,
                               cost_basis=cost_basis)
               if max_total_budget_usd is not None else None)
+    if ledger is not None:
+        ledger.reconcile_receipts(apply=True)
 
     skill_manifest, skill_context = (
         _role_skill_context(profile.name, prompt) if auto_skills else
@@ -1262,7 +1398,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     try:
         args = _role_cli_args(profile, workspace=workspace, output=output,
                               python=sys.executable, model=model,
-                              max_budget_usd=None if official_pricing else turn_budget_usd)
+                              max_budget_usd=None if official_pricing else turn_budget_usd,
+                              decision_only=decision_only, output_format=output_format)
         if resume:
             args.extend(("--resume", session_id))
         else:
@@ -1282,12 +1419,14 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     final_result: dict[str, Any] | None = None
     visible_progress: list[str] = []
     last_progress_at = time.monotonic()
+    last_document_at = 0.0
     process_attempt_id = uuid.uuid4().hex
     process_ref = f"agent/processes/{process_attempt_id}.json"
     process_path = output / process_ref
     process_identity: dict[str, Any] | None = None
     active_process_action: dict[str, Any] = {
         "step": "coding_agent_turn", "status": "running", "role": profile.name,
+        "started_at": time.time(),
         "attempt_id": process_attempt_id, "process_ref": process_ref,
         "parent_action": parent_action,
     }
@@ -1295,7 +1434,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         active_process_action["decision_attempt_id"] = decision_attempt_id
 
     def emit(row: dict[str, Any], *, status: str = "running") -> None:
-        nonlocal projected_events
+        nonlocal projected_events, last_document_at
         projected_events += 1
         record = {"sequence": projected_events, "role": profile.name,
                   "turn_id": process_attempt_id, "process_ref": process_ref,
@@ -1314,9 +1453,14 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                      decision_relevant=False)
         if on_event is not None:
             on_event(record)
-        run_record.refresh_live_status(output, fallback_status=status,
-                                       fallback_current=str(row.get("type") or "agent event"))
-        refresh_agent_document(output)
+        # Events remain durable immediately. Reassembling the whole report for every
+        # read/tool event stalls stream consumption and can discard a finished result at
+        # the turn deadline. Final projection occurs after process accounting below.
+        if row.get("type") != "session_result" and time.monotonic() - last_document_at >= 5:
+            run_record.refresh_live_status(output, fallback_status=status,
+                                           fallback_current=str(row.get("type") or "agent event"))
+            refresh_agent_document(output)
+            last_document_at = time.monotonic()
 
     def on_stdout(line: str) -> None:
         nonlocal seen_session, final_result, last_progress_at
@@ -1425,6 +1569,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         raise
 
     gateway_snapshot: dict[str, Any] | None = None
+    gateway = None
     launched = False
     startup_failure = None
     startup_phase = "deepseek_gateway_start"
@@ -1443,15 +1588,32 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             launched = True
             attempt = run_process_stream([executable, *args], cwd=workspace, env=environment,
                                          input_bytes=prompt.encode("utf-8"),
-                                         timeout=timeout, on_stdout_line=on_stdout,
+                                         timeout=timeout, on_stdout_line=on_stdout if output_format == "stream-json" else None,
                                          on_stderr_line=on_stderr,
                                          on_heartbeat=heartbeat, heartbeat_interval=15,
                                          max_output_bytes=16 * 1024 * 1024,
                                          max_line_bytes=2 * 1024 * 1024,
-                                         on_start=on_process_start)
-            if gateway is not None:
-                gateway_snapshot = gateway.snapshot() if hasattr(gateway, "snapshot") else gateway.gate.snapshot()
+                                         on_start=on_process_start, decouple_callbacks=True,
+                                         stdout_line_filter=_critical_stream_line if output_format == "stream-json" else None)
+            if output_format == "json" and not attempt.timed_out and attempt.error is None:
+                # Parse the whole response, not individual pretty-printed lines.
+                try:
+                    response = json.loads(attempt.stdout or "")
+                    if not isinstance(response, dict) or response.get("type") != "result":
+                        raise ValueError("nonstream response has no terminal result")
+                    on_stdout(json.dumps(response))
+                except ValueError:
+                    protocol_errors.append("invalid or incomplete nonstream terminal response")
+        if gateway is not None:
+            # Server shutdown gives terminal stream settlement a chance to complete.
+            # Any request still in flight remains charged at its admitted ceiling.
+            gateway_snapshot = gateway.snapshot() if hasattr(gateway, "snapshot") else gateway.gate.snapshot()
     except Exception as exc:
+        if gateway is not None:
+            try:
+                gateway_snapshot = gateway.snapshot() if hasattr(gateway,'snapshot') else gateway.gate.snapshot()
+            except Exception:
+                gateway_snapshot = None
         # Persist pre-process failures through the same terminal receipt path as CLI
         # failures. In particular, a denied loopback socket must not leave a phantom
         # running session or a reference to an events file that was never written.
@@ -1466,20 +1628,51 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                            "message": safe_error[:1000], "traceback": safe_trace[-8000:]}
         attempt = ProcessAttempt(launched=launched, returncode=None, error=exc)
     except BaseException:
+        # An interrupted CLI may already have forwarded paid requests. Seal the
+        # local gate receipt before propagating the interruption; process death
+        # alone is never evidence of zero provider usage.
+        interrupted_cost = 0.0 if not launched else None
+        interrupted_ref = None
+        interrupted_snapshot = None
+        if official_pricing:
+            try:
+                if gateway is not None:
+                    interrupted_snapshot = (gateway.snapshot() if hasattr(gateway, "snapshot")
+                                            else gateway.gate.snapshot())
+                from .budget_receipts import known_gateway_cost
+                if launched:
+                    interrupted_cost = known_gateway_cost(interrupted_snapshot)
+                interrupted_path = output / f"agent/pricing/{process_attempt_id}.json"
+                interrupted_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if interrupted_path.is_symlink() or interrupted_path.parent.is_symlink():
+                    raise AgentRuntimeError("interrupted pricing receipt path is a symlink")
+                atomic_json(interrupted_path, {"schema_version": 1, "price_card": PRICE_CARD_ID,
+                    "cost_basis": cost_basis, "turn_id": process_attempt_id,
+                    "official_estimate_usd": interrupted_cost, "cli_estimate_usd": None,
+                    "gateway": interrupted_snapshot, "interrupted": True})
+                interrupted_ref = str(interrupted_path.relative_to(budget_root))
+            except Exception:
+                # Retain the original interruption and a conservative hold if
+                # receipt persistence fails, rather than silently inventing usage.
+                interrupted_cost = 0.0 if not launched else None
+                interrupted_snapshot = None
         if ledger is not None and reservation is not None:
-            ledger.settle(str(reservation["reservation_id"]), actual_usd=None,
-                          launched=launched)
+            ledger.settle(str(reservation["reservation_id"]), actual_usd=interrupted_cost,
+                launched=launched,
+                request_bound_usd=(interrupted_snapshot.get("accounting_ceiling_usd")
+                    if interrupted_cost is None and interrupted_snapshot and
+                       interrupted_snapshot.get("bound_valid") is True else None),
+                details={"pricing_ref": interrupted_ref,
+                         "price_card": PRICE_CARD_ID if official_pricing else None})
         raise
     reported_cost = final_result.get("total_cost_usd") if final_result else None
     cli_estimate = (float(reported_cost) if isinstance(reported_cost, (int, float)) and
                     not isinstance(reported_cost, bool) and
                     math.isfinite(float(reported_cost)) and float(reported_cost) >= 0
                     else None)
-    accounted_cost = (0.0 if not attempt.launched else gateway_snapshot["cost_usd"] if official_pricing and
-                      gateway_snapshot is not None and
-                      not gateway_snapshot["unknown"] and
-                      gateway_snapshot["requests"] > 0 else
-                      cli_estimate if not official_pricing else None)
+    from .budget_receipts import known_gateway_cost
+    accounted_cost = (0.0 if not attempt.launched else known_gateway_cost(gateway_snapshot)
+                      if official_pricing else cli_estimate)
     pricing_ref = None
     if official_pricing:
         pricing_ref = f"agent/pricing/{process_attempt_id}.json"
@@ -1496,7 +1689,11 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         ledger.settle(
             str(reservation["reservation_id"]),
             actual_usd=accounted_cost, launched=bool(attempt.launched),
-            details={"pricing_ref": pricing_ref, "cli_estimate_usd": cli_estimate,
+            request_bound_usd=(gateway_snapshot.get("accounting_ceiling_usd")
+                if official_pricing and accounted_cost is None and gateway_snapshot and
+                   gateway_snapshot.get("bound_valid", True) else None),
+            details={"pricing_ref": str(pricing_path.relative_to(budget_root)) if pricing_ref else None,
+                     "cli_estimate_usd": cli_estimate,
                      "price_card": PRICE_CARD_ID if official_pricing else None})
     process_status = ("not_launched" if not attempt.launched else
                       "timed_out" if attempt.timed_out else
@@ -1526,6 +1723,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         total_cost = previous_cost
     status, failure_category, completed = _turn_status(
         attempt, final_result, protocol_errors)
+    if _missing_resume_session(attempt, session_id, final_result, resume=resume):
+        status, failure_category, completed = "failed", "missing_resume_session", False
     if startup_failure:
         status, failure_category = "infrastructure_blocked", "runtime_startup"
     elif not attempt.launched and isinstance(attempt.error, (PermissionError, FileNotFoundError)):
@@ -1537,6 +1736,10 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             status, failure_category = "budget_exhausted", "run_model_budget"
         else:
             status, failure_category = "failed", "request_reservation_blocked"
+    elif (official_pricing and gateway_snapshot and not completed and
+            any(row.get("diagnostics", {}).get("error_type") for row in
+                gateway_snapshot.get("receipts", []))):
+        status, failure_category = "failed", "provider_transport"
     session.update({"status": status, "finished_at": time.time(),
                     "failure_category": failure_category,
                     "session_id": seen_session, "total_cost_usd": total_cost,
@@ -1549,6 +1752,12 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                     "usage": final_result.get("usage") if final_result else None,
                     "returncode": attempt.returncode, "timed_out": attempt.timed_out,
                     "protocol_error_count": len(protocol_errors)})
+    stream_evidence = None
+    if status != "completed" and attempt.launched:
+        from .runtime_recovery import seal_protocol_stream
+        stream_evidence = seal_protocol_stream(output, workspace, turn_id=process_attempt_id,
+            attempt=attempt, secrets=(key, environment.get("ANTHROPIC_AUTH_TOKEN", "")))
+        session["stream_evidence"] = stream_evidence
     run_budget = ledger.snapshot() if ledger is not None else None
     if run_budget is not None:
         session["run_budget"] = run_budget
@@ -1603,6 +1812,12 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             "run_budget": run_budget,
             "returncode": attempt.returncode, "timed_out": attempt.timed_out,
             "error": terminal["error"],
+            "stream_evidence": stream_evidence,
+            # Local executor input is not a display projection. Callers still validate
+            # operation contracts, paths and permissions before running anything.
+            # Never persist/forward this field as telemetry or a model prompt.
+            "execution_text": str(final_result.get("result") or "")
+                if final_result and status == "completed" else "",
             "final_text": sanitize_model_text(
                 str(final_result.get("result") or "")) if final_result else ""}
 
@@ -1616,7 +1831,8 @@ def run_coding_agent(*, workspace: Path, output: Path, prompt: str,
                      auto_skills: bool = True,
                      decision_attempt_id: str | None = None,
                      on_event: Callable[[dict[str, Any]], None] | None = None,
-                     budget_output: Path | None = None) -> dict[str, Any]:
+                     budget_output: Path | None = None,
+                     decision_only: bool = False, output_format: str = "stream-json") -> dict[str, Any]:
     """Serialize role turns so no concurrent process can corrupt this run's handoffs."""
     resolved_output = Path(output).expanduser().resolve(strict=True)
     from .budget import RunBudget
@@ -1627,7 +1843,28 @@ def run_coding_agent(*, workspace: Path, output: Path, prompt: str,
         raise TimeoutError("hard run wall deadline reached; no provider call started")
     from .scheduling import model_slot
     admission_started = time.monotonic()
-    with _agent_turn_lock(resolved_output), model_slot(budget_output or resolved_output, timeout=timeout,
+    with _agent_turn_lock(resolved_output):
+        # A fresh role context does not mean forgetting an interrupted prior role.
+        # Only the exclusive owner may retire its exact receipt-bound stale projection.
+        latest = _safe_session(resolved_output)
+        if latest.get('status') == 'running':
+            _reconcile_abandoned_agent_session(output=resolved_output, workspace=workspace,
+                session=latest, run_id=run_id)
+        return _admitted_coding_agent_turn(workspace=workspace, resolved_output=resolved_output,
+            prompt=prompt,run_id=run_id,timeout=timeout,admission_started=admission_started,
+            max_budget_usd=max_budget_usd,resume=resume,max_total_budget_usd=max_total_budget_usd,
+            cli=cli,role=role,read_only=read_only,auto_skills=auto_skills,
+            decision_attempt_id=decision_attempt_id,on_event=on_event,budget_output=budget_output,
+            decision_only=decision_only,output_format=output_format)
+
+
+def _admitted_coding_agent_turn(*, workspace, resolved_output, prompt, run_id, timeout,
+        admission_started, max_budget_usd, resume, max_total_budget_usd, cli, role,
+        read_only, auto_skills, decision_attempt_id, on_event, budget_output,
+        decision_only, output_format):
+    """Called only with the run's exclusive agent-turn lock held."""
+    from .scheduling import model_slot
+    with model_slot(budget_output or resolved_output, timeout=timeout,
             foreground=budget_output is None or Path(budget_output).resolve() == resolved_output):
         remaining = timeout - (time.monotonic() - admission_started)
         if remaining <= 0:
@@ -1638,7 +1875,8 @@ def run_coding_agent(*, workspace: Path, output: Path, prompt: str,
             max_total_budget_usd=max_total_budget_usd, cli=cli, role=role,
             read_only=read_only, auto_skills=auto_skills,
             decision_attempt_id=decision_attempt_id,
-            on_event=on_event, budget_output=budget_output)
+            on_event=on_event, budget_output=budget_output,
+            decision_only=decision_only, output_format=output_format)
         from .scheduling import policy, note
         shared_output = Path(budget_output or resolved_output)
         if policy(shared_output):

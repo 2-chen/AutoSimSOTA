@@ -54,6 +54,7 @@ def allocated_bytes(root: Path) -> int:
 
 
 def configure(output: Path, root: Path | None = None, *, enabled: bool = True,
+              publish_snapshots: bool | None = None,
               source_repository: Path | None = None) -> dict[str, Any]:
     output = Path(output).resolve()
     path = output / "environment_pool.json"
@@ -63,6 +64,8 @@ def configure(output: Path, root: Path | None = None, *, enabled: bool = True,
             raise ValueError("environment pool changed; use a fresh run")
         if held.get("enabled") != enabled:
             raise ValueError("environment pool policy changed; use a fresh run")
+        if publish_snapshots is not None and bool(held.get('publish_snapshots')) != publish_snapshots:
+            raise ValueError('environment snapshot policy changed; use a fresh run')
         return held
     root = Path(root or DEFAULT_ROOT).resolve()
     if root == Path("/") or root.is_relative_to(output) or output.is_relative_to(root):
@@ -76,6 +79,7 @@ def configure(output: Path, root: Path | None = None, *, enabled: bool = True,
         for name in ("wheels", "snapshots", "registered"):
             (root / name).mkdir(exist_ok=True)
     result = {"schema_version": 1, "enabled": enabled, "root": str(root),
+              'publish_snapshots': bool(publish_snapshots),
               "created_at": now(), "policy": "read-only bases; isolated installs; probes required"}
     atomic_json(path, result)
     return result
@@ -181,9 +185,16 @@ def describe(prefix: Path) -> dict[str, Any]:
     version = version or next((site.parent.name.removeprefix("python") for site in sites), "unknown")
     fingerprint = object_digest({"kind": kind, "python": version, "packages": packages,
                                  "unsafe": sorted(set(unsafe))})
+    rebind = sorted({item.split('package ', 1)[1].lower().replace('_', '-') for item in unsafe
+                     if item.startswith(('editable package ', 'repository-local installed package '))})
+    portable = {name: value for name, value in packages.items() if name not in rebind
+                and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', name)
+                and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.+!-]*', value)}
     return {"id": object_digest([str(prefix), fingerprint])[:32], "prefix": str(prefix),
             "kind": kind, "python": version, "packages": packages,
             "fingerprint": fingerprint, "cloneable": not unsafe,
+            "reconstructable": bool(re.fullmatch(r'\d+\.\d+', version)),
+            "portable_packages": portable, "rebind_packages": rebind,
             "limitations": sorted(set(unsafe)), "readiness": "unverified"}
 
 
@@ -212,13 +223,20 @@ def tree_digest(prefix: Path, *, timeout: float = 600) -> str:
 
 
 def discover(root: Path, *, prefixes: list[Path] | None = None,
-             timeout: float = 15) -> list[dict[str, Any]]:
+             timeout: float = 15, machine: dict | None = None) -> list[dict[str, Any]]:
     candidates = list(prefixes or [])
     registered = []
+    registrations = {}
     for registry in sorted((root / "registered").glob("*.json"))[:32]:
-        if not registry.is_symlink():
+        if not registry.is_symlink() and registry.stat().st_size <= 128 * 1024:
             try:
-                registered.append(Path(read_json(registry)["prefix"]))
+                entry = read_json(registry)
+                prefix = Path(entry['prefix'])
+                registered.append(prefix)
+                key = str(prefix.absolute())
+                if str(entry.get('updated_at') or entry.get('created_at') or '') >= str(
+                        registrations.get(key, {}).get('updated_at') or registrations.get(key, {}).get('created_at') or ''):
+                    registrations[key] = entry
             except (OSError, ValueError, KeyError, TypeError):
                 continue
     if prefixes is None:
@@ -249,7 +267,18 @@ def discover(root: Path, *, prefixes: list[Path] | None = None,
             continue
         seen.add(str(prefix))
         try:
-            rows.append(describe(prefix))
+            row = describe(prefix)
+            entry = registrations.get(str(prefix.absolute()))
+            if entry:
+                row.update(origin='registered_base', label=str(entry.get('label') or '')[:80])
+                from .environment_overlay import inspect
+                row['overlay_reusable'] = inspect(prefix, row['python'])['reusable']
+                from .environment_bases import verification_view
+                if machine is None and entry.get('proofs'):
+                    from .provision import platform_facts
+                    machine = platform_facts()
+                row['base_verification'] = verification_view(prefix, entry.get('proofs') or [], machine or {})
+            rows.append(row)
         except (OSError, ValueError, TypeError):
             continue
     return rows
@@ -263,17 +292,17 @@ def dependency_key(manifests: dict[str, str], machine: dict[str, Any]) -> str:
 def failed_selection(output: Path, *, base_id: str, error: Exception,
                      seconds: float, phase: str = "before_execution",
                      failure_kind: str = "cache_validation",
-                     prior_attempt: dict[str, Any] | None = None) -> dict[str, Any]:
+                     prior_attempt: dict[str, Any] | None = None, operation: str = 'clone') -> dict[str, Any]:
     """Seal validation failures without rewriting the original command receipt."""
     from .evidence_store import capture_attempt_evidence
     identity = uuid.uuid4().hex
     log = output / "provision_attempts" / f"{identity}.log"
-    text = f"clone base {base_id}\n{type(error).__name__}: {error}\n"
+    text = f"{operation} base {base_id}\n{type(error).__name__}: {error}\n"
     if prior_attempt:
         text += "Original command evidence: " + str(prior_attempt.get("evidence_id")) + "\n"
     atomic_text(log, text)
     ref = f"provision_attempts/{identity}.json"
-    receipt = {"command": f"clone_base:{base_id}", "phase": phase,
+    receipt = {"command": f"{operation}_base:{base_id}", "phase": phase,
         "ok": False, "returncode": None, "seconds": seconds,
         "failure_kind": failure_kind, "excerpt": text,
         "prior_evidence_id": (prior_attempt or {}).get("evidence_id"),
@@ -287,12 +316,12 @@ def failed_selection(output: Path, *, base_id: str, error: Exception,
     return receipt
 
 
-def catalog(output: Path, manifests: dict[str, str], machine: dict[str, Any]) -> list[dict[str, Any]]:
+def catalog(output: Path, manifests: dict[str, str], machine: dict[str, Any], *, repo: Path | None = None) -> list[dict[str, Any]]:
     root = store_for(output)
     if root is None:
         return []
     key = dependency_key(manifests, machine)
-    rows = [row for row in discover(root)
+    rows = [row for row in discover(root, machine=machine)
             if not Path(row["prefix"]).resolve().is_relative_to(Path(output).resolve())]
     for path in sorted((root / "snapshots").glob("*/manifest.json"))[:32]:
         if path.is_symlink() or (path.parent / "quarantined.json").exists():
@@ -308,19 +337,98 @@ def catalog(output: Path, manifests: dict[str, str], machine: dict[str, Any]) ->
                          "readiness": "requires_current_repository_probes"})
         except (OSError, ValueError, KeyError):
             continue
+    for path in sorted((root / 'templates').glob('*/manifest.json'))[:32]:
+        if path.is_symlink() or not path.resolve().is_relative_to(root) or path.stat().st_size > 256*1024:
+            continue
+        try:
+            template = read_json(path)
+            payload = template['payload']
+            if object_digest(payload) != template['identity'] or path.parent.name != template['identity']:
+                continue
+            rows.append({**payload['environment'], 'id':template['identity'], 'prefix':None,
+                'origin':'verified_portable_template', 'cloneable':False,
+                'dependency_match':payload['dependency_key'] == key,
+                'readiness':'previous_declared_consumers_verified; current_consumers_require_revalidation'})
+            reuse = payload.get('base_reuse') or {}
+            for base in rows:
+                if base.get('prefix') and base.get('fingerprint') == reuse.get('fingerprint'):
+                    base['successful_incremental_pins'] = dict(list(reuse.get('incremental_pins', {}).items())[:24])
+                    base['prior_setup_scope'] = 'prior_declared_consumers_only; current_consumers_require_revalidation'
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    declared = re.sub(r"[-_.]+", "-", "\n".join(manifests.values()).lower())
+    for row in rows:
+        from .environment_overlay import inspect, binding_catalog
+        overlay = inspect(Path(row['prefix']), row['python'], repo=repo or output/'checkout') if row.get('prefix') else {}
+        row['overlay_reusable'] = bool(overlay.get('reusable'))
+        row['overlay_fingerprint'] = overlay.get('fingerprint')
+        row['source_binding_options'] = binding_catalog(overlay) if overlay else []
+        matches = {name: version for name, version in row["packages"].items()
+            if re.search(r"(?<![a-z0-9-])" + re.escape(re.sub(r"[-_.]+", "-", name.lower())) +
+                r"(?![a-z0-9-])", declared)}
+        row["matching_package_count"] = len(matches)
+        row["declared_package_matches"] = dict(sorted(matches.items())[:40])
+        portable = row.get('portable_packages') or {}
+        row['reconstruction_pins'] = {name: portable[name] for name in sorted(portable)
+            if name in matches or name in CORE}
     atomic_json(Path(output) / "environment_catalog.json", {
         "schema_version": 1, "created_at": now(), "profiles": list(PROFILES),
+        "registry_revision": registry_revision(root),
         "candidates": rows, "note": "Local references only; models receive opaque IDs."})
     return rows
 
 
 def short_catalog(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{**{key: row.get(key) for key in ("id", "python", "kind", "cloneable",
-             "limitations", "readiness", "origin", "dependency_match")},
+             "limitations", "readiness", "origin", "dependency_match", "matching_package_count",
+             "declared_package_matches", "reconstructable", "rebind_packages", "reconstruction_pins",
+             "overlay_reusable", "source_binding_options", "label", "base_verification",
+             "successful_incremental_pins", "prior_setup_scope")},
              "core_packages": {name: version for name, version in row["packages"].items()
                                if name in CORE}, "package_count": len(row["packages"])}
             for row in sorted(rows, key=lambda r: (not r.get("dependency_match"),
-                not r.get("cloneable"), -len(CORE.intersection(r["packages"]))))[:12]]
+                -int(r.get("matching_package_count") or 0),
+                (r.get('base_verification') or {}).get('status') != 'verified',
+                r.get('origin') != 'registered_base', not r.get("cloneable"),
+                -len(CORE.intersection(r["packages"]))))[:12]]
+
+
+def candidate_view(output: Path, manifests: dict[str, str] | None = None, *, repo: Path | None = None) -> list[dict]:
+    """Refresh legacy metadata once; a supplied interpreter must not hide alternatives."""
+    if store_for(output) is None:
+        return []
+    path = output / 'environment_catalog.json'
+    if path.is_symlink():
+        raise ValueError('unsafe environment catalog')
+    previous = read_json(path) if path.is_file() else {}
+    rows = previous.get('candidates') or []
+    root = store_for(output)
+    if (not rows or any('overlay_reusable' not in row for row in rows)
+            or previous.get('registry_revision') != registry_revision(root)):
+        from .provision import platform_facts, manifests_of
+        if manifests is None:
+            manifests = manifests_of(repo) if repo is not None else {}
+        rows = catalog(output, manifests, platform_facts(), repo=repo)
+    elif any(row.get('base_verification') for row in rows):
+        from .environment_bases import verification_view
+        from .provision import platform_facts
+        machine = platform_facts()
+        def metadata_changed(row):
+            try:
+                return bool(row.get('origin') == 'registered_base' and row.get('prefix') and
+                            describe(Path(row['prefix']))['fingerprint'] != row.get('fingerprint'))
+            except (OSError, ValueError, KeyError, TypeError):
+                return False  # Missing base is marked stale by verification_view below.
+        if any(metadata_changed(row) for row in rows):
+            from .provision import manifests_of
+            declared = manifests if manifests is not None else manifests_of(repo) if repo else {}
+            return short_catalog(catalog(output, declared, machine, repo=repo))
+        for row in rows:
+            if row.get('origin') == 'registered_base' and row.get('prefix'):
+                registration = root / 'registered' / (row['id'] + '.json')
+                entry = read_json(registration) if registration.is_file() and not registration.is_symlink() else {}
+                row['base_verification'] = verification_view(Path(row['prefix']), entry.get('proofs') or [], machine)
+    return short_catalog(rows)
 
 
 def clone(source: Path, *, destination: Path, output: Path, repo: Path,
@@ -404,6 +512,7 @@ def publish_wheels(output: Path, *, max_bytes: int = 16 * 1024**3,
         return {"status": "disabled"}
     cache = Path(output) / "home" / ".cache" / "pip"
     added, total = [], 0
+    verified_links = []
     deadline = time.monotonic() + timeout
     index_path = Path(output) / "package_cache_export_index.json"
     index = read_json(index_path) if index_path.is_file() else {}
@@ -412,13 +521,21 @@ def publish_wheels(output: Path, *, max_bytes: int = 16 * 1024**3,
         for path in sorted(cache.rglob("*")):
             if time.monotonic() >= deadline:
                 break
-            if path.is_symlink() or not path.is_file() or path.suffix not in {".whl", ".body"}:
+            if (path.is_symlink() or not path.is_file() or path.suffix not in {".whl", ".body"}
+                    or not path.resolve().is_relative_to(Path(output).resolve())):
                 continue
             size = path.stat().st_size
             stamp = [size, path.stat().st_mtime_ns]
             relative = path.relative_to(cache).as_posix()
-            if index.get(relative) == stamp:
-                continue
+            exported = index.get(relative)
+            if (isinstance(exported, dict) and exported.get("stamp") == stamp and
+                    re.fullmatch(r"[0-9a-f]{64}", str(exported.get("sha256", ""))) and
+                    isinstance(exported.get("filename"), str) and
+                    Path(exported["filename"]).name == exported["filename"]):
+                target = root / "wheels" / exported["sha256"] / exported["filename"]
+                if target.is_file() and not target.is_symlink():
+                    verified_links.append(target.as_uri())
+                    continue
             if size > max_bytes or total + size > min(max_bytes, capacity):
                 continue
             name = _wheel_name(path)
@@ -429,7 +546,8 @@ def publish_wheels(output: Path, *, max_bytes: int = 16 * 1024**3,
             if target.exists():
                 if _bounded_digest(target, deadline) != sha:
                     raise ValueError("shared wheel integrity check failed")
-                index[relative] = stamp
+                verified_links.append(target.as_uri())
+                index[relative] = {"stamp": stamp, "sha256": sha, "filename": name}
                 continue
             if shutil.disk_usage(root).free < size * 1.2:
                 continue
@@ -458,8 +576,18 @@ def publish_wheels(output: Path, *, max_bytes: int = 16 * 1024**3,
                 "trust": "same-operator verified provisioning; not an upstream signature"})
             total += size
             added.append(name)
-            index[relative] = stamp
+            verified_links.append(target.as_uri())
+            index[relative] = {"stamp": stamp, "sha256": sha, "filename": name}
     atomic_json(index_path, index)
+    # A run's first view predates its own downloads. Refresh it after publication,
+    # including failed installations; otherwise the next Fix still sees old links.
+    view_path = Path(output) / "package_cache_view.json"
+    view = read_json(view_path) if view_path.is_file() else {}
+    if view.get("root") not in (None, str(root)):
+        raise ValueError("package cache view differs from configured store")
+    atomic_json(view_path, {"root": str(root),
+        "links": sorted(set(view.get("links") or []) | set(verified_links)),
+        "verified_at": now()})
     result = {"status": "published", "wheels": added, "bytes": total}
     atomic_json(Path(output) / "package_cache_publication.json", result)
     return result
@@ -490,8 +618,10 @@ def publish_snapshot(output: Path, *, interpreter: Path,
         return {"status": "disabled"}
     prefix = interpreter.parent.parent
     row = describe(prefix)
+    portable_template = publish_template(output, row=row, manifests=manifests, machine=machine)
     if not row["cloneable"]:
-        return {"status": "not_cacheable", "limitations": row["limitations"]}
+        return {"status": "not_cacheable", "limitations": row["limitations"],
+                'portable_template':portable_template}
     key = dependency_key(manifests, machine)
     identity = object_digest([key, row["fingerprint"]])
     with locked(root, timeout=min(10, timeout)):
@@ -530,14 +660,93 @@ def publish_snapshot(output: Path, *, interpreter: Path,
     return {"status": "published", "id": identity}
 
 
+def publish_template(output: Path, *, row: dict, manifests: dict, machine: dict) -> dict:
+    """Retain verified consumer identity and portable pins without copying editable hooks."""
+    root = store_for(output)
+    environment = read_json(output / 'environment.json') if (output / 'environment.json').is_file() else {}
+    if root is None or (environment.get('verdict') or {}).get('passed') is not True:
+        return {'status':'not_verified'}
+    payload = {'dependency_key':dependency_key(manifests, machine),
+        'environment':{key:row[key] for key in ('kind','python','packages','portable_packages',
+            'rebind_packages','reconstructable','fingerprint','limitations')},
+        'origin_run':output.name,
+        'consumer_evidence':{'environment_digest':digest(output / 'environment.json'),
+            'verified_entrypoints':environment.get('verified_entrypoints') or {},
+            'probes_digest':object_digest(environment.get('probes') or []),
+            'authority':'declared_probes_only_not_simulation_or_score'}}
+    # Reuse the original external base plus the successful small delta. Do not
+    # offer a run overlay as a standalone base: skipping its .pth would lose deps.
+    interpreter = environment.get('interpreter')
+    overlay_path = Path(interpreter).parent.parent / 'overlay.json' if interpreter else None
+    if (overlay_path is not None and overlay_path.resolve().is_relative_to(output.resolve())
+            and overlay_path.is_file() and not overlay_path.is_symlink()):
+        overlay = read_json(overlay_path)
+        payload['base_reuse'] = {'fingerprint': overlay['base_fingerprint'],
+            'incremental_pins': row['portable_packages'],
+            'bindings_require_current_selection': True}
+    identity = object_digest(payload)
+    with locked(root):
+        path = root / 'templates' / identity / 'manifest.json'
+        if path.is_symlink() or not path.resolve().is_relative_to(root):
+            raise ValueError('unsafe portable template path')
+        if not path.exists():
+            atomic_json(path, {'schema_version':1, 'identity':identity, 'payload':payload,
+                'created_at':now(), 'policy':'recreate isolated prefix; rebind workspace sources; native revalidation required'})
+    return {'status':'published', 'id':identity}
+
+
+def registry_revision(root: Path) -> str:
+    return object_digest([(path.name, digest(path)) for path in sorted((root / 'registered').glob('*.json'))[:32]
+                          if not path.is_symlink() and path.stat().st_size <= 128 * 1024])
+
+
+def register_base(root: Path, prefix: Path, *, label: str = 'operator-base', proof: Path | None = None) -> dict:
+    """Both relocatable conda bases and safe read-only venv overlays are useful."""
+    from .environment_overlay import inspect
+    root, prefix = root.resolve(), prefix.absolute()
+    if (root == Path('/') or root.is_relative_to(prefix.resolve()) or prefix.resolve().is_relative_to(root)
+            or prefix.resolve() in {Path('/'), Path('/home'), Path('/tmp')}):
+        raise ValueError('base and environment store must be disjoint, bounded directories')
+    if (prefix / 'overlay.json').exists():
+        raise ValueError('register the underlying base, not a run-owned overlay')
+    if not isinstance(label, str) or len(label) > 80 or any(ord(c) < 32 for c in label):
+        raise ValueError('base label must be a short single-line description')
+    row = describe(prefix)
+    if not row['cloneable'] and not inspect(prefix, row['python'])['reusable']:
+        raise ValueError('base supports neither isolated clone nor read-only overlay')
+    if proof:
+        from .environment_bases import verification_view
+        from .provision import platform_facts
+        if verification_view(prefix, [str(proof)], platform_facts())['status'] != 'verified':
+            raise ValueError('base verification is stale, failed or missing sealed evidence')
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (root / 'registered').mkdir(exist_ok=True)
+    with locked(root):
+        path = root / 'registered' / (row['id'] + '.json')
+        if path.is_symlink():
+            raise ValueError('unsafe base registration')
+        previous = read_json(path) if path.is_file() else {}
+        proofs = list(previous.get('proofs') or [])
+        if proof and str(proof.absolute()) not in proofs:
+            proofs.append(str(proof.absolute()))
+        atomic_json(path, {'prefix': row['prefix'], 'label': label, 'fingerprint': row['fingerprint'],
+                          'proofs': proofs[-8:], 'created_at': previous.get('created_at') or now(),
+                          'updated_at': now(), 'note': 'live read-only base; per-repository probes required'})
+    return row
+
+
 def main(argv: list[str] | None = None) -> int:
     """Operator catalog/registration; never silently download a simulator distribution."""
     import argparse
     parser = argparse.ArgumentParser(prog="autosim environments")
-    parser.add_argument("operation", choices=("list", "register"))
+    parser.add_argument("operation", choices=("list", "register", "verify"))
     parser.add_argument("--store", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--prefix", type=Path)
     parser.add_argument("--label", default="operator-base")
+    parser.add_argument('--profile', choices=[row['id'] for row in PROFILES])
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--wall-seconds', type=float, default=180)
+    parser.add_argument('--gpu-seconds', type=float, default=0)
     args = parser.parse_args(argv)
     root = args.store.resolve()
     if args.operation == "list":
@@ -545,15 +754,21 @@ def main(argv: list[str] | None = None) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     if args.prefix is None:
-        parser.error("register requires --prefix; a profile is not a downloaded environment")
-    row = describe(args.prefix)
-    if not row["cloneable"]:
-        parser.error("base is not independently cloneable: " + "; ".join(row["limitations"]))
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (root / "registered").mkdir(exist_ok=True)
-    with locked(root):
-        atomic_json(root / "registered" / (row["id"] + ".json"), {
-            "prefix": row["prefix"], "label": args.label, "fingerprint": row["fingerprint"],
-            "created_at": now(), "note": "live read-only source; each run clones and probes"})
+        parser.error("register/verify requires --prefix; a profile is not a downloaded environment")
+    if args.operation == 'verify':
+        if not args.profile or not args.output:
+            parser.error('verify requires --profile and a fresh --output')
+        from .environment_bases import verify
+        try:
+            result = verify(args.prefix, profile=args.profile, output=args.output, store=root,
+                            wall_seconds=args.wall_seconds, gpu_seconds=args.gpu_seconds, label=args.label)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result['status'] == 'verified' else 1
+    try:
+        row = register_base(root, args.prefix, label=args.label)
+    except ValueError as exc:
+        parser.error(str(exc))
     print(json.dumps({"id": row["id"], "status": "registered", "readiness": "unverified"}))
     return 0

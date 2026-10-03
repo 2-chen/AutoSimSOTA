@@ -132,6 +132,7 @@ def _threads(report: Mapping[str, Any]) -> dict[str, str]:
 def decide(*, runner: Callable[..., str] | None = None,
            environ: Mapping[str, str] | None = None,
            python: Path | str | None = None,
+           torch_rows: list[dict] | None = None,
            prefer: str | None = None,
            avoid: tuple[int, ...] = (),
            require_gpu: bool = False) -> ComputeDecision:
@@ -155,6 +156,8 @@ def decide(*, runner: Callable[..., str] | None = None,
             kwargs["environ"] = environ
         if python is not None:
             kwargs["python"] = python
+        if torch_rows is not None:
+            kwargs['torch_rows'] = torch_rows
         report = discover(**kwargs)
     except Exception as exc:                                     # noqa: BLE001
         # An unreadable device table is not evidence that the host has no GPU. Keep the

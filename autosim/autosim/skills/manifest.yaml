@@ -14,6 +14,25 @@ defaults: &defaults
 
 skills:
   - <<: *defaults
+    id: autosimsota.data-first-score-optimization
+    file: data-first-score-optimization/SKILL.md
+    version: "1.2.0"
+    capabilities: [research.direction, data.collection, data.consumer_validation, experiment.design]
+    keywords: [score, baseline, improve, data-first, SOTA, 自动刷指标, 提分, 数据优先, 数据闭环]
+    preconditions: [A native benchmark score is to be improved under a fixed evaluation protocol.]
+    invalid_when: [Used to guarantee SOTA or override fixed-data and held-out restrictions.]
+    outputs: [Short execution-first plan linking a baseline and a feasible data-led candidate or justified fallback.]
+
+  - <<: *defaults
+    id: autosimsota.targeting-simulation-data
+    file: targeting-simulation-data/SKILL.md
+    version: "1.2.0"
+    capabilities: [data.collection, data.correction, yield.analysis, experiment.design]
+    keywords: [targeted, failure, recovery, coverage, DAgger, MimicGen, self-bootstrap, 针对性采集, 失败状态, 覆盖, 纠错, 自举]
+    preconditions: [Legal development failures or training-coverage evidence can guide a data acquisition target.]
+    invalid_when: [Uses held-out feedback or invents an expert, successful labels or collector compatibility.]
+    verification: [Trace real production and accepted labels to native loader consumption and comparable policy scores.]
+  - <<: *defaults
     id: autosimsota.choosing-simulation-improvements
     file: choosing-simulation-improvements/SKILL.md
     capabilities: [research.direction, experiment.design, skill.routing]
@@ -79,6 +98,7 @@ skills:
   - <<: *defaults
     id: autosimsota.connecting-native-data-collection
     file: connecting-native-data-collection/SKILL.md
+    version: "1.2.0"
     capabilities: [data.collection, workflow.mapping, data.consumer_validation, experiment.design]
     keywords: [collect, collector, collection, expert, planner, demonstrations, data root, loader, 采集, 专家, 数据根目录, 训练数据]
     inputs: [Current producer source and configuration, native stage receipts, trainer loader and data protocol.]
@@ -257,7 +277,7 @@ skills:
 
   - <<: *defaults
     id: autosimsota.using-the-method-library
-    version: "1.1.0"
+    version: "1.2.0"
     file: using-the-method-library/SKILL.md
     capabilities: [skill.library_orientation, evidence.weighting]
     keywords: [skill, method, evidence, confidence, scope, library]

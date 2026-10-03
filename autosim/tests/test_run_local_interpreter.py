@@ -19,5 +19,5 @@ def test_parent_venv_packages_remain_visible_from_run_local_child(tmp_path):
         [str(child), "-c", "import autosim_parent_marker,sys; "
          "print(sys.prefix); print(autosim_parent_marker.MARKER)"], text=True, timeout=15)
     assert done.splitlines() == [str(output / "env"), "73"]
-    assert str(parent_site) in (output / "env" / "lib" / version / "site-packages" /
-                                "autosim_parent_site.pth").read_text(encoding="utf-8")
+    assert (output/'env/dependencies/autosim_parent_marker.py').resolve() == parent_site/'autosim_parent_marker.py'
+    assert (output/'env/overlay.json').is_file()

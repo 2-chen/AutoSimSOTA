@@ -42,6 +42,11 @@ class RunBudget:
                                  "remaining_wall_seconds": remaining,
                                  "gpu_seconds": None, "llm_cost": None,
                                  "status": "exhausted" if remaining <= 0 else "active"}
+        if self.path.is_file():
+            amendment_id = read_json(self.path).get('budget_amendment_id')
+            if (isinstance(amendment_id, str) and len(amendment_id) == 64
+                    and all(c in '0123456789abcdef' for c in amendment_id)):
+                state['budget_amendment_id'] = amendment_id
         gpu_path = self.path.parent / "task_gpu_budget.json"
         if gpu_path.is_file():
             gpu = read_json(gpu_path)

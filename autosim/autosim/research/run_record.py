@@ -274,12 +274,33 @@ def gather(root: Path) -> dict[str, Any]:
                              if shared_events_path else {})
     if shared_events_path and source["run_events"]:
         try:
+            if source["run_events"].get("schema_version") == 2:
+                # Human-facing tail projection is bounded. Full history verification is
+                # the state store's job, not a synchronous per-message report task.
+                journal = shared_events_path.parent / "run_events.jsonl"
+                rows = []
+                if journal.exists():
+                    with journal.open("rb") as stream:
+                        size = journal.stat().st_size
+                        stream.seek(max(0, size - 1024 * 1024))
+                        if size > 1024 * 1024:
+                            stream.readline()
+                        data = stream.read()
+                    if data and not data.endswith(b"\n"):
+                        raise ResearchStateError("journal tail has an incomplete append")
+                    rows = [json.loads(line) for line in data.splitlines()][-100:]
+                if rows:
+                    verify_event_rows(rows, start_sequence=rows[0]["sequence"],
+                                      previous_hash=rows[0]["previous_hash"])
+                source["run_events"]["rows"] = rows
+                source["run_events"]["projection_scope"] = "bounded_verified_tail"
             event_rows = source["run_events"].get("rows")
             if not isinstance(event_rows, list) or not all(
                     isinstance(row, dict) for row in event_rows):
                 raise ResearchStateError("run event log rows are invalid")
-            verify_event_rows(event_rows)
-        except (ResearchStateError, TypeError, ValueError) as exc:
+            if source["run_events"].get("schema_version") != 2:
+                verify_event_rows(event_rows)
+        except (ResearchStateError, TypeError, ValueError, KeyError, OSError) as exc:
             source["unreadable"].append(
                 f"run_events：共享事件链校验失败（{type(exc).__name__}: {exc}）")
     source["decisions"] = want("decisions", root / "decisions.json") or {}
@@ -1808,10 +1829,20 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
     else:
         current_action = ""
 
-    candidates = [root / "run_state.json", root / "run_events.json", root / "budget.json",
+    from .baseline_reference import view as reference_view
+    from .experiment_view import view as experiment_view
+    from .data_versions import catalog
+    reference = reference_view(root)
+    lifecycle = experiment_view(root,run_id)
+    versions = catalog(root)
+    job_sources=[root/row['request_ref'] for row in lifecycle['experiments']]
+    version_sources=[root/'data_versions'/(row['id']+'.json') for row in versions]
+    candidates = [root / "baseline_reference.json", *sorted((root/'baseline_references').glob('*.json')),
+                  root / "run_state.json", root / "run_events.json", root / "budget.json",
                   root / f"preparation_{run_id}.json", research / "research_report.json",
                   research / "controller_session.json", research / "media" / "manifest.json",
-                  *measurement_paths, *receipt_paths, *telemetry_files, *telemetry_chart_files]
+                  *measurement_paths, *receipt_paths, *telemetry_files, *telemetry_chart_files,
+                  *job_sources,*[p.with_name('result.json') for p in job_sources],*version_sources]
     revisions: dict[str, str | None] = {}
     for path in candidates:
         try:
@@ -1847,6 +1878,9 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
         "budget": budget,
         "verified_level": report.get("verified_level"),
         "measurements": measurements,
+        "baseline_reference": reference,
+        "experiment_lifecycle": lifecycle,
+        "data_versions": versions,
         "telemetry_attempts": telemetry_attempts[-12:],
         "verified_media": verified_media[:12],
         "unverified_media_count": pending_media,
@@ -1990,6 +2024,22 @@ def refresh_live_status(root: Path, *, destination: Path | None = None,
     destination = Path(destination) if destination is not None else root / "RUN.md"
     live_root = Path(live_root) if live_root is not None else root
     live = _load(live_root / "running.json") or {}
+    if not live and fallback_status in {"", "running"}:
+        state = _load(root / "run_state.json") or {}
+        action = state.get("current_action") or {}
+        if (state.get("status") == "running" and isinstance(action, dict)
+                and action.get("step")):
+            from datetime import datetime
+            try:
+                value = action.get("started_at") or action.get("at")
+                if value is None:
+                    parent = action.get("parent_action") or {}
+                    value = parent.get("started_at") or parent.get("at")
+                started = float(value) if isinstance(value, (int, float)) else datetime.fromisoformat(str(value)).timestamp()
+                if math.isfinite(started):
+                    live = {"stage": action["step"], "started_at": started}
+            except (ValueError, TypeError, OverflowError):
+                pass
     budget = _load(destination.parent / "budget.json") or _load(root / "budget.json") or {}
     elapsed = max(0, round(time.time() - float(live.get("started_at") or time.time())))
     remaining = budget.get("remaining_wall_seconds")
@@ -2030,11 +2080,25 @@ def refresh_live_status(root: Path, *, destination: Path | None = None,
         else:
             first, sep, rest = original.partition("\n")
             updated = (first + f"\n\n{strip}\n" + (rest if sep else ""))
+        # This panel must advance during a long blocking native operation, not
+        # only when the Scheduler's entire derivation finally returns. Bound the
+        # evidence scan rate; it neither invokes Recorder nor claims liveness.
+        panel_at = previous_health.get('native_panel_refresh_epoch', 0)
+        if not isinstance(panel_at, (int, float)):
+            panel_at = 0
+        if time.time() - panel_at >= 15:
+            try:
+                from .recorder import refresh_native_panel
+                updated = refresh_native_panel(updated, root)
+                panel_at = time.time()
+            except (OSError, ValueError, TypeError, KeyError):
+                pass  # presentation failures must not interrupt execution
         atomic_text(destination, updated)
         _publish_presentation_html(destination, updated)
         health_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_json(health_path, {"schema_version": 1, "destination": str(destination),
                                   "last_successful_refresh": now(),
                                   "last_successful_refresh_epoch": time.time(),
+                                  "native_panel_refresh_epoch": panel_at,
                                   "status": status, "current_action": current})
     return destination

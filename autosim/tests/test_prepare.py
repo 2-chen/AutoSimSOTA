@@ -41,12 +41,13 @@ def preparation(tmp_path, choices=()):
 
 def test_preparation_steps_are_closed_and_named():
     """The set is closed and named, including the mandatory interruption recovery step."""
-    assert set(OPERATIONS) == {"read_the_checkout", "declare", "build_the_environment",
+    assert set(OPERATIONS) == {'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference",
+                               "extend_research_rounds", "read_the_checkout", "declare", "build_the_environment",
                                "derive_a_command", "reconcile_interrupted_action",
                                "discard_interrupted_candidate",
                                "bind_metric", "recover_unscored_baseline", "run_the_loop",
                                "generate_research_ideas", "propose_research_idea",
-                               "confirm_best", "stop", "research_task",
+                               "confirm_best", "stop", "research_task", "propose_harness_repair",
                                "update_research_plan", "retry_failed_action",
                                "submit_native_job", "inspect_native_job",
                                "adjust_native_job", "cancel_native_job", "review_report_demo",
@@ -92,7 +93,8 @@ def test_fix_retry_replays_original_operation_once(tmp_path, monkeypatch):
     assert real.do("retry_failed_action")["outcome"] == "not attempted"
 
 
-def test_completed_detached_train_is_passed_to_initial_baseline_only(tmp_path, monkeypatch):
+@pytest.mark.parametrize('existing_unscored', [False, True])
+def test_completed_detached_train_is_passed_to_unscored_baseline_only(tmp_path, monkeypatch, existing_unscored):
     from autosim.research import native_jobs
 
     real = preparation(tmp_path)
@@ -121,19 +123,57 @@ def test_completed_detached_train_is_passed_to_initial_baseline_only(tmp_path, m
             return settings
 
         @staticmethod
-        def _verified_training_receipt(attempt, settings):
+        def _verified_training_receipt(attempt, settings, *, audit_progress=False):
             return {"verified": True} if attempt == attempt_id and settings == {} else None
 
         def run(self, **kwargs):
             seen.append(kwargs)
             return {"rounds": [], "run_status": "completed", "objective": {}}
 
+        def recover_unscored_baseline(self, *, replacement_training_attempt_id):
+            seen.append({'replacement_training_attempt_id': replacement_training_attempt_id})
+            return {'ok': True, 'metric_value': 0.5, 'evaluate': {'attempt_id': 'c'*32}}
+
     seen = []
     monkeypatch.setattr(real, "_research_controller", lambda: (Research(), {}))
+    if existing_unscored:
+        root=Research.run_root
+        root.mkdir(parents=True)
+        (root/'controller_session.json').write_text(json.dumps({
+            'run_id': real.run_id, 'repository': str(real.repo), 'status': 'paused',
+            'base_settings': {}}))
+        (root/'research_report.json').write_text(json.dumps({
+            'run_id': real.run_id, 'repo': str(real.repo), 'run_status': 'paused'}))
     result = real._step_run_the_loop(job_id=job_id)
-    assert result["outcome"] == "no number came out"
-    assert seen[0]["baseline_training_attempt_id"] == attempt_id
+    if existing_unscored:
+        assert result['outcome']=='yielded' and result['training_reused'] is True
+        assert seen==[{'replacement_training_attempt_id': attempt_id}]
+    else:
+        assert result["outcome"] == "no number came out"
+        assert seen[0]["baseline_training_attempt_id"] == attempt_id
     assert real._step_run_the_loop(job_id="x" * 32)["outcome"] == "not attempted"
+
+
+@pytest.mark.parametrize('fault', ['', 'unoffered', 'candidate', 'interrupted'])
+def test_public_operation_gate_accepts_only_offered_unscored_baseline_job(tmp_path, monkeypatch, fault):
+    real=preparation(tmp_path)
+    offered='a'*32
+    state={'available':['run_the_loop'], 'research_progress': {'status': 'paused'},
+           'research_options': {'status': 'baseline_job_recovery_available', 'items':[]},
+           'native_job_baseline_recovery': [{'job_id':offered}]}
+    if fault=='interrupted': state['research_progress']['status']='interrupted'
+    monkeypatch.setattr(real, 'state', lambda: state)
+    monkeypatch.setattr(real, '_unscored_baseline_recovery_status', lambda: {'available':False})
+    seen=[]
+    monkeypatch.setattr(real, '_step_run_the_loop', lambda **kwargs: (
+        seen.append(kwargs) or {'outcome':'done', 'because':'verified handler was reached'}))
+    arguments={'job_id': 'b'*32 if fault=='unoffered' else offered}
+    if fault=='candidate': arguments['idea_label']='some candidate'
+    result=real.do('run_the_loop', **arguments)
+    if not fault:
+        assert result['outcome']=='done' and seen==[{'job_id':offered}]
+    else:
+        assert result['outcome']=='not attempted' and not seen
 
 
 def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_path):
@@ -918,7 +958,8 @@ def test_the_state_is_read_from_the_records(tmp_path):
     assert state["stages_the_checkout_has"] == {"train": "kept from an earlier run",
                                                 "collect": "no command"}
     assert state["available"] == [name for name in OPERATIONS
-                                      if name not in {"research_task", "update_research_plan", "review_report_demo", "capture_environment_demo",
+                                          if name not in {'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds",
+                                                          "research_task", "propose_harness_repair", "update_research_plan", "review_report_demo", "capture_environment_demo",
                                                       "retry_failed_action", "submit_research_task",
                                                       "cancel_research_task", "wait_for_jobs",
                                                       "configure_screening", "run_screening_trial", "inspect_screening",
@@ -1330,6 +1371,33 @@ def test_choose_gives_one_bounded_repair_for_an_unavailable_operation(tmp_path):
 
     assert choice["do"] == "read_the_checkout"
     assert "permitted_actions" in client.seen[1]
+
+
+def test_choose_repairs_missing_stage_instead_of_launching_alphabetically_first(tmp_path,monkeypatch):
+    client = _Client([
+        {'do':'derive_a_command','why':'evaluate the trained policy','arguments':{}},
+        {'do':'derive_a_command','arguments':{'stage':'evaluate'},'why':'explicit stage'}])
+    real = preparation(tmp_path)
+    real.client = client
+    facts = {'state_revision':0,'available':['derive_a_command'],
+        'surveyed_stages':{'collect':{'available':True},'evaluate':{'available':True}}}
+    monkeypatch.setattr(real,'state',lambda:facts)
+    monkeypatch.setattr(real,'_publish_main_context',lambda *_:None)
+    choice = real.choose()
+    assert choice['arguments'] == {'stage':'evaluate'}
+    assert 'requires arguments.stage' in client.seen[1]
+
+
+def test_direct_derivation_rejects_ambiguous_stage_before_model_or_native(tmp_path):
+    from types import SimpleNamespace
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.decision = SimpleNamespace(device='cuda',why='fixture')
+    real.execution = {'stages':{'collect':{'available':True},'evaluate':{'available':True}}}
+    result = real._step_derive_a_command()
+    assert result['outcome'] == 'rejected'
+    assert 'No native command was launched' in result['because']
+    assert real.client.seen == []
 
 
 def test_choose_repairs_a_malformed_json_response_without_ending_the_run(tmp_path):
@@ -2278,7 +2346,8 @@ def test_metric_binding_needs_a_label_in_verified_output_and_source(tmp_path):
     assert real.do("bind_metric")["outcome"] == "not bound"
 
 
-def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_path):
+@pytest.mark.parametrize("mapping_fault", [None, "name", "json_key", "changed_bytes"])
+def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_path, mapping_fault):
     real = preparation(tmp_path)
     real.declaration = {"benchmark": "toy"}
     real.stages = {"evaluate": "def stage_argv_evaluate(i): return [i['python']]"}
@@ -2307,17 +2376,46 @@ def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_
                 "mtime": artifact.stat().st_mtime,
                 "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}]}}]}),
         encoding="utf-8")
-    real.client.choices = [{"primary_metric": {
+    good_answer = {"primary_metric": {
         "name": "eval_success_once_mean", "direction": "maximize", "unit": "fraction",
         "source": "json", "artifact_candidate": "candidate_1",
         "json_key": "episodes",
         "json_value_key": "success", "episode_id_column": "episode_id",
         "aggregation": "mean", "min_samples": 2},
-        "evidence": "the native source maps each completed rollout record's boolean success"}]
+        "evidence": "the native source maps each completed rollout record's boolean success"}
+    real.client.choices = [good_answer]
+    if mapping_fault:
+        bad_answer = json.loads(json.dumps(good_answer))
+        bad_answer["primary_metric"]["name" if mapping_fault == "name" else "json_key"] = (
+            "" if mapping_fault == "name" else "missing_records")
+        real.client.choices = [bad_answer, good_answer]
+        if mapping_fault == "changed_bytes":
+            original_chat = real.client.chat_with_metadata
+            def mutate_before_repair(system, user, **kwargs):
+                if real.client.seen:
+                    artifact.write_text('{"episodes": []}', encoding="utf-8")
+                return original_chat(system, user, **kwargs)
+            real.client.chat_with_metadata = mutate_before_repair
 
     result = real.do("bind_metric")
 
+    if mapping_fault == "changed_bytes":
+        assert result["outcome"] == "not bound"
+        assert not (real.output / "metric_binding.json").exists()
+        assert "no native rerun performed" in result["because"]
+        assert len(real.client.seen) == 2
+        return
     assert result["outcome"] == "done", result
+    assert len(real.client.seen) == (2 if mapping_fault else 1)
+    if mapping_fault:
+        repair = json.loads(real.client.seen[-1])
+        assert repair["mapping_validation_error"]
+        audits = list((real.output / "metric_proposals").glob("*.json"))
+        assert len(audits) == 1
+        audit = json.loads(audits[0].read_text())
+        assert len(audit["attempts"]) == 2
+        assert audit["attempts"][0]["validation_error"]
+        assert not audit["attempts"][1]["validation_error"]
     bound = json.loads((real.output / "metric_binding.json").read_text())
     assert bound["verified_artifact"]["sha256"] == hashlib.sha256(
         artifact.read_bytes()).hexdigest()
@@ -2567,6 +2665,23 @@ def test_stop_remains_available_when_paused_research_has_no_action(tmp_path):
     options = {"status": "empty", "items": [], "generation_attempted": True}
 
     assert "stop" in real._available_operations(progress, options)
+
+
+@pytest.mark.parametrize('recoverable', [False, True])
+@pytest.mark.parametrize('configured_policy', [False, True])
+def test_active_native_job_operation_pruning_is_idempotent(tmp_path, monkeypatch, recoverable, configured_policy):
+    real = preparation(tmp_path)
+    real.client.supports_main_agent = True
+    real.main_agent = {'plan': {'goal': 'continue native work'}}
+    real.stages = {'train': 'source', 'evaluate': 'source'}
+    real.declaration = {'benchmark': 'test'}
+    real.interpreter = Path(sys.executable)
+    monkeypatch.setattr('autosim.research.native_jobs.active_jobs', lambda _: [{'job_id': 'active'}])
+    monkeypatch.setattr('autosim.research.scheduling.policy', lambda _: {'native_slots': 1} if configured_policy else None)
+    progress = {'status': 'paused', 'unscored_baseline_recovery': {'available': recoverable}}
+    available = real._available_operations(progress, {'status': 'empty', 'items': []})
+    assert {'inspect_native_job', 'adjust_native_job', 'cancel_native_job'} <= set(available)
+    assert not {'run_the_loop', 'retry_failed_action', 'recover_unscored_baseline', 'declare', 'confirm_best', 'submit_native_job'} & set(available)
 
 
 def test_the_loop_is_bounded(tmp_path):
@@ -2862,7 +2977,8 @@ def test_existing_interpreter_hint_is_passed_to_provision_without_skipping_it(
     from autosim.research import prepare as module
 
     seen = {}
-    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs:
+                        seen.update(kwargs) or {"verdict": {"passed": True}})
     monkeypatch.setattr(module.provision, "env_python", lambda output: None)
     real = Preparation(repo=tmp_path, output=tmp_path / "out", client=_Client([
         {"stages": ["evaluate"], "asset_keys": [], "why": "native scorer only"}]),
@@ -2903,11 +3019,11 @@ def test_environment_failure_evidence_reopens_probe_verification(tmp_path, monke
     (attempts / "evaluate.json").write_text(json.dumps({"attempts": [
         {"status": "rejected", "error": "ModuleNotFoundError: No module named runtime_dep"}
     ]}), encoding="utf-8")
-    real._select_execution_path = lambda: {"stages": ["evaluate"], "asset_keys": [],
+    real._select_execution_path = lambda **_: {"stages": ["evaluate"], "asset_keys": [],
                                            "why": "selected native evaluation"}
     seen = {}
     monkeypatch.setattr(module.provision, "build",
-                        lambda *args, **kwargs: seen.update(kwargs))
+                        lambda *args, **kwargs: seen.update(kwargs) or {"verdict": {"passed": True}})
     monkeypatch.setattr(module.provision, "env_python", lambda _output: Path(sys.executable))
 
     state = real.state()["environment"]
@@ -2981,7 +3097,8 @@ def test_environment_build_receives_only_the_selected_workflow(tmp_path, monkeyp
     from autosim.research import prepare as module
 
     seen = {}
-    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs:
+                        seen.update(kwargs) or {"verdict": {"passed": True}})
     monkeypatch.setattr(module.provision, "env_python", lambda output: Path(sys.executable))
     real = Preparation(repo=tmp_path, output=tmp_path / "out", client=_Client([
         {"stages": ["train", "evaluate"], "asset_keys": ["checkpoint"],
@@ -3008,7 +3125,8 @@ def test_selected_external_asset_cannot_be_a_selected_future_stage_output(
     from autosim.research import prepare as module
 
     seen = {}
-    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(module.provision, "build", lambda *args, **kwargs:
+                        seen.update(kwargs) or {"verdict": {"passed": True}})
     monkeypatch.setattr(module.provision, "env_python", lambda output: Path(sys.executable))
     real = Preparation(repo=tmp_path, output=tmp_path / "out", client=_Client([
         {"stages": ["prepare_data", "train", "evaluate"], "asset_keys": ["dataset"],
@@ -3343,3 +3461,34 @@ def test_failed_derivation_keeps_attempts_but_not_a_fake_command(tmp_path, monke
     assert "train" not in real.stages
     assert not (real.output / "derived_stages.json").exists()
     assert (real.output / "derivation_attempts" / "train.json").is_file()
+
+
+def test_interrupted_derivation_keeps_unverified_revision_for_explicit_selection(tmp_path, monkeypatch):
+    from autosim.research import prepare as module, invocation_drafts
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.execution = {'stages': {'train': {'available': True, 'entrypoint': 'train.py'}}}
+    monkeypatch.setattr(module.execution_derive, 'checkpoint_for_verification',
+                        lambda *a, **k: {'path': ''})
+    seen = []
+    def derive(*args, **kwargs):
+        seen.append(args[2])
+        if len(seen) == 1:
+            kwargs['on_revision']('train', {**args[2], 'environment': {'MODE': 'agent_choice'}},
+                                  'native failure showed runtime configuration issue',
+                                  'evidence/native.json')
+            raise KeyboardInterrupt
+        return None, {}, [{'status': 'rejected', 'error': 'still unverified'}], args[2]
+    monkeypatch.setattr(module.execution_derive, 'make_runnable', derive)
+    with pytest.raises(KeyboardInterrupt):
+        real._step_derive_a_command(stage='train')
+    offered = invocation_drafts.catalog(real.output)
+    assert offered and 'train' not in real.stages
+    assert not (real.output / 'derived_stages.json').exists()
+    real._step_derive_a_command(stage='train')
+    assert 'environment' not in seen[-1]  # no implicit adoption
+    real._step_derive_a_command(stage='train', draft_ref=offered[0]['ref'])
+    assert seen[-1]['environment'] == {'MODE': 'agent_choice'}
+    real.execution['stages']['train']['entrypoint'] = 'other.py'
+    result = real._step_derive_a_command(stage='train', draft_ref=offered[0]['ref'])
+    assert result['outcome'] == 'rejected' and len(seen) == 3

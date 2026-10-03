@@ -45,8 +45,13 @@ def _active(output: Path) -> list[str]:
     for directory in root.iterdir() if root.is_dir() else []:
         if not _JOB_ID.fullmatch(directory.name) or directory.is_symlink():
             continue
-        if (directory / "result.json").is_file():
-            continue
+        if (directory / "result.json").is_file() and not (directory / "result.json").is_symlink():
+            try:
+                result = read_json(directory / "result.json")
+                if isinstance(result, dict) and result.get("job_id") == directory.name and result.get("status") in {"completed", "failed", "cancelled"}:
+                    continue
+            except (OSError, ValueError, TypeError):
+                pass  # An unreadable result does not release an unknown side effect.
         if (directory / "request.json").is_file():
             # A dead worker without a result is an unresolved side effect, not a free slot.
             active.append(directory.name)
@@ -87,14 +92,22 @@ def source_identity(output: Path, repo: Path) -> str:
                 raise ValueError("an inventoried source link changed")
         elif row[0] != "directory":
             raise ValueError("job source inventory has an unknown entry type")
+    from .source_tracking import materialized_files
+    original = {str(row[1]) for row in entries}
+    materialized = [(str(name), digest(Path(repo) / name))
+                    for name in materialized_files(Path(repo)) if str(name) not in original]
     return object_digest({"base": manifest["source_tree_fingerprint"],
                           "existing_files": current,
-                          "derived_stages": digest(Path(output) / "derived_stages.json")})
+                          "materialized_source": materialized,
+                          # Early source investigation precedes command derivation.
+                          # Absence is part of identity, not a fabricated verified stage.
+                          "derived_stages": digest(Path(output) / "derived_stages.json")
+                          if (Path(output) / "derived_stages.json").is_file() else None})
 
 
 def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
            requested_seconds: float, reason: str, run_id: str = "derived",
-           resources: dict | None = None) -> dict[str, Any]:
+           resources: dict | None = None, candidate_binding: dict | None = None) -> dict[str, Any]:
     output = Path(output).resolve(strict=True)
     repo = Path(repo).resolve(strict=True)
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", stage):
@@ -125,6 +138,9 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
         raise ValueError("CPU resource profile conflicts with CUDA settings")
     if profile and profile["gpu"] and settings.get("device") == "cpu":
         raise ValueError("GPU resource profile conflicts with CPU settings")
+    if (candidate_binding is not None and profile and profile['gpu'] is False
+            and settings.get('device') != 'cpu'):
+        raise ValueError('candidate CPU profile must be declared in audited settings')
     root = output / "native_jobs"
     root.mkdir(parents=True, exist_ok=True)
     with (root / "submission.lock").open("a+b") as lock:
@@ -146,25 +162,34 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
                "requested_seconds": float(requested_seconds),
                "reason": reason.strip(), "submitted_at": now(),
                "submitted_epoch": started}
+    if candidate_binding is not None:
+        request['candidate_binding'] = candidate_binding
     if scheduling:
         request["resources"] = profile
         if request["resources"]["gpu"] is False:
             request["settings"] = {**settings, "device": "cpu"}
-    atomic_json(directory / "request.json", request)
-    atomic_json(directory / "control.json", {
-        "schema_version": 1, "job_id": job_id, "revision": 0,
-        "deadline_epoch": started + requested_seconds, "cancelled": False,
-        "state": "queued" if scheduling else "running"})
-    package_root = Path(__file__).resolve().parents[2]
-    environment = {key: value for key, value in os.environ.items()
-                   if not _SECRET.search(key)}
-    environment["PYTHONPATH"] = str(package_root)
-    with (directory / "worker.log").open("w", encoding="utf-8") as log:
-        worker = subprocess.Popen(
-            [sys.executable, "-m", "autosim.research.native_jobs", "worker",
-             "--output", str(output), "--job-id", job_id],
-            cwd=repo, env=environment, stdin=subprocess.DEVNULL,
-            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        atomic_json(directory / "request.json", request)
+        atomic_json(directory / "control.json", {
+            "schema_version": 1, "job_id": job_id, "revision": 0,
+            "deadline_epoch": started + requested_seconds, "cancelled": False,
+            "state": "queued" if scheduling else "running"})
+        package_root = Path(__file__).resolve().parents[2]
+        environment = {key: value for key, value in os.environ.items()
+                       if not _SECRET.search(key)}
+        environment["PYTHONPATH"] = str(package_root)
+        with (directory / "worker.log").open("w", encoding="utf-8") as log:
+            worker = subprocess.Popen(
+                [sys.executable, "-m", "autosim.research.native_jobs", "worker",
+                 "--output", str(output), "--job-id", job_id],
+                cwd=repo, env=environment, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    except (OSError, ValueError) as exc:
+        _seal_terminal(output, directory, {"job_id": job_id, "status": "failed",
+            "launched": False, "error": sanitize_model_text(str(exc)),
+            "termination_reason": "worker_launch_failed", "finished_at": now()},
+            traceback.format_exc())
+        raise
     try:
         identity = capture_process_identity(worker, run_id=run_id,
                                             attempt_id=job_id, argv=worker.args)
@@ -180,10 +205,29 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
 
 def status(output: Path, job_id: str) -> dict[str, Any]:
     directory = _path(output, job_id)
-    request = read_json(directory / "request.json")
-    control = read_json(directory / "control.json")
+    try:
+        request = read_json(directory / "request.json")
+        control = read_json(directory / "control.json")
+        if not isinstance(request, dict) or not isinstance(control, dict):
+            raise ValueError("job records must be objects")
+    except (OSError, ValueError, TypeError) as exc:
+        return {"job_id": job_id, "status": "unreadable", "stage": None,
+            "worker": "unverifiable", "progress": {}, "result": None,
+            "ownership_retained": True, "reconciliation_required": True,
+            "error": sanitize_model_text(str(exc))[:500],
+            "job_ref": f"native_jobs/{job_id}/request.json"}
     result_path = directory / "result.json"
-    result = read_json(result_path) if result_path.is_file() else None
+    try:
+        result = read_json(result_path) if result_path.is_file() else None
+        if result is not None and (not isinstance(result, dict) or result.get("job_id") != job_id
+                or result.get("status") not in {"completed", "failed", "cancelled"}):
+            raise ValueError("job result identity/status is invalid")
+    except (OSError, ValueError, TypeError) as exc:
+        return {"job_id": job_id, "status": "unreadable", "stage": request.get("stage"),
+            "worker": "unverifiable", "progress": {}, "result": None,
+            "ownership_retained": True, "reconciliation_required": True,
+            "error": sanitize_model_text(str(exc))[:500],
+            "job_ref": f"native_jobs/{job_id}/result.json"}
     identity_path = directory / "worker_identity.json"
     identity = (inspect_process_identity(read_json(identity_path))
                 if identity_path.is_file() else {"status": "starting"})
@@ -224,6 +268,7 @@ def status(output: Path, job_id: str) -> dict[str, Any]:
                                         "utf-8", "replace"))[-3000:])
                 break
     return {"job_id": job_id, "stage": request.get("stage"), "status": state,
+            "candidate_binding": request.get("candidate_binding"),
             "resources": request.get("resources"), "wait_reason": control.get("wait_reason") if state == "queued" else None,
             "window_seconds": control.get("window_seconds", request.get("requested_seconds")),
             "deadline_epoch": None if state == "queued" else control.get("deadline_epoch"),
@@ -267,6 +312,8 @@ def cancel(output: Path, job_id: str, *, reason: str) -> dict[str, Any]:
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
         raise ValueError("cancellation needs a concise reason")
     current = status(output, job_id)
+    if current["status"] == "unreadable":
+        return reconcile(output, job_id, reason=reason)
     if current["status"] not in {"running", "queued", "outcome_unknown"}:
         return current
     directory = _path(output, job_id)
@@ -277,6 +324,64 @@ def cancel(output: Path, job_id: str, *, reason: str) -> dict[str, Any]:
         control.update(revision=int(control.get("revision", 0)) + 1,
                        cancelled=True, cancel_reason=reason.strip(), updated_at=now())
         atomic_json(path, control)
+    if current["status"] == "outcome_unknown":
+        reconcile(output, job_id, reason=reason)
+    return status(output, job_id)
+
+
+def _seal_terminal(output: Path, directory: Path, result: dict, detail: str) -> None:
+    from .evidence_store import capture_attempt_evidence
+    log = directory / "reconciliation.log"
+    atomic_text(log, sanitize_model_text(detail))
+    sealed = capture_attempt_evidence(output, attempt_id=result["job_id"], log=log,
+        receipt_ref=f"native_jobs/{result['job_id']}/result.json", status=result["status"],
+        returncode=None, termination_reason=result["termination_reason"])
+    atomic_json(directory / "result.json", {**result, **sealed})
+
+
+def reconcile(output: Path, job_id: str, *, reason: str) -> dict:
+    """Close dead ownership only after worker AND native children are proven absent.
+
+    Unknown metrics are never adopted. Missing/partial process identities remain blocked,
+    not permission to signal a bare PID or free a possibly executing source namespace.
+    """
+    from .scheduling import locked
+    directory = _path(output, job_id)
+    with locked(directory / "reconciliation.lock"):
+        current = status(output, job_id)
+        if current["status"] in {"completed", "cancelled", "failed"}:
+            return current
+        identity_path = directory / "worker_identity.json"
+        if not identity_path.is_file() or identity_path.is_symlink():
+            raise ValueError("worker identity absent; ownership cannot safely be released")
+        observed = inspect_process_identity(read_json(identity_path))
+        if observed.get("status") != "not_running":
+            raise ValueError("worker or process-group outcome is not proven absent")
+        request = read_json(directory / "request.json")
+        run_id = request.get("run_id", "derived")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", run_id) or run_id in {".", ".."}:
+            raise ValueError("job run identity is unreadable")
+        children = []
+        attempts = Path(output) / "research" / run_id / "attempts"
+        for index, path in enumerate(attempts.glob("*/receipt.json")):
+            if index >= 10000 or path.is_symlink() or not path.resolve().is_relative_to(Path(output).resolve()):
+                raise ValueError("native receipt inventory cannot safely be reconciled")
+            receipt = read_json(path)
+            if receipt.get("controller_decision_id") != job_id:
+                continue
+            child = receipt.get("process_identity")
+            if child:
+                observation = inspect_process_identity(child)
+                if observation.get("status") != "not_running":
+                    raise ValueError("native child still runs or has unverifiable identity")
+            elif receipt.get("status") not in {"completed", "failed", "blocked", "cancelled"}:
+                raise ValueError("native child has unknown launch side effects")
+            children.append(receipt.get("attempt_id"))
+        result = {"job_id": job_id, "status": "cancelled", "finished_at": now(),
+            "termination_reason": "dead_owner_reconciled", "reason": reason[:1000],
+            "measurement_adopted": False, "outcome_scope": "unknown_output_discarded",
+            "reconciled_child_attempt_ids": children}
+        _seal_terminal(output, directory, result, json.dumps({**result, "worker": observed}))
     return status(output, job_id)
 
 

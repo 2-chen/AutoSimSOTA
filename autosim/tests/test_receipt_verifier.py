@@ -103,7 +103,7 @@ def test_json_score_is_verified_from_frozen_result_bytes(tmp_path):
     real.backend.sources["evaluate"] = (
         "def stage_argv_evaluate(i):\n"
         "    return [i['python'], '-c', 'import pathlib,json,sys; "
-        "pathlib.Path(sys.argv[1],\"result.json\").write_text(" 
+        "p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True); (p/\"result.json\").write_text("
         "json.dumps({\"summary\":{\"reward\":2.25}}))', i['output']]\n")
     real.backend = DeclarativeBackend(repo=tmp_path, answer=real.backend.answer,
                                       sources=real.backend.sources, parameters={})

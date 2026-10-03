@@ -14,10 +14,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .common import atomic_json, atomic_text, now, object_digest, sanitize_model_payload
+from .common import atomic_json, atomic_text, now, object_digest, read_json, sanitize_model_payload
 
 START = "<!-- AUTOSIM_PRESENTATION_START -->"
 END = "<!-- AUTOSIM_PRESENTATION_END -->"
+NATIVE_START = "<!-- AUTOSIM_NATIVE_TRIALS_START -->"
+NATIVE_END = "<!-- AUTOSIM_NATIVE_TRIALS_END -->"
 FIELDS = ("current", "purpose", "finding", "blocker", "next")
 CHARTS = {"comparison", "training", "cost"}
 SYSTEM = """你是只读 Recorder，为研究者编写简体中文运行说明。
@@ -28,6 +30,9 @@ provisioning.attempts 是实际执行证据；最终环境记录缺失不等于�
 区分部分安装成功与环境核验通过，区分局部请求额度拒绝与总费用/GPU/墙钟耗尽。
 表格、差值与图由发布器生成。叙述可引用所列证据里的数字、版本和错误次数，
 不得添加证据没有的数字，不能给出 SOTA/显著提升的断言。
+本地 baseline.ok 只表示测量有效，不代表官方基线复现。以 baseline_reference
+证据中的状态区分来源审核、实测成功、性能不符和不可获得；没有该证据就写尚未核验。
+参考发布权重的得分不是本次候选优化收益；不能把来源声明审核说成远端权重字节认证。
 凡正文涉及数值性能结论，必须在该 section 的 metric_claims 中声明
 [{"measurement_id":"所引用的测量ID","field":"metric_value|delta","value":数值,"unit":"测量单位"}]。
 预算、版本、次数中的数字不能当作指标数字；没有真实测量不能声称性能提高。
@@ -57,6 +62,60 @@ def read(root: Path, relative: str) -> dict[str, Any]:
         return {}
 
 
+def native_table(native: list[dict]) -> str:
+    """A fact-only bounded panel shared by snapshots and live telemetry."""
+    lines = [NATIVE_START, '### 最近的原生试跑（不计分）', '',
+        '这里记录命令验收，不是正式 baseline/candidate。退出成功也不等于策略提升；完成进度、加载身份和 rollout 仍需分别核验。', '',
+        '| 阶段/尝试 | 实际结果 | 用时 | 原生错误或输出摘要 | 证据 |',
+        '| --- | --- | --- | --- | --- |']
+    for attempt in native:
+        state = {'completed':'命令退出成功','failed':'命令失败','interrupted':'已中断',
+            'timed_out':'达到单次期限','running_unverified':'运行记录待核验'}.get(attempt['status'], attempt['status'])
+        seconds = attempt.get('seconds')
+        duration = f'{seconds:.1f} 秒' if finite(seconds) else '未结算'
+        live = attempt.get('live_telemetry') or {}
+        if not finite(seconds) and finite(attempt.get('elapsed_wall_seconds')):
+            duration = f"约 {attempt['elapsed_wall_seconds']:.0f} 秒（未结算）"
+        plain = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(
+            attempt.get('excerpt') or live.get('tail') or ''))
+        plain = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', plain)
+        text = [line.strip() for line in plain.splitlines() if line.strip()]
+        excerpt = ' / '.join(text[-3:]) if text else '尚无封存结果'
+        if live and not attempt.get('evidence_verified'):
+            excerpt = '日志末尾（未封存）：' + excerpt
+        ref = str(attempt.get('evidence_ref') or attempt['receipt_ref'])
+        if not re.fullmatch(r'[A-Za-z0-9_./-]+',ref) or '..' in Path(ref).parts or Path(ref).is_absolute():
+            continue
+        label = attempt.get('stage') or '历史试跑'
+        lines.append(f"| {cell(label)} / {cell(attempt['id'][:10])} | {cell(state)} | {duration} | {cell(excerpt,240)} | [查看]({ref}) |")
+    return '\n'.join(lines + ['', NATIVE_END])
+
+
+def refresh_native_panel(content: str, root: Path) -> str:
+    """Replace only the native panel, leaving narration and measurements untouched."""
+    from .stage_verification import recent_attempts
+    if START not in content or END not in content:
+        return content
+    prefix, rest = content.split(START, 1)
+    body, suffix = rest.split(END, 1)
+    native = recent_attempts(root)
+    if not native:
+        return content
+    panel = native_table(native)
+    if NATIVE_START in body and NATIVE_END in body:
+        before, remaining = body.split(NATIVE_START, 1)
+        _, after = remaining.split(NATIVE_END, 1)
+        body = before + panel + after
+    elif '### 最近的原生试跑（不计分）' in body:
+        before, remaining = body.split('### 最近的原生试跑（不计分）', 1)
+        position = remaining.find('\n### ')
+        after = remaining[position:] if position >= 0 else ''
+        body = before + panel + '\n' + after
+    else:
+        body += '\n\n' + panel + '\n'
+    return prefix + START + body + END + suffix
+
+
 def finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -70,18 +129,40 @@ def number(value: Any) -> str:
     return f"{value:.6g}" if finite(value) else "未测得"
 
 
+def action_explanation(row):
+    name = {"build_the_environment": "准备／恢复运行环境", "research_task": "专项调查",
+            "reconcile_interrupted_action": "核对中断操作", "run_the_loop": "训练与评测",
+            "wait_for_jobs": "等待后台任务"}.get(row.get("step"), row.get("step") or "尚无记录")
+    outcome = row.get("outcome") or "未记录"
+    label = {"raised": "操作抛出异常，未正常完成", "repair proposal rejected": "修复提案未通过校验",
+             "checkpoint failure": "准备操作返回了失败证据，环境未就绪",
+             "checkpoint": "准备操作已返回，仍需能力核验",
+             "reported": "调查报告已返回，不代表实验成功"}.get(outcome, outcome)
+    reason = str(row.get("because") or "")
+    if outcome == "raised" and "stream_protocol" in reason:
+        detail = "模型调用的输出协议异常，没有可采用的最终结果；这不是原生安装失败或环境就绪的证据。"
+    elif outcome == "raised" and "wall_timeout" in reason:
+        detail = "模型调用超过局部时间窗口；不能据此断言仿真或安装失败。"
+    else:
+        detail = reason
+    return name, label, detail
+
+
 def pending_requests(root: Path) -> list[dict[str, Any]]:
     return [row for row in read(root, "report/demo_requests.json").get("requests", [])
             if isinstance(row, dict) and row.get("status") == "pending"]
 
 
 def make_snapshot(root: Path, view: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    from .harness_repair import status as harness_repair_status
+    from .stage_verification import recent_attempts
     """Keep presentation facts immutable and separate event triggers from live telemetry."""
     rows = [dict(row) for row in view.get("measurements", []) if not row.get("confirmation")]
     baseline = next((row for row in rows if row.get("label") == "baseline"), {})
     for row in rows:
         row["id"] = "m-" + object_digest(row.get("measurement_ref"))[:16]
-        comparable = bool(view.get("source_consistency") == "stable" and row.get("protocol_sha256") and
+        comparable = bool(not str(row.get('label', '')).startswith('reference_') and
+                          view.get("source_consistency") == "stable" and row.get("protocol_sha256") and
                           row.get("protocol_sha256") == baseline.get("protocol_sha256") and
                           row.get("metric_name") == baseline.get("metric_name") and
                           row.get("metric_unit") == baseline.get("metric_unit") and
@@ -97,25 +178,47 @@ def make_snapshot(root: Path, view: dict[str, Any], context: dict[str, Any]) -> 
     ledger = read(root, "agent/cost_ledger.json") if ledger_path.is_file() else {}
     entries = ledger.get("entries", [])
     reuse = read(root, "environment_selection.json")
+    current_environment = read(root, 'environment.json')
+    cursor = read(root, 'provision_cursor.json')
+    environment_queue = {'python':(cursor.get('planned') or {}).get('python') or current_environment.get('python'),
+        'passed':(current_environment.get('verdict') or {}).get('passed') is True,
+        'pending':cursor.get('pending') or [], 'next_probe':cursor.get('next_probe'),
+        'probe_count':len(cursor.get('probes') or []), 'prefix':cursor.get('prefix')}
     pool_policy = read(root, "environment_pool.json")
     cache_view = read(root, "package_cache_view.json")
     publication = read(root, "environment_cache_publication.json")
     environment_reuse = {"enabled": pool_policy.get("enabled", False),
+        "mode": reuse.get('mode'),
+        "source_bindings": [{k:b.get(k) for k in ('module','origin')} for b in
+                            ((reuse.get('result') or {}).get('overlay') or {}).get('bindings', [])],
         "selected_id": reuse.get("id"), "selection_reason": reuse.get("reason"),
+        "base_verification": reuse.get('base_verification') or {},
         "clone_ok": (reuse.get("result") or {}).get("ok"),
         "available_wheels": len(cache_view.get("links") or []),
         "snapshot_status": (publication.get("snapshot") or {}).get("status"),
         "publication_status": publication.get("status")}
     model_budget = {"limit_usd": ledger.get("limit_usd"),
+        "updated_at":ledger.get('updated_at'),
+        "pending_reserved_usd":sum(float(r.get('reserved_usd') or 0) for r in entries if r.get('status')=='reserved'),
+        "unknown_reserved_usd":sum(float(r.get('reserved_usd') or 0) for r in entries if r.get('status')=='unknown'),
         "spent_usd": sum(float(row.get("actual_usd") or 0)
                          for row in entries if row.get("status") == "settled"),
         "held_usd": sum(float(row.get("reserved_usd") or 0)
                         for row in entries if row.get("status") in {"reserved", "unknown"})}
     # Context is supplied by Preparation, never inferred from heartbeat process activity.
+    from .review_transaction import review_view
     facts = {"status": view.get("status"), "measurements": rows,
+             "baseline_reference": view.get('baseline_reference') or {'status':'not_declared'},
+             "experiment_lifecycle": view.get('experiment_lifecycle') or {},
+             "data_versions": view.get('data_versions') or [],
              "actions": actions, "plan": context.get("plan") or {},
+             "review_transactions": review_view(root),
+             "recovery_transaction": context.get("recovery_transaction") or {},
              "provisioning": progress, "model_budget": model_budget,
-             "environment_reuse": environment_reuse,
+             "installation_recovery_inventory": read(root, "installation_recovery_inventory.json"),
+             "harness_repair": harness_repair_status(root),
+             "native_stage_verifications": recent_attempts(root),
+             "environment_reuse": environment_reuse, 'environment_queue':environment_queue,
              "verified_media": [row for row in view.get("verified_media", [])
                                 if row.get("trigger") != "final_confirmation"],
              "telemetry_attempts": view.get("telemetry_attempts") or [],
@@ -143,7 +246,7 @@ def make_snapshot(root: Path, view: dict[str, Any], context: dict[str, Any]) -> 
             screening.append({key: row.get(key) for key in
                 ("trial_id", "idea_label", "rung", "status", "metric_value", "measurement_ref")})
     facts["screening"] = screening
-    event_facts = {key: facts[key] for key in ("status", "measurements", "actions", "plan", "verified_media")}
+    event_facts = {key: facts[key] for key in ("status", "measurements", "actions", "plan", "verified_media", "recovery_transaction")}
     demo = read(root, "environment_demo.json")
     if demo.get("status") == "recorded_unscored":
         from .common import digest
@@ -174,9 +277,15 @@ def make_snapshot(root: Path, view: dict[str, Any], context: dict[str, Any]) -> 
         facts["environment_demo"] = demo
     event_facts["environment_demo"] = facts["environment_demo"]
     event_facts["provisioning"] = progress
+    event_facts["installation_recovery_inventory"] = (facts["installation_recovery_inventory"] or {}).get("digest")
     event_facts["runtime_failure"] = facts["runtime_failure"]
     event_facts["runtime_recovery"] = facts["runtime_recovery"]
+    event_facts['baseline_reference'] = facts['baseline_reference']
+    event_facts['experiment_lifecycle'] = facts['experiment_lifecycle']
+    event_facts['data_versions'] = facts['data_versions']
+    event_facts["harness_repair"] = facts["harness_repair"]
     event_facts["environment_reuse"] = environment_reuse
+    event_facts['environment_queue'] = environment_queue
     event_facts["screening"] = screening
     event_facts["background_states"] = [[row.get("job_id"), row.get("status")]
                                       for row in facts["scheduling"]["jobs"]]
@@ -202,7 +311,11 @@ def _evidence(snapshot: dict[str, Any]) -> dict[str, Any]:
                 "plan": snapshot["plan"]}
     evidence["runtime_failure"] = snapshot.get("runtime_failure") or {}
     evidence["runtime_recovery"] = snapshot.get("runtime_recovery") or {}
+    evidence['baseline_reference'] = snapshot.get('baseline_reference') or {}
+    evidence['experiment_lifecycle'] = snapshot.get('experiment_lifecycle') or {}
+    evidence['data_versions'] = snapshot.get('data_versions') or []
     evidence["environment_demo"] = snapshot.get("environment_demo") or {}
+    evidence['environment_queue'] = snapshot.get('environment_queue') or {}
     evidence.update({row["id"]: row for row in snapshot["measurements"]})
     evidence.update({f"action-{i}": row for i, row in enumerate(snapshot["actions"])})
     evidence["training"] = [{key: row.get(key) for key in (
@@ -212,7 +325,20 @@ def _evidence(snapshot: dict[str, Any]) -> dict[str, Any]:
         "trigger", "measurement_label", "episode_id", "attempt_id")}
         for row in snapshot["verified_media"]]
     evidence["budget"] = snapshot["budget"]
-    evidence["provisioning"] = snapshot.get("provisioning") or {}
+    provisioning = dict(snapshot.get("provisioning") or {})
+    attempts = provisioning.get("attempts") or []
+    if isinstance(attempts, list) and len(attempts) > 8:
+        provisioning.update(attempt_count=len(attempts),
+            failed_attempt_count=sum(row.get("ok") is False for row in attempts if isinstance(row, dict)),
+            attempts=attempts[-8:], history_scope="latest eight attempts; full history remains in the immutable report snapshot")
+    evidence["provisioning"] = provisioning
+    inventory = dict(snapshot.get("installation_recovery_inventory") or {})
+    wheels = inventory.get("local_wheels")
+    if isinstance(wheels, list) and len(wheels) > 8:
+        inventory.update(local_wheel_count=len(wheels), local_wheels=wheels[:8],
+            inventory_scope="eight examples, not the complete install inventory; Recorder does not select installation resources")
+    evidence["installation_recovery_inventory"] = inventory
+    evidence["harness_repair"] = snapshot.get("harness_repair") or {}
     evidence["model_budget"] = snapshot.get("model_budget") or {}
     evidence["environment_reuse"] = snapshot.get("environment_reuse") or {}
     evidence["scheduling"] = snapshot.get("scheduling") or {}
@@ -289,19 +415,66 @@ def _validate(answer: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
     return {"sections": clean, "charts": charts, "demo_requests": requests}
 
 
+def narration_allowance(root: Path) -> dict:
+    """Read fresh accounting; reporting cannot spend the recovery safety margin."""
+    path = root/'agent/cost_ledger.json'
+    if not path.exists():
+        return {'allowed':True,'reason':'no persistent model ledger'}
+    try:
+        from .agent_budget import AgentCostLedger
+        if path.is_symlink():
+            raise ValueError('unsafe model ledger')
+        row = read_json(path)
+        usage = AgentCostLedger(root,run_id=row['run_id'],limit_usd=row['limit_usd'],
+            cost_basis=row.get('cost_basis','cli_reported')).snapshot()
+        return {'allowed':usage['remaining_usd'] > usage['recovery_reserve_usd']+1e-9,
+            'remaining_usd':usage['remaining_usd'],'protected_usd':usage['recovery_reserve_usd'],
+            'reason':'优先保留实验执行和故障恢复额度；事实报告继续更新'}
+    except (OSError,ValueError,RuntimeError,KeyError,TypeError) as exc:
+        return {'allowed':False,'reason':'模型账本无法核验，暂不调用报告模型：'+type(exc).__name__}
+
+
 def narrate(root: Path, snapshot: dict[str, Any], *, client: Any = None,
             timeout: float = 60) -> dict[str, Any]:
     """At most one attempt per semantic event, including failures and restarts."""
     previous = read(root, "report/narrative.json")
     if client is None or not getattr(client, "supports_recorder", False):
         return previous
+    allowance = narration_allowance(root)
+    if not allowance['allowed']:
+        atomic_json(root/'report/recorder_deferred.json', {**allowance,'at':now(),'mode':'fact_only'})
+        return previous
     if snapshot.get("source_consistency") != "stable":
+        return previous
+    if snapshot.get('status') in {'budget_waiting','budget_exhausted','internal_error'}:
+        return previous
+    actions = snapshot.get('actions') or []
+    if actions and actions[-1].get('failure_domain') == 'framework_plan':
+        return previous
+    if (snapshot.get('status') == 'running' and actions and
+            actions[-1].get('step') == 'choose' and actions[-1].get('outcome') == 'decision_rejected'):
+        # The deterministic presentation already displays the exact rejected fields.
+        # A formatting-retry/Monitor cycle is not a new experiment to narrate.
         return previous
     from .run_record import _report_lock
     with _report_lock(root / "report" / "recorder-turn"):
         previous = read(root, "report/narrative.json")
         trigger = read(root, "report/recorder_trigger.json")
-        if trigger.get("event_revision") == snapshot["event_revision"]:
+        if trigger.get("event_revision") == snapshot["event_revision"] and trigger.get('status') != 'deferred':
+            return previous
+        # RUN.md facts/charts are refreshed independently. Batch routine prose updates,
+        # but never delay a new measurement, failure, demo or terminal transition.
+        important = object_digest({key: snapshot.get(key) for key in
+            ("status", "measurements", "runtime_failure", "runtime_recovery",
+             "verified_media", "environment_demo", "recovery_transaction")} | {
+                 "latest_action_failure": actions[-1] if actions and
+                     actions[-1].get("outcome") in {"raised", "failed", "rejected"} else None})
+        import time
+        if (previous.get("important_event_digest") == important and
+                time.time() - previous.get("written_epoch", 0) < 180):
+            atomic_json(root / "report" / "recorder_deferred.json", {
+                "at": now(), "mode": "fact_only", "reason": "routine prose coalesced for 180 seconds",
+                "event_revision": snapshot["event_revision"]})
             return previous
         attempt = {"event_revision": snapshot["event_revision"], "revision": snapshot["revision"],
                    "attempted_at": now(), "status": "started"}
@@ -315,10 +488,23 @@ def narrate(root: Path, snapshot: dict[str, Any], *, client: Any = None,
                       "evidence": _evidence(snapshot), "skill_catalog": catalog,
                       "instruction": '仅返回 {"skill_reads":[{"id":"目录ID","why":"选择理由"}]}，最多两项。'}
             packet = sanitize_model_payload(packet, local_roots=(root,))
+            # Skill selection needs a task outline, not the entire evidence packet.
+            # The subsequent writer still receives all evidence and chosen skill bodies.
+            selection_packet = {"event_revision": packet["event_revision"],
+                "skill_catalog": packet["skill_catalog"], "instruction": packet["instruction"],
+                "task_outline": {"status": snapshot.get("status"),
+                    "measurement_count": len(snapshot.get("measurements") or []),
+                    "latest_actions": (snapshot.get("actions") or [])[-2:],
+                    "has_failure": bool(snapshot.get("runtime_failure")),
+                    "has_media": bool(snapshot.get("verified_media")),
+                    "purpose": "中文进度说明、结果对比、阻碍解释及主动请求 demo"}}
+            selection_packet = sanitize_model_payload(selection_packet, local_roots=(root,))
             options = {"max_tokens": 1800, "timeout": max(1, timeout / 2),
                        "read_only": True, "auto_skills": False, "include_research_context": False}
+            if getattr(client, "supports_main_agent", False):
+                options.update(decision_only=True, output_format="json")
             with role_scope(client, "recorder"):
-                content, metadata = client.chat_with_metadata(SYSTEM, json.dumps(packet, ensure_ascii=False), **options)
+                content, metadata = client.chat_with_metadata(SYSTEM, json.dumps(selection_packet, ensure_ascii=False), **options)
                 selection = _object(content).get("skill_reads")
                 if not isinstance(selection, list) or len(selection) > 2:
                     raise ValueError("invalid Recorder skill selection")
@@ -330,12 +516,19 @@ def narrate(root: Path, snapshot: dict[str, Any], *, client: Any = None,
                     ids.append(row["id"])
                     reasons[row["id"]] = row["why"][:400]
                 methods = read_selected_skills(ids)
+                allowance = narration_allowance(root)
+                if not allowance['allowed']:
+                    attempt.update(status='deferred',reason=allowance['reason'])
+                    atomic_json(root/'report/recorder_deferred.json', {**allowance,'at':now(),'mode':'fact_only'})
+                    return previous
                 packet.pop("skill_catalog")
                 packet["instruction"] = "根据相同证据快照，返回规定的最终报告 JSON。"
                 packet["methods"] = [{"id": row["id"], "method": row["method"]} for row in methods["skills"]]
                 content, final_metadata = client.chat_with_metadata(SYSTEM, json.dumps(packet, ensure_ascii=False), **options)
             answer = _validate(_object(content), snapshot)
             record = {**answer, **attempt, "written_at": now(), "status": "written",
+                      "written_epoch": time.time(),
+                      "important_event_digest": important,
                       "model_authored": True, "skill_selection": [
                           {**row, "why": reasons[row["id"]]} for row in methods["selection"]],
                       "turns": [metadata, final_metadata]}
@@ -413,7 +606,41 @@ def bar_svg(points: list[tuple[str, float]], title: str, unit: str) -> str:
 
 def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> str:
     lines = [START, "## 当前进展", ""]
+    reference = snapshot.get('baseline_reference') or {'status':'not_declared'}
+    reference_status = {'not_declared':'尚未核验', 'ready':'来源已审核，待实测',
+        'evaluating':'实测中', 'reproduced':'达到已审核参考值',
+        'performance_mismatch':'实测未达到参考值', 'evaluation_failed':'评测失败',
+        'unavailable':'资源不可获得（已审核）', 'unverified':'证据需要修复',
+        'rejected':'来源审核未通过'}.get(reference.get('status'), reference.get('status'))
+    lines += ['### 基线复现状态', '',
+        '本地 baseline 的有效测量不等于官方性能复现；原基线与历史不重置。', '',
+        f"已发布基线：{cell(reference_status)}。来源审核不等于对远端权重字节的独立认证。", '']
+    if reference.get('expected_metric') is not None:
+        lines += ['| 已发布参考值 | 实测值 | 样本数 |', '| --- | --- | --- |',
+            f"| {cell(reference.get('expected_metric'))} | {cell(reference.get('measured_metric'))} | {cell(reference.get('samples'))} |", '']
     demo = snapshot.get("environment_demo") or {}
+    experiments=(snapshot.get('experiment_lifecycle') or {}).get('experiments') or []
+    if experiments:
+        lines += ['### 长期训练与正式采用', '',
+            '训练结束不等于已经计分：必须由主 Agent 选择采用，核验策略加载并执行冻结评测。', '',
+            '| 候选 | 作业状态 | 正式指标 | 证据 |', '| --- | --- | ---: | --- |']
+        names={'completed':'训练完成，待采用','running':'训练中','queued':'排队中',
+               'pending':'待启动','scored':'正式测量已核验','unscored':'尚未获得有效正式分数',
+               'failed':'作业失败','cancelled':'已取消'}
+        for job in experiments:
+            ref=job.get('measurement_ref') or job.get('request_ref')
+            lines.append(f"| {cell(job.get('idea_label'))} | {cell(names.get(job.get('status'),job.get('status')))} | "
+                         f"{cell(job.get('metric_value'))} | [查看]({ref}) |")
+        lines.append('')
+    versions=snapshot.get('data_versions') or []
+    if versions:
+        lines += ['### 数据版本', '', '以下版本已注册；是否实际用于训练以候选测量的 data_consumption 证据为准。', '',
+                  '| 版本 | 文件数 | 大小（字节） | 注册证据 |', '| --- | ---: | ---: | --- |']
+        for version in versions:
+            ident=version['id']
+            lines.append(f"| {cell(ident)} | {cell(version.get('files'))} | {cell(version.get('bytes'))} | "
+                         f"[查看](data_versions/{ident}.json) |")
+        lines.append('')
     if demo.get("status") == "recorded_unscored":
         lines += ["### 环境预览（不计分）", "",
                   "这是 Agent 提交并由原生执行器录制的预览。任务与策略身份尚未审计，不能用它证明得分或 SOTA。", "",
@@ -432,6 +659,7 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
     status = snapshot.get("status") or "unknown"
     localized = {"running": "运行中", "completed": "运行已结束", "adaptation_unresolved": "接入未完成，已停止",
                  "budget_exhausted": "预算边界触发，已停止", "stopped": "已停止", "internal_error": "内部错误，已停止",
+                 "budget_waiting": "模型额度被用量预留占用，等待核清后续跑（非实际费用已耗尽）",
                  "infrastructure_blocked": "运行环境阻塞，需修复启动条件后续跑",
                  "created": "已创建", "paused": "已暂停", "action_limit": "局部动作额度已到，已暂停"}.get(status, status)
     rows = snapshot["measurements"]
@@ -439,16 +667,116 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
     lines += [f"状态：**{cell(localized)}**。已记录 {len(rows)} 项开发实验，其中 {measured} 项有有效指标。", ""]
     fault = snapshot.get("runtime_failure") or {}
     recovery = snapshot.get("runtime_recovery") or {}
-    if fault and status not in {"completed"}:
+    terminal_action = (snapshot.get("actions") or [{}])[-1]
+    name, result_label, detail = action_explanation(terminal_action)
+    lines += [f"最近一次操作：**{cell(name)}**；状态：**{cell(result_label)}**。", ""]
+    if detail:
+        lines += [f"具体说明：{cell(detail, 700)}", ""]
+    native = snapshot.get('native_stage_verifications') or []
+    if native:
+        lines += [native_table(native), '']
+    queue = snapshot.get('environment_queue') or {}
+    if queue.get('prefix'):
+        lines += ['### 当前环境与安装待办', '',
+            f"当前计划 Python：{cell(queue.get('python'))}；环境验收：{'已通过' if queue.get('passed') else '未通过'}。", '',
+            '以下是当前隔离环境的队列，不是历史环境的失败命令。历史研究计划可能过期，以当前回执为准。', '',
+            '| 顺序 | 尚未执行的安装命令 |', '| --- | --- |']
+        for i, command in enumerate(queue.get('pending') or [], 1):
+            lines.append(f'| {i} | {cell(command, 500)} |')
+        lines += ['', f"探针游标：{cell(queue.get('next_probe'))} / {cell(queue.get('probe_count'))}；安装完成也不代表能力验收通过。", '']
+        reuse = snapshot.get('environment_reuse') or {}
+        if reuse.get('mode') == 'overlay':
+            lines += ['依赖策略：只读复用已有包，新增/替换包写入本次环境；旧可编辑安装钩子不继承。', '',
+                '已连接的源码模块：'+cell('、'.join(b.get('module','') for b in reuse.get('source_bindings', [])), 1000)+'。', '']
+    reviews = snapshot.get("review_transactions") or []
+    if reviews:
+        review = reviews[0]
+        label = {"running": "正在进行独立审核", "completed": "独立审核结果已返回，仍需原生执行与复验",
+                 "validated": "审核意见及引用已通过校验，尚未证明原生能力恢复",
+                 "validation_rejected": "审核意见已返回，但引用或合同未通过校验，需要修正提案",
+                 "transport_interrupted": "审核调用中断，保留原提案恢复审核",
+                 "transport_unavailable": "同一证据的审核通道恢复未成功，不重复安装"}.get(
+                     review.get("status"), "审核记录状态待核对")
+        lines += [f"审核进度：{cell(label)}。审核结果不是环境就绪或性能提升的证明。", ""]
+        if review.get("validation_errors"):
+            lines += [f"需修正：{cell('; '.join(review['validation_errors']), 700)}。", ""]
+    proposal_failures = [row for row in snapshot.get("actions") or []
+                         if row.get("failure_domain") == "framework_plan"]
+    if proposal_failures:
+        latest = proposal_failures[-1]
+        actions = snapshot.get("actions") or []
+        last_index = max(index for index, row in enumerate(actions)
+                         if row.get("failure_domain") == "framework_plan")
+        resolved = any((row.get("step") == "build_the_environment" and row.get("outcome") in {"done", "already done"}) or
+                       (row.get("replayed_step") == "build_the_environment" and
+                        row.get("outcome") == "reverified") for row in actions[last_index + 1:])
+        installation_started = bool((snapshot.get("provisioning") or {}).get("attempts"))
+        crossed = installation_started and any(row.get("step") == "build_the_environment" or
+            row.get("replayed_step") == "build_the_environment" for row in actions[last_index + 1:])
+        lines += ["### 历史环境方案校验失败（后续已进入原生安装）" if crossed and not resolved else
+                  "### 环境方案校验失败（后续已复验通过）" if resolved else "### 环境方案尚未通过校验", "",
+                  ("这是历史方案错误，后续已执行原生安装；不代表完整环境就绪，当前阻碍以最新安装与复验回执为准。"
+                   if crossed else "后续方案已复验通过。" if resolved else
+                   "失败发生在模型方案解析或合同校验阶段。" +
+                   ("已有安装操作记录，不能据此声称从未安装；当前方案仍需修正。" if installation_started else
+                    "尚未执行原生安装、训练或仿真。") + "应由环境规划器读取被拒绝的方案并修正。"), "",
+                  f"具体原因：{cell(latest.get('because'), 1200)}。", ""]
+        for ref in latest.get("evidence_refs") or []:
+            if re.fullmatch(r"evidence/[0-9a-f]{32}\.json", ref):
+                lines += [f"[被拒绝方案及校验错误]({ref})", ""]
+    transaction = snapshot.get("recovery_transaction") or {}
+    pending = transaction.get("pending") or {}
+    trial = transaction.get("latest_revalidation") or {}
+    if pending or trial:
+        lines += ["### 故障修复与复验", "",
+                  "修复建议不等于恢复成功；下面记录原操作是否实际重新执行。", "",
+                  "| 项目 | 当前证据 |", "| --- | --- |"]
+        if pending:
+            owner = {"environment_planner": "环境规划器", "environment_executor": "环境执行器 / 安装修复 Fix", "source_fix": "源码 Fix"}.get(pending.get("owner"), pending.get("owner"))
+            lines += [f"| 待复验原操作 | {cell(pending.get('original_step'))} |",
+                      f"| 修复责任 | {cell(owner)} |",
+                      f"| 下一操作 | {cell(pending.get('next_action'))}；总预算与准入仍有效 |"]
+        if trial:
+            outcome = {"reverified": "原操作复验通过", "reverification_failed": "原操作复验仍失败",
+                       "revalidation_in_progress": "安装已有进展，完整复验尚未完成"}.get(trial.get("outcome"), trial.get("outcome"))
+            lines += [f"| 最近复验 | {cell(trial.get('replayed_step'))}：{cell(outcome)} |",
+                      f"| 原操作结果 | {cell(trial.get('original_outcome'))}；不代表正式指标提升 |"]
+        lines.append("")
+    unresolved = transaction.get("unresolved_failure") or {}
+    if unresolved.get("failure_domain") in {"native_install", "native_probe"}:
+        probe_failure = unresolved.get("failure_domain") == "native_probe"
+        lines += ["### 原生能力探针尚未通过" if probe_failure else "### 原生安装故障尚未解除", "",
+                  ("能力探针失败已封存；解释器存在或包已安装不代表实际任务可用。" if probe_failure else
+                  "安装命令失败已封存；中间修复命令成功不等于完整环境就绪。") +
+                  "应修正安装操作并完成能力探针，不能将未使用的重试额度当作已恢复。", "",
+                  f"失败操作证据 ID：{cell(unresolved.get('evidence_id'))}。", ""]
+        if transaction.get("status") == "unresolved_requires_new_evidence":
+            lines += ["相同操作的有界复验未恢复；需要新的源码/错误证据或明确框架边界，不能反复执行同一错误命令。", ""]
+    if terminal_action.get("step") == "stop":
+        lines += ["### 为什么停止", "",
+                  f"调度 Agent 的停止说明：{cell(terminal_action.get('because') or terminal_action.get('why'), 1500)}。", "",
+                  "停止说明是 Agent 的判断；应结合下面的具体执行证据核对，不能单凭它认定资源不足。", ""]
+    if fault.get("role") == "recorder" and status not in {"completed"}:
+        lines += ["### 报告写作回合异常（不代表主实验停止）", "",
+            f"记录 Agent 的历史异常：{cell(fault.get('message'), 700)}。", "",
+            "这是写作子任务的证据，不能据此认定 Scheduler、安装、训练或仿真已停止。"
+            "主流程是否推进应看原生回执与任务进程；本页心跳刷新也不证明实验有进展。", ""]
+        relative = fault.get("evidence_ref") or ""
+        if re.fullmatch(r"evidence/[0-9a-f]{32}\.json", relative):
+            lines += [f"[写作异常证据]({relative})", ""]
+    elif fault and status not in {"completed"}:
         result = recovery.get("recovery") or {}
         recovery_status = {"revalidated": "已通过原安全检查，尚需恢复实际调度",
                            "blocked": "未恢复，需要处理具体原因", "unsupported": "尚无安全恢复操作"}.get(
                                result.get("status"), "尚无已核验恢复")
-        lines += ["### 启动故障与恢复", "",
+        lines += ["### 框架 / 运行故障与恢复", "",
             *( ["安全检查发现源码副本内的外部链接或疑似敏感文件，阻止了 Agent 启动；"
                 "这不表示模型上下文耗尽或 benchmark 不可运行。", ""]
                if fault.get("category") == "workspace_guard" else []),
             f"最近封存的具体错误：{cell(fault.get('message'), 700)}。", "",
+            *(["这是模型规划回合中断，不是原生安装、reset、训练或 rollout 失败。"
+                "修复应先检查实际回合时限与已封存的工具进展，不能据此判定仿真仓库不可运行。", ""]
+              if fault.get("native_operation_status") == "not_inferred" else []),
             f"恢复状态：{cell(recovery_status)}；"
             f"说明：{cell(result.get('reason') or (result.get('answer') or {}).get('reason') or '以封存证据为准', 700)}。", "",
             "这是启动/恢复证据，不等同于仿真不可实现，也不等同于总预算耗尽。", ""]
@@ -468,7 +796,6 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
         action = snapshot.get("current_action")
         last = (snapshot.get("actions") or [{}])[-1]
         lines += [f"当前动作：{cell(action or '没有已确认的活动动作')}。", "",
-                  f"最近完成的操作：{cell(last.get('step') or '尚无记录')}；结果：{cell(last.get('outcome') or '未记录')}。", "",
                   "研究解释尚未更新，不能从心跳推断实验成功。目标、阻碍与下一步以已记录计划和操作证据为准。", ""]
         plan = snapshot.get("plan") or {}
         lines += [f"研究目的（已记录计划）：{cell(plan.get('objective') or '尚未记录')}。", "",
@@ -477,6 +804,15 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
         if narrative.get("sections"):
             lines += [f"上一份叙述已过期，见 [历史说明](report/narratives/{narrative['event_revision']}.json)。", ""]
     model = snapshot.get("model_budget") or {}
+    data_strategy = (snapshot.get("plan") or {}).get("data_strategy") or {}
+    if data_strategy:
+        lines += ["### 数据提分计划（尚非采集结果）", "",
+                  f"选择路径：{cell(data_strategy.get('route'))}；原因：{cell(data_strategy.get('why'), 700)}。", "",
+                  "| 需要补什么 | 计划依据 |", "| --- | --- |",
+                  *[f"| 目标 {index + 1} | {cell(target, 700)} |" for index, target in enumerate(data_strategy.get("targets") or [])],
+                  "", f"生产者到训练器：{cell(' → '.join(data_strategy.get('producer_to_loader') or []), 1000)}。", "",
+                  f"下一次小试：{cell(data_strategy.get('next_probe'), 700)}。", "",
+                  "以上是 Agent 计划；只有原生采集回执、实际 loader 消费与后续同协议分数才能证明执行和效果。", ""]
     scheduling = snapshot.get("scheduling") or {}
     if scheduling.get("policy"):
         lines += ["### 后台任务与资源调度", "",
@@ -526,9 +862,39 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
             "| --- | --- | --- | --- |",
             f"| ${limit:.2f} | ${spent:.5f} | ${held:.5f} | ${max(0, limit-spent-held):.5f} |", "",
             "局部额度不足不代表总预算耗尽；预留不是实际消费。GPU 与墙钟预算独立计算。", ""]
+        lines += [f"尚未结算回合预留：${float(model.get('pending_reserved_usd') or 0):.5f}；"
+                  f"未知用量保留：${float(model.get('unknown_reserved_usd') or 0):.5f}。"
+                  "未结算不等于进程仍活跃；没有可靠用量证据不能清零。", "",
+                  f"账本更新时间：{cell(model.get('updated_at') or '未记录')}。", ""]
+        if snapshot.get('status') == 'budget_waiting' and limit-spent-held > 1e-9:
+            lines += ['账本已有可用余额；这不代表已停止的实验自动恢复，需核对服务或明确续跑。','']
+    recovery_resources = snapshot.get("installation_recovery_inventory") or {}
+    if recovery_resources:
+        wheel_count = len(recovery_resources.get("local_wheels") or [])
+        candidates = len(recovery_resources.get("environment_candidates") or [])
+        lines += ["### 安装恢复可用资源", "",
+            f"本轮缓存发现 {wheel_count} 个 wheel，另有 {candidates} 个环境复用候选。"
+            "这是恢复线索，不是已安装、兼容或仿真就绪的证明。下载源不可达不等于本地资源不存在。", "",
+            "[资源清单与核验要求](installation_recovery_inventory.json)。"
+            "是否复用及采用哪条安装路径由 Agent 根据失败证据决定。", ""]
+        if recovery_resources.get("scan_complete") is not True:
+            lines += ["清单扫描未完成，不能据此断言没有其他缓存资源。", ""]
+    repairs = (snapshot.get("harness_repair") or {}).get("repairs") or []
+    if repairs:
+        lines += ["### 框架修复候选（未部署）", "",
+            "Fix 只在独立副本提出补丁。语法通过不代表原故障已修好；"
+            "必须独立复验原操作和回归测试。当前不会自动替换运行中的 Python 框架。", "",
+            "| 候选 | 状态 | 原故障证据 |", "| --- | --- | --- |"]
+        for repair in repairs:
+            lines += [f"| {cell(repair.get('id'))} | {cell(repair.get('status'))} | {cell(repair.get('failure_evidence_id'))} |"]
+        lines += [""]
     attempts = (snapshot.get("provisioning") or {}).get("attempts") or []
     reuse = snapshot.get("environment_reuse") or {}
     if reuse.get("enabled"):
+        if reuse.get('mode') == 'overlay':
+            reuse_text = '只读依赖连接已建立，仍需原生探针' if reuse.get('clone_ok') else '只读依赖连接未确认成功'
+        else:
+            reuse_text = '已复制，仍需原生探针' if reuse.get('clone_ok') else '未确认复制成功'
         publication_status = reuse.get("snapshot_status") or reuse.get("publication_status") or "not_published"
         publication_text = {
             "published": "已发布（后续运行仍须复验）", "already_present": "已有同身份快照",
@@ -536,14 +902,25 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
             "incomplete_snapshot": "已有未完成副本，保留待检查", "clone_failed": "复制失败，已保留证据",
             "deadline_reached": "剩余时间不足，未发布", "cache_unavailable": "缓存不可用，未发布",
             "disabled": "未启用", "not_published": "尚未发布",
+            "template_only": "已保存底座与增量模板，不复制大环境（后续仍须复验）",
         }.get(publication_status, publication_status)
         lines += ["### 环境复用", "",
             f"可供安装器使用的共享 wheel：{reuse.get('available_wheels', 0)} 个（不是实测命中数）。",
             f"基础环境选择：{cell(reuse.get('selected_id') or '未选择公共基础环境')}。",
             f"选择依据：{cell(reuse.get('selection_reason') or '尚未记录')}。",
-            f"独立副本：{'已复制，仍需原生探针' if reuse.get('clone_ok') else '未确认复制成功'}；"
+            f"复用状态：{reuse_text}；"
             f"快照发布：{cell(publication_text)}。", "",
             "缓存命中与安装成功都不等于仿真就绪；数据、权重和资源连接独立验证。", ""]
+    base_check = reuse.get('base_verification') or {}
+    if base_check.get('status'):
+        capability_names = {'cuda_compute': 'GPU 运算', 'backward_optimizer': '反向传播与参数更新',
+            'weights_roundtrip': '权重保存和重载', 'reset': '初始状态重置',
+            'scene_initialize': '场景初始化', 'physics_step': '物理步进',
+            'offscreen_frame': '离屏画面', 'python_subprocess': 'Python 子进程', 'local_io': '本地读写'}
+        capabilities = '、'.join(capability_names.get(name, name) for name in base_check.get('capabilities') or []) or '尚无通过记录'
+        status = {'verified': '已验收', 'stale': '证据已失效，需复验', 'unverified': '未验收'}.get(base_check['status'], base_check['status'])
+        lines += [f"选择底座时的运行栈检查：{cell(status)}；能力：{cell(capabilities)}。",
+                  '这只说明底层运行栈，不代表本仓库任务、数据采集或训练评测已经通过。', '']
     if attempts:
         lines += ["### 环境准备的实际操作", "",
             "以下操作已经执行；安装成功不等于仿真环境已核验。", "",
@@ -558,6 +935,8 @@ def render(root: Path, snapshot: dict[str, Any], narrative: dict[str, Any]) -> s
                       f"{cell(row.get('seconds', '未记录'))} | {link} |"]
         lines += ["", "[累计安装日志](build.log) · [逐操作进度](provision_progress.json)", ""]
     trigger = read(root, "report/recorder_trigger.json")
+    if not narration_allowance(root)['allowed']:
+        lines += ['报告写作暂用事实模式：优先保留实验执行和故障恢复额度，表格、图表及已核验媒体仍更新。','']
     if trigger.get("status") == "failed":
         lines += ["写作服务本轮未完成，保留事实展示；[失败原因](report/recorder_trigger.json)。", ""]
     lines += ["## 实验对比", "", "只对同一已记录评测协议、指标、单位与方向计算原始差值；差值不是显著性结论。", "",
@@ -702,6 +1081,10 @@ def refresh(root: Path, view: dict[str, Any], *, context: dict[str, Any] | None 
     else:
         atomic_json(root / "report" / "context.json", context)
     snapshot = make_snapshot(root, view, context)
+    allowance = narration_allowance(root)
+    if not allowance['allowed']:
+        atomic_json(root/'report/recorder_deferred.json', {**allowance,'at':now(),'mode':'fact_only'})
+        return render(root,snapshot,read(root,'report/narrative.json'))
     from .scheduling import policy
     asynchronous = policy(root).get("async_recorder") and hasattr(client, "fork_readonly")
     if asynchronous:

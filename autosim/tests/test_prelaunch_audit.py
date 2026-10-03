@@ -362,10 +362,14 @@ def test_latest_agent_resource_request_survives_cooperative_resume(tmp_path, mon
     monkeypatch.setattr(pv, "bounded_run", lambda argv, **kwargs:
         subprocess.CompletedProcess(argv, 0, "native import diagnostic", ""))
     probe = "{python} -c 'import sys;print(sys.version)'"
+    repaired_probe = "{python} -c 'import sys;print(sys.version);print(sys.executable)'"
     def repair(client, repo, record, failure, **kwargs):
         kwargs["transcript"].append({"kind": "resume", "resource_requests": [
-            {"command": probe, "resource": "cpu", "why": "only inspect interpreter identity"}]})
-        return [], None
+            {"command": repaired_probe, "resource": "cpu", "why": "only inspect interpreter identity"}],
+            "reviewed_same_capability": True})
+        # A rejected/empty repair must never authorize replay. This fixture models an
+        # accepted, capability-preserving corrected diagnostic and CPU resource request.
+        return [], [repaired_probe]
     monkeypatch.setattr(pv, "resume", repair)
     seed = {"python": sys.executable, "templates": ["echo setup"], "probes": [probe],
             "resource_requests": [{"command": probe, "resource": "gpu", "why": "initial assumption"}]}

@@ -31,7 +31,8 @@ def main(argv: list[str] | None = None) -> int:
         print("  autosim scout    <repo> [--read-limit N]")
         print("  autosim recheck  <run-root> <label> --output <fresh-dir> [--plan-only]")
         print("  autosim agent    <repo> <output-dir> (--prompt TEXT | --prompt-file FILE) [--resume]")
-        print("  autosim environments list | register --prefix <conda-env> [--store PATH]")
+        print("  autosim environments list | register --prefix <existing-env> [--store PATH]")
+        print("  autosim environments verify --prefix <existing-env> --profile <family> --output <fresh-dir> [--gpu-seconds N]")
         return 0
 
     if argv[0] == "research":

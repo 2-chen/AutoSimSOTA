@@ -1,4 +1,6 @@
 import json
+import time
+import uuid
 import shutil
 from pathlib import Path
 
@@ -20,6 +22,22 @@ from autosim.research.agent_runtime import (_McpExecutor, execute_agent_command,
 from autosim.research.process_executor import ProcessAttempt
 from autosim.research.agent_roles import role_profile
 from autosim.research.agent_runtime import _role_skill_context
+
+
+def test_missing_resume_session_requires_precise_cli_preexecution_evidence():
+    from autosim.research.agent_runtime import _missing_resume_session
+    session_id = str(uuid.uuid4())
+    attempt = ProcessAttempt(launched=True, returncode=1,
+                             stderr=f"No conversation found with session ID: {session_id}\n")
+    result = {"is_error": True, "num_turns": 0, "session_id": session_id}
+    assert _missing_resume_session(attempt, session_id, result, resume=True)
+    assert not _missing_resume_session(attempt, session_id, result, resume=False)
+    assert not _missing_resume_session(attempt, str(uuid.uuid4()), result, resume=True)
+    assert not _missing_resume_session(attempt, session_id, {**result, "num_turns": 1}, resume=True)
+    assert not _missing_resume_session(attempt, session_id, {**result, "is_error": False}, resume=True)
+    attempt = ProcessAttempt(launched=True, returncode=1,
+                             stderr="tool says: " + attempt.stderr)
+    assert not _missing_resume_session(attempt, session_id, result, resume=True)
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -78,7 +96,8 @@ def test_autosota_roles_get_narrow_tool_profiles_and_recorder_is_not_a_code_agen
     assert not supervisor.can_edit_checkout and not supervisor.can_execute_diagnostics
     assert "Edit" not in supervisor.builtin_tools
     assert set(supervisor.mcp_tools) == {"mcp__autosim_exec__read_evidence",
-        "mcp__autosim_exec__search_public_sources", "mcp__autosim_exec__read_public_source"}
+        "mcp__autosim_exec__search_public_sources", "mcp__autosim_exec__read_public_source",
+        "mcp__autosim_exec__inspect_workspace_resources"}
     assert not resource.can_edit_checkout and not resource.can_execute_diagnostics
     recorder = role_profile("recorder")
     assert recorder.can_run_agent
@@ -123,7 +142,8 @@ def test_autosota_roles_get_narrow_tool_profiles_and_recorder_is_not_a_code_agen
     assert not supervisor.can_edit_checkout and not supervisor.can_execute_diagnostics
     assert "Edit" not in supervisor.builtin_tools
     assert set(supervisor.mcp_tools) == {"mcp__autosim_exec__read_evidence",
-        "mcp__autosim_exec__search_public_sources", "mcp__autosim_exec__read_public_source"}
+        "mcp__autosim_exec__search_public_sources", "mcp__autosim_exec__read_public_source",
+        "mcp__autosim_exec__inspect_workspace_resources"}
     assert not resource.can_edit_checkout and not resource.can_execute_diagnostics
     recorder = role_profile("recorder")
     assert recorder.can_run_agent
@@ -180,6 +200,69 @@ def test_coding_agent_sends_large_prompt_via_stdin(tmp_path, monkeypatch):
     assert prompt not in captured["command"]
     assert captured["input_bytes"] == prompt.encode("utf-8")
     assert len(captured["input_bytes"]) > 128 * 1024
+
+
+def test_executor_text_is_separate_from_redacted_display(tmp_path, monkeypatch):
+    from autosim.research import agent_runtime
+    output, workspace = _fixture(tmp_path)
+    monkeypatch.setattr("autosim.llm_client.load_credential_file",
+                        lambda **_: {"source": "fixture", "model": "fixture-model"})
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-secret")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "fixture-model")
+    monkeypatch.setattr(agent_runtime, "_role_skill_context", lambda *_: ({"skills": []}, ""))
+    code = 'except BaseException as e:\n    raise\n'
+    original = json.dumps({'commands': [code], 'private': '/home/operator/private'})
+
+    def fake_stream(command, **kwargs):
+        kwargs['on_stdout_line'](json.dumps({'type': 'result', 'total_cost_usd': 0.01,
+            'duration_ms': 12, 'usage': {'input_tokens': 10}, 'result': original}))
+        return ProcessAttempt(launched=True, returncode=0, stdout='', stderr='',
+                              containment_mode='fixture')
+
+    monkeypatch.setattr(agent_runtime, 'run_process_stream', fake_stream)
+    result = agent_runtime.run_coding_agent(workspace=workspace, output=output,
+        prompt='Return a proposal', run_id='separation-test', max_budget_usd=0.05,
+        max_total_budget_usd=0.05, cli='/usr/bin/claude', role='resource')
+    assert result['status'] == 'completed'
+    assert result['execution_text'] == original
+    assert json.loads(result['final_text'])['commands'] == [code]
+    assert '/home/operator' not in result['final_text']
+    # Persistent stream projections never receive the raw execution field.
+    assert 'execution_text' not in (output/'agent/events.jsonl').read_text()
+
+
+@pytest.mark.parametrize('truncated', [False, True])
+def test_decision_only_json_has_no_tools_and_requires_complete_terminal(tmp_path, monkeypatch, truncated):
+    from autosim.research import agent_runtime
+    output, workspace = _fixture(tmp_path)
+    monkeypatch.setattr('autosim.llm_client.load_credential_file',
+                        lambda **_: {'source':'fixture','model':'fixture-model'})
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'fixture-secret')
+    monkeypatch.setenv('DEEPSEEK_MODEL', 'fixture-model')
+    captured={}
+    response=json.dumps({'type':'result','result':'{"approved":true,"reason":"quoted source"}',
+                         'total_cost_usd':.01,'usage':{'input_tokens':10}},indent=2)
+    def fake_stream(command, **kwargs):
+        captured.update(command=command,options=kwargs)
+        assert kwargs['on_stdout_line'] is None
+        return ProcessAttempt(launched=True,returncode=0,stdout=response[:-5] if truncated else response,
+                              stderr='',containment_mode='fixture')
+    monkeypatch.setattr(agent_runtime,'run_process_stream',fake_stream)
+    result=agent_runtime.run_coding_agent(workspace=workspace,output=output,prompt='review source',
+        run_id='decision-test',max_budget_usd=.05,max_total_budget_usd=.05,
+        cli='/usr/bin/claude',role='objective',read_only=True,decision_only=True,output_format='json')
+    command=captured['command']
+    assert command[command.index('--tools')+1]==''
+    assert '--allowedTools' not in command
+    assert command[command.index('--output-format')+1]=='json'
+    assert '--verbose' not in command
+    assert captured['options']['decouple_callbacks']
+    if truncated:
+        assert result['status']=='failed' and result['failure_category']=='stream_protocol'
+        assert result['execution_text']==''
+    else:
+        assert result['status']=='completed'
+        assert json.loads(result['execution_text'])['approved'] is True
 
 
 def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monkeypatch):
@@ -525,6 +608,108 @@ def test_formal_preparation_reconciles_an_interrupted_coding_agent_process(tmp_p
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('fault', ['', 'reserved', 'starting', 'uncapped', 'foreign_run'])
+def test_unreserved_prelaunch_proof_requires_capped_admission_absence(tmp_path, fault):
+    from autosim.research import agent_runtime
+    from autosim.research.common import atomic_json
+    output, workspace = _fixture(tmp_path)
+    session = {'status':'running','run_id':'formal-run',
+        'workspace_identity':str(workspace.resolve()),'session_id':str(uuid.uuid4()),
+        'agent_session_key':'b'*32,'max_total_budget_usd':10,
+        'budget_output':str(output),'budget_reservation_id':None}
+    ledger = {'run_id':'formal-run','entries':[]}
+    if fault == 'reserved': ledger['entries'] = [{'session_id':session['session_id']}]
+    if fault == 'uncapped': session['max_total_budget_usd'] = None
+    if fault == 'foreign_run': ledger['run_id'] = 'elsewhere'
+    if fault == 'starting':
+        atomic_json(output/'agent/processes/start.json', {'session_id':session['session_id']})
+    atomic_json(output/'agent/cost_ledger.json', ledger)
+    proof = agent_runtime.unreserved_prelaunch_proof(output=output, workspace=workspace,
+        session=session, run_id='formal-run')
+    assert bool(proof) == (fault == '')
+
+
+def test_preparation_reconciles_fix_interrupted_before_admission(tmp_path):
+    from autosim.research import agent_runtime
+    from autosim.research.common import atomic_json, now
+    from autosim.research.prepare import Preparation
+    output, workspace = _fixture(tmp_path)
+    action = {'step':'agent_fix','status':'running','started_at':now()}
+    session = {'schema_version':1,'status':'running','run_id':'formal-run','role':'fix',
+        'workspace_identity':str(workspace.resolve()),'session_id':str(uuid.uuid4()),
+        'agent_session_key':'b'*32,'max_total_budget_usd':10,
+        'budget_output':str(output),'budget_reservation_id':None,'started_at':time.time()}
+    agent_runtime._persist_agent_session(output, session)
+    atomic_json(output/'agent/cost_ledger.json', {'run_id':'formal-run','entries':[]})
+    preparation = Preparation(repo=workspace, output=output, client=object(),
+        scouting=tmp_path/'scouting', run_id='formal-run')
+    preparation.recovery_after_interruption = {'action':action,
+        'process_status':{'status':'not_recorded'}}
+    result = preparation.do('reconcile_interrupted_action')
+    assert result.get('process_status') == 'not_launched', result
+    assert result['outcome_known'] is False
+    assert not preparation.recovery_after_interruption
+    assert agent_runtime._safe_session(output)['status'] == 'interrupted'
+
+
+def _stale_role_projection(output, workspace):
+    from autosim.research import agent_runtime
+    from autosim.research.common import atomic_json
+    attempt = 'e'*32
+    identity = {'pid':12345,'run_id':'formal-run','attempt_id':attempt}
+    session = {'schema_version':1,'status':'running','run_id':'formal-run','role':'init',
+        'workspace_identity':str(workspace.resolve()),'session_id':str(uuid.uuid4()),
+        'agent_session_key':'c'*32,'max_total_budget_usd':10,
+        'process_attempt_id':attempt,'process_ref':f'agent/processes/{attempt}.json',
+        'process_identity':identity}
+    agent_runtime._persist_agent_session(output,session)
+    atomic_json(output/session['process_ref'],{'run_id':'formal-run','attempt_id':attempt,
+        'process_identity':identity,'status':'interrupted'})
+    return session
+
+
+def test_fresh_role_retires_stopped_prior_role_projection_preserving_costs(tmp_path,monkeypatch):
+    from autosim.research import agent_runtime
+    from autosim.research.common import atomic_json
+    output,workspace = _fixture(tmp_path)
+    _stale_role_projection(output,workspace)
+    atomic_json(output/'agent/cost_ledger.json',{'run_id':'formal-run','entries':[
+        {'status':'unknown','reserved_usd':2}]})
+    original = (output/'agent/cost_ledger.json').read_bytes()
+    monkeypatch.setattr(agent_runtime,'inspect_process_identity',lambda _: {'status':'not_running'})
+    def fresh(**kw):
+        assert agent_runtime._safe_session(output)['status'] == 'interrupted'
+        return {'status':'completed'}
+    monkeypatch.setattr(agent_runtime,'_run_coding_agent_turn',fresh)
+    result = agent_runtime.run_coding_agent(workspace=workspace,output=output,prompt='next',
+        run_id='formal-run',role='scheduler')
+    assert result['status'] == 'completed'
+    assert (output/'agent/cost_ledger.json').read_bytes() == original
+
+
+@pytest.mark.parametrize('fault',['foreign_workspace','receipt_mismatch','lock_owned'])
+def test_stale_role_reconciliation_fails_closed_before_any_signal(tmp_path,monkeypatch,fault):
+    from autosim.research import agent_runtime
+    from autosim.research.common import atomic_json
+    output,workspace = _fixture(tmp_path)
+    session = _stale_role_projection(output,workspace)
+    if fault == 'foreign_workspace':
+        session['workspace_identity'] = str(tmp_path/'foreign')
+        agent_runtime._persist_agent_session(output,session)
+    elif fault == 'receipt_mismatch':
+        atomic_json(output/session['process_ref'],{'run_id':'different'})
+    signals = []
+    monkeypatch.setattr(agent_runtime,'terminate_recorded_process',lambda i:signals.append(i))
+    monkeypatch.setattr(agent_runtime,'inspect_process_identity',lambda _: {'status':'matching_running'})
+    monkeypatch.setattr(agent_runtime,'_run_coding_agent_turn',lambda **kw:pytest.fail('launched'))
+    from contextlib import nullcontext
+    lock = agent_runtime._agent_turn_lock(output) if fault == 'lock_owned' else nullcontext()
+    with lock, pytest.raises(agent_runtime.AgentRuntimeError):
+        agent_runtime.run_coding_agent(workspace=workspace,output=output,prompt='next',run_id='formal-run')
+    assert not signals
+    assert agent_runtime._safe_session(output)['status'] == 'running'
 
 
 def test_agent_command_requires_checkout_bound_to_run(tmp_path):

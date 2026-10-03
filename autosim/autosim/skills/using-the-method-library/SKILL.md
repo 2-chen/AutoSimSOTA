@@ -20,6 +20,7 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 
 ## 1. 选择研究方向
 
+- [data-first-score-optimization](../data-first-score-optimization/SKILL.md)：固定协议下先跑基线，再用小规模数据闭环提高指标；不把全面调研作为启动前提。
 - [choosing-simulation-improvements](../choosing-simulation-improvements/SKILL.md)：按失败、资源和协议选择下一假设；先区分修复、复现、本地增分与 SOTA。
 - [spending-a-budget-across-ideas](../spending-a-budget-across-ideas/SKILL.md)：低保真筛选、长期作业与局部预算分配；先验证代理指标。
 - [make-your-prior-earn-it](../make-your-prior-earn-it/SKILL.md)：何时需要随机/简单对照来检验 LLM 选法的价值。
@@ -41,6 +42,7 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 
 - [where-successes-come-from](../where-successes-come-from/SKILL.md)：谁提供动作，是否能自主产生训练轨迹？
 - [connecting-native-data-collection](../connecting-native-data-collection/SKILL.md)：原生采集→转换→真实 loader 如何接通？
+- [targeting-simulation-data](../targeting-simulation-data/SKILL.md)：从开发失败选择训练场景及正确动作来源，再核验成功、字段和消费；零成功不能自举。
 - [budget-attempts-not-episodes](../budget-attempts-not-episodes/SKILL.md)：失败重试和接受目标实际花多少资源？
 - [generator-success-is-not-data-value](../generator-success-is-not-data-value/SKILL.md)：采集产出率与下游策略收益有何区别？
 - [diversity-before-volume](../diversity-before-volume/SKILL.md)：新增覆盖还是重复已有场景？

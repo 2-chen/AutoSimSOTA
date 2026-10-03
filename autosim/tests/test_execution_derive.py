@@ -1009,6 +1009,94 @@ def test_identical_rejected_argv_gets_at_most_one_runtime_retry():
     assert "Exact argv already failed twice" in log[-1]["error"]
 
 
+def test_unique_output_slots_do_not_hide_identical_failed_commands():
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            return json.dumps({'source': "def stage_argv_evaluate(i):\n"
+                "    return ['python', 'eval.py', '--output=' + i['output']]\n"}), {}
+
+    count = iter(range(5))
+    executions = []
+    def verify(argv):
+        executions.append(argv)
+        return {'ok': False, 'error': 'material assertion',
+                'native_evidence_ref': 'evidence/failure.json'}
+    _, _, log = execution_derive.generate_argv(Client(), 'evaluate',
+        entrypoint='eval.py', invocation='python eval.py', repository_files=[],
+        inputs_for_verify={'output': '/run/output/old'}, attempts=5,
+        verification_inputs_factory=lambda: {'output': f'/run/output/{next(count)}'},
+        verify=verify)
+    assert len(executions) == 2
+    assert executions[0] != executions[1]
+    assert log[-1]['native_evidence_ref'] == 'evidence/failure.json'
+    assert 'disposable verification output' in log[-1]['error']
+
+
+def test_retry_key_keeps_inputs_seeds_and_opaque_shell_distinct():
+    key = execution_derive.verification_retry_key
+    first = ['python', '--out=/r/one/results', '--checkpoint=/input/one', '--seed=1']
+    second = ['python', '--out=/r/two/results', '--checkpoint=/input/one', '--seed=1']
+    assert key(first, {'output': '/r/one'}) == key(second, {'output': '/r/two'})
+    assert key(first, {'output': '/r/one'}) != key(second[:-1]+['--seed=2'], {'output': '/r/two'})
+    assert key(['/r/one-extra'], {'output': '/r/one'}) == ('/r/one-extra',)
+    assert key(['sh', '-c', 'echo /r/one'], {'output': '/r/one'}) == ('sh', '-c', 'echo /r/one')
+    assert key(['/input/one'], {'output': ''}) == ('/input/one',)
+
+
+def test_agent_can_yield_failed_native_to_invocation_repair_without_replay():
+    replies = iter([{'source': "def stage_argv_train(i): return ['python', 'train.py']"},
+        {'invocation_handoff': {'reason': 'native runtime needs environment repair',
+                               'native_evidence_ref': 'evidence/owned.json'}}])
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps(next(replies)), {}
+    calls = []
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py', invocation='python train.py', repository_files=[], attempts=3,
+        verify=lambda argv: calls.append(argv) or {'ok': False, 'error': 'runtime failed',
+                                                  'native_evidence_ref': 'evidence/owned.json'})
+    assert source is None and len(calls) == 1
+    assert log[-1]['status'] == 'Agent requested invocation repair'
+    assert log[-1]['argv'] == calls[0] and log[-1]['native_evidence_ref'] == 'evidence/owned.json'
+
+
+def test_handoff_cannot_claim_success_or_foreign_evidence_before_native_execution():
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff': {'reason': 'skip',
+                'native_evidence_ref': 'evidence/foreign.json'}}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py', invocation='python train.py', repository_files=[], attempts=1,
+        verify=lambda argv: pytest.fail('invalid handoff must not execute'))
+    assert source is None and 'exact latest failed native evidence' in log[-1]['error']
+
+
+def test_successful_native_artifact_failure_keeps_stable_execution_evidence(tmp_path, monkeypatch):
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            if 'as_derived' in user:
+                return json.dumps({'finding':'native completed but artifact declaration differs',
+                    'about':'the invocation', 'working_directory':'{repo}',
+                    'artifact':'**/metrics.json', 'why':'inspect actual native output layout'}), {}
+            request = json.loads(user)
+            assert request['native_resource_context']['stage_postconditions']['declared_artifact'] == 'missing/**/*.json'
+            return json.dumps({'source': "def stage_argv_evaluate(i): return ['python', 'eval.py']"}), {}
+    done = subprocess.CompletedProcess(['python', 'eval.py'], 0, 'native evaluation finished', '')
+    done.evidence_ref = 'evidence/owned-native.json'
+    monkeypatch.setattr(execution_derive, 'isolated_argv', lambda argv, **kw: argv)
+    monkeypatch.setattr(execution_derive, 'bounded_run', lambda *args, **kwargs: done)
+    output = tmp_path/'run/v'
+    _, _, log, _ = execution_derive.make_runnable(Client(), 'evaluate',
+        {'entrypoint':'eval.py', 'invocation':'python eval.py', 'artifact':'missing/**/*.json'},
+        repo=tmp_path, repository_files=[], inputs_for_verify={'output':str(output)},
+        rounds=1, attempts=1)
+    assert log[0]['status'] == 'rejected'
+    assert log[0]['native_evidence_ref'] == 'evidence/owned-native.json'
+    assert log[0]['native_diagnostics']['returncode'] == 0
+    assert 'native evaluation finished' in log[0]['native_diagnostics']['stdout_tail']
+    assert 'fresh declared artifact' in log[0]['error']
+
+
 def test_exhausted_wall_budget_stops_command_derivation_rounds(tmp_path):
     class Client:
         def chat_with_metadata(self, system, user, **kwargs):
@@ -1519,6 +1607,56 @@ def test_sparse_settings_keep_config_equals_syntax_and_leave_unmatched_keys_alon
     checkpoint = ["python", "eval.py", "--checkpoint=/frozen/policy.pt"]
     assert execution_derive.coalesce_dynamic_overrides(
         checkpoint, {"--checkpoint": "/another/policy.pt"}) == checkpoint
+
+
+@pytest.mark.parametrize('spelling', ['separate', 'equals', 'config'])
+def test_repository_defaults_cannot_override_agent_bound_verification_work(spelling):
+    from autosim.research import execution_derive as ed
+    fragment = ("['--completion-count', str(i['episodes'])]" if spelling == 'separate'
+                else "['--completion-count=' + str(i['episodes'])]" if spelling == 'equals'
+                else "['completion_count=' + str(i['episodes'])]")
+    class Client:
+        def chat_with_metadata(self, *a, **kw):
+            return json.dumps({'source':"def stage_argv_evaluate(i): return ['runner'] + "
+                + fragment + " + ['--parallelism', '16']"}), {}
+    observed = []
+    source, _, _ = ed.generate_argv(Client(), 'evaluate', entrypoint='eval.py',
+        invocation='runner', repository_files=[],
+        declared_parameters={'--completion-count':'100', '--parallelism':'2'},
+        inputs_for_verify={'episodes':1}, verify=lambda argv: observed.append(argv) or {'ok':True})
+    assert source and len(observed) == 1
+    argv = observed[0]
+    assert '100' not in argv and not any(str(part).endswith('=100') for part in argv)
+    assert '--parallelism' in argv and argv[argv.index('--parallelism')+1] == '2'
+    assert ('1' in argv or '--completion-count=1' in argv or 'completion_count=1' in argv)
+
+
+def test_caller_bound_training_budget_survives_same_named_repository_default():
+    from autosim.research import execution_derive as ed
+    class Client:
+        def chat_with_metadata(self, *a, **kw):
+            return json.dumps({'source':"def stage_argv_train(i): return ['runner', "
+                "'--total-updates', str(i['steps'])]"}), {}
+    seen = []
+    source, _, _ = ed.generate_argv(Client(), 'train', entrypoint='train.py', invocation='runner',
+        repository_files=[], declared_parameters={'--total-updates':'9999'},
+        inputs_for_verify={'steps':1024}, require_step_control=True,
+        verify=lambda argv: seen.append(argv) or {'ok':True})
+    assert source and seen == [['runner','--total-updates','1024']]
+
+
+def test_explicit_settings_still_override_repository_defaults_and_bound_work():
+    from autosim.research import execution_derive as ed
+    class Client:
+        def chat_with_metadata(self, *a, **kw):
+            return json.dumps({'source':"def stage_argv_evaluate(i): return ['runner', "
+                "'completion_count=' + str(i['episodes'])]"}), {}
+    seen = []
+    source, _, _ = ed.generate_argv(Client(), 'evaluate', entrypoint='eval.py', invocation='runner',
+        repository_files=[], declared_parameters={'completion_count':'100'},
+        inputs_for_verify={'episodes':1, 'settings':{'completion_count':3}},
+        verify=lambda argv: seen.append(argv) or {'ok':True})
+    assert source and seen == [['runner','completion_count=3']]
 
 
 # -- looking, instead of being handed a list of conventions --------------------------------

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import selectors
+import queue
+import threading
 import signal
 import subprocess
 import tempfile
@@ -16,7 +18,7 @@ import json
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterable
 
@@ -47,6 +49,7 @@ class ProcessAttempt:
     error: Exception | None = None
     orphaned_children: bool = False
     containment_mode: str = "process_group_only"
+    cleanup_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def requested_containment(command: list[str] | str) -> str:
@@ -74,6 +77,28 @@ def _live_group_members(pgid: int) -> list[int]:
         except (OSError, ValueError):
             continue
     return found
+
+
+def _audit_group_cleanup(process, containment_mode: str) -> tuple[bool, dict[str, Any]]:
+    """Allow namespace teardown to settle, never ignore persistent live workers."""
+    first = _live_group_members(process.pid)
+    remaining = first
+    started = time.monotonic()
+    if first and containment_mode == "pid_namespace":
+        deadline = started + 0.5
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.02)
+            remaining = _live_group_members(process.pid)
+    orphaned = bool(remaining)
+    if orphaned:
+        terminate_group(process)
+    after = _live_group_members(process.pid) if orphaned else []
+    status = ("remaining" if after else "terminated_orphans" if orphaned else
+              "namespace_settled" if first else "clean")
+    return orphaned, {"observed_pids": first, "persistent_pids": remaining,
+                      "remaining_pids": after,
+                      "settle_seconds": time.monotonic() - started,
+                      "status": status}
 
 
 def _proc_identity(pid: int) -> dict[str, Any] | None:
@@ -271,12 +296,11 @@ def run_process(command: list[str] | str, *, cwd: Path, env: dict[str, str],
                     except subprocess.TimeoutExpired:
                         pending_input = None
                         continue
-        orphaned = bool(_live_group_members(process.pid))
-        if orphaned:
-            terminate_group(process)
+        orphaned, cleanup = _audit_group_cleanup(process, containment_mode)
         return ProcessAttempt(True, process.returncode, produced, errors,
                               cancelled=cancelled,
                               orphaned_children=orphaned,
+                              cleanup_diagnostics=cleanup,
                               containment_mode=containment_mode)
     except subprocess.TimeoutExpired:
         terminate_group(process)
@@ -328,7 +352,9 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                        max_line_bytes: int = 1024 * 1024,
                        during: ContextManager[Any] | None = None,
                        on_start: Callable[[subprocess.Popen[Any]], None] | None = None,
-                       pass_fds: Iterable[int] = ()) -> ProcessAttempt:
+                       pass_fds: Iterable[int] = (),
+                       decouple_callbacks: bool = False,
+                       stdout_line_filter: Callable[[str], bool] | None = None) -> ProcessAttempt:
     """Run one bounded process while delivering newline-delimited output as it arrives.
 
     The output cap applies to captured stdout plus stderr; the process is terminated when
@@ -369,6 +395,24 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
     timed_out = False
     failure: Exception | None = None
     overflow = False
+    records: queue.Queue = queue.Queue(maxsize=8192)
+    stop_reader = threading.Event()
+    reader = None
+
+    def dispatch(name, line):
+        if callbacks[name] is None:
+            return  # Nonstream output is captured and parsed after EOF, not queued.
+        # Filtering is only for non-authoritative telemetry; raw capture remains intact.
+        # Malformed/unknown records and control messages must reach the normal consumer.
+        if name == "stdout" and stdout_line_filter is not None and not stdout_line_filter(line):
+            return
+        if decouple_callbacks:
+            try:
+                records.put_nowait((name, line))
+            except queue.Full as exc:
+                raise ValueError("stream callback queue capacity exceeded; no record adopted") from exc
+        elif callbacks[name] is not None:
+            callbacks[name](line)
 
     def deliver(name: str, raw: bytes, *, final: bool = False) -> None:
         nonlocal failure
@@ -380,16 +424,62 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                 break
             line = bytes(buffer[:newline])
             del buffer[:newline + 1]
-            callback = callbacks[name]
-            if callback is not None:
-                callback(line.decode("utf-8", errors="replace"))
+            if len(line) > max_line_bytes:
+                raise ValueError(f"{name} line exceeded the {max_line_bytes}-byte limit")
+            dispatch(name, line.decode("utf-8", errors="replace"))
         if len(buffer) > max_line_bytes:
             raise ValueError(f"{name} line exceeded the {max_line_bytes}-byte limit")
         if final and buffer:
-            callback = callbacks[name]
-            if callback is not None:
-                callback(bytes(buffer).decode("utf-8", errors="replace"))
+            dispatch(name, bytes(buffer).decode("utf-8", errors="replace"))
             buffer.clear()
+
+    def read_loop():
+        nonlocal timed_out, overflow, last_heartbeat
+        while selector.get_map() and not stop_reader.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if process.poll() is None:
+                    timed_out = True
+                    break
+                ready = selector.select(0)
+                if not ready:
+                    timed_out = True
+                    break
+            else:
+                ready = selector.select(min(remaining, 0.25))
+            for key, _ in ready:
+                name, stream = str(key.data), key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    deliver(name, b"", final=True)
+                    continue
+                remaining_bytes = max_output_bytes - sum(len(value) for value in output.values())
+                if len(chunk) > remaining_bytes:
+                    output[name].extend(chunk[:max(0, remaining_bytes)])
+                    overflow = True
+                    raise ValueError(f"combined process output exceeded {max_output_bytes} bytes")
+                output[name].extend(chunk)
+                deliver(name, chunk)
+            current = time.monotonic()
+            if (not decouple_callbacks and on_heartbeat is not None and
+                    current - last_heartbeat >= heartbeat_interval):
+                on_heartbeat()
+                last_heartbeat = current
+
+    def reader_worker():
+        nonlocal failure
+        try:
+            read_loop()
+        except Exception as exc:
+            failure = exc
+        finally:
+            if failure is not None or timed_out:
+                terminate_group(process)
 
     try:
         observer = on_start or _PROCESS_START_OBSERVER.get()
@@ -400,32 +490,26 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, name)
         with during if during is not None else nullcontext():
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                ready = selector.select(min(remaining, 0.25))
-                for key, _ in ready:
-                    name = str(key.data)
-                    stream = key.fileobj
+            if decouple_callbacks:
+                reader = threading.Thread(target=reader_worker, name="autosim-stream-reader")
+                reader.start()
+                while reader.is_alive() or not records.empty():
+                    if failure is not None:
+                        break
                     try:
-                        chunk = os.read(stream.fileno(), 65536)
-                    except BlockingIOError:
-                        continue
-                    if not chunk:
-                        selector.unregister(stream)
-                        stream.close()
-                        deliver(name, b"", final=True)
-                        continue
-                    remaining_bytes = max_output_bytes - sum(len(value) for value in output.values())
-                    if len(chunk) > remaining_bytes:
-                        output[name].extend(chunk[:max(0, remaining_bytes)])
-                        overflow = True
-                        raise ValueError(
-                            f"combined process output exceeded {max_output_bytes} bytes")
-                    output[name].extend(chunk)
-                    deliver(name, chunk)
+                        name, line = records.get(timeout=0.1)
+                    except queue.Empty:
+                        name = None
+                    if name is not None:
+                        callback = callbacks[name]
+                        if callback is not None:
+                            callback(line)
+                    current = time.monotonic()
+                    if on_heartbeat is not None and current - last_heartbeat >= heartbeat_interval:
+                        on_heartbeat()
+                        last_heartbeat = current
+            else:
+                read_loop()
                 now = time.monotonic()
                 if on_heartbeat is not None and now - last_heartbeat >= heartbeat_interval:
                     on_heartbeat()
@@ -436,6 +520,11 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
         terminate_group(process)
         raise
     finally:
+        stop_reader.set()
+        if reader is not None:
+            reader.join(timeout=3)
+            if reader.is_alive():
+                failure = failure or RuntimeError("stream receiver failed to stop")
         selector.close()
 
     if timed_out or failure is not None:
@@ -456,10 +545,9 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
     stderr_text = output["stderr"].decode("utf-8", errors="replace")
     if overflow and failure is None:
         failure = ValueError("process output limit exceeded")
-    orphaned = bool(_live_group_members(process.pid))
-    if orphaned:
-        terminate_group(process)
+    orphaned, cleanup = _audit_group_cleanup(process, containment_mode)
     return ProcessAttempt(True, process.returncode, stdout_text, stderr_text,
                           timed_out=timed_out, error=failure,
                           orphaned_children=orphaned,
+                          cleanup_diagnostics=cleanup,
                           containment_mode=containment_mode)

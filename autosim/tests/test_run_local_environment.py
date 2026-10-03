@@ -23,6 +23,43 @@ def test_implicit_home_and_cache_writes_use_the_run_directory(tmp_path):
     assert not outside.exists()
 
 
+def test_native_home_has_short_alias_but_preserves_actual_cache_bytes(tmp_path):
+    import json
+    output = tmp_path / ('long_run_' * 12)
+    repo = output / 'checkout'
+    repo.mkdir(parents=True)
+    env = run_local_environment(output, {})
+    home = output / 'home'
+    (home / '.cache' / 'witness.txt').write_text('existing cache')
+    code = ("import os,json;from pathlib import Path;"
+            "h=Path.home(); c=Path(os.environ['XDG_CACHE_HOME']);"
+            "print(json.dumps({'home':str(h),'cached':(c/'witness.txt').read_text()}));"
+            "(c/'native_write.txt').write_text('same backing home')")
+    command = isolated_argv([sys.executable, '-c', code], output=output, repo=repo,
+                            native_environment=env, allow_gpu=False)
+    result = subprocess.run(command, cwd=repo, env=env, capture_output=True,
+                            text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert len(data['home'].encode()) < 32 and data['cached'] == 'existing cache'
+    assert (home / '.cache/native_write.txt').read_text() == 'same backing home'
+    assert not (Path(data['home']) / '.cache/native_write.txt').exists()
+    assert list((output / 'native_home_mappings').glob('*.json'))
+
+
+def test_native_alias_cannot_grant_external_home_or_restricted_write_access(tmp_path):
+    output = tmp_path / 'run'
+    repo = output / 'checkout'
+    repo.mkdir(parents=True)
+    with pytest.raises(ValueError, match='confined'):
+        isolated_argv(['true'], output=output, repo=repo,
+                      native_environment={'HOME': str(tmp_path / 'external')})
+    env = run_local_environment(output, {})
+    with pytest.raises(ValueError, match='widen'):
+        isolated_argv(['true'], output=output, repo=repo,
+                      native_environment=env, writable_paths=(repo,))
+
+
 def test_isolated_copy_can_write_its_run_but_not_a_sibling():
     if not shutil.which("bwrap"):
         pytest.skip("bubblewrap is not available")

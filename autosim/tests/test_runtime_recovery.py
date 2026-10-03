@@ -131,6 +131,27 @@ def test_recovery_agent_selects_generated_venv_then_original_guard_passes(tmp_pa
     _validate_agent_workspace(source)
 
 
+@pytest.mark.parametrize('fault_kind',['none','fingerprint','status','external_ref'])
+def test_revalidated_guard_is_projected_from_bound_receipt_not_historical_errors(tmp_path,fault_kind):
+    output,source=workspace(tmp_path)
+    venv(source)
+    record=fault(output,source)
+    result=recovery.recover(RecoveryClient(output,source),failure_row(record),timeout=10)
+    blocker={**failure_row(record),'recovery':result}
+    receipt=output/result['receipt_ref']
+    if fault_kind=='fingerprint':
+        row=json.loads(receipt.read_text());row['fault_fingerprint']='wrong';atomic_json(receipt,row)
+    if fault_kind=='status':
+        row=json.loads(receipt.read_text());row['status']='blocked';atomic_json(receipt,row)
+    if fault_kind=='external_ref':blocker['recovery']['receipt_ref']='../outside.json'
+    atomic_json(output/'runtime_blocker.json',blocker)
+    got=recovery.view(output)
+    if fault_kind=='none':
+        assert got['status']=='revalidated' and got['receipt_sha256']
+        assert 'not native readiness' in got['guidance']
+    else:assert got['status']=='unverified'
+
+
 @pytest.mark.parametrize("unsafe", ["credential", "asset_link", "original", "missing_inventory"])
 def test_recovery_never_moves_credentials_resources_or_original_source(tmp_path, unsafe):
     output, source = workspace(tmp_path)
@@ -170,6 +191,41 @@ def test_recovery_refuses_active_native_job(tmp_path, monkeypatch):
     client = RecoveryClient(output, source)
     result = recovery.recover(client, failure_row(record), timeout=10)
     assert result["status"] == "blocked" and not client.calls and root.exists()
+
+
+@pytest.mark.parametrize('fault_kind',['none','original','other_target','missing_context','linked_parent'])
+def test_generated_bound_interpreter_link_is_quarantined_not_allowed(tmp_path,fault_kind):
+    output, source = workspace(tmp_path)
+    interpreter = output/'environment/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b'bound interpreter')
+    atomic_json(output/'native_context.json', {'interpreter':str(interpreter)})
+    parent=source/'{repo}'/'.run_bin'
+    parent.mkdir(parents=True)
+    link=parent/'python'
+    link.symlink_to(interpreter)
+    if fault_kind=='original':
+        manifest=json.loads((output/'workspace_snapshot.json').read_text())
+        manifest['source_entries'].append(['link','{repo}/.run_bin/python',0])
+        atomic_json(output/'workspace_snapshot.json',manifest)
+    if fault_kind=='other_target':
+        link.unlink();link.symlink_to('/usr/bin/python3')
+    if fault_kind=='missing_context':
+        (output/'native_context.json').unlink()
+    if fault_kind=='linked_parent':
+        parent.rename(source/'actual_bin')
+        parent.symlink_to(source/'actual_bin',target_is_directory=True)
+    record=fault(output,source)
+    client=RecoveryClient(output,source)
+    result=recovery.recover(client,failure_row(record),timeout=10)
+    if fault_kind in {'none','linked_parent'}:
+        # The internal parent link is not moved; the real generated leaf is.
+        assert result['status']=='revalidated'
+        moved=output/result['moved'][0]['to']
+        assert moved.is_symlink() and interpreter.read_bytes()==b'bound interpreter'
+        assert not link.is_symlink()
+    else:
+        assert result['status']=='blocked' and not result['moved'] and link.is_symlink()
 
 
 def test_fault_fingerprint_changes_when_relevant_link_identity_changes(tmp_path):
@@ -221,6 +277,30 @@ def test_repeated_sealed_startup_failure_stops_after_one_recovery_assessment(tmp
     assert result["supervision"]["automatic_relaunches"] == 0
 
 
+def test_scheduler_sees_recovery_receipt_instead_of_stale_startup_failure(tmp_path, monkeypatch):
+    from tests.test_prepare import preparation
+    controller=preparation(tmp_path)
+    class Client:
+        @contextmanager
+        def as_role(self,role):
+            yield
+    controller.client=Client()
+    calls=[]
+    def choose():
+        calls.append('choose')
+        raise AgentRuntimeClientError('startup refusal',failure_category='fixture')
+    def recover(*,failure):
+        failure['recovery']={'status':'revalidated','receipt_ref':'diagnostics/recovery.json'}
+        return True
+    monkeypatch.setattr(controller,'choose',choose)
+    monkeypatch.setattr(controller,'_handoff_scheduler_decision_failure',recover)
+    controller.run(max_steps=1,max_relaunch=0)
+    assert calls==['choose']
+    assert controller.last_action['recovery']['status']=='revalidated'
+    state=json.loads((controller.output/'run_state.json').read_text())
+    assert state['last_action']['recovery']['receipt_ref']=='diagnostics/recovery.json'
+
+
 def test_recorder_accepts_cited_versions_but_rejects_invented_numbers(tmp_path):
     from autosim.research import recorder, run_record
     held = recorder.make_snapshot(tmp_path, run_record.build_report_view(tmp_path, "derived", status="paused"),
@@ -242,7 +322,7 @@ def test_report_displays_sealed_error_not_just_pause_limit(tmp_path):
     held = recorder.make_snapshot(tmp_path, run_record.build_report_view(tmp_path, "derived", status="paused"),
                                    {"actions": [], "plan": {}})
     text = recorder.render(tmp_path, held, {})
-    assert "启动故障与恢复" in text and "external-link guard refusal" in text
+    assert "框架 / 运行故障与恢复" in text and "external-link guard refusal" in text
     assert "不等同于总预算耗尽" in text and "完整错误证据" in text
 
 

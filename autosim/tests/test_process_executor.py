@@ -35,6 +35,34 @@ def test_live_process_window_can_extend_without_restarting(tmp_path):
     assert result.stdout.strip() == "done"
 
 
+def test_namespace_cleanup_allows_transient_teardown_without_signalling(monkeypatch):
+    from types import SimpleNamespace
+    import autosim.research.process_executor as executor
+    snapshots = iter([[123], [123], []])
+    monkeypatch.setattr(executor, "_live_group_members", lambda pgid: next(snapshots))
+    monkeypatch.setattr(executor, "terminate_group",
+                        lambda process: pytest.fail("transient teardown must not be signalled"))
+    orphaned, audit = executor._audit_group_cleanup(SimpleNamespace(pid=123), "pid_namespace")
+    assert not orphaned
+    assert audit["observed_pids"] == [123]
+    assert audit["persistent_pids"] == audit["remaining_pids"] == []
+    assert audit["status"] == "namespace_settled"
+
+
+@pytest.mark.parametrize("containment", ["pid_namespace", "process_group_only"])
+def test_cleanup_preserves_persistent_orphan_failure_after_termination(monkeypatch, containment):
+    from types import SimpleNamespace
+    import autosim.research.process_executor as executor
+    terminated = []
+    monkeypatch.setattr(executor, "_live_group_members",
+                        lambda pgid: [] if terminated else [456])
+    monkeypatch.setattr(executor, "terminate_group", lambda process: terminated.append(process.pid))
+    orphaned, audit = executor._audit_group_cleanup(SimpleNamespace(pid=123), containment)
+    assert orphaned and terminated == [123]
+    assert audit["persistent_pids"] == [456] and audit["remaining_pids"] == []
+    assert audit["status"] == "terminated_orphans"
+
+
 def test_live_process_cancellation_stops_process_group(tmp_path):
     control = {"deadline_epoch": time.time() + 2, "cancelled": False}
     def cancel():

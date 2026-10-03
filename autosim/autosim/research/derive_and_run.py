@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[3]
 def validate_paused_research_resume(output: Path, *, rounds: int,
                                     settings: dict[str, Any],
                                     repository: Path | None = None,
-                                    rederive: bool = False) -> None:
+                                    rederive: bool = False) -> int | None:
     """Reject protocol drift before the outer controller records or starts an action.
 
     The inner research engine validates its frozen identity, but discovering a mismatch only
@@ -97,46 +97,33 @@ def validate_paused_research_resume(output: Path, *, rounds: int,
                 Path(saved_repo).expanduser().resolve() != expected_repo):
             raise ValueError("paused research session repository identity differs; "
                              "resume with the original repository or start a new output")
-    if session["rounds"] != rounds or prior_settings != settings:
+    if prior_settings != settings:
         raise ValueError("paused research session has different frozen rounds/settings; "
                          "resume with the original inputs or start a new output directory")
+    if session['rounds']!=rounds:
+        from .round_extension import resume_rounds
+        return resume_rounds(root,session,rounds)
+    return rounds
 
 
-def _run_local_interpreter(source_python: Path, output: Path) -> Path:
-    """Clone interpreter access without installing packages into its shared prefix.
-
-    A venv created from another venv inherits the *base* environment, not the parent's
-    local wheels. Those wheels may contain the GPU-capable torch absent from the base.
-    A local .pth keeps the parent's local site-packages readable while pip still writes
-    only to this run's own venv. It remains an external dependency, not a portable copy.
-    """
+def _run_local_interpreter(source_python: Path, output: Path, repo: Path | None = None) -> Path:
+    """Borrow dependencies without inheriting stale editable imports/startup hooks."""
     source_python = Path(source_python).expanduser().absolute()
     if not source_python.is_file():
         raise ValueError(f"--interpreter does not exist: {source_python}")
     local_env = output / "env"
-    if not (local_env / "pyvenv.cfg").is_file():
-        if local_env.exists() and any(local_env.iterdir()):
-            raise ValueError("run-local env exists without pyvenv.cfg; refusing to overwrite it")
-        subprocess.run([str(source_python), "-m", "venv", "--system-site-packages",
-                        str(local_env)], check=True, timeout=120)
-    interpreter = local_env / "bin" / "python"
-    if not interpreter.is_file():
-        raise ValueError("run-local virtual environment has no Python interpreter")
-    inspected = subprocess.check_output(
-        [str(source_python), "-c", "import json,site,sys; print(json.dumps({"
-         "'prefix':sys.prefix,'version':f'{sys.version_info.major}.{sys.version_info.minor}',"
-         "'sites':site.getsitepackages()}))"], text=True, timeout=15)
-    parent = json.loads(inspected)
-    parent_prefix = Path(parent["prefix"]).absolute()
-    inherited = [Path(site).absolute() for site in parent["sites"]
-                 if Path(site).absolute().is_relative_to(parent_prefix)
-                 and Path(site).is_dir() and not Path(site).absolute().is_relative_to(local_env)]
-    local_site = local_env / "lib" / f"python{parent['version']}" / "site-packages"
-    if not local_site.is_dir():
-        raise ValueError("run-local virtual environment has no site-packages directory")
-    (local_site / "autosim_parent_site.pth").write_text(
-        "".join(str(path) + "\n" for path in inherited), encoding="utf-8")
-    return interpreter
+    from .environment_pool import describe
+    from .environment_overlay import create, readonly_roots
+    repo = repo or output/'checkout'
+    if local_env.exists():
+        manifest = local_env/'overlay.json'
+        if not manifest.is_file() or read_json(manifest).get('base_prefix') != str(source_python.parent.parent):
+            raise ValueError('legacy or different run-local environment; explicitly switch base instead of overwriting')
+        readonly_roots(local_env, output, repo)
+    else:
+        create(describe(source_python.parent.parent), prefix=local_env, output=output,
+               repo=repo, source_binding_ids=[])
+    return local_env/'bin/python'
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="shared read-only wheel/base/snapshot store (outside this run)")
     parser.add_argument("--no-environment-reuse", action="store_true",
                         help="disable catalog, package cache and snapshot reuse for a fresh run")
+    parser.add_argument('--publish-environment-snapshots', action='store_true', default=None,
+                        help='opt in to large conda snapshot copies; default publishes small base/delta templates only')
     parser.add_argument("--max-actions", type=int, default=8,
                         help="maximum Scheduler actions per supervised segment; the AutoSOTA "
                              "Monitor resumes additional segments within the frozen budgets")
@@ -226,11 +215,13 @@ def main(argv: list[str] | None = None) -> int:
         print("--keep-only and --rederive contradict each other; pick one")
         return 2
     try:
-        validate_paused_research_resume(output, rounds=rounds, settings=settings,
+        persisted_rounds = validate_paused_research_resume(output, rounds=rounds, settings=settings,
                                         repository=repo,
                                         rederive=args.rederive)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.error(str(exc))
+    if persisted_rounds is not None:
+        rounds=persisted_rounds
     from ..llm_client import LLMClient, PROJECT_ROOT, load_credential_file
     from .budget import RunBudget
     from .prepare import Preparation
@@ -238,6 +229,9 @@ def main(argv: list[str] | None = None) -> int:
 
     load_credential_file(project_root=PROJECT_ROOT)
     output.mkdir(parents=True, exist_ok=True)
+    for amendment_path in (output / 'budget_amendments').glob('*.json'):
+        if amendment_path.is_symlink() or read_json(amendment_path).get('status') != 'applied':
+            parser.error('unfinished/unsafe explicit budget amendment; reconcile before resume')
     wall_seconds = args.wall_seconds
     if wall_seconds is None:
         old_budget = output / "budget.json"
@@ -292,12 +286,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(message)
                 return 2
         interpreter_hint = None
-        if args.interpreter:
-            try:
-                interpreter_hint = _run_local_interpreter(args.interpreter, output)
-            except (OSError, ValueError, subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired) as exc:
-                parser.error(f"run-local interpreter setup failed: {exc}")
         if args.rederive:
             for name in ("derived_stages.json", "environment.json", "execution.json"):
                 (output / name).unlink(missing_ok=True)
@@ -327,11 +315,18 @@ def main(argv: list[str] | None = None) -> int:
                 create(repo, working, max_bytes=args.copy_limit_bytes,
                        tracked_only=not args.full_copy, resources=resources)
             repo = working
+        if args.interpreter:
+            try:
+                interpreter_hint = _run_local_interpreter(args.interpreter, output, repo)
+            except (OSError, ValueError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired) as exc:
+                parser.error(f"run-local interpreter setup failed: {exc}")
         if args.framework == "autosota_sim_v1" or args.environment_store is not None:
             from .environment_pool import configure
             try:
                 configure(output, args.environment_store,
                           enabled=not args.no_environment_reuse,
+                          publish_snapshots=args.publish_environment_snapshots,
                           source_repository=(Path(read_json(output / "workspace_snapshot.json")["source"])
                               if (output / "workspace_snapshot.json").is_file() else repo))
             except (OSError, ValueError) as exc:

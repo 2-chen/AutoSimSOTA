@@ -93,8 +93,11 @@ def resource_profile(value: dict | None, *, gpu: bool = False) -> dict:
             raise ValueError("resource counts must be integers")
     if not 1 <= answer["cpu"] <= 256 or not 1 <= answer["memory_mib"] <= 2**24:
         raise ValueError("resource request exceeds supported bounds")
-    if not -10 <= answer["priority"] <= 10 or not isinstance(answer["gpu"], bool):
-        raise ValueError("invalid resource priority or GPU request")
+    if not -10 <= answer["priority"] <= 10:
+        raise ValueError("resources.priority must be an integer between -10 and 10")
+    if not isinstance(answer["gpu"], bool):
+        raise ValueError("resources.gpu must be a JSON boolean true/false, not a device count; "
+                         "omit it to use the verified stage GPU requirement")
     return answer
 
 

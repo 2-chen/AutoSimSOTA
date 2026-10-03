@@ -51,6 +51,8 @@ from .common import (atomic_json, atomic_text, digest, now, object_digest, read_
                      sanitize_model_text)
 from .codepatch import patches_from_change
 from .main_agent import memory_view
+from .execution_progress import execution_progress
+from .review_transaction import review_view
 from .scheduling import view as scheduling_view
 from .compute_decision import ComputeDecision, decide
 from .declaration import space_from, usable_declarations
@@ -139,10 +141,36 @@ def _structured_result_schema(path: Path) -> dict[str, Any]:
 #: The steps, in the order they usually happen. The order is a default and not a rule: the
 #: model may take them in any order it can justify, and may take one twice.
 OPERATIONS: dict[str, str] = {
+    'register_data_version': 'independently review training data and its native loader connection. '
+        'version={id,dataset_ref,source_refs:[{ref,quote}],reason}; dataset_ref is run-relative '
+        'or an authorized checkout resource. Use data-version:<id> in an audited training '
+        'axis. Actual loader must emit AUTOSIM_TRAIN_DATA_CONSUMPTION JSON with data_version_id, '
+        'setting, identity_field, identity, samples_read>0, computed from actual loaded bytes; '
+        'registration is not proof of consumption or quality. Never use held-out data.',
+    "configure_baseline_reference": "review a published reference separately from local optimization. "
+        "reference={id,kind:released_checkpoint|unavailable,source_refs:[{ref,quote}],reason}. "
+        "reason is nonempty and at most 1000 characters; keep long provenance in source_refs, not reason. "
+        "Released kind also requires checkpoint_ref (run-relative policy file/bundle, including "
+        "checkout/authorized resource paths), release_url, revision, expected_metric, tolerance, "
+        "episodes. Supervisor independently reviews exact sources and protocol/tolerance. "
+        "Unavailable requires evidence, never silently substituting probe-trained weights.",
+    "evaluate_baseline_reference": "evaluate the active reviewed reference using reference_id "
+        "and optional retry_reason for a known failed/mismatched attempt. No training, no "
+        "baseline replacement and no best-score promotion. Frozen native evaluator, policy "
+        "load/rollout/metric identity and published sample count remain mandatory.",
+    "extend_research_rounds": "allocate additional development rounds within existing total "
+        "budgets: additional_rounds (integer 1..1000), expected_rounds (current planned_rounds), "
+        "reason (<=1000 characters). Preserve original baseline, settings, history and best; "
+        "never reopen after held-out exposure or while jobs/pending actions own the workspace.",
+    "propose_harness_repair": "investigate a suspected framework-owned failure using "
+        "evidence_id and diagnosis. Fix reads an isolated framework snapshot and proposes "
+        "bounded exact edits. No live modification, budget reset, validator edits or automatic "
+        "Python activation. Repository faults return to native recovery. Candidate-only, "
+        "not successful recovery; independent original-operation replay is still required.",
     "configure_screening": "declare a fidelity study: study={id,budget_axis,rungs,eta,min_peers,evidence,reason}; final rung matches formal training budget, evaluation stays frozen.",
     "run_screening_trial": "execute one audited param idea at an explicit study_id/rung with idea_label, window_seconds, reason; separate receipts and scores, never formal best.",
     "inspect_screening": "read study_id and advisory same-rung promotion recommendations; Scheduler decides promotion and must revalidate full-protocol candidates.",
-    "submit_research_task": "submit a read-only specialist assignment asynchronously: role, task, expected_result; independent session, shared total model budget. Results are merged only by Scheduler.",
+    "submit_research_task": "submit a read-only specialist assignment asynchronously: role, task, expected_result, optional source_paths controlling actual copied files/directories; independent session, shared total model budget. Results are merged only by Scheduler.",
     "cancel_research_task": "discard an active read-only task result using task_id and reason; in-flight provider charges remain accounted.",
     "wait_for_jobs": "wait for native/agent completion events without model polling; provide no arguments. Use when dependencies are running and no useful independent work remains.",
     "review_report_demo": "resolve a Recorder request with request_id, decision (capture or "
@@ -156,14 +184,27 @@ OPERATIONS: dict[str, str] = {
                             "questions; this is memory, not a change to the frozen objective.",
     "research_task": "investigate an arbitrary evidence-backed question yourself or delegate "
                      "it to an AutoSOTA role using its tools; return findings to the main "
-                     "Agent without launching benchmark jobs or certifying success.",
-    "retry_failed_action": "after AgentFix changed the isolated checkout, rerun the exact "
-                           "failed preparation operation and judge its new receipt; do not "
+                     "Agent without launching benchmark jobs or certifying success. "
+                     "Use mode=inspect for read-only diagnosis without invalidating commands; "
+                     "mode=edit invalidates commands before checkout mutations. Optional "
+                     "timeout_seconds requests a local window within the configured model/run limit.",
+    "retry_failed_action": "after a concrete AgentFix repair, or a sealed environment-plan "
+                           "rejection, revalidate the exact preparation operation once through "
+                           "its responsible executor/planner and judge its new receipt; do not "
                            "turn a patch or CPU probe into a verified recovery.",
-    "submit_native_job": "submit a verified native stage as a detached, budgeted job; optional resources={cpu,memory_mib,gpu,priority}. "
+    "submit_native_job": "submit a verified native stage as a detached, budgeted job; optional "
+                         "training_settings={steps: positive integer, ...} explicitly chooses "
+                         "declared learning axes for a train job without rewriting baseline. "
+                         "Required fields: stage, window_seconds, reason (nonempty, <=1000 characters). Optional "
+                         "resources={cpu: integer 1..256, memory_mib: integer 1..16777216, "
+                         "gpu: JSON boolean true/false (not a count), priority: integer -10..10}. "
+                         "Omit resources to use validated defaults. "
                          "provide a positive local window and evidence-based reason. A "
-                         "completed producer can be adopted as an initial baseline only "
-                         "when its receipt matches the frozen settings and protocol.",
+                         "Use idea_label to bind a cleared param/algo candidate to its exact "
+                         "allocated round and settings; optional training_settings explicitly "
+                         "selects a validated local learning budget and is sealed in that binding. "
+                         "Adopt completed candidates with run_the_loop(idea_label,job_id); "
+                         "without idea_label the existing initial-baseline contract applies.",
     "inspect_native_job": "read a submitted job's liveness, result and local budget.",
     "adjust_native_job": "extend or shorten a running job's local window within the hard "
                          "frozen wall, GPU and model budgets, with a reason based on progress.",
@@ -175,14 +216,36 @@ OPERATIONS: dict[str, str] = {
     "build_the_environment": "make or re-verify an environment the stages can run in, "
                              "Optional max_operations (1..64) lets Scheduler batch stable "
                              "setup work; failures always return control. Default is one. "
+                             "Optional repair_proposal submits a compact Scheduler/Init/Fix proposal "
+                             "to the native executor: failure_evidence_id must match the current "
+                             "sealed failed queue head; commands, repair_mode, source-backed "
+                             "install_replacement_evidence and optional probe_replacement_evidence "
+                             "use the SAME review and safety gates as native Fix. Use the state's "
+                             "installation_recovery_inventory.execution_path_aliases, never display-redacted paths. "
+                             "When using run_path aliases, echo execution_aliases_digest from that inventory "
+                             "so changed resource mappings reject safely instead of installing the wrong wheel. "
+                             "Optional operation_timeout_seconds requests a longer/shorter install window "
+                             "within the unchanged hard wall/GPU budget. "
+                             "During onboarding, optional base_environment_id, base_environment_mode "
+                             "(overlay|clone|reconstruct), environment_selection_reason allow an explicit "
+                             "base selection. Prefer a read-only overlay for compatible existing venvs; "
+                             "Init selects needed source_binding_ids from the candidate catalog and "
+                             "tests native consumers before installing missing dependencies. "
+                             "Optional source_binding_ids with an explicit overlay selection lets "
+                             "Scheduler revise the binding definition; prose alone is not a revision. "
+                             "source-backed base switch EVEN when an interpreter exists. New prefix "
+                             "is isolated, old evidence retained; disallowed once stages are verified. "
                              "recording only the commands that worked. After a later native "
                              "stage failure, re-run its capability probes and give the "
                              "failure evidence to the planner; do not recreate a verified "
                              "interpreter. Writes environment.json and recipe.json.",
     "derive_a_command": "find a command that runs one stage, revising the invocation until it "
-                        "does. Optional timeout_seconds requests a local verification window "
+                        "does. REQUIRED arguments.stage names the exact available surveyed "
+                        "stage; never omit it or put it only in prose. Optional "
+                        "timeout_seconds requests a local verification window "
                         "within the unchanged run hard budgets. Writes what it kept "
-                        "to derived_stages.json.",
+                        "to derived_stages.json. Optional reference_id selects the reviewed "
+                        "frozen released-policy bundle for score verification instead of local training.",
     "reconcile_interrupted_action": "inspect the prior attempt receipt and process identity; "
                                     "stop only its verified process group, preserve unknown "
                                     "outcome, and report evidence before another attempt.",
@@ -195,7 +258,13 @@ OPERATIONS: dict[str, str] = {
     "recover_unscored_baseline": "revalidate an unscored baseline's exact completed train "
                                  "receipt and native policy selection, then evaluate that "
                                  "already-produced policy without retraining.",
-    "run_the_loop": "run the research loop on the stages that have commands.",
+    "run_the_loop": "run the research loop; an offered completed job_id (without idea_label) "
+                    "can restore an unchanged, failed unscored round-zero baseline. "
+                    "Before a new baseline, training_settings supplies explicitly chosen "
+                    "declared training-axis values (e.g. steps). Existing baseline settings "
+                    "are immutable. With a paused audited idea_label, training_settings chooses "
+                    "only this candidate's local learning work; it never rewrites baseline settings. "
+                    "Do not combine an adopting job_id with new training_settings.",
     "generate_research_ideas": "ask for and audit a fresh batch of candidate research ideas; "
                               "this does not run a benchmark stage.",
     "propose_research_idea": "submit one evidence-backed idea from the main controller for "
@@ -241,6 +310,11 @@ a fix. Installation success and environment-round exhaustion do not replace that
 Inspect native configuration initialization for unattended input/EOF failures; prepare
 run-local configuration with consistent paths and revalidate the original failing operation.
 Put CPU diagnostic environments in /tmp/diagnostics, never inside the source checkout.
+Provider wall_timeout is not evidence that a native installation, reset or rollout failed.
+When the receipt scope is provider_turn_failed, inspect its recent tool progress, configured
+timeout and unadopted response first. Do not patch benchmark input/config code without a
+native failure proving that cause. Ask for a compact plan or an appropriate local window;
+retain already discovered source facts rather than repeating the whole investigation.
 
 Return exactly one JSON object with `assessment` (`repair_attempted`, `no_safe_repair`,
 `blocked`, or `uncertain`), concise `summary`, a list of `changes`, and relative
@@ -258,15 +332,141 @@ _FIX_ASSISTANCE_OUTCOMES = frozenset({
 STEP_SYSTEM = """You are the main AgentScheduler, responsible for the whole research run,
 from repository onboarding through baseline, optimization, verification and final handoff.
 
+`execution_progress` distinguishes failed/rejected actions from real capability progress.
+When needs_strategy_change is true, reuse settled evidence and select a materially different
+executable remedy, or correct the exact rejected field. New prose, plans and delegated scans
+are not progress. This signal does not forbid a justified retry or stop a live long job.
+For repair_proposal use repair_mode="prerequisites" or "replace_operation" exactly;
+put rationale in reasoning, not a newly invented enum value. Separate commands (installation)
+from probes (capability verification); a probe must fail nonzero if a required import fails.
+Replacement evidence is an object, NOT a list of prose: same_capability (nonempty string,
+up to 2000 characters), source_refs (1..6 checkout source citations); installation replacement
+also requires failure_evidence_id matching the current sealed failure inside that object.
+For source_refs prefer exact checkout-relative strings such as "policy/scripts/train.py";
+objects may use path/file/source/ref naming that same file with optional start_line/end_line.
+Do not confuse these source file inputs with Objective output citations {{ref,quote}} from its
+supplied citation_bundle. Never put failure log/evidence IDs in source_refs.
+Use these exact fields for install_replacement_evidence and probe_replacement_evidence.
+Capability operations belong in probes, NOT probe_commands. Unknown repair fields are
+rejected together before review. review_transactions records only the independent review;
+transport_interrupted is not an installation failure, and transport_unavailable on unchanged
+evidence cannot be fixed by another source scan. Preserve the pending proposal and explain
+the model channel boundary rather than claiming missing native resources. Completed reviews
+may be reused only for identical source/proposal/model/protocol identity and still require
+native execution and revalidation; cached approval is never an environment success.
+First inspect the existing native interpreter and the smallest source-backed consumer;
+install only the demonstrated missing capability, not every old plan item. Once ready,
+run a small valid producer→actual policy load→rollout→native metric chain before optional
+research. Smoke/screening results are not formal baseline scores unless the frozen protocol
+is satisfied. Keep the protocol unchanged; expand training/data only after this chain works.
+
+The user's objective is AUTOMATIC BENCHMARK SCORE IMPROVEMENT, not open-ended science.
+First distinguish official performance reproduction from a valid local measurement.
+Investigate published weights/revision/task/evaluator/episode count/metric. Prefer
+configure_baseline_reference and evaluation-only released weights before a new random
+trainer. Use reference_id when deriving its score command. Genuine unavailable resources
+require independent source review and explicit disclosure. Never label baseline.ok or a
+probe checkpoint official reproduction. Existing baseline/history cannot be replaced.
+Reference mismatch or unavailable weights do not forbid valid local optimization: state
+the reproduction gap and local-improvement scope; do not claim official reproduction or
+SOTA without separate evidence. Investigate deployment semantics before blind training.
+For detached candidates submit_native_job with the cleared idea_label, inspect completion,
+then run_the_loop with that same idea_label and job_id; never launch a duplicate trainer.
+When development allocation is exhausted but total budgets remain, use
+extend_research_rounds with expected_rounds and a reasoned small allocation. Do not submit
+expensive optimization jobs with no candidate adoption path. Never reset usage or held-out.
+Verification work is NOT a formal learning budget. Before a new baseline explicitly choose
+training_settings from the native training axes, learning units, measured cost and total
+budget; submit_native_job likewise needs explicit learning settings. Never silently reuse
+the probe's 1024 updates or convert epochs into updates. A cheap baseline is permissible
+with an explicit cost/learning rationale, but is not evidence of convergence.
+After a scored baseline, explain whether your next action is score improvement, diagnosis,
+or throughput work and its expected causal metric effect in question/hypothesis. Prefer a
+bounded performance experiment over provenance/installation/worker-count edits once the
+execution chain is verified. Diagnostics are allowed when they resolve a concrete blocker,
+but use inspect/CPU probes where possible instead of spending a full training+rollout round
+on a logging-only change. Do not call a throughput improvement a policy improvement.
+Use latest_development_measurements as the current score/sample authority, not the old
+one-episode command probe. For a floor score, check expert/data-to-observation/action
+semantics and sufficient learning before tuning blind; actively request a development demo
+through report_demo_requests/review_report_demo or inspect native failures. Do not alter
+success criteria, evaluation horizons or held-out rules to obtain a positive score.
+Treat runtime_recovery as the sealed guard-revalidation authority: earlier workspace_guard
+errors do not prove current role blockage after revalidated. A recovered guard does not
+prove native readiness or reopen completed research; distinguish these boundaries.
+Keep the native task, evaluator and held-out protocol fixed. Reach a trustworthy baseline
+as early as possible, retain the best verified policy, then iterate bounded improvements.
+Prefer data-led improvements when legal and feasible: diagnose DEVELOPMENT failure modes,
+probe a matching data producer, add targeted/diverse/quality-controlled training data,
+verify actual loader consumption, train and rescore. Do not use held-out failures to steer
+collection. Data is a priority, not a promise that more samples always help. If automated
+new-data supply is genuinely unavailable, optimize legal existing-data cleaning, weighting
+or sampling, or another bounded improvement instead of spending all time researching it.
+Source inspection and literature search should resolve the NEXT executable decision; reuse
+handoffs and stop investigating once that action can be attempted safely. A progress report
+or elaborate plan is not the deliverable: native scores and auditable policy/data are.
+When failure_domain=framework_plan, no native command ran. Read its planning evidence,
+which seals the rejected proposals and validation errors. Repair belongs to the environment
+planner via build_the_environment; do not assign checkout-only Fix to scan for a JSON file
+or redeclare the benchmark merely to change a model proposal. Existing bound resource IDs
+must refer to their actual native mount targets, not an invented dataset directory.
+`environment.verdict.passed` remains a fact about its declared consumers. A later missing
+input path, timeout, interrupted provider turn, malformed argv or unavailable dataset is
+not evidence that installed packages are broken. Repair resource/command invocation first;
+reopen environment preparation only when a new native dependency/ABI error supports it.
+`recovery_transaction` identifies a receipt-linked outstanding revalidation. Resolve it
+before declaring the run blocked. For a rejected environment proposal, retry_failed_action
+asks the planner to correct the proposal using the sealed evidence; no source edit is needed.
+Keep onboarding to the next small executable probe. A concise objective and next action
+suffice for its roadmap; defer optional collection research until baseline prerequisites run.
+`native_install` / `environment_executor` means an actual setup command failed, even when
+the outcome is a cooperative checkpoint. Read its evidence ID, inspect the pending repair
+queue and continue its bounded capability revalidation. Do not claim no recovery is pending
+because the installation yielded, or repeat the same invalid installer indefinitely.
+`native_probe` is a failed capability check, not a successful environment checkpoint.
+Distribution metadata and import-name hints are recovery leads, never consumer readiness.
+Use actual_environment_observation and sealed successful receipts before acquiring packages
+again; inspect the native module/API and task version when distribution and import names
+differ. The unchanged-recovery guard will not buy another Fix turn or replay a failed probe
+for the same evidence and executable inputs. Submit a changed repair_proposal, correct the
+rejected citation/field, or obtain genuinely changed source/environment evidence. No local
+wheel is not proof of impossibility: any unbuildable claim needs resource_assessment and
+independent boundary review, including alternative documented acquisition routes.
+environment_candidates stays visible even when the current interpreter exists. If repairs
+show a missing capability, compare base_verification's actual runtime-family evidence and
+version variants before reinstalling large packages. A stale check is not current proof.
+Prefer compatible prevalidated bases, but choose with your own evidence-backed reason;
+catalog order is a recommendation, not a mandatory decision. Separate the read-only base,
+run-owned incremental packages/current source bindings, and explicitly connected resources.
+Past engine frames or GPU training probes never replace this task's consumer/rollout checks.
+successful_incremental_pins are small prior repair leads, not a blanket installation list.
+If repairs
+show a real Python/ABI/version conflict, compare candidate pins and bindings and submit a
+reasoned base_environment_id/mode switch rather than remaining stuck in a half-built env.
+overlay mode borrows compatible dependencies read-only, selects missing editable/nested
+modules by source_binding_ids, and revalidates consumers without reinstalling the whole stack.
+An evidenced binding revision on the same base is allowed; do not change bases just to evade
+deduplication. clone mode is only for independently relocatable bases; reconstruct mode uses a new prefix
+and selective portable pins, and rebinds local/editable packages to THIS isolated checkout.
+Never copy old venv hooks, install into source environments, or use a template's past
+consumer verification as current readiness. Preserve bound data/assets and re-probe consumers.
+
 You are given what is known so far: the records that exist, what each step produced, and what
 failed and why. Choose the next step.
 
 Own a coherent global plan, not just the next missing pipeline stage. `main_agent` contains
 your persisted working plan and specialist handoffs across sessions. Reconcile new evidence
 with that memory; keep unknowns explicit and revise contradicted hypotheses. If supported,
-use `update_research_plan` with arguments.plan containing exactly objective (string),
+use `update_research_plan` with arguments.plan containing the required objective (string),
 hypotheses, open_questions, next_actions and evidence_refs (lists of strings). This does not
 change the benchmark's frozen objective or confer permissions.
+An optional plan.data_strategy may persist route, why, targets (development failure/coverage
+goals), producer_to_loader (the actual producer/conversion/loader chain), evidence_refs and
+next_probe. route/why/next_probe are short strings; the other fields are lists of strings.
+This is a plan, not permission or verified collection. Include native controllable settings,
+successful-label requirements, training-only scope and observed yield in those explanations.
+Persist a SHORT execution plan early (hypotheses may be empty); do not hold environment
+setup hostage to an exhaustive literature review or to listing every uncertainty.
 Before freezing the experiment, ask Objective which secondary metrics the native evaluator
 reports and which must not regress. If supported by source, declare research_goal.guardrail_metrics
 with explicit name/direction/unit/source and max_regression. Use the same archived result as
@@ -286,6 +486,9 @@ This decision turn cannot edit or run arbitrary shell commands. You may inspect 
 selected environment with inspect_native_environment: CPU only, read-only source/config,
 no network, writes only diagnostic scratch; its receipt is not simulation readiness.
 Put edits, installation, GPU work and native benchmark actions in explicit validated operations.
+Never assign research_task to install the live prefix/cache: its shell cannot write them.
+Ask Init/Fix for a source-backed proposal, then submit build_the_environment.repair_proposal
+with the current failure_evidence_id. A proposal rejection is not another failed native launch.
 Skill selection is your prior choice, cached with its reasons while the context is unchanged.
 Set refresh_skill_selection=true in your decision JSON to request a fresh skill choice next turn.
 Environment preparation executes one native operation by default, then hands evidence back
@@ -309,6 +512,13 @@ Choose by what is missing and by what failed. A few things are worth knowing:
 * `monitor_observation`, when present, is an independent high-level assessment, not a diagnosis
   or permission. Use its cited evidence as a prompt to inspect the records; the Scheduler alone
   chooses the next action.
+* `current_model_budget` is the current verified allowance. Historical Monitor/Fix
+  budget snapshots are NOT current admission facts; never claim the current budget
+  is exhausted from them. `historical_budget_exhausted` cannot justify stopping.
+* `controller_runtime.previous_setup_failure.validity=unverified_in_current_runtime`
+  means an old failure has not been reproduced under this controller. Preserve it,
+  but consider one bounded trusted-executor revalidation before asserting the same
+  framework fault still blocks execution. Do not infer a successful repair either.
 
 * **A step that failed is not a reason to stop.** The record says why it failed. If the reason
   is about one stage, another stage may still be derivable. If the environment could not be
@@ -324,7 +534,7 @@ Choose by what is missing and by what failed. A few things are worth knowing:
   claiming the repair worked. If the idea cannot be represented within the frozen protocol,
   state the boundary instead of changing the declaration mid-session.
 * **A step already done does not need doing again** unless something it depended on changed.
-* Data acquisition is a user-prioritized research option. During onboarding, resolve its
+* Data acquisition is a user-prioritized optimization option. During onboarding, identify its
   feasibility before freezing the declaration: choose the catalog skill
   `autosimsota.connecting-native-data-collection` when relevant, and use `research_task`
   with role `resource` to trace the native producer, expert/planner/policy prerequisites,
@@ -340,6 +550,19 @@ Choose by what is missing and by what failed. A few things are worth knowing:
   hard budget. Decide whether to scale from observed yield and downstream score. Explain any
   deferral (fixed-data protocol, human-only control, missing assets, inadequate policy yield,
   or poor expected value). Do not assume collection always helps or force it into online RL.
+  Native expert/planner, trajectory adaptation and TRAINING policy success-filtering are
+  different routes. A human-only recorder does not prove every autonomous route is absent.
+  If the simulator and a compatible policy exist but no autonomous recorder does, use an
+  Init task BEFORE the baseline protocol freezes to implement a small source-backed
+  training-side wrapper in the isolated checkout, then resurvey/derive/verify it. Never
+  relabel test evaluation dumps as expert data; failed actions without expert relabels are
+  not successful BC demonstrations. A learned policy with no successes cannot bootstrap
+  by filtering: use legal existing demos/weights or an applicable expert, or defer it.
+  Ensure source-backed collection controls and conversion-to-loader edges are represented
+  before freezing; deferring all collection integration until after freeze can make it
+  impossible to express an otherwise useful data candidate.
+  Use inspect_workspace_resources for actual bound file metadata before claiming missing
+  data/checkpoints. Builtin file tools see mount placeholders, not the resource contents.
 * **Derive the path that can produce a score for the selected task.** `prepare_data` and
   `collect` are optional; if the available trainer learns directly from simulator interaction
   and no demonstration dataset is present, derive `train` and `evaluate` before attempting
@@ -393,13 +616,29 @@ Choose by what is missing and by what failed. A few things are worth knowing:
   collection, data preparation and other native stages. Inspect its progress
   before `adjust_native_job` or `cancel_native_job`; these actions take `job_id` and a
   reason (adjustment also takes `window_seconds` from now). A completed detached trainer
-  is not a score; to adopt it as the initial baseline, call `run_the_loop` with `job_id`.
+  is not a score. With candidate_binding adopt with job_id and the matching idea_label;
+  Pass the cleared idea_label at submission to bind its declared settings, allocated round,
+  original baseline and protocol. Optional training_settings is a validated local training
+  budget sealed in the candidate binding, not a replacement for the original baseline.
+  Detached code patches/graph candidates are not admitted without their source/node
+  transactions: run those through the existing synchronous audited candidate path.
+  without that binding only the initial-baseline adoption contract applies.
   The executor rechecks the original training receipt, settings and artifact before native
   evaluation. Never run the same stage concurrently in its shared output namespace.
   Independent CPU preparation may overlap GPU work; queued work does not consume its
   local execution window or GPU time, but still counts against the hard wall deadline.
+* If native collection is feasible and protocol-legal, first inspect a small production
+  and loader connection. Register reviewed training data with register_data_version, then
+  select its data-version:<id> handle through a declared training axis. The actual sample
+  reader must emit AUTOSIM_TRAIN_DATA_CONSUMPTION JSON after reads, not echo expected hashes.
+  Consult connecting-native-data-collection for the witness fields. Registration is not
+  consumption or a score. Missing consumption evidence belongs to Fix, not a successful
+  data experiment. Fixed-data tasks and RL-only tasks need different legal strategies.
 * Use `submit_research_task` for an independent read-only specialist question,
-  with role, task, expected_result. It has a separate source snapshot/session
+  with role, task, expected_result and optional source_paths (1..64 checkout-relative
+  files/directories). source_paths controls the real copied snapshot; narrowing task prose
+  alone cannot reduce it. Exclude unrelated policy families/binary meshes for large repos.
+  It has a separate source snapshot/session
   but shares the run's model ledger. Do not delegate sequentially dependent questions.
   A stale report is a lead to recheck, not evidence about the current checkout.
   When there is no useful independent work, choose `wait_for_jobs` (no arguments)
@@ -425,6 +664,11 @@ Choose by what is missing and by what failed. A few things are worth knowing:
   record is not proof that no side effect occurred.
 * **A runnable evaluator is not yet a score.** If a score command is verified but its
   primary metric is unbound, choose `bind_metric` before `run_the_loop`.
+* If native_identity_schema.status is incompatible, fix the reported logging interface
+  at its real native sites BEFORE freezing a new research session. Use an editable
+  Init/Fix research_task while preparation permits it, following native_identity_contract,
+  then reverify the changed command. Do not alter actions, episodes or scoring. This
+  schema check does not certify loading or replace independent byte/rollout/metric audits.
 * `to_measure.ready` means the evaluator and metric contract can be attempted; it does not
   mean a prior measurement produced a number. If
   `research_progress.unscored_baseline_recovery.available` is true, choose
@@ -441,7 +685,11 @@ Choose by what is missing and by what failed. A few things are worth knowing:
   anything.
 * `research_progress.status == "paused"` means one bounded research action finished: inspect
   its evidence and `research_options`; `run_the_loop` may resume at the recorded next round
-  only with `arguments.idea_label` set to one exact currently available option. This is the
+  with `arguments.idea_label` set to one exact currently available option. EXCEPTION:
+  when native_job_baseline_recovery lists a completed training job, inspect that exact job
+  for parent-owned source-backed progress review, then use run_the_loop with its job_id
+  and NO idea_label. This restores ONLY an unchanged, never-scored failed round-zero
+  baseline from already-paid training, not a candidate or protocol reset. This is the
   main research controller's decision: the inner engine validates and executes that label but
   must not choose another idea. Existing candidates are suggestions, not a closed menu: the
   main controller may submit `propose_research_idea` with its own evidence-backed idea for
@@ -497,6 +745,21 @@ Choose by what is missing and by what failed. A few things are worth knowing:
 * **`stop` is for when nothing available would change anything.** Say what is missing and what
   would have to be true for it to be possible. A run that stops should leave a reader knowing
   exactly what blocked it.
+  Re-evaluate old stop conditions against the CURRENT environment and pending_queue.
+  If latest_failure is empty and pending_queue is nonempty, a historical install failure
+  is not a reason to stop or submit repair_proposal: choose a bounded continuation unless
+  current evidence identifies a specific unsafe/unavailable prerequisite. An environment
+  switch does not certify readiness, but it retires the old prefix's recovery obligation.
+  Set `arguments.stop_scope` to `pause` for an unresolved/stalled investigation, or
+  `framework` for a harness/contract blocker. These preserve a resumable state and do NOT
+  claim this repository is impossible. Only `resource` (the legacy default) claims a
+  resource boundary and requires the independent review below.
+  For an unready environment, inspect `installation_recovery_inventory` first. A failed
+  online download does not rule out cached wheels or compatible isolated clones. Return
+  `arguments.resource_assessment` with its current `inventory_digest` and evidence-backed
+  `local_artifacts`, `environment_reuse`, `alternative_sources` explanations. Resource-based
+  stopping requires an independent read-only review; inspect or repair unexplored routes
+  rather than repeating the same online probe. Keep native capability probes unchanged.
 
 `method_library` contains candidate methods retrieved from metadata, not executable policy.
 The main Agent selected the bodies to read from a short directory; lexical recommendations
@@ -526,12 +789,20 @@ Return exactly one JSON object: {{"state_revision": <integer>, "do": "<one permi
 "method_review": [{{"id":"<selected skill id>","verdict":"use|decline|insufficient_evidence",
 "why":"<applicability reasoning>","evidence_refs":["<shown reference>"]}}],
 "arguments": {{<only when needed: "stage":
-"<one surveyed stage>" and optional positive "timeout_seconds" for derive_a_command,
+"<one surveyed stage>" and optional positive "timeout_seconds" (native trial) and
+"agent_timeout_seconds" (model reasoning window, bounded by the configured runner and
+remaining whole-run deadline) for derive_a_command; omitting the model window uses the
+configured runner ceiling, not a fixed 180 seconds;
+when verified_train_artifacts is available, choose its policy file or native bundle by
+save/load source and pass the run-relative "checkpoint_ref" for score verification,
+when unverified_invocation_drafts offers a relevant Agent revision, explicitly select
+its "ref" as "draft_ref" to retain that environment/invocation across a refresh.
+Drafts are not verified commands or scores; changed source/input context is rejected,
 "idea_label": "<exact offered label>" for a paused run_the_loop, or
-"job_id": "<completed baseline trainer job ID>" for the initial run_the_loop,
+"job_id": "<offered completed trainer job ID>" for initial or unscored baseline recovery,
 "idea": {{...}} for propose_research_idea, "reason":
 "<evidence-backed discard rationale>" for discard_interrupted_candidate,
-"role", "task", "expected_result" for submit_research_task,
+"role", "task", "expected_result", optional "source_paths" for submit_research_task,
 "study" for configure_screening; "study_id", "idea_label", "rung", "window_seconds",
 "reason" for run_screening_trial; "study_id" for inspect_screening;
 "task_id", "reason" for cancel_research_task; no arguments for wait_for_jobs;
@@ -584,6 +855,9 @@ def _latest_per_step(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for row in steps:
         step = str(row.get("step") or "")
+        previous = latest.pop(step, None)
+        if previous is not None:
+            latest[step] = previous
         held = latest.setdefault(step, {"step": step, "outcome": row.get("outcome") or "",
                                         "because": str(row.get("because") or "")[:300],
                                         "attempts": 0})
@@ -911,6 +1185,7 @@ class Preparation:
                                  if interpreter_hint is not None else None)
         self.budget: RunBudget | None = None
         self._step_budget = 8
+        self._cycle_step_start = 0
         self.steps: list[dict[str, Any]] = []
         self.last_decision: dict[str, Any] = {}
         self.current_action: dict[str, Any] = {}
@@ -1010,6 +1285,16 @@ class Preparation:
                 self.recovery_after_interruption = dict(saved_recovery)
             action = shared_state.get("current_action")
             phases = shared_state.get("phases")
+            runtime_phase = (phases.get("agent_runtime", {}) if isinstance(phases, dict) else {})
+            owner_phase = (phases.get(str(shared_state.get("phase")), {})
+                           if isinstance(phases, dict) else {})
+            if (runtime_phase.get("status") == "running"
+                    and isinstance(runtime_phase.get("current_action"), dict)
+                    and runtime_phase["current_action"].get("status") == "running"
+                    and int(runtime_phase.get("event_sequence") or 0) >=
+                        int(owner_phase.get("event_sequence") or 0)):
+                # Agent process identity belongs to the subtask, not the run's lifecycle.
+                action = runtime_phase["current_action"]
             research_phase = (phases.get("research") if isinstance(phases, dict) else {})
             parent_action = (action.get("parent_action")
                              if isinstance(action, dict) and
@@ -1289,6 +1574,13 @@ class Preparation:
         """
         if not progress or progress.get("status") != "paused":
             return {"status": "not_paused", "items": []}
+        completed_jobs = self._completed_baseline_jobs()
+        if completed_jobs:
+            return {'status': 'baseline_job_recovery_available', 'items': [],
+                    'jobs': completed_jobs,
+                    'guidance': 'Inspect a completed job for parent-owned progress review, then '
+                    'choose run_the_loop with its exact job_id and NO idea_label. Reuse training; '
+                    'do not submit another train or start optimization before this baseline.'}
         root = self.output / "research" / self.run_id
         path = root / "ideas.json"
         if path.is_symlink():
@@ -1364,7 +1656,7 @@ class Preparation:
             if kinds_wanted is not None and idea.granularity not in kinds_wanted:
                 continue
             compatible, why = execution_compatibility(
-                idea, stage_parameters=training_parameters)
+                idea, stage_parameters=training_parameters, repo=self.repo)
             if compatible and idea.granularity in {"param", "algo"}:
                 if declared_space is None:
                     compatible, why = False, "the declaration has no usable optimization space"
@@ -1375,17 +1667,31 @@ class Preparation:
                 options.append(idea)
             else:
                 excluded.append({"label": idea.label, "because": why})
+        from .training_work import consumes_steps
         return {"status": "available" if options else "empty", "items": [
                     {"label": idea.label, "granularity": idea.granularity,
                      "mechanism": idea.mechanism, "change": idea.change,
                      "risk": idea.risk, "why": idea.why,
                      "evidence": idea.evidence, "times_tried": idea.times_tried}
                     for idea in options],
+                "candidate_training_budget": {
+                    'explicit_steps_input': consumes_steps(self.stages.get('train','')),
+                    'guidance':'For Main-selected candidates run_the_loop(training_settings=...) '
+                        'selects validated local work, preserving baseline. A declared grouped '
+                        'setting is not automatically an alias for the native caller steps slot. '
+                        'Inspect the verified function; supply actual steps explicitly when it '
+                        'reads that slot. Do not invent epochs-to-updates conversions.'},
                 "eligible_granularities": (sorted(kinds_wanted) if kinds_wanted else
                                            ["param", "code", "algo"]),
                 "excluded_incompatible": excluded[:40],
                 "generation_attempted": generation_attempted,
                 "next_round": session.get("next_round"),
+                "remaining_candidate_rounds": max(0,session['rounds']-session['next_round']+1),
+                "cursor_semantics":'next_round <= planned rounds is an allocated candidate; '
+                    'empty audited options is not round-budget exhaustion. Main may propose '
+                    'a new literal code candidate with validated local training_settings. '
+                    'A previous unmeasured failure stays in history; use a new audited label '
+                    'rather than overwriting it.',
                 "evidence_ref": f"research/{self.run_id}/ideas.json"}
 
     def _stage_has_command(self, stage: str) -> bool:
@@ -1398,6 +1704,15 @@ class Preparation:
         ones were refused and why, what the last step's failure said, which stages have a
         command. The decision is the model's and it is made from this.
         """
+        from .runtime_freshness import current_model_budget, budget_observation, controller_context
+        from .stage_verification import recent_attempts
+        from .policy_consumption import identity_contract
+        from .checkpoint_handoff import catalog as producer_catalog
+        from .invocation_drafts import catalog as draft_catalog
+        model_budget = current_model_budget(self.output, self.run_id)
+        self.monitor_observation = budget_observation(self.monitor_observation, model_budget)
+        self.fix_observation = budget_observation(self.fix_observation, model_budget)
+        runtime_context = controller_context(self.output, self.steps)
         found, refused = self._declaration_candidates()
         held = json.loads((self.output / "environment.json").read_text(encoding="utf-8")) \
             if (self.output / "environment.json").is_file() else {}
@@ -1413,9 +1728,14 @@ class Preparation:
         probe_faults = [
             {"index": index, "because": violation[:300]}
             for index, probe in enumerate(probes[:32]) if isinstance(probe, str)
-            for violation in [provision.probe_stage_violation(probe, probe_context)]
+            for violation in [provision.consumer_or_asset_violation(probe, probe_context, held.get('assets'))]
             if violation]
         runtime_failure = _last_stage_failure_after_build(self.steps, self.output, self.run_id)
+        if runtime_failure:
+            failure = next((row for row in runtime_context['previous_action_failures']
+                if row['step'] == 'derive_a_command' and row['stage'] == runtime_failure.get('stage')), {})
+            runtime_failure = {**runtime_failure, **{key:failure[key] for key in
+                ('validity','recorded_controller_runtime_id','repair_status') if key in failure}}
         held_verdict = held.get("verdict") or {}
         if probe_faults:
             verification_status = "stale_probe_contract"
@@ -1446,15 +1766,21 @@ class Preparation:
         score_ready = score_target in self.stages
         score_row = (answer.get("stages") or {}).get(score_target) or {}
         needs_checkpoint = "checkpoint" in str(score_row.get("invocation") or "").lower()
-        workflow_input_digest = object_digest({
-            "execution": answer, "declaration": self.declaration,
-            "task": self._declared_task(),
-        })
+        workflow_identity_error = ""
+        try:
+            workflow_input_digest = self._workflow_input_digest(answer)
+        except (OSError, ValueError, TypeError) as exc:
+            # A corrupt checkout identity must not crash observation/recovery. It
+            # remains invalid, and selection/execution still validate the source.
+            workflow_input_digest = ""
+            workflow_identity_error = redact(f"{type(exc).__name__}: {exc}")[:600]
         workflow_selection: dict[str, Any] = {
             "status": "not_selected", "input_digest": workflow_input_digest,
             "score_target": score_target,
             "requested_task": self._declared_task(),
         }
+        if workflow_identity_error:
+            workflow_selection.update(status="invalid_source_identity", identity_error=workflow_identity_error)
         selected_path_file = self.output / "selected_path.json"
         if selected_path_file.is_symlink():
             workflow_selection["status"] = "unsafe_selection_record"
@@ -1464,13 +1790,13 @@ class Preparation:
             except (OSError, ValueError, TypeError):
                 selected_path = {}
                 workflow_selection["status"] = "unreadable_selection_record"
-            if isinstance(selected_path, dict):
+            if isinstance(selected_path, dict) and not workflow_identity_error:
                 review = selected_path.get("handoff_review")
                 review = review if isinstance(review, dict) else {}
                 workflow_selection["status"] = (
-                    "selected_current_inputs" if
-                    selected_path.get("input_digest") == workflow_input_digest and
-                    review.get("compatible") is True
+                    ("selected_current_inputs" if review.get("compatible") is True else
+                     "selected_pending_handoff") if
+                    selected_path.get("input_digest") == workflow_input_digest
                     else "selected_for_different_inputs")
                 workflow_selection["selected_stages"] = selected_path.get("stages") or []
                 workflow_selection["reason"] = str(selected_path.get("why") or "")[:600]
@@ -1517,6 +1843,9 @@ class Preparation:
             missing.append("a verified train command for the selected workflow")
         if not self._metric_bound():
             missing.append("an explicit primary metric bound to native output")
+        native_identity_schema = self._native_identity_schema_view(score_target)
+        if native_identity_schema.get('status') == 'incompatible':
+            missing.append('native identity logging compatible with the executor contract before protocol freeze')
         score_reason = ("missing: " + ", ".join(missing) if missing else
                         f"the research loop can start: score target {score_target} has a "
                         "verified command and declaration, with the primary metric bound; "
@@ -1661,10 +1990,15 @@ class Preparation:
                             "new native output, then bind the metric from that output")
         research_options = self._research_options(research_progress, answer)
         from .workspace_resources import resource_view
+        from .environment_observation import cached_view
+        from .environment_pool import candidate_view
         return {
             "repository": str(self.repo),
             "requested_task": self._declared_task(),
             "workspace_resources": resource_view(self.repo),
+            "actual_environment_observation": cached_view(self.output,
+                json.dumps([self.declaration, answer], ensure_ascii=False)),
+            "environment_candidates": candidate_view(self.output, repo=self.repo),
             "declarations_on_file": {
                 "usable": [{"name": name, "axes": sum(len(v) for v in
                                                       (doc.get("optimization_space") or {}).values())}
@@ -1685,6 +2019,10 @@ class Preparation:
                                  "train" not in self.stages else "none known"),
             "environment": {
                 "interpreter": str(self.interpreter) if self.interpreter else "",
+                "existing_unverified_interpreter": (str(held.get("interpreter") or "")
+                    if held.get("interpreter") and Path(str(held["interpreter"])).is_file()
+                    and not self.interpreter else ""),
+                "native_inspection_available": (self.output / "native_context.json").is_file(),
                 "base_python_hint": ({
                     "path": str(self.interpreter_hint),
                     "exists": self.interpreter_hint.is_file(),
@@ -1701,6 +2039,10 @@ class Preparation:
                     for row in (held.get("record") or [])
                     if isinstance(row, dict) and row.get("kind") == "probe"][-8:],
                 "stage_failure_after_verification": runtime_failure,
+                "stage_failure_guidance": "A later stage failure does not revoke the passing "
+                    "consumer verdict. Missing input paths, provider interruption and timeouts "
+                    "belong to resource/invocation recovery unless new native dependency/ABI "
+                    "evidence supports changing the environment.",
                 # Named for what it is: how many commands the *build* recorded. It used to be
                 # `commands_recorded`, and a scheduler read it beside
                 # `stages_the_checkout_has: {'evaluate': 'has a command'}` and concluded that
@@ -1713,21 +2055,48 @@ class Preparation:
                 "partial_status": held.get("status") or "",
                 "latest_installation_attempt": held.get("latest_attempt") or {},
                 "latest_failure": provision.latest_failure(self.output, held),
+                "pending_queue": (read_json(self.output / "provision_cursor.json").get("pending", [])
+                    if (self.output / "provision_cursor.json").is_file() else []),
+                "historical_failure": held.get("latest_failure") or {},
+                "recovery_guidance": "Only latest_failure is actionable for this environment. If it is empty "
+                    "and pending_queue is nonempty, continue build without repair_proposal; never replay "
+                    "a historical failure from a different prefix. Capability probes still required.",
+                "repair_rejection": held.get("repair_rejection") or {},
+                "recovery_status": held.get("recovery_status") or "",
+                "recovery_revision": held.get("recovery_revision") or "",
+                "installation_recovery_inventory": self._installation_recovery_inventory(),
             },
+            "harness_repair": self._harness_repair_status(),
+            "native_stage_verifications": recent_attempts(self.output),
+            "native_identity_contract": identity_contract(),
+            "native_job_baseline_recovery": self._completed_baseline_jobs(),
+            "native_identity_schema": native_identity_schema,
+            "verified_train_artifacts": producer_catalog(self.output),
+            "unverified_invocation_drafts": draft_catalog(self.output),
             "device": {"chosen": self.decision.device, "why": self.decision.why},
             "task_gpu_budget": self._task_gpu_budget_view(),
             "scheduling": scheduling_view(self.output),
+            "execution_progress": execution_progress(self.steps),
+            "review_transactions": review_view(self.output),
             "steps_taken": _latest_per_step(self.steps),
+            "recent_actions": [{key: row.get(key) for key in (
+                "step", "outcome", "because", "evidence_id", "receipt_ref", "failure_domain")}
+                for row in self.steps[-8:]],
             "last_decision": self.last_decision or None,
             "current_action": self.current_action or None,
             "last_action": self.last_action or None,
             "monitor_observation": self.monitor_observation or None,
             "fix_observation": self.fix_observation or None,
+            "current_model_budget": model_budget,
+            "controller_runtime": runtime_context,
+            "recovery_transaction": self._recovery_transaction(),
             "native_jobs": self._native_job_view(),
             "agent_tasks": self._agent_task_view(),
             "main_agent": memory_view(self.main_agent),
             "report_demo_requests": recorder.pending_requests(self.output),
             "recovery_after_interruption": self.recovery_after_interruption or None,
+            "runtime_recovery": self._runtime_recovery_view(),
+            "baseline_reference": self._baseline_reference_view(),
             "state_persistence_error": self.state_persistence_error or None,
             # This revision advances only for facts that can change the next legal
             # research decision. The shared run_state.json state_revision remains the
@@ -1752,8 +2121,13 @@ class Preparation:
             "research_progress": research_progress,
             "evaluation_verdict": evaluation_verdict,
             "research_options": research_options,
+            "latest_development_measurements": self._development_evidence(),
             "confirmation_requested": bool(self.base_settings.get("_confirm")),
         }
+
+    def _development_evidence(self) -> list[dict[str, Any]]:
+        from .development_evidence import summaries
+        return summaries(self.output/'research'/self.run_id)
 
     @staticmethod
     def _confirmation_controller_view(value: Any) -> dict[str, Any]:
@@ -1969,6 +2343,26 @@ class Preparation:
         if research_options is None:
             research_options = self._research_options(progress, self.execution)
         available = list(OPERATIONS)
+        if (not getattr(self.client,'supports_main_agent',False) or self.keep_only
+                or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json'))):
+            available.remove('register_data_version')
+        reference = self._baseline_reference_view()
+        exposed = any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json'))
+        if not getattr(self.client, 'supports_main_agent', False) or self.keep_only or exposed:
+            available.remove('configure_baseline_reference')
+            available.remove('evaluate_baseline_reference')
+        elif reference.get('status') not in {'ready', 'evaluating', 'evaluation_failed', 'performance_mismatch'} or 'evaluate' not in self.stages:
+            available.remove('evaluate_baseline_reference')
+        # Reference status qualifies claims, not permission to improve a valid local baseline.
+        if (not getattr(self.client, 'supports_main_agent', False) or self.keep_only
+                or not progress or progress.get('status') not in {'paused', 'completed'}
+                or (progress.get('confirmation') or {}).get('recorded')
+                or self.budget is None or self.budget.remaining() <= 0
+                or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json'))):
+            available.remove('extend_research_rounds')
+        if (not hasattr(self.client, "fork_readonly") or self.keep_only or
+                not self._harness_repair_status().get('can_propose', False)):
+            available.remove("propose_harness_repair")
         from .scheduling import policy
         if not policy(self.output) or progress is None or progress.get("status") != "paused":
             for name in ("configure_screening", "run_screening_trial", "inspect_screening"):
@@ -1981,6 +2375,7 @@ class Preparation:
                 not pending_requests(self.output)):
             available.remove("review_report_demo")
         if (not getattr(self.client, "supports_recorder", False) or self.keep_only or
+                not (self.output / "native_context.json").is_file() or
                 not any(r.get("kind") == "environment_smoke" for r in pending_requests(self.output))):
             available.remove("capture_environment_demo")
         if not getattr(self.client, "supports_main_agent", False) or self.keep_only:
@@ -1996,16 +2391,17 @@ class Preparation:
                 available.remove("submit_native_job")
             if active:
                 if not policy(self.output) or len(active) >= policy(self.output).get("native_slots", 1):
-                    available.remove("submit_native_job")
-                for name in ("run_the_loop", "derive_a_command", "confirm_best", "build_the_environment", "retry_failed_action", "configure_screening", "run_screening_trial", "declare", "bind_metric", "recover_unscored_baseline"):
+                    if "submit_native_job" in available:
+                        available.remove("submit_native_job")
+                for name in ('register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds", "run_the_loop", "derive_a_command", "confirm_best", "build_the_environment", "retry_failed_action", "configure_screening", "run_screening_trial", "declare", "bind_metric", "recover_unscored_baseline"):
                     if name in available:
                         available.remove(name)
             else:
                 for name in ("adjust_native_job", "cancel_native_job"):
                     available.remove(name)
-        if not self._repair_retry_available():
+        if not self._repair_retry_available() and "retry_failed_action" in available:
             available.remove("retry_failed_action")
-        if not self._declaration_refresh_is_justified(
+        if "declare" in available and not self._declaration_refresh_is_justified(
                 research_progress=progress, research_options=research_options):
             available.remove("declare")
         if not self.declaration:
@@ -2046,12 +2442,14 @@ class Preparation:
                 if name in available:
                     available.remove(name)
         if not ((progress or {}).get("unscored_baseline_recovery") or {}).get("available"):
-            available.remove("recover_unscored_baseline")
+            if "recover_unscored_baseline" in available:
+                available.remove("recover_unscored_baseline")
         else:
             # A reusable completed train attempt is the only safe next measurement path.
             # Do not let another idea obscure or duplicate it before the master resolves the
             # already-paid baseline attempt.
-            available.remove("run_the_loop")
+            if "run_the_loop" in available:
+                available.remove("run_the_loop")
         if not self._research_loop_ready() and "run_the_loop" in available:
             available.remove("run_the_loop")
         if not self.recovery_after_interruption:
@@ -2066,9 +2464,14 @@ class Preparation:
         if not self._interrupted_candidate_discard_available(progress):
             available.remove("discard_interrupted_candidate")
         if progress and progress.get("status") == "paused":
+            baseline_jobs = self._completed_baseline_jobs()
             has_options = (research_options.get("status") == "available" and
                            bool(research_options.get("items")))
-            if not has_options and "run_the_loop" in available:
+            if baseline_jobs and self._research_loop_ready() and 'run_the_loop' not in available:
+                from .native_jobs import active_jobs
+                if not active_jobs(self.output):
+                    available.append('run_the_loop')
+            if not has_options and not baseline_jobs and "run_the_loop" in available:
                 available.remove("run_the_loop")
             if (has_options or research_options.get("generation_attempted") and
                     "generate_research_ideas" in available):
@@ -2080,6 +2483,7 @@ class Preparation:
             budget_left = self.budget.remaining() if self.budget else 1.0
             has_actionable_research = (
                 (has_options and "run_the_loop" in available) or
+                (baseline_jobs and 'run_the_loop' in available) or
                 "generate_research_ideas" in available)
             if has_actionable_research and budget_left > 0 and "stop" in available:
                 available.remove("stop")
@@ -2091,14 +2495,22 @@ class Preparation:
         if (not self.base_settings.get("_confirm") or not progress or
                 progress.get("status") != "completed" or
                 confirmation_state.get("status") != "available_not_taken"):
-            available.remove("confirm_best")
+            if "confirm_best" in available:
+                available.remove("confirm_best")
         if (getattr(self.client, "supports_main_agent", False) and not self.keep_only and
                 not self.main_agent.get("plan")):
-            # Let source discovery happen first, but require an Agent-authored roadmap
-            # before any environment mutation or research workload is submitted.
-            guarded = {"build_the_environment", "run_the_loop", "submit_native_job", "capture_environment_demo",
-                       "run_screening_trial", "derive_a_command"}
+            # Do not hide environment preparation behind a planning-only gate: that
+            # deadlocks onboarding into repeated source inventories. A short persisted
+            # roadmap still precedes scored workloads and demonstrations.
+            guarded = {"run_the_loop", "submit_native_job", "capture_environment_demo",
+                       "run_screening_trial"}
             available = [name for name in available if name not in guarded]
+        if (getattr(self.client, "supports_main_agent", False) and not self.keep_only and
+                "retry_failed_action" in available and
+                (not self.budget or self.budget.remaining() > 0) and "stop" in available):
+            # One explicit repair handoff must be revalidated, not discarded as a stop.
+            # Admission/total-budget checks still run before the operation.
+            available.remove("stop")
         return available
 
     @staticmethod
@@ -2312,6 +2724,15 @@ class Preparation:
                                    if retry_after_archive_failure else
                                    attempt_dir / "baseline_recovery.json")
             if recovery_state_path.exists():
+                retry = {'available': False}
+                if measurement.get('where') == 'policy_artifact':
+                    research, _ = self._research_controller()
+                    retry = research.baseline_selection_retry_plan(measurement)
+                if retry.get('available'):
+                    return {'available':True, 'attempt_id':attempt_id,
+                        'kind':'revalidate_policy_selection_with_additive_producer_evidence',
+                        'evidence_context_sha256':retry['evidence_context_sha256'],
+                        'why':'same completed training; new verified producer/metadata associations; no prior evaluation'}
                 return {"available": False, "attempt_id": attempt_id,
                         "why": "this bounded recovery attempt already exists; inspect its receipt "
                                "rather than replaying it"}
@@ -2322,6 +2743,11 @@ class Preparation:
                 return {"available": False, "attempt_id": attempt_id,
                         "why": "the exact train receipt is missing or escapes the run root"}
             receipt = read_json(receipt_path)
+            if (receipt.get('training_progress') or {}).get('status') != 'observed':
+                research, _ = self._research_controller()
+                reviewed = research._verified_training_receipt(attempt_id, measurement.get('settings') or {})
+                if reviewed is not None:
+                    receipt = reviewed
             protocol_path = root / "comparison_protocol.json"
             settings = measurement.get("settings")
             cwd = Path(str(receipt.get("working_directory") or "")).resolve()
@@ -2888,12 +3314,33 @@ class Preparation:
                     "because": "process identity is not safe to reconcile automatically; "
                                f"{process_state.get('why') or process_status}"}
         elif process_status == "not_recorded":
+            if action.get('step') == 'agent_fix':
+                from .agent_runtime import (_agent_turn_lock, _safe_session,
+                    unreserved_prelaunch_proof, _reconcile_abandoned_agent_session)
+                from datetime import datetime
+                with _agent_turn_lock(self.output):
+                    session = _safe_session(self.output)
+                    try:
+                        action_started = datetime.fromisoformat(str(action['started_at'])).timestamp()
+                        gap = float(session.get('started_at') or 0) - action_started
+                        parent = session.get('parent_action')
+                        linked = (session.get('role') == 'fix' and 0 <= gap <= 180 and
+                                  (parent is None or parent == action))
+                    except (ValueError, TypeError, KeyError):
+                        linked = False
+                    proof = (unreserved_prelaunch_proof(output=self.output, workspace=self.repo,
+                        session=session, run_id=self.run_id) if linked else {})
+                    if proof:
+                        _reconcile_abandoned_agent_session(output=self.output, workspace=self.repo,
+                            session=session, run_id=self.run_id)
+                        process_state, process_status = proof, 'not_launched'
             # A model decision can be interrupted without starting a repository command. For
             # any action that could have external side effects, missing process identity is a
             # hard stop rather than a guess that the process was never launched. A durable
             # parent research action is different: it owns the controller checkpoint and can
             # be marked interrupted without claiming that its hidden work completed.
-            if (action.get("step") not in {"choose", "discard_interrupted_candidate"} and
+            if (process_status != 'not_launched' and
+                    action.get("step") not in {"choose", "discard_interrupted_candidate"} and
                     not is_research_action_name(action.get("step"))):
                 return {"outcome": "blocked",
                         "because": "the interrupted action may have started a command, but no "
@@ -3204,6 +3651,7 @@ class Preparation:
                   "process_status": process_status,
                   "evidence_status": evidence_status,
                   "evidence_ref": evidence_ref or None,
+                  "resume_scope": "research" if is_research_action else "preparation",
                   "outcome_known": False}
         self.recovery_after_interruption = {}
         self.last_action = {**result, "outcome": "interrupted; outcome unknown",
@@ -3248,6 +3696,180 @@ class Preparation:
              seconds=time.monotonic()-started, operation=step, status=result.get("outcome"))
         return result
 
+    def _runtime_recovery_view(self) -> dict[str, Any]:
+        from .runtime_recovery import view
+        return view(self.output)
+
+    def _baseline_reference_view(self) -> dict[str, Any]:
+        from .baseline_reference import view
+        return view(self.output)
+
+    def _step_register_data_version(self, *, version: dict[str, Any]) -> dict[str, Any]:
+        from .baseline_reference import source_evidence
+        from .data_versions import register
+        from .agent_client import role_scope
+        from .execution_derive import _object
+        from .native_jobs import active_jobs
+        if active_jobs(self.output) or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
+            return {'outcome':'not attempted','because':'active job or held-out boundary prevents new data registration'}
+        try:
+            if not isinstance(version,dict) or set(version)!={'id','dataset_ref','source_refs','reason'}:
+                raise ValueError('version requires exactly id,dataset_ref,source_refs,reason')
+            import re
+            if (not isinstance(version['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',version['id'])
+                    or not isinstance(version['dataset_ref'],str) or not version['dataset_ref']
+                    or not isinstance(version['reason'],str) or not version['reason'].strip()
+                    or len(version['reason'])>1000):
+                raise ValueError('version needs a safe id, dataset_ref and concise nonempty reason')
+            from .baseline_reference import resolve_checkpoint
+            resolve_checkpoint(self.output,self.repo,version['dataset_ref'])
+            citations=source_evidence(self.repo,version['source_refs'])
+            with role_scope(self.client,'supervisor'):
+                answer,_=self.client.chat_with_metadata(
+                    'Independently review DEVELOPMENT TRAINING data, not evaluation data. '
+                    'Require exact source evidence that new data are allowed by the protocol, '
+                    'the stated dataset root actually reaches the trainer sample reader, and '
+                    'the AUTOSIM_TRAIN_DATA_CONSUMPTION event is emitted only after actual sample '
+                    'reads with identity recomputed from the loaded dataset, not echoed constants. '
+                    'Registration does not certify quality, successful collection or performance. '
+                    'Return JSON booleans allowed_training_data,loader_connection_supported,sources_supported, '
+                    'why and exact citations:[{ref,quote}] from supplied sources.',
+                    json.dumps(_controller_model_value({'version':{**version,'source_refs':citations},
+                        'declaration':self.declaration},local_roots=(self.repo,self.output)),ensure_ascii=False),
+                    max_tokens=1800,read_only=True,include_research_context=False)
+            review=_object(answer)
+            quoted=review.get('citations')
+            if not isinstance(quoted,list) or not quoted or any(not isinstance(c,dict) or not any(
+                    c.get('ref')==x['ref'] and c.get('quote')==x['quote'] for x in citations) for c in quoted):
+                raise ValueError('data Supervisor requires exact provided source citations')
+            if source_evidence(self.repo,citations)!=citations:
+                raise ValueError('data/loader sources changed during review')
+            row=register(self.output,self.repo,{**version,'source_refs':citations},review)
+        except (OSError,ValueError,TypeError,RuntimeError) as exc:
+            return {'outcome':'not attempted','because':f'data version refused: {exc}'[:700]}
+        return {'outcome':'registered','because':'reviewed version is not yet consumed or scored',
+                'data_version_id':row['id'],'handle':'data-version:'+row['id'],
+                'evidence_refs':['data_versions/'+row['id']+'.json']}
+
+    def _step_configure_baseline_reference(self, *, reference: dict[str, Any]) -> dict[str, Any]:
+        from . import baseline_reference as refs
+        from .agent_client import role_scope
+        from .execution_derive import _object
+        from .experiment_bundle import freeze_artifact
+        if any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
+            return {'outcome': 'not attempted', 'because': 'held-out exposure forbids new development references'}
+        try:
+            spec = refs.validate(self.repo, reference)
+            record = self.output/'baseline_references'/(spec['id']+'.json')
+            if record.exists():
+                raise ValueError('reference id already recorded; use a new id without overwriting history')
+            frozen = None
+            if spec['kind'] == 'released_checkpoint':
+                source = refs.resolve_checkpoint(self.output, self.repo, spec['checkpoint_ref'])
+                frozen = freeze_artifact(source, self.output/'baseline_references'/spec['id']/'policy', max_bytes=2*1024**3)
+            context = {'reference': spec, 'metric': self._research_controller()[0].metric_spec.as_dict(),
+                       'verified_evaluator_source': self.stages.get('evaluate'),
+                       'declared_task': self._declared_task(),
+                       'frozen_evaluation_settings': self.base_settings,
+                       'checkpoint_byte_identity': {k:v for k,v in (frozen or {}).items() if k != 'path'}}
+            session = self.output/'research'/self.run_id/'controller_session.json'
+            if session.is_file():
+                context['frozen_evaluation_settings'] = read_json(session).get('base_settings') or {}
+            with role_scope(self.client, 'supervisor'):
+                answer, _ = self.client.chat_with_metadata(
+                    'Independently audit a published-reference claim against exact repository source '
+                    'citations and frozen native task/evaluator. No edits or native execution. '
+                    'Reject unrelated weights/family/task/revision, incorrect metric units, changed '
+                    'evaluation semantics, unsupported expected scores or excessively broad tolerance. '
+                    'Availability may be genuinely absent; require evidence, not a shortcut around '
+                    'publicly obtainable resources. Provenance review is NOT proof of performance. '
+                    'Return JSON booleans sources_supported, protocol_matches, tolerance_supported, '
+                    'release_identity_supported, unavailability_supported, plus why and citations '
+                    'as exact {ref,quote} pairs from the supplied sources. Do not claim external '
+                    'release bytes were cryptographically verified without independent release hashes.',
+                    json.dumps(_controller_model_value(context, local_roots=(self.repo,self.output)), ensure_ascii=False),
+                    max_tokens=1800, read_only=True, include_research_context=False)
+            review = _object(answer)
+            citations = review.get('citations')
+            if (not isinstance(citations, list) or not citations or any(
+                    not any(c.get('ref') == x['ref'] and c.get('quote') == x['quote']
+                            for x in spec['source_refs']) for c in citations if isinstance(c,dict))
+                    or any(not isinstance(c,dict) for c in citations)):
+                raise ValueError('Supervisor must cite exact supplied reference evidence')
+            if refs.source_evidence(self.repo, spec['source_refs']) != spec['source_refs']:
+                raise ValueError('reference citations changed during review')
+            row = refs.register(self.output, spec, review, frozen_checkpoint=frozen)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            return {'outcome': 'not attempted', 'because': f'baseline reference refused: {exc}'[:700]}
+        return {'outcome': 'reviewed', 'because': 'provenance review recorded; performance is not yet reproduced',
+                'reference_id': row['id'], 'reference_status': row['status'],
+                'evidence_refs': [f'baseline_references/{row["id"]}.json']}
+
+    def _step_evaluate_baseline_reference(self, *, reference_id: str,
+                                         retry_reason: str = '') -> dict[str, Any]:
+        from . import baseline_reference as refs
+        from .native_jobs import active_jobs
+        if active_jobs(self.output) or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
+            return {'outcome': 'not attempted', 'because': 'active native job or held-out boundary forbids reference evaluation'}
+        research, _ = self._research_controller()
+        try:
+            handoff = refs.handoff(self.output, reference_id)
+            spec = read_json(self.output/'baseline_references'/(reference_id+'.json'))['reference']
+            if refs.source_evidence(self.repo,spec['source_refs']) != spec['source_refs']:
+                raise ValueError('reference source evidence changed')
+            registry = read_json(self.output/'baseline_references'/(reference_id+'.json'))
+            if registry.get('status') == 'evaluating':
+                pending = registry.get('pending_measurement_ref') or ''
+                rel = Path(pending)
+                if rel.is_absolute() or '..' in rel.parts or not pending:
+                    raise ValueError('unsafe pending reference measurement')
+                result = refs.complete(self.output, reference_id, read_json(self.output/rel), pending)
+                return {'outcome':'reconciled', 'reference_status':result['status'],
+                        'because':'sealed reference measurement reconciled without replaying native evaluation',
+                        'evidence_refs':[pending,result['record_ref']]}
+            session_path = research.run_root/'controller_session.json'
+            session = read_json(session_path) if session_path.is_file() else None
+            settings = (session.get('base_settings') if session else
+                        {k:v for k,v in self.base_settings.items() if not k.startswith('_')})
+            if session and (session.get('status') not in {'paused','completed'} or session.get('pending_action')):
+                raise ValueError('research session is not idle')
+            label = 'reference_'+uuid.uuid4().hex[:16]
+            measurement_ref = f'research/{self.run_id}/measurements/{label}.json'
+            refs.begin(self.output, reference_id, measurement_ref=measurement_ref, retry_reason=retry_reason)
+            measurement = research.measure(settings=settings, label=label,
+                _reference_checkpoint=Path(handoff['selected_path']))
+            result = refs.complete(self.output, reference_id, measurement, measurement_ref)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            return {'outcome': 'not attempted', 'because': f'reference evaluation refused: {exc}'[:700]}
+        return {'outcome': 'measured' if measurement.get('ok') else 'reference failed',
+                'because': 'reference evaluated separately; original baseline/history/best unchanged',
+                'reference_status': result['status'], 'metric_value': result.get('measured_metric'),
+                'verification_level': 'development_reference',
+                'evidence_id': (measurement.get('evaluate')or{}).get('evidence_id'),
+                'evidence_refs': [measurement_ref,result['record_ref']]}
+
+    def _step_extend_research_rounds(self, *, additional_rounds: int,
+                                    expected_rounds: int, reason: str) -> dict[str, Any]:
+        from .round_extension import extend
+        from .runtime_freshness import current_model_budget
+        model = current_model_budget(self.output, self.run_id)
+        if model.get('remaining_usd', 0) <= 0:
+            return {'outcome': 'not attempted', 'because': 'no verified remaining total model budget'}
+        gpu_path = self.output/'task_gpu_budget.json'
+        if gpu_path.is_file():
+            from .task_budget import TaskGPUBudget
+            if TaskGPUBudget(self.output).snapshot()['available_gpu_seconds'] <= 0:
+                return {'outcome': 'not attempted', 'because': 'total GPU budget exhausted'}
+        research, _ = self._research_controller()
+        try:
+            result = extend(research, additional_rounds=additional_rounds,
+                            expected_rounds=expected_rounds, reason=reason)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {'outcome': 'not attempted', 'because': f'round extension refused: {exc}'[:700]}
+        return {'outcome': 'extended', 'because': 'development allocation extended; original baseline and total budgets unchanged',
+                'planned_rounds': result['new_rounds'], 'extension_id': result['id'],
+                'evidence_refs': [f'research/{self.run_id}/round_extensions/{result["id"]}.json']}
+
     def _do_operation(self, step: str, **arguments: Any) -> dict[str, Any]:
         """Take one step. Never raises: a step that fails is a step that failed.
 
@@ -3282,7 +3904,7 @@ class Preparation:
                 if step == "research_task":
                     validate_task(arguments)
                     if (self.state().get("research_progress") and
-                            arguments["role"] not in READ_ONLY_ROLES):
+                            arguments["role"] not in READ_ONLY_ROLES and arguments.get("mode") != "inspect"):
                         return {"outcome": "rejected", "because":
                                 "existing research requires a read-only task role; code "
                                 "changes must use the audited candidate path"}
@@ -3337,7 +3959,7 @@ class Preparation:
                     "recovery_attempt_id": recovery.get("attempt_id")}
         if step == "retry_failed_action" and not self._repair_retry_available():
             return {"outcome": "not attempted", "because":
-                    "no unused, repair-attempted AgentFix handoff names a failed operation"}
+                    "no unused repair or sealed planning handoff names a failed operation"}
         if step in {"submit_native_job", "inspect_native_job", "adjust_native_job",
                     "cancel_native_job"}:
             if not getattr(self.client, "supports_main_agent", False):
@@ -3347,6 +3969,18 @@ class Preparation:
             current = self.state()
             progress = current.get("research_progress") or {}
             options = current.get("research_options") or {}
+            baseline_adoption = (step == 'run_the_loop' and arguments.get('job_id')
+                and not arguments.get('idea_label') and progress.get('status') == 'paused'
+                and any(row.get('job_id') == arguments['job_id']
+                        for row in current.get('native_job_baseline_recovery') or []
+                        if isinstance(row, dict)))
+            if (step == 'run_the_loop' and not progress and
+                    (current.get('native_identity_schema') or {}).get('status') == 'incompatible'):
+                return {'outcome':'not attempted', 'because':
+                        'Native identity logging is incompatible with the executor contract. '
+                        'Repair the reported schema through Init/Fix before protocol freeze, '
+                        'then reverify; do not change actions or scoring.',
+                        'native_identity_schema':current['native_identity_schema']}
             if step in {"generate_research_ideas", "propose_research_idea"} and \
                     progress.get("status") != "paused":
                 return {"outcome": "not attempted",
@@ -3361,7 +3995,7 @@ class Preparation:
                         "because": "a fresh suggestion batch was already requested for this "
                                   "paused research round; formulate a different main-controller "
                                   "proposal or state why no safe action remains"}
-            if step == "run_the_loop" and progress.get("status") == "paused":
+            if step == "run_the_loop" and progress.get("status") == "paused" and not baseline_adoption:
                 label = arguments.get("idea_label")
                 selectable = {str(row.get("label")) for row in options.get("items") or []
                               if isinstance(row, dict)}
@@ -3376,7 +4010,8 @@ class Preparation:
                         "because": "idea_label is only valid when resuming a paused candidate "
                                   "round; baseline, recovery, and finalization do not consume it"}
             if step == "run_the_loop" and arguments.get("job_id") and \
-                    (progress.get("status") or arguments.get("idea_label")):
+                    (progress.get("status") or arguments.get("idea_label")) and not baseline_adoption \
+                    and not (progress.get('status') == 'paused' and arguments.get('idea_label')):
                 return {"outcome": "not attempted", "because":
                         "a detached trainer can only be adopted before the initial baseline"}
         handler = getattr(self, f"_step_{step}", None)
@@ -3385,25 +4020,20 @@ class Preparation:
         # The scheduler chooses an operation, but cannot extend its input contract by
         # inventing arguments. A stray `stage` on a repository survey used to raise and
         # consume another preparation step even though the survey itself needed no input.
-        arguments = (arguments if step in {"research_task", "submit_research_task", "cancel_research_task", "update_research_plan", "review_report_demo", "capture_environment_demo",
+        arguments = (arguments if step in {'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds", "propose_harness_repair", "research_task", "submit_research_task", "cancel_research_task", "update_research_plan", "review_report_demo", "capture_environment_demo",
                                          "configure_screening", "run_screening_trial", "inspect_screening",
                                          "submit_native_job", "inspect_native_job",
                                          "adjust_native_job", "cancel_native_job"}
-                     else {"max_operations": arguments["max_operations"]}
-                     if step == "build_the_environment" and "max_operations" in arguments
-                     else {"stage": arguments["stage"], **(
-                         {"timeout_seconds": arguments["timeout_seconds"]}
-                         if "timeout_seconds" in arguments else {})}
+                     else {key: arguments[key] for key in ("max_operations", "repair_proposal", "operation_timeout_seconds",
+                         "base_environment_id", "base_environment_mode", "environment_selection_reason", "source_binding_ids") if key in arguments}
+                     if step == "build_the_environment"
+                     else {"stage": arguments["stage"], **{key:arguments[key] for key in
+                         ('timeout_seconds','agent_timeout_seconds','checkpoint_ref','draft_ref','reference_id') if key in arguments}}
                      if step == "derive_a_command"
                      and isinstance(arguments.get("stage"), str) and arguments["stage"]
-                     else {"idea_label": arguments["idea_label"]}
-                     if step == "run_the_loop" and
-                     isinstance(arguments.get("idea_label"), str) and
-                     arguments["idea_label"]
-                     else {"job_id": arguments["job_id"]}
-                     if step == "run_the_loop" and
-                     isinstance(arguments.get("job_id"), str) and
-                     arguments["job_id"]
+                     else {key: arguments[key] for key in ('idea_label', 'job_id', 'training_settings')
+                           if key in arguments}
+                     if step == "run_the_loop"
                      else {"idea": arguments["idea"]}
                      if step == "propose_research_idea" and
                      isinstance(arguments.get("idea"), dict)
@@ -3412,6 +4042,17 @@ class Preparation:
                      isinstance(arguments.get("reason"), str)
                      else {"because": arguments["because"]} if step == "stop"
                      and isinstance(arguments.get("because"), str) else {})
+        import inspect
+        signature = inspect.signature(handler)
+        try:
+            signature.bind(**arguments)
+            if not any(p.kind == p.VAR_KEYWORD for p in signature.parameters.values()):
+                from .operation_contracts import schema, validate
+                validate(schema(handler), arguments)
+        except (TypeError, ValueError) as exc:
+            return {'outcome': 'not attempted', 'failure_category': 'operation_arguments_invalid',
+                    'because': f'{step} argument contract: {exc}; correct the request, not native code',
+                    'allowed_arguments': list(signature.parameters)}
         try:
             # The opt-in coding-agent runtime uses one persistent session per AutoSOTA
             # responsibility.  Legacy chat clients do not expose a role scope and remain
@@ -3486,6 +4127,20 @@ class Preparation:
                 result["agent_status"] = agent_status
             if failure_category:
                 result["failure_category"] = failure_category
+            runtime_failure = getattr(exc, "runtime_failure", {}) or {}
+            if runtime_failure:
+                result.update(evidence_id=runtime_failure.get("evidence_id"),
+                    evidence_refs=[runtime_failure["evidence_ref"]],
+                    runtime_failure=runtime_failure,
+                    failure_fingerprint=runtime_failure.get("fingerprint"))
+            planning_failure = getattr(exc, "planning_failure", {}) or {}
+            if planning_failure:
+                result.update(failure_domain="framework_plan",
+                              repair_owner=planning_failure.get('repair_owner','environment_planner'),
+                              failure_category="environment_plan_invalid")
+                if planning_failure.get("evidence_ref"):
+                    result.update(evidence_id=planning_failure["evidence_id"],
+                                  evidence_refs=[planning_failure["evidence_ref"]])
             run_budget = getattr(exc, "run_budget", None)
             if isinstance(run_budget, dict):
                 result["run_budget"] = {
@@ -3505,6 +4160,22 @@ class Preparation:
         if (self.state_persistence_error or
                 not callable(getattr(self.client, "as_role", None))):
             return False
+        if failure.get('failure_category') in {'resource_boundary_unproven','invalid_stop_scope'}:
+            # Format repair is Scheduler's job, not another expensive Monitor survey.
+            # Count across monitor/prose interleaving and persist across relaunches.
+            gate_path = self.output / 'agent/resource_boundary_retry.json'
+            gate = read_json(gate_path) if gate_path.is_file() else {}
+            identity = object_digest({'evidence':failure.get('evidence_id'),
+                'environment':read_json(self.output / 'environment.json').get('interpreter')
+                if (self.output / 'environment.json').is_file() else ''})
+            count = int(gate.get('attempts', 0)) + 1 if gate.get('identity') == identity else 1
+            atomic_json(gate_path, {'identity':identity, 'attempts':count, 'at':now()})
+            self.last_action = {**failure, 'finished_at':now(),
+                'recovery':{'status':'retry_pending' if count < 3 else 'blocked',
+                    'reason':'correct only the rejected resource assessment fields; no new scan or monitor required'}}
+            self.current_action = {}
+            self._persist_run_state(status='running' if count < 3 else 'paused')
+            return count < 3
         # Stable pre-launch evidence is separate from model/session event references:
         # no CLI process (and hence no such event) necessarily exists yet.
         fingerprint = failure.get("failure_fingerprint")
@@ -3513,17 +4184,32 @@ class Preparation:
             if guard_path.is_symlink():
                 raise ValueError("runtime recovery gate is unsafe")
             gate = read_json(guard_path) if guard_path.is_file() else {}
+            recovery_version = None
+            if failure.get('failure_category') == 'workspace_guard':
+                from . import runtime_recovery
+                recovery_version = digest(Path(runtime_recovery.__file__))
             transient = failure.get("failure_category") in {
                 "TimeoutError", "ConnectionError", "BrokenPipeError", "ConnectionResetError",
                 "ConnectionAbortedError", "provider_or_tool_error", "wall_timeout", "admission_wait"}
+            transient = transient or failure.get("failure_category") == "provider_transport"
             attempts = int(gate.get("attempts", 0)) + 1 if gate.get("fingerprint") == fingerprint else 1
-            if gate.get("fingerprint") == fingerprint and (not transient or attempts > 3):
+            same_recovery = (recovery_version is None or
+                             gate.get('recovery_version') == recovery_version)
+            if gate.get("fingerprint") == fingerprint and same_recovery and (not transient or attempts > 3):
                 failure["recovery"] = {"status": "blocked", "reason":
                     "same startup fault already assessed; repair the recorded cause before retry"}
                 atomic_json(self.output / "runtime_blocker.json", failure)
                 return False
             atomic_json(guard_path, {"fingerprint": fingerprint, "at": now(), "attempts": attempts,
-                                    "evidence_id": failure.get("evidence_id")})
+                                    "evidence_id": failure.get("evidence_id"),
+                                    "recovery_version": recovery_version})
+            if failure.get("failure_category") == "provider_transport":
+                # No benchmark action ran. Retry the decision at most three times;
+                # do not invoke Monitor/Fix through the same unavailable transport.
+                failure["recovery"] = {"status": "retry_pending", "attempt": attempts,
+                    "reason": "bounded provider transport retry; request costs remain reserved"}
+                atomic_json(self.output / "runtime_blocker.json", failure)
+                return True
             if failure.get("failure_category") == "workspace_guard":
                 try:
                     from .runtime_recovery import recover
@@ -3578,12 +4264,17 @@ class Preparation:
         if not callable(getattr(self.client, "as_role", None)):
             return None
         facts = self.state()
+        from .operation_contracts import schema
+        from .experiment_view import view as experiment_view
+        facts['experiment_lifecycle'] = experiment_view(self.output, self.run_id)
+        facts['operation_contracts'] = {name:schema(getattr(self,f'_step_{name}'))
+            for name in facts.get('available',[]) if callable(getattr(self,f'_step_{name}',None))}
         self._publish_main_context(facts)
         payload = {
             "run_id": self.run_id,
             "action_id": action_id,
             "failed_action": action,
-            "recent_actions": (facts.get("steps_taken") or [])[-6:],
+            "recent_actions": (facts.get("recent_actions") or [])[-6:],
             "environment": facts.get("environment"),
             "surveyed_stages": facts.get("surveyed_stages"),
             "to_measure": facts.get("to_measure"),
@@ -3658,6 +4349,9 @@ class Preparation:
                         "run_id", "limit_usd", "spent_usd", "reserved_usd",
                         "remaining_usd", "unknown_entries", "entry_count")
                     if key in run_budget}
+        if status == 'budget_exhausted' and self._await_model_settlement():
+            status = observation['status'] = 'unavailable'
+            observation['guidance'] = 'Monitor unavailable; settled budget permits Scheduler recovery. No native outcome inferred.'
         self.monitor_observation = observation
         try:
             stored = self.state_store.record(
@@ -3678,6 +4372,35 @@ class Preparation:
                 f"{type(exc).__name__}: {exc}")[:400]
         return observation
 
+    def _await_model_settlement(self) -> bool:
+        """Wait once per rejected allowance, only for real outstanding reservations."""
+        from .agent_budget import AgentCostLedger
+        path = self.output / 'agent/cost_ledger.json'
+        retries = getattr(self, '_settlement_retries', 0)
+        if not path.is_file() or path.is_symlink():
+            return False
+        raw = read_json(path)
+        self._budget_settlement_pending = any(row['status'] in {'reserved','unknown'}
+            for row in raw.get('entries', []))
+        if retries >= 2:
+            return False
+        allowance = min(30, self.budget.remaining()) if self.budget else 30
+        if allowance <= 0:
+            return False
+        ledger = AgentCostLedger(self.output, run_id=raw['run_id'], limit_usd=raw['limit_usd'],
+                                 cost_basis=raw.get('cost_basis', 'cli_reported'))
+        ledger.reconcile_receipts(apply=True)
+        raw = read_json(path)
+        self._persist_run_state(status='budget_waiting')
+        result = ledger.wait_for_settlement(timeout=allowance)
+        atomic_json(self.output / 'agent/budget_wait.json', {**result, 'at':now()})
+        self._budget_settlement_pending = (result['status'] != 'available' and
+            any(row['status'] in {'reserved','unknown'} for row in raw.get('entries', [])))
+        if result['status'] == 'available':
+            self._settlement_retries = retries + 1
+            return True
+        return False
+
     def _fix_failed_action(self, *, action_id: str,
                            action: dict[str, Any]) -> dict[str, Any] | None:
         """Delegate one recoverable onboarding failure to AgentFix.
@@ -3687,6 +4410,11 @@ class Preparation:
         inspect its report and choose whether to retry the original action. Expensive native
         train/evaluate jobs and confirmation actions are never replayed by this hook.
         """
+        if action.get("repair_owner") in {"environment_planner", "environment_executor"}:
+            # Proposal failures belong to the planner; native install failures already
+            # enter the provisioner's Fix/repair queue. Do not duplicate either route
+            # with a checkout-only source repair detached from the actual installer.
+            return None
         if (not getattr(self.client, "supports_agent_fix", False) or
                 not callable(getattr(self.client, "as_role", None))):
             return None
@@ -3707,7 +4435,7 @@ class Preparation:
             "failed_action_id": action_id,
             "failed_action": action,
             "failure_receipt_ref": parent_receipt,
-            "recent_actions": (facts.get("steps_taken") or [])[-6:],
+            "recent_actions": (facts.get("recent_actions") or [])[-6:],
             "environment": facts.get("environment"),
             "surveyed_stages": facts.get("surveyed_stages"),
             "to_measure": facts.get("to_measure"),
@@ -3864,6 +4592,35 @@ class Preparation:
             publish({key: value for key, value in facts.items()
                      if key not in {"current_action", "last_decision"}})
 
+    def _native_identity_schema_view(self, stage: str) -> dict[str, Any]:
+        from .policy_consumption import audit_identity_schema
+        unavailable = {'status':'unavailable', 'issues':[],
+                       'authority':'schema inspection only; not consumption or scoring evidence'}
+        if not getattr(self.client, 'supports_main_agent', False):
+            return unavailable
+        path = self.output/'derivation_attempts'/f'{stage}.json'
+        try:
+            if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 2*1024**2:
+                return unavailable
+            accepted = next(row for row in reversed(read_json(path).get('attempts') or [])
+                            if row.get('status') == 'accepted')
+            text = str(accepted.get('said') or '')
+            # Only inspect metadata of a run-owned loader path. This does NOT
+            # choose an artifact or verify its bytes; the formal verifier still does.
+            kind = None
+            for line in text.splitlines():
+                if line.startswith('AUTOSIM_POLICY_LOADED '):
+                    row = json.loads(line[len('AUTOSIM_POLICY_LOADED '):])
+                    policy = Path(str(row.get('path') or ''))
+                    if policy.is_absolute() and policy.resolve().is_relative_to(self.output.resolve()):
+                        kind = 'directory' if policy.is_dir() else 'file' if policy.is_file() else None
+                    break
+            return {**audit_identity_schema(text, policy_kind=kind),
+                    'stage':stage, 'native_evidence_ref':accepted.get('native_evidence_ref'),
+                    'source':'accepted derivation output projection; formal receipt verification still required'}
+        except (OSError, ValueError, TypeError, KeyError, StopIteration, AttributeError):
+            return unavailable
+
     def _save_main_memory(self, memory: dict[str, Any], *, event: str) -> None:
         # This is LOCAL durable evidence, not an outbound model projection. Applying the
         # artifact scrub here would destroy valid .json/.jsonl receipt references forever.
@@ -3911,14 +4668,56 @@ class Preparation:
                              "progress": job.get("progress"), "resources": job.get("resources"),
                              "wait_reason": job.get("wait_reason"),
                              "window_seconds": job.get("window_seconds"),
-                             "failure": result.get("error") or stage_result.get("why"),
+                             "failure": job.get("error") or result.get("error") or stage_result.get("why"),
+                             "ownership_retained": job.get("ownership_retained"),
                              "result_ref": f"native_jobs/{job['job_id']}/result.json" if result else None,
                              "attempt_id": stage_result.get("attempt_id"),
                              "evidence_id": stage_result.get("evidence_id") or result.get("evidence_id"),
                              "job_ref": job.get("job_ref")})
             except (OSError, ValueError, TypeError, KeyError):
-                continue
+                rows.append({"job_id": directory.name, "status": "unreadable",
+                    "worker": "unverifiable", "ownership_retained": directory.name in active,
+                    "failure": "job records unreadable; reconcile ownership before proceeding",
+                    "job_ref": f"native_jobs/{directory.name}/request.json"})
         return rows
+
+    def _completed_baseline_jobs(self) -> list[dict[str, Any]]:
+        """Advisory IDs only; explicit adoption repeats receipt/source/protocol checks."""
+        if not getattr(self.client, 'supports_main_agent', False):
+            return []
+        root = self.output/'research'/self.run_id
+        try:
+            session_path, baseline_path = root/'controller_session.json', root/'measurements/baseline.json'
+            if session_path.is_symlink() or baseline_path.is_symlink():
+                return []
+            session, baseline = read_json(session_path), read_json(baseline_path)
+            history = session.get('history') or []
+            if (session.get('status') != 'paused' or session.get('run_id') != self.run_id
+                    or len(history) != 1 or history[0].get('measured') is True
+                    or baseline.get('ok') is True or baseline.get('where') != 'train'):
+                return []
+            from .native_jobs import status
+            jobs = []
+            directories = sorted((self.output/'native_jobs').iterdir(),
+                                 key=lambda p:p.stat().st_mtime, reverse=True)
+            for directory in directories[:12]:
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                request_path = directory/'request.json'
+                if request_path.is_symlink():
+                    continue
+                request = read_json(request_path)
+                job = status(self.output, directory.name)
+                result = (job.get('result') or {}).get('stage_result') or {}
+                if (job.get('status') == 'completed' and result.get('stage') == 'train'
+                        and request.get('run_id') == self.run_id and request.get('repo') == str(self.repo)
+                        and request.get('settings') == baseline.get('settings')):
+                    jobs.append({'job_id': directory.name, 'attempt_id': result.get('attempt_id'),
+                        'next': 'inspect_native_job then run_the_loop(job_id), without idea_label',
+                        'scope': 'unscored baseline only; admission repeats all checks'})
+            return jobs
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return []
 
     def _agent_task_view(self) -> list[dict[str, Any]]:
         from .agent_tasks import records
@@ -3945,12 +4744,15 @@ class Preparation:
             reported = True
         return reported
 
-    def _step_submit_research_task(self, *, role: str, task: str, expected_result: str):
+    def _step_submit_research_task(self, *, role: str, task: str, expected_result: str,
+                                   source_paths: list[str] | None = None):
         from .agent_tasks import submit
         try:
             row = submit(self.output, self.repo, self.client,
-                {"role": role, "task": task, "expected_result": expected_result}, self.state(),
-                min(240, self.budget.remaining()) if self.budget else 240)
+                {"role": role, "task": task, "expected_result": expected_result,
+                 **({"source_paths": source_paths} if source_paths is not None else {})}, self.state(),
+                min(float(getattr(self.client, "timeout", 240)), self.budget.remaining())
+                    if self.budget else float(getattr(self.client, "timeout", 240)))
             return {"outcome": "submitted", "because": "read-only investigation runs independently",
                     "task_id": row["id"], "evidence_refs": [f"agent_tasks/{row['id']}/task.json"]}
         except (OSError, ValueError) as exc:
@@ -4013,18 +4815,34 @@ class Preparation:
                 "screening": inspect(self._screening_controller(), study_id)}
 
     def _repair_retry_available(self) -> bool:
-        fix = self.fix_observation
-        if fix.get("status") != "assessed" or fix.get("assessment") != "repair_attempted":
-            return False
-        fix_id = str(fix.get("fix_attempt_id") or "")
-        failed_ref = str(fix.get("failure_receipt_ref") or "")
-        if not fix_id or not failed_ref:
-            return False
-        if any(row.get("step") == "retry_failed_action" and
-               row.get("fix_attempt_id") == fix_id for row in self.steps):
-            return False
-        return any(row.get("receipt_ref") == failed_ref and
-                   row.get("step") in _FIX_ASSISTANCE_STEPS for row in self.steps)
+        target = self._pending_repair()
+        return bool(target and (target["original"].get("replayed_step") or
+                                target["original"].get("step")) in _FIX_ASSISTANCE_STEPS)
+
+    def _pending_repair(self) -> dict[str, Any]:
+        from .recovery_contract import pending
+        return pending(self._environment_epoch_steps(), self.fix_observation)
+
+    def _environment_epoch_steps(self) -> list[dict]:
+        """Keep old receipts in history, not in the active environment obligation."""
+        boundary = next((i for i in range(len(self.steps)-1, -1, -1)
+            if self.steps[i].get('step') == 'build_the_environment'
+            and (self.steps[i].get('arguments') or {}).get('base_environment_id')
+            and self.steps[i].get('outcome') in {'checkpoint','done'}), 0)
+        return self.steps[boundary:]
+
+    def _recovery_transaction(self) -> dict[str, Any]:
+        from .recovery_contract import view
+        result = view(self._environment_epoch_steps(), self.fix_observation)
+        path = self.output / 'provision_cursor.json'
+        if path.is_file() and not path.is_symlink():
+            cursor = read_json(path)
+            held = read_json(self.output / 'environment.json') if (self.output / 'environment.json').is_file() else {}
+            if cursor.get('prefix') and cursor.get('pending') and not provision.latest_failure(self.output, held):
+                result.update(status='pending_environment_setup', pending=None, unresolved_failure=None,
+                              next_action='build_the_environment',
+                              required_input='continue current queue without repair_proposal; old failures are historical')
+        return result
 
     def _task_gpu_budget_view(self) -> dict[str, Any] | None:
         from .task_budget import TaskGPUBudget
@@ -4033,12 +4851,44 @@ class Preparation:
         return None
 
     def _step_submit_native_job(self, *, stage: str, window_seconds: float,
-                                reason: str, resources: dict | None = None) -> dict[str, Any]:
+                                reason: str, resources: dict | None = None,
+                                training_settings: dict[str, Any] | None = None,
+                                idea_label: str = '') -> dict[str, Any]:
         from .native_jobs import submit
         from .repository_budget import RepositoryBudget
         if stage not in self.stages:
             return {"outcome": "not attempted", "because":
                     "only a verified native stage may be submitted"}
+        settings = {key: value for key, value in self.base_settings.items()
+                    if not key.startswith('_')}
+        candidate_binding = None
+        if idea_label:
+            try:
+                from .candidate_jobs import allocation
+                if stage != 'train':
+                    raise ValueError('candidate job must use the train stage')
+                research, _ = self._research_controller()
+                candidate_binding = allocation(research, idea_label,training_settings)
+                settings = candidate_binding['settings']
+            except (OSError, ValueError, RuntimeError) as exc:
+                return {'outcome':'rejected', 'because':f'candidate job refused: {exc}'[:700]}
+        if training_settings is not None and not candidate_binding:
+            if stage != 'train' or not isinstance(training_settings, dict) or not training_settings:
+                return {'outcome': 'not attempted', 'because': 'training_settings requires a train job and nonempty mapping'}
+            research, _ = self._research_controller()
+            axes = {axis.name: axis for axis in research.space.training}
+            from .training_work import consumes_steps, missing_formal_work
+            source = research.sources.get('train', '')
+            for key, value in training_settings.items():
+                valid = (axes[key].accepts(value) if key in axes else
+                         key == 'steps' and consumes_steps(source) and
+                         isinstance(value, int) and not isinstance(value, bool) and value > 0)
+                if not valid:
+                    return {'outcome': 'not attempted', 'because': f'invalid or undeclared learning setting: {key}'}
+            settings.update(training_settings)
+            problem = missing_formal_work(source, research._inputs('train', settings=settings))
+            if problem:
+                return {'outcome': 'not attempted', 'because': problem}
         # Legacy studies retain their original repository reservation. New task-scoped
         # studies reserve GPU time only when the worker acquires the physical device.
         from .derive_and_run import ROOT
@@ -4052,12 +4902,11 @@ class Preparation:
         except (OSError, ValueError, TypeError) as exc:
             return {"outcome": "blocked", "because":
                     f"repository GPU reservation refused job: {exc}"[:500]}
-        settings = {key: value for key, value in self.base_settings.items()
-                    if not key.startswith("_")}
         try:
             job = submit(self.output, repo=self.repo, stage=stage,
                          settings=settings, requested_seconds=window_seconds,
-                         reason=reason, run_id=self.run_id, resources=resources)
+                         reason=reason, run_id=self.run_id, resources=resources,
+                         **({'candidate_binding':candidate_binding} if candidate_binding else {}))
         except (OSError, ValueError, TypeError) as exc:
             return {"outcome": "rejected", "because":
                     f"native job refused: {type(exc).__name__}: {exc}"[:600]}
@@ -4072,7 +4921,22 @@ class Preparation:
         except (OSError, ValueError, TypeError) as exc:
             return {"outcome": "rejected", "because":
                     f"job status unavailable: {type(exc).__name__}: {exc}"[:500]}
+        review = {}
+        result = (job.get('result') or {}).get('stage_result') or {}
+        if job.get('status') == 'completed' and result.get('stage') == 'train':
+            research, _ = self._research_controller()
+            request = read_json(self.output/'native_jobs'/job_id/'request.json')
+            from .native_jobs import source_identity
+            if (request.get('repo') == str(self.repo) and request.get('run_id') == self.run_id
+                    and request.get('source_identity') == source_identity(self.output, self.repo)):
+                proof = research._verified_training_receipt(str(result.get('attempt_id') or ''),
+                    request.get('settings') or {}, audit_progress=True)
+                review = {'training_progress_review': {
+                    'status': 'verified' if proof else 'unverified',
+                    'revalidation_ref': (proof or {}).get('training_progress_revalidation_ref'),
+                    'scope': 'completed training only; not a score'}}
         return {"outcome": "observed", "because": f"native job {job['status']}",
+                **review,
                 **job, "evidence_refs": [job["job_ref"]]}
 
     def _step_adjust_native_job(self, *, job_id: str, window_seconds: float,
@@ -4104,21 +4968,31 @@ class Preparation:
         if not self._repair_retry_available():
             return {"outcome": "not attempted", "because":
                     "no unused repair handoff matches a failed action"}
-        fix = dict(self.fix_observation)
-        original = next(row for row in reversed(self.steps)
-                        if row.get("receipt_ref") == fix["failure_receipt_ref"])
-        original_step = str(original["step"])
-        arguments = original.get("arguments") or {}
+        target = self._pending_repair()
+        original = target["original"]
+        original_step = str(original.get("replayed_step") or original["step"])
+        arguments = original.get("replayed_arguments") or original.get("arguments") or {}
         if not isinstance(arguments, dict):
             arguments = {}
         result = self.do(original_step, **arguments)
-        return {"outcome": "reverified" if result.get("outcome") == "done" else
-                "reverification_failed",
+        outcome = result.get("outcome")
+        return {"outcome": ("reverified" if outcome in {"done", "already done"} else
+                            "revalidation_in_progress" if outcome == "checkpoint" else
+                            "reverification_failed"),
                 "because": (f"original {original_step} returned "
                             f"{result.get('outcome')}: {result.get('because') or ''}")[:800],
-                "fix_attempt_id": fix.get("fix_attempt_id"),
+                "fix_attempt_id": target.get("fix_attempt_id"),
+                "recovery_parent_ref": target["failure_receipt_ref"],
+                "recovery_owner": target["owner"],
                 "replayed_step": original_step,
+                "replayed_arguments": arguments,
                 "original_outcome": result.get("outcome"),
+                "original_failure_reason": result.get("because"),
+                "attempt_ids": result.get("attempt_ids") or [],
+                "evidence_id": result.get("evidence_id"),
+                "failure_domain": result.get("failure_domain"),
+                "native_operation": result.get("native_operation"),
+                "repair_owner": result.get("repair_owner"),
                 "evidence_refs": result.get("evidence_refs") or []}
 
     def _step_review_report_demo(self, *, request_id: str, decision: str,
@@ -4178,6 +5052,10 @@ class Preparation:
                                        resource: str) -> dict[str, Any]:
         from . import recorder, environment_demo
         from .native_jobs import active_jobs
+        if not (self.output / "native_context.json").is_file():
+            return {"outcome": "blocked", "because":
+                    "native environment is not published; build_the_environment first; "
+                    "a demo cannot bootstrap the interpreter"}
         request = next((r for r in recorder.pending_requests(self.output)
                         if r.get("id") == request_id and r.get("kind") == "environment_smoke"), None)
         if request is None or active_jobs(self.output):
@@ -4214,25 +5092,40 @@ class Preparation:
 
     def _step_update_research_plan(self, *, plan: dict[str, Any]) -> dict[str, Any]:
         from .main_agent import validate_plan
-        self._save_main_memory({**self.main_agent, "plan": validate_plan(plan)},
+        checked = validate_plan(plan)
+        self._save_main_memory({**self.main_agent, "plan": checked},
                                event="plan_updated")
+        if checked.get("data_strategy"):
+            atomic_json(self.output / "data_strategy.json", {
+                **checked["data_strategy"], "updated_at": now(), "run_id": self.run_id})
         return {"outcome": "recorded", "because": "global working plan persisted; "
                 "frozen benchmark objective and verified facts are unchanged",
                 "evidence_refs": ["run_state.json#phases.main_agent.memory.plan"]}
 
+    def _step_propose_harness_repair(self, *, evidence_id: str,
+                                   diagnosis: str) -> dict[str, Any]:
+        from .harness_repair import propose
+        return propose(self.output, self.client, evidence_id=evidence_id, diagnosis=diagnosis)
+
+    def _harness_repair_status(self) -> dict[str, Any]:
+        from .harness_repair import status
+        return status(self.output)
+
     def _step_research_task(self, *, role: str, task: str,
-                            expected_result: str) -> dict[str, Any]:
+                            expected_result: str, mode: str = "edit",
+                            timeout_seconds: float | None = None) -> dict[str, Any]:
         from .agent_client import role_scope
         from .main_agent import READ_ONLY_ROLES, TASK_SYSTEM, validate_report
         from .execution_derive import _object
 
         from .native_jobs import active_jobs
-        if role not in READ_ONLY_ROLES and active_jobs(self.output):
+        editable = role not in READ_ONLY_ROLES and mode != "inspect"
+        if editable and active_jobs(self.output):
             return {"outcome": "blocked", "because":
                     "an unresolved native job owns this checkout; editable research must wait"}
 
         task_id = uuid.uuid4().hex
-        if role not in READ_ONLY_ROLES:
+        if editable:
             self._save_main_memory({**self.main_agent, "checkout_needs_resurvey": True,
                                    "metric_revalidation_required": True,
                                    "last_editable_task_id": task_id},
@@ -4259,15 +5152,23 @@ class Preparation:
         facts = self.state()
         self._publish_main_context(facts)
         payload = _controller_model_value({
-            "assignment": {"role": role, "task": task, "expected_result": expected_result},
+            "assignment": {"role": role, "task": task, "expected_result": expected_result, "mode": mode},
             "state": facts,
         }, local_roots=(self.repo, self.output))
-        timeout = max(1, min(240, int(self.budget.remaining()))) if self.budget else 240
+        configured = float(getattr(self.client, "timeout", 240))
+        if timeout_seconds is not None:
+            configured = min(configured, timeout_seconds)
+        timeout = max(1, min(configured, self.budget.remaining())) if self.budget else configured
+        task_started = time.monotonic()
         with role_scope(self.client, role):
             content, metadata = self.client.chat_with_metadata(
                 TASK_SYSTEM, json.dumps(payload, ensure_ascii=False, default=str),
-                max_tokens=4000, timeout=timeout, include_research_context=False)
-        report = validate_report(_object(content))
+                max_tokens=4000, timeout=timeout, include_research_context=False,
+                **({"read_only": True} if mode == "inspect" else {}))
+            from .main_agent import receive_report
+            report = receive_report(content, client=self.client, output=self.output,
+                workspace=self.repo, timeout=max(1, timeout-(time.monotonic()-task_started)),
+                metadata=metadata)
         runtime_refs: list[str] = []
         metadata = metadata if isinstance(metadata, dict) else {}
         turn_id = str(metadata.get("turn_id") or "")
@@ -4343,7 +5244,13 @@ class Preparation:
                            f"{len(refused)} refused",
                 "declaration": name}
 
-    def _step_build_the_environment(self, *, max_operations: int = 1) -> dict[str, Any]:
+    def _step_build_the_environment(self, *, max_operations: int = 1,
+                                   repair_proposal: dict | None = None,
+                                   operation_timeout_seconds: float | None = None,
+                                   base_environment_id: str | None = None,
+                                   base_environment_mode: str = 'clone',
+                                   environment_selection_reason: str = '',
+                                   source_binding_ids: list[str] | None = None) -> dict[str, Any]:
         """Build or re-verify an environment, keeping only the commands that worked.
 
         A valid, unrebutted passing record is reused. A later failed native-stage derivation
@@ -4354,6 +5261,14 @@ class Preparation:
         """
         if isinstance(max_operations, bool) or not isinstance(max_operations, int) or not 1 <= max_operations <= 64:
             return {"outcome": "rejected", "because": "max_operations must be an integer within 1..64"}
+        if base_environment_id is not None and self.stages:
+            return {'outcome':'rejected', 'because':'base switching is onboarding-only; verified stage commands require explicit re-derivation, not environment substitution'}
+        if operation_timeout_seconds is not None:
+            import math
+            if (isinstance(operation_timeout_seconds, bool) or not isinstance(operation_timeout_seconds, (int, float))
+                    or not math.isfinite(operation_timeout_seconds) or operation_timeout_seconds <= 0
+                    or self.budget is None):
+                return {"outcome": "rejected", "because": "install window needs a finite positive value and an existing hard run budget"}
         record = self.output / "environment.json"
         held: dict[str, Any] = {}
         if record.is_file():
@@ -4375,20 +5290,37 @@ class Preparation:
             name: {"entrypoint": str(row.get("entrypoint") or "")}
             for name, row in stage_rows.items() if row.get("entrypoint")}}
         probes_to_check = held.get("probes") or probe_document.get("probes") or []
-        probe_faults = [provision.probe_stage_violation(probe, probe_context)
+        probe_faults = [provision.consumer_or_asset_violation(probe, probe_context,
+                        held.get('assets') or probe_document.get('assets'))
                         for probe in probes_to_check if isinstance(probe, str)]
         probe_faults = [fault for fault in probe_faults if fault]
         later_stage_failure = _last_stage_failure_after_build(
             self.steps, self.output, self.run_id)
         native_path = self.output / "native_context.json"
-        native_identity = read_json(native_path).get("identity") if native_path.is_file() else None
+        planner_context_error = None
+        try:
+            native_identity = read_json(native_path).get("identity") if native_path.is_file() else None
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            native_identity = None
+            planner_context_error = str(exc)
         verified_stages = held.get("verified_entrypoints") or {}
         verified_context = {"stage_paths": {name: row for name, row in probe_context["stage_paths"].items()
                                             if name in verified_stages}}
-        context_changed = bool(held.get("verified_native_context") and
+        context_changed = bool(planner_context_error or (held.get("verified_native_context") and
             (held["verified_native_context"] != native_identity or
-             verified_stages != provision.source_context_hashes(self.repo, verified_context)))
-        if ((held.get("verdict") or {}).get("passed") and self.interpreter and
+             verified_stages != provision.source_context_hashes(self.repo, verified_context))))
+        if self.interpreter and (Path(self.interpreter).parent.parent/'overlay.json').is_file() and not native_path.is_file():
+            context_changed = True
+            planner_context_error = 'overlay native context is missing; original consumers require revalidation'
+        if native_path.is_file() and self.interpreter:
+            from .native_context import load_context
+            try:
+                current_native = load_context(self.output, self.repo)
+                context_changed = context_changed or current_native['interpreter'] != str(self.interpreter)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                context_changed = True
+                planner_context_error = str(exc)
+        if (base_environment_id is None and (held.get("verdict") or {}).get("passed") and self.interpreter and
                 not probe_faults and not later_stage_failure and not context_changed):
             return {"outcome": "already done",
                     "because": f"the record holds a passing build and the interpreter at "
@@ -4403,7 +5335,10 @@ class Preparation:
         if not stage_rows:
             return {"outcome": "not attempted", "because":
                     "no surveyed runnable stage; read the checkout before provisioning"}
-        selected = self._select_execution_path()
+        # Environment consumers must be runnable before an external trainer's
+        # save/load implementation can be investigated or exercised. Select the
+        # source-backed graph here, not a proof of a future trained artifact.
+        selected = self._select_execution_path(require_handoff=False)
         available = selected["stages"]
         stage_paths = {name: {"entrypoint": stage_rows[name].get("entrypoint"),
                               "invocation": stage_rows[name].get("invocation"),
@@ -4416,20 +5351,30 @@ class Preparation:
             candidate = Path(declared) if declared else None
             if candidate is not None and not candidate.is_absolute():
                 candidate = self.repo / candidate
-            asset_present[name] = bool(candidate and candidate.exists() and
-                                       not candidate.is_symlink())
+            asset_present[name] = bool(candidate and provision._asset_exists(self.repo, candidate))
         planner_assets = {**needed_assets, "research_context": {
                             "task": self._declared_task(),
                             "available_stages": available,
                             "stage_paths": stage_paths,
                             "selected_asset_keys": selected["asset_keys"],
                             "asset_present_at_declared_path": asset_present,
+                            "workspace_resources": self.state().get("workspace_resources"),
                             "writable_output": str(self.output.resolve()),
                             "selected_path_reason": selected["why"],
                             "dataset_present": asset_present.get("dataset", False),
                             "checkpoint_present": asset_present.get("checkpoint", False)}}
         if later_stage_failure:
             planner_assets["observed_stage_failure"] = later_stage_failure
+        planner_assets['workflow_memory'] = {
+            'input_digest':selected.get('input_digest'), 'stages':selected['stages'],
+            'asset_keys':selected['asset_keys'], 'why':selected.get('why'),
+            'handoff_review':selected.get('handoff_review'),
+            'scope':'source-backed decision memory, not native execution or performance proof',
+            'instruction':'Reuse this reviewed path. Probe consumers; do not repeat unchanged source investigation.'}
+        if context_changed:
+            planner_assets['environment_identity_revalidation'] = {
+                'reason':planner_context_error or 'verified environment or entrypoint identity changed',
+                'instruction':'Preserve local installs and revalidate original consumers; do not reuse old passing probes.'}
         existing_python = self.interpreter
         if existing_python is None:
             recorded_python = str(held.get("interpreter") or "").strip()
@@ -4441,10 +5386,26 @@ class Preparation:
                         assets=planner_assets,
                         budget=self.budget, max_operations=max_operations, compute=self.decision,
                         python=(str(existing_python) if existing_python else
-                                str(self.interpreter_hint) if self.interpreter_hint else None))
+                                str(self.interpreter_hint) if self.interpreter_hint else None),
+                        **({"repair_proposal": repair_proposal} if repair_proposal is not None else {}),
+                        **({'base_environment_id':base_environment_id, 'base_environment_mode':base_environment_mode,
+                            'environment_selection_reason':environment_selection_reason}
+                           if base_environment_id is not None else {}),
+                        **({'source_binding_ids':source_binding_ids} if source_binding_ids is not None else {}),
+                        **({"step_timeout": min(operation_timeout_seconds, self.budget.remaining())}
+                           if operation_timeout_seconds is not None else {}))
         self.interpreter = provision.env_python(self.output)
         if (build_result or {}).get("status") == "yielded":
             latest = build_result.get("latest_attempt") or {}
+            if build_result.get("new_native_operation") is False:
+                rejection = build_result.get("repair_rejection") or {}
+                return {"outcome": "repair proposal rejected", "because":
+                    str(rejection.get("reason") or "No accepted repair; no new native operation launched"),
+                    "failure_domain": "repair_contract", "repair_owner": "scheduler",
+                    "native_operation_launched": False,
+                    "parent_evidence_id": (build_result.get("latest_failure") or {}).get("evidence_id"),
+                    "recovery_revision": build_result.get("recovery_revision"),
+                    "evidence_refs": self._existing_evidence_refs("environment.json", "transcript.json")}
             handoff = {"task_id": "provision-" + str(latest.get("attempt_id") or uuid.uuid4().hex),
                 "role": "init", "task": "原生环境准备", "expected_result": "能力证据或可定位故障",
                 "report": {"summary": "原生准备操作已返回；不代表仿真就绪。",
@@ -4454,13 +5415,34 @@ class Preparation:
                     "authority": "executor_receipt_not_performance_claim"}, "at": now()}
             self._save_main_memory({**self.main_agent, "handoffs":
                 [*(self.main_agent.get("handoffs") or []), handoff][-12:]}, event="provision_checkpoint")
-            return {"outcome": "checkpoint failure" if latest.get("ok") is False else "checkpoint", "because":
+            failed = latest.get("ok") is False
+            failure_refs = [latest["evidence_ref"]] if failed and latest.get("evidence_ref") else []
+            return {"outcome": "checkpoint failure" if failed else "checkpoint", "because":
                     "一次原生准备操作已封存，控制权返回 Scheduler；环境尚未核验。",
+                    "failure_domain": ("native_probe" if latest.get("kind") == "probe" else "native_install") if failed else None,
+                    "repair_owner": "environment_executor" if failed else None,
+                    "evidence_id": latest.get("evidence_id") if failed else None,
+                    "native_operation": ({"attempt_id": latest.get("attempt_id"),
+                        "template": latest.get("probe") or latest.get("template"), "returncode": latest.get("returncode"),
+                        "failure_kind": latest.get("failure_kind")} if failed else None),
                     "pending_commands": build_result.get("pending_commands"),
                     "latest_failure": build_result.get("latest_failure"),
-                    "evidence_refs": self._existing_evidence_refs(
-                        "environment.json", "provision_cursor.json", "native_context.json")}
+                    "evidence_refs": [*failure_refs, *self._existing_evidence_refs(
+                        "environment.json", "provision_cursor.json", "native_context.json")]}
         old_verdict = held.get("verdict") if isinstance(held.get("verdict"), dict) else {}
+        if (build_result or {}).get("verdict", {}).get("passed") is not True:
+            failure = (build_result or {}).get("latest_failure") or {}
+            reason = str((build_result or {}).get("verdict", {}).get("reason") or "environment not verified")
+            return {"outcome": "failed", "because": reason,
+                "failure_domain": ("native_probe" if failure.get("kind") == "probe" else
+                                   "native_install") if failure.get("evidence_id") else "framework_plan",
+                "repair_owner": "environment_executor" if failure.get("evidence_id") else "scheduler",
+                "evidence_id": failure.get("evidence_id"),
+                "native_operation": {"template": failure.get("probe") or failure.get("template"),
+                    "attempt_id": failure.get("attempt_id"), "returncode": failure.get("returncode")},
+                "interpreter": str(self.interpreter) if self.interpreter else None,
+                "evidence_refs": self._existing_evidence_refs("environment.json", "transcript.json",
+                    *([failure["evidence_ref"]] if failure.get("evidence_ref") else []))}
         return {"outcome": "done" if self.interpreter else "no interpreter recorded",
                 "because": f"interpreter: {self.interpreter}" if self.interpreter else
                            ("the re-verification did not restore a passing environment"
@@ -4474,20 +5456,30 @@ class Preparation:
                 "evidence_refs": self._existing_evidence_refs(
                     "environment.json", "selected_path.json")}
 
-    def _select_execution_path(self) -> dict[str, Any]:
+    def _workflow_input_digest(self, answer=None) -> str:
+        """One identity for execution, state presentation and reusable workflow memory."""
+        answer = answer if answer is not None else self.execution or read_json(self.output / "execution.json")
+        rows = {name: row for name, row in (answer.get("stages") or {}).items()
+                if isinstance(row, dict) and row.get("available")}
+        from .native_jobs import source_identity
+        return object_digest({"execution": answer, "declaration": self.declaration,
+                              "task": self._declared_task(), "score_target": self._score_target(),
+                              "source": source_identity(self.output, self.repo),
+                              "entrypoints": provision.source_context_hashes(self.repo, {'stage_paths': rows})})
+
+    def _select_execution_path(self, *, require_handoff: bool = True) -> dict[str, Any]:
         """Choose one producer-to-score path before provisioning optional workflows."""
         answer = self.execution or read_json(self.output / "execution.json")
         rows = {name: row for name, row in (answer.get("stages") or {}).items()
                 if isinstance(row, dict) and row.get("available")}
         target = self._score_target()
         assets = self.declaration.get("assets") or {}
-        identity = object_digest({"execution": answer, "declaration": self.declaration,
-                                  "task": self._declared_task()})
+        identity = self._workflow_input_digest(answer)
         path = self.output / "selected_path.json"
         if path.is_file():
             saved = read_json(path)
             if (saved.get("input_digest") == identity and
-                    (saved.get("handoff_review") or {}).get("compatible") is True):
+                    (not require_handoff or (saved.get("handoff_review") or {}).get("compatible") is True)):
                 if ("checkpoint" in (saved.get("asset_keys") or []) and
                         "train" in (saved.get("stages") or []) and
                         not self._shipped_checkpoint()):
@@ -4621,8 +5613,12 @@ class Preparation:
                                  f"{produced_asset[1]}"})
                 persist_rejections()
                 continue
-            review = self._review_policy_handoff(rows, stages, target, str(picked["why"]))
-            if review.get("compatible") is False:
+            review = (self._review_policy_handoff(rows, stages, target, str(picked["why"]))
+                      if require_handoff else {'status':'pending_evidence', 'compatible':None,
+                          'why':'Environment-only workflow selection; no trained artifact exists yet. '
+                                'Inspect native library/save-load evidence after consumers work; '
+                                'actual policy loading and rollout remain mandatory before scoring.'})
+            if require_handoff and review.get("compatible") is not True:
                 attempts.append({"stages": stages, "why_rejected": str(review.get("why"))[:600]})
                 persist_rejections()
                 continue
@@ -4631,8 +5627,22 @@ class Preparation:
                         "handoff_review": review}
             atomic_json(path, selected)
             return selected
-        raise ValueError("no source-supported train-to-score policy handoff after three "
-                         f"selection attempts: {attempts[-1] if attempts else 'none'}")
+        failure = {'failure_domain':'framework_plan','repair_owner':'workflow_planner',
+                   'native_operation_status':'not_started','attempts':attempts,
+                   'input_digest':identity,'require_handoff':require_handoff}
+        from .common import atomic_text
+        from .evidence_store import capture_attempt_evidence
+        attempt_id = uuid.uuid4().hex
+        ref = f'planning_failures/{attempt_id}.json'
+        log = self.output/f'planning_failures/{attempt_id}.log'
+        atomic_text(log,json.dumps(failure,ensure_ascii=False))
+        failure.update(capture_attempt_evidence(self.output,attempt_id=attempt_id,log=log,
+            receipt_ref=ref,status='proposal_rejected',returncode=None,
+            termination_reason='workflow_plan_invalid'))
+        atomic_json(self.output/ref,failure)
+        requirement = ("train-to-score policy handoff" if require_handoff else "native environment workflow")
+        raise provision.EnvironmentPlanError(f"no source-supported {requirement} after three "
+            f"selection attempts: {attempts[-1] if attempts else 'none'}", failure)
 
     def _review_policy_handoff(self, rows: dict[str, Any], stages: list[str],
                                target: str, reason: str) -> dict[str, Any]:
@@ -4660,11 +5670,29 @@ class Preparation:
         question = ("Determine whether the selected native train stage's exact checkpoint "
                     "format is loadable by the selected native score stage. Same file suffix "
                     "or both being policies is not evidence. If source does not prove a "
-                    "producer→consumer match, return compatible=false. Return JSON with "
-                    "compatible (boolean) and why (specific save/load evidence or mismatch).")
+                    "producer→consumer match, distinguish missing evidence from a proved mismatch. "
+                    "Return JSON with status compatible/incompatible/unknown, compatible true/false/null, "
+                    "why, and missing_evidence. unknown means inspect the native library implementation "
+                    "or perform a bounded save/load test after environment setup, not that the repo cannot run.")
         evidence = {"train": train, "score": score, "selection_reason": reason,
                     "train_source_excerpt": excerpt(train),
                     "score_source_excerpt": excerpt(score)}
+        from .native_jobs import source_identity
+        key = object_digest({'evidence':{k:v for k,v in evidence.items() if k != 'selection_reason'},
+                             'source':source_identity(self.output,self.repo),
+                             'entrypoints':provision.source_context_hashes(self.repo,{'stage_paths':{'train':train,'score':score}}),
+                             'contract':'native_handoff_v3'})
+        cache = self.output/'handoff_reviews'/f'{key}.json'
+        if cache.is_file() and not cache.is_symlink():
+            try:
+                saved = read_json(cache)
+            except (OSError, ValueError, TypeError):
+                saved = {}
+            saved = saved if isinstance(saved, dict) else {}
+            review = saved.get('review') or {}
+            if (isinstance(review, dict) and saved.get('input_digest') == key and review.get('compatible') is True and
+                    isinstance(review.get('why'), str) and review['why']):
+                return {**review, 'reused':True, 'evidence_ref':str(cache.relative_to(self.output))}
         content, _ = self.client.chat_with_metadata(
             _controller_model_text(question, local_roots=(self.repo, self.output)),
             json.dumps(_controller_model_value(
@@ -4674,12 +5702,29 @@ class Preparation:
             if self.budget else 180, thinking="disabled")
         from .execution_derive import _object
         review = _object(content)
-        if not isinstance(review.get("compatible"), bool) or not str(review.get("why") or ""):
-            return {"compatible": False, "why": "handoff review lacked a definite evidence-backed answer"}
-        return {"compatible": review["compatible"], "why": str(review["why"])[:1200]}
+        if not str(review.get("why") or ""):
+            return {"status":"unknown", "compatible":None,
+                    "why":"handoff review lacked an evidence-backed answer"}
+        status = review.get('status')
+        compatible = review.get('compatible')
+        if compatible is True:
+            status = 'compatible'
+        elif status == 'incompatible' and compatible is False:
+            status = 'incompatible'
+        else:
+            status, compatible = 'unknown', None
+        result = {"status":status, "compatible": compatible, "why": str(review["why"])[:1200],
+                  'missing_evidence':review.get('missing_evidence') or []}
+        if result['compatible']:
+            atomic_json(cache, {'input_digest':key,'review':result,'created_at':now(),
+                               'readiness':'source_review_only_requires_native_load_and_rollout'})
+        return result
 
     def _step_derive_a_command(self, *, stage: str = "",
-                               timeout_seconds: int | float | None = None) -> dict[str, Any]:
+                               timeout_seconds: int | float | None = None,
+                               agent_timeout_seconds: int | float | None = None,
+                               checkpoint_ref: str = '', draft_ref: str = '',
+                               reference_id: str = '') -> dict[str, Any]:
         """Find a command that runs one stage, revising the invocation until it does.
 
         The invocation is what gets revised, not the argv: a failure the invocation caused
@@ -4702,7 +5747,11 @@ class Preparation:
         if not rows:
             return {"outcome": "not attempted",
                     "because": "no stage of this checkout has an entry point"}
-        wanted = stage or sorted(rows)[0]
+        if not stage and len(rows) > 1:
+            return {'outcome':'rejected','because':
+                    'stage is required when multiple native stages are available; choose '
+                    f'one explicitly from {sorted(rows)}. No native command was launched.'}
+        wanted = stage or next(iter(rows))
         if wanted not in rows:
             return {"outcome": "no such stage",
                     "because": f"{wanted} is not a stage of this checkout; "
@@ -4719,11 +5768,48 @@ class Preparation:
             requested_timeout = min(requested_timeout, self.budget.remaining())
         if requested_timeout <= 0:
             return {"outcome": "blocked", "because": "run wall-clock budget exhausted"}
+        if agent_timeout_seconds is not None and (
+                not isinstance(agent_timeout_seconds, (int, float)) or
+                isinstance(agent_timeout_seconds, bool) or
+                not math.isfinite(agent_timeout_seconds) or agent_timeout_seconds <= 0):
+            return {"outcome": "rejected", "because":
+                    "agent_timeout_seconds must be a positive finite number"}
+        configured_window = float(getattr(self.client, 'timeout', 180))
+        model_window = min(configured_window, float(agent_timeout_seconds)
+                           if agent_timeout_seconds is not None else configured_window)
+        if self.budget:
+            model_window = min(model_window, self.budget.remaining())
+        if model_window <= 0:
+            return {"outcome": "blocked", "because": "run wall-clock budget exhausted"}
         from .survey import survey
         checkpoint = execution_derive.checkpoint_for_verification(
             survey(self.repo), declaration=self.declaration)
         requires_checkpoint = (wanted == self._score_target() and
                                "checkpoint" in str(rows[wanted].get("invocation") or "").lower())
+        from .checkpoint_handoff import (catalog as producer_catalog, select as select_checkpoint,
+                                         validate as validate_checkpoint)
+        offered = producer_catalog(self.output)
+        choice = None
+        if reference_id:
+            if wanted != self._score_target() or checkpoint_ref:
+                return {'outcome':'not attempted', 'because':'reference_id selects score-stage weights only; do not combine with checkpoint_ref'}
+            from .baseline_reference import handoff
+            choice = handoff(self.output, reference_id)
+            checkpoint = {'path': choice['selected_path'], 'from':'reviewed released reference',
+                          'evidence_ref': choice['evidence_ref']}
+        elif wanted == self._score_target() and (requires_checkpoint or checkpoint_ref):
+            if offered['status'] == 'available':
+                if not checkpoint_ref:
+                    return {'outcome':'not attempted', 'because':
+                        'A verified train producer exists. Choose its policy file or native '
+                        'bundle from verified_train_artifacts and loader source, and pass '
+                        'checkpoint_ref. The old largest-file survey is not a policy selector.'}
+                choice = select_checkpoint(self.output,checkpoint_ref,offered)
+                checkpoint = {'path':choice['selected_path'], 'from':'Agent-selected verified producer',
+                              'evidence_ref':choice['evidence_ref']}
+            elif checkpoint_ref:
+                return {'outcome':'rejected','because':'No currently verified producer catalog '
+                        'can bind checkpoint_ref; inspect training evidence and changed bytes first.'}
         if requires_checkpoint and not checkpoint["path"] and "train" in rows:
             return {"outcome": "not attempted", "because":
                     "the native score command consumes a checkpoint, but none exists; "
@@ -4738,8 +5824,24 @@ class Preparation:
                   "steps": execution_derive.TRAINING_VERIFICATION_STEPS, "episodes": 1,
                   "device": self.decision.device, "device_index": self.decision.device_index}
         self._attempts = []
+        from .invocation_drafts import load as load_draft, save as save_draft
+        draft_base = {'stage': wanted, 'row': rows[wanted],
+            'repo': str(self.repo.resolve()), 'interpreter': str(self.interpreter),
+            'checkpoint': checkpoint, 'task': inputs['task']}
+        entry = self.repo / str(rows[wanted].get('entrypoint') or '')
+        if entry.is_file() and entry.resolve().is_relative_to(self.repo.resolve()):
+            from .common import digest
+            draft_base['entrypoint_sha256'] = digest(entry)
+        selected_row = rows[wanted]
+        if draft_ref:
+            try:
+                selected_row = load_draft(self.output, draft_ref, stage=wanted,
+                                          base=draft_base)['row']
+            except (OSError, ValueError, TypeError) as exc:
+                return {'outcome': 'rejected', 'because': f'Cannot select invocation draft: {exc}'}
+        from .native_execution import resource_window
         source, settled, log, row = execution_derive.make_runnable(
-            self.client, wanted, rows[wanted], repo=self.repo,
+            self.client, wanted, selected_row, repo=self.repo,
             repository_files=answer.get("read") or [], inputs_for_verify=inputs,
             base_environment=self.decision.environment,
             attempts=execution_derive.ARGV_DERIVATION_ATTEMPTS,
@@ -4751,7 +5853,16 @@ class Preparation:
             # 180 seconds incorrectly classified legitimate epoch-only trainers as
             # impossible before a single positive update could finish.
             verification_timeout=requested_timeout,
+            agent_timeout_seconds=model_window,
+            verification_window=lambda timeout: resource_window(
+                self.output, self.repo, timeout, self.decision),
+            verification_inputs_guard=(lambda: validate_checkpoint(self.output, choice))
+                if choice else None,
+            unique_verification_outputs=True,
             remaining_seconds=(self.budget.remaining if self.budget else None),
+            on_revision=lambda stage, row, reason, evidence_ref: save_draft(
+                self.output, stage=stage, base=draft_base, row=row, reason=reason,
+                evidence_ref=evidence_ref),
             on_event=lambda stage, entries: self._note(stage, entries))
         derivation_evidence = self._record_attempts(wanted, inputs)
         if source is None:
@@ -4780,7 +5891,8 @@ class Preparation:
         return {"outcome": "done", "because": f"{wanted} runs",
                 "still_without_a_command": remaining,
                 "evidence_refs": self._existing_evidence_refs(
-                    f"derivation_attempts/{wanted}.json", "derived_stages.json")}
+                    f"derivation_attempts/{wanted}.json", "derived_stages.json",
+                    *([choice['evidence_ref']] if choice else []))}
 
     def _step_bind_metric(self) -> dict[str, Any]:
         """Bind a native log or fresh structured result to a source-backed metric."""
@@ -4964,8 +6076,6 @@ class Preparation:
                 # The first source-backed proposal remains eligible; a failed optional
                 # review must not erase it or turn transport trouble into a fake metric.
                 pass
-        if metric_alias_error:
-            return {"outcome": "not bound", "because": metric_alias_error}
         if not isinstance(metric, dict) or not str(answer.get("evidence") or "").strip():
             excerpt = output_shape.strip().replace("\n", " | ")[-400:]
             return {"outcome": "not bound", "because":
@@ -4973,17 +6083,68 @@ class Preparation:
                     "exact metric; "
                     f"output excerpt: {excerpt or '(empty)'}; re-derive and verify the score "
                     "command before retrying metric binding"}
-        trial = {**self.declaration,
-                 "research_goal": {**(self.declaration.get("research_goal") or {}),
-                                   "primary_metric": metric}}
-        spec = MetricSpec.from_declaration(trial)
-        verified_metric = resolve_proposal(spec)
-        reading = verified_metric.get("reading") or {"value": None}
-        if reading.get("value") is None:
-            return {"outcome": "not bound", "because": "proposed metric could not be "
-                    "read from the exact verified output using its declared mapping; "
-                    f"verification={verified_metric.get('status')}; re-derive a fresh score "
-                    "artifact before retrying metric binding"}
+        # Schema/mapping mistakes are CPU repair work, not evidence that native
+        # simulation must be repeated. Allow one correction against the SAME sealed
+        # candidates; each proposal still goes through byte/freshness checks. Missing
+        # or changed artifacts and later aggregate conflicts are not repairable here.
+        proposal_ref = f"metric_proposals/{uuid.uuid4().hex}.json"
+        proposal_rows: list[dict[str, Any]] = []
+        for repair_round in range(2):
+            verified_metric: dict[str, Any] = {}
+            reading: dict[str, Any] = {"value": None}
+            error = metric_alias_error
+            if not error:
+                try:
+                    trial = {**self.declaration,
+                             "research_goal": {**(self.declaration.get("research_goal") or {}),
+                                               "primary_metric": metric}}
+                    spec = MetricSpec.from_declaration(trial)
+                    verified_metric = resolve_proposal(spec)
+                    reading = verified_metric.get("reading") or {"value": None}
+                    if reading.get("value") is None:
+                        error = ("proposed metric could not be read from the exact verified "
+                                 "output; verification=" + str(verified_metric.get("status")) +
+                                 "; reader_reason=" + str(reading.get("why_not") or
+                                                          "no numeric reading"))
+                except (ValueError, TypeError, OverflowError) as exc:
+                    error = f"metric declaration invalid: {type(exc).__name__}: {exc}"
+            proposal_rows.append({"round": repair_round,
+                                  "proposal": answer.get("primary_metric"),
+                                  "source_evidence": str(answer.get("evidence") or "")[:1000],
+                                  "validation_error": redact(str(error or ""))[:1200]})
+            atomic_json(self.output / proposal_ref, {
+                "stage": target, "native_evidence_ref": accepted.get("native_evidence_ref"),
+                "authority": "mapping audit only; not a score or policy-consumption proof",
+                "attempts": proposal_rows})
+            if not error:
+                break
+            repairable = not verified_metric or verified_metric.get("status") in {"log", "matched"}
+            if repair_round or not repairable:
+                return {"outcome": "not bound", "because": redact(str(error))[:1200] +
+                        f"; mapping evidence={proposal_ref}; bounded CPU correction exhausted "
+                        "or artifact verification failed; no native rerun performed"}
+            repair_payload = json.dumps(_controller_model_value({
+                **payload_data, "prior_proposal": answer.get("primary_metric"),
+                "mapping_validation_error": redact(str(error))[:1200],
+            }, local_roots=(self.repo, self.output)), ensure_ascii=False)
+            try:
+                repaired, _ = self.client.chat_with_metadata(
+                    prompt + "\nCorrect this metric mapping once using the SAME source and "
+                    "candidate schemas. This is CPU-only mapping repair, not a request to "
+                    "rerun the evaluator or change its score. Return the complete original "
+                    "JSON shape with source-backed evidence. Never guess result values.",
+                    repair_payload, max_tokens=1200, timeout=request_timeout,
+                    thinking="disabled")
+                answer = _object(repaired)
+                metric, metric_alias_error = localize_candidate_alias(answer.get("primary_metric"))
+                if not isinstance(metric, dict) or not str(answer.get("evidence") or "").strip():
+                    return {"outcome": "not bound", "because":
+                            f"CPU mapping correction did not establish a source-backed metric; "
+                            f"mapping evidence={proposal_ref}"}
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                return {"outcome": "not bound", "because":
+                        f"CPU mapping correction unavailable ({type(exc).__name__}); "
+                        f"mapping evidence={proposal_ref}; native evidence retained"}
         if spec.source != "log":
             log_reading = spec.read_log(said)
             if log_reading.get("value") is not None and not math.isclose(
@@ -5097,7 +6258,8 @@ class Preparation:
                                        self.current_action.get("decision_id") or ""))
         return research, answer
 
-    def _step_run_the_loop(self, *, idea_label: str = "", job_id: str = "") -> dict[str, Any]:
+    def _step_run_the_loop(self, *, idea_label: str = "", job_id: str = "",
+                           training_settings: dict[str, Any] | None = None) -> dict[str, Any]:
         """Run one bounded research action, then return control to Preparation."""
         report_path = self.output / "research" / self.run_id / "research_report.json"
         session_path = report_path.with_name("controller_session.json")
@@ -5128,7 +6290,7 @@ class Preparation:
                 return {"outcome": "blocked", "because":
                         "existing research session identity does not match this run"}
             session_status = str(session.get("status") or "unreadable")
-            if session_status == "paused" and not idea_label:
+            if session_status == "paused" and not idea_label and not job_id:
                 return {"outcome": "not attempted", "because":
                         "the main controller must select one exact audited idea before a "
                         "paused candidate round can resume"}
@@ -5177,16 +6339,106 @@ class Preparation:
                                "metric and any producer required by the selected workflow; "
                                "an incidental checkpoint from failed training is not enough"}
         research, answer = self._research_controller()
+        reference_checkpoint = None
+        reference_id = ''
+        if getattr(self.client, 'supports_main_agent', False):
+            reference = self._baseline_reference_view()
+            if session is None and reference.get('kind') == 'released_checkpoint' and reference.get('status') in {'ready','reproduced'}:
+                from .baseline_reference import handoff
+                try:
+                    choice = handoff(self.output, reference['id'])
+                    reference_checkpoint = Path(choice['selected_path'])
+                    reference_id = reference['id']
+                except (OSError, ValueError, TypeError) as exc:
+                    return {'outcome':'not attempted', 'because':f'published-reference bytes refused: {exc}'}
+        execution_settings = {k: v for k, v in self.base_settings.items()
+                              if k not in ('_rounds', '_confirm')}
+        candidate_training_settings = None
+        if training_settings is not None and session is not None and idea_label:
+            if session.get('status')!='paused' or job_id:
+                return {'outcome':'not attempted','because':'candidate work needs an idle selected round, without job overrides'}
+            baseline_path=research.run_root/'measurements/baseline.json'
+            idea=(research.library.get(idea_label) if hasattr(research,'library') else None)
+            if (baseline_path.is_symlink() or not baseline_path.is_file()
+                    or read_json(baseline_path).get('ok') is not True
+                    or idea is None or idea.status!='cleared'):
+                return {'outcome':'not attempted','because':
+                    'training_settings cannot rewrite an existing baseline; candidate work needs '
+                    'a valid original baseline and an exact audited idea_label'}
+            from .candidate_settings import apply
+            try:
+                apply(research,session['base_settings'],training_settings)
+            except (ValueError,KeyError,TypeError) as exc:
+                return {'outcome':'not attempted','because':str(exc)}
+            candidate_training_settings=dict(training_settings)
+        if training_settings is not None and candidate_training_settings is None:
+            if session is not None or prior is not None:
+                return {'outcome': 'not attempted', 'because':
+                        'training_settings cannot rewrite an existing baseline; choose an audited candidate'}
+            axes = {axis.name: axis for axis in research.space.training}
+            from .training_work import consumes_steps
+            def learning_value_valid(key: str, value: Any) -> bool:
+                if key in axes:
+                    return axes[key].accepts(value)
+                # The verified command may map optimizer updates to native epochs.
+                # This explicit execution input is not an invented research axis.
+                return (key == 'steps' and consumes_steps(getattr(research, 'sources', {}).get('train', ''))
+                        and isinstance(value, int) and not isinstance(value, bool) and value > 0)
+            if (not isinstance(training_settings, dict) or not training_settings or
+                    any(not learning_value_valid(key, value)
+                        for key, value in training_settings.items())):
+                return {'outcome': 'not attempted', 'because':
+                        'training_settings must contain valid declared training-axis values'}
+            if any(key in execution_settings and execution_settings[key] != value
+                   for key, value in training_settings.items()):
+                return {'outcome': 'not attempted', 'because':
+                        'training_settings conflicts with explicit run settings'}
+            execution_settings.update(training_settings)
+        elif session is not None:
+            held_settings = session.get('base_settings')
+            if not isinstance(held_settings, dict) or any(
+                    held_settings.get(key) != value for key, value in execution_settings.items()):
+                return {'outcome': 'not attempted', 'because':
+                        'explicit run settings differ from the persisted baseline settings'}
+            execution_settings = dict(held_settings)
+        if session is None and not job_id and reference_checkpoint is None and getattr(research, 'sources', {}).get('train'):
+            from .training_work import missing_formal_work
+            problem = missing_formal_work(research.sources['train'],
+                research._inputs('train', settings=execution_settings))
+            if problem:
+                return {'outcome': 'not attempted', 'because': problem}
         baseline_training_attempt_id = ""
-        if job_id:
+        if session is not None and session.get('status')=='paused' and idea_label and not job_id:
+            from .candidate_settings import proposed,apply
+            from .training_work import missing_formal_work
+            idea=research.library.get(idea_label) if hasattr(research,'library') else None
+            if idea is not None and research.sources.get('train'):
+                try:
+                    proposed_settings=proposed(research,session['base_settings'],idea)
+                    if candidate_training_settings is not None:
+                        proposed_settings=apply(research,proposed_settings,candidate_training_settings)
+                    problem=missing_formal_work(research.sources['train'],
+                        research._inputs('train',settings=proposed_settings))
+                except (ValueError,TypeError,KeyError) as exc:
+                    problem=f'candidate settings preflight rejected: {exc}'
+                if problem:
+                    return {'outcome':'not attempted','because':problem,
+                            'native_operation_status':'not_started','failure_category':'candidate_input_required'}
+        candidate_job = None
+        if job_id and idea_label:
+            try:
+                from .candidate_jobs import adopt
+                candidate_job = adopt(research, job_id, idea_label)
+            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                return {'outcome':'not attempted', 'because':f'candidate adoption refused: {exc}'[:700]}
+        if job_id and not idea_label:
             from .native_jobs import status as native_job_status, source_identity
             try:
                 job = native_job_status(self.output, job_id)
                 request = read_json(self.output / "native_jobs" / job_id / "request.json")
                 result = (job.get("result") or {}).get("stage_result") or {}
                 attempt = str(result.get("attempt_id") or "")
-                settings = research._base_settings({
-                    k: v for k, v in self.base_settings.items() if not k.startswith("_")})
+                settings = research._base_settings(execution_settings)
                 if (job.get("status") != "completed" or
                         request.get("repo") != str(self.repo) or
                         request.get("run_id") != self.run_id or
@@ -5195,13 +6447,47 @@ class Preparation:
                         request.get("source_identity") != source_identity(
                             self.output, self.repo) or
                         result.get("stage") != "train" or
-                        research._verified_training_receipt(attempt, settings) is None):
+                        research._verified_training_receipt(attempt, settings, audit_progress=True) is None):
                     raise ValueError("job result does not match a verified baseline receipt")
                 baseline_training_attempt_id = attempt
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 return {"outcome": "not attempted", "because":
                         f"detached baseline adoption refused: {type(exc).__name__}: {exc}"}
+            if session is not None:
+                if session.get('status') != 'paused' or idea_label:
+                    return {'outcome': 'not attempted', 'because':
+                            'completed native training cannot replace a scored/candidate/interrupted action'}
+                recovered = research.recover_unscored_baseline(
+                    replacement_training_attempt_id=baseline_training_attempt_id)
+                return {'outcome': 'yielded' if recovered.get('ok') else 'not recovered',
+                        'because': 'evaluated the exact completed native job under the original baseline protocol'
+                            if recovered.get('ok') else str(recovered.get('why') or 'baseline recovery failed'),
+                        'training_reused': True, 'job_id': job_id,
+                        'training_attempt_id': baseline_training_attempt_id,
+                        'evaluation_attempt_id': (recovered.get('evaluate') or {}).get('attempt_id'),
+                        'metric_value': recovered.get('metric_value')}
         attempt_root = research.run_root / "attempts"
+        if session is not None and (isinstance(session.get('rounds'), bool)
+                or not isinstance(session.get('rounds'), int) or session['rounds'] < 0):
+            return {'outcome':'blocked', 'because':'persisted research round allocation is invalid'}
+        allocated_rounds = (int(session['rounds']) if session is not None
+                            else int(self.base_settings.get('_rounds', 2)))
+        if reference_checkpoint is not None:
+            from .baseline_reference import begin
+            if self._baseline_reference_view().get('status') == 'reproduced':
+                # Already measured references remain immutable. A fresh baseline may
+                # evaluate these frozen weights without overwriting the earlier review.
+                reference_id = ''
+            else:
+                begin(self.output, reference_id,
+                      measurement_ref=f'research/{self.run_id}/measurements/baseline.json')
+        def finish_reference() -> None:
+            if reference_id:
+                from .baseline_reference import complete
+                path = research.run_root/'measurements/baseline.json'
+                if path.is_file():
+                    complete(self.output, reference_id, read_json(path),
+                             f'research/{self.run_id}/measurements/baseline.json')
         attempts_before = ({path.parent.name for path in attempt_root.glob("*/receipt.json")}
                            if attempt_root.is_dir() else set())
 
@@ -5277,15 +6563,17 @@ class Preparation:
 
         if score_target and not research.available("evaluate"):
             report = research.run(
-                rounds=int(self.base_settings.get("_rounds", 2)),
-                settings={k: v for k, v in self.base_settings.items()
-                          if k not in ("_rounds", "_confirm")},
+                rounds=allocated_rounds,
+                settings=execution_settings,
                 yield_after_action=True, max_rounds_per_action=1,
                 resume_interrupted=resume_interrupted,
                 selected_idea_label=idea_label,
                 main_controller_owns_selection=True,
                 baseline_training_attempt_id=baseline_training_attempt_id,
+                **({'candidate_training_settings':candidate_training_settings} if candidate_training_settings is not None else {}),
+                **({'baseline_reference_checkpoint':reference_checkpoint} if reference_checkpoint is not None else {}),
             )
+            finish_reference()
             rounds = report.get("rounds") or []
             attempt_ids, evidence_refs = new_attempt_evidence()
             valid = [row for row in rounds if isinstance(
@@ -5312,15 +6600,18 @@ class Preparation:
                       if candidate_failure else {}),
                     **({"selected_idea_label": idea_label} if idea_label else {}),
                     "independently_confirmed": False}
-        report = research.run(rounds=int(self.base_settings.get("_rounds", 2)),
-                              settings={k: v for k, v in self.base_settings.items()
-                                        if k not in ("_rounds", "_confirm")},
+        report = research.run(rounds=allocated_rounds,
+                              settings=execution_settings,
                               confirm=False, yield_after_action=True,
                               max_rounds_per_action=1,
                               resume_interrupted=resume_interrupted,
                               selected_idea_label=idea_label,
                               main_controller_owns_selection=True,
-                              baseline_training_attempt_id=baseline_training_attempt_id)
+                              baseline_training_attempt_id=baseline_training_attempt_id,
+                              **({'candidate_job':candidate_job} if candidate_job else {}),
+                              **({'candidate_training_settings':candidate_training_settings} if candidate_training_settings is not None else {}),
+                              **({'baseline_reference_checkpoint':reference_checkpoint} if reference_checkpoint is not None else {}))
+        finish_reference()
         measured = [row for row in report.get("rounds") or []
                     if isinstance(row.get("metric_value", row.get("success_rate")),
                                   (int, float))]
@@ -5713,6 +7004,73 @@ class Preparation:
     def _step_stop(self, *, because: str = "") -> dict[str, Any]:
         return {"outcome": "stopped", "because": because or "the model chose to stop"}
 
+    def _installation_recovery_inventory(self) -> dict[str, Any]:
+        from .installation_recovery import inventory
+        from .execution_paths import ExecutionPaths
+        paths = ExecutionPaths(self.repo, self.output)
+        paths.manifests(provision.manifests_of(self.repo))
+        # Persist exactly the snapshot given to Scheduler. Stop review must not rescan
+        # a moving cache between the decision and validation.
+        resources = paths.bind_inventory(inventory(self.output, persist=self.output.is_dir()))
+        return {**resources, "execution_path_aliases": paths.catalog(),
+                "execution_aliases_digest": object_digest(paths.catalog())}
+
+    def _review_environment_stop(self, choice: dict[str, Any]) -> dict[str, Any]:
+        """Do not let Scheduler bypass Fix's evidence-based resource boundary review."""
+        if (choice.get("do") != "stop" or choice.get("decision_failure") or
+                self.interpreter or (self.budget and self.budget.remaining() <= 0)):
+            return choice
+        scope = (choice.get("arguments") or {}).get("stop_scope", "resource")
+        if scope in {"pause", "framework"}:
+            return choice
+        if scope != "resource":
+            return {**choice, "decision_failure":{"kind":"invalid_stop_scope", "attempts":1},
+                    "why":"stop_scope must be pause, framework or resource"}
+        held = read_json(self.output / "environment.json") if (self.output / "environment.json").is_file() else {}
+        failure = provision.latest_failure(self.output, held)
+        if not failure.get("evidence_id"):
+            return choice
+        from .installation_recovery import review_boundary
+        snapshot_path = self.output / "installation_recovery_inventory.json"
+        supplied_assessment = (choice.get('arguments') or {}).get('resource_assessment')
+        requested_digest = supplied_assessment.get('inventory_digest') if isinstance(supplied_assessment, dict) else None
+        if isinstance(requested_digest, str) and re.fullmatch(r'[0-9a-f]{64}', requested_digest):
+            bound_snapshot = self.output / 'installation_inventory_snapshots' / (requested_digest + '.json')
+            if bound_snapshot.is_file() and not bound_snapshot.is_symlink() and not bound_snapshot.parent.is_symlink():
+                snapshot_path = bound_snapshot
+        resources = read_json(snapshot_path) if snapshot_path.is_file() and not snapshot_path.is_symlink() else {}
+        if not resources.get('digest'):
+            resources = self._installation_recovery_inventory()
+        transcript_path = self.output / "transcript.json"
+        transcript = read_json(transcript_path) if transcript_path.is_file() else {}
+        reviewed = next((row for row in reversed(transcript.get("rows") or [])
+                         if row.get("kind") == "unbuildable"), {})
+        if ((reviewed.get("boundary_review") or {}).get("approved") is True and
+                object_digest({key:resources.get(key) for key in (
+                    'local_wheels','environment_candidates','scan_complete')}) == resources.get('digest') and
+                (reviewed.get("boundary_review") or {}).get("inventory_digest") == resources["digest"] and
+                (reviewed.get("boundary_review") or {}).get("failure_evidence_id") == failure["evidence_id"]):
+            return choice
+        try:
+            if object_digest({key:resources.get(key) for key in (
+                    'local_wheels','environment_candidates','scan_complete')}) != resources.get('digest'):
+                raise ValueError('resource snapshot digest invalid; reread inventory before review')
+            review = review_boundary(self.client, resources=resources, reason=choice.get("why", ""),
+                assessment=(choice.get("arguments") or {}).get("resource_assessment"),
+                failure={"evidence_id": failure["evidence_id"], "excerpt": failure.get("excerpt")})
+            atomic_json(self.output / "environment_stop_review.json", review)
+            return choice
+        except Exception as exc:
+            from .agent_client import run_model_budget_exhausted
+            if run_model_budget_exhausted(exc):
+                return {**choice, "why": "run-level model budget exhausted during resource boundary review",
+                        "resource_boundary_review_budget_exhausted": True}
+            rejection = {"kind": "resource_boundary_unproven", "attempts": 1,
+                "reason": str(exc), "inventory_digest": resources["digest"],
+                "evidence_id": failure["evidence_id"]}
+            atomic_json(self.output / "environment_stop_review.json", rejection)
+            return {**choice, "why": str(exc), "decision_failure": rejection}
+
     def _shipped_checkpoint(self) -> str:
         """A checkpoint the benchmark ships, if this machine has one.
 
@@ -6022,6 +7380,17 @@ class Preparation:
                             "runnable stage, or interpreter"),
                     "arguments": {}, "decision_by": "tool"}
         facts = self.state()
+        from .operation_contracts import schema
+        from .experiment_view import view as experiment_view
+        from .usage_reconciliation import due
+        facts['usage_reconciliation'] = due(self.output)
+        facts['experiment_lifecycle'] = experiment_view(self.output, self.run_id)
+        from .data_versions import catalog
+        facts['data_versions'] = catalog(self.output)
+        from .research_efficiency import view as efficiency_view
+        facts['research_efficiency'] = efficiency_view(self.output)
+        facts['operation_contracts'] = {name:schema(getattr(self,f'_step_{name}'))
+            for name in facts.get('available',[]) if callable(getattr(self,f'_step_{name}',None))}
         self._publish_main_context(facts)
         base_revision = int(facts.get("state_revision") or 0)
         permitted = set(facts.get("available") or [])
@@ -6111,7 +7480,17 @@ class Preparation:
                               (isinstance(proposed_revision, bool) or
                                not isinstance(proposed_revision, int) or
                                proposed_revision != base_revision))
-            if requested in permitted and not stale_revision:
+            action_argument_error = ''
+            if requested == 'derive_a_command':
+                action_args = row.get('arguments')
+                chosen_stage = action_args.get('stage') if isinstance(action_args, dict) else None
+                offered_stages = {name for name,value in (facts.get('surveyed_stages') or {}).items()
+                                  if value.get('available')}
+                if not isinstance(chosen_stage, str) or chosen_stage not in offered_stages:
+                    action_argument_error = ('derive_a_command requires arguments.stage naming '
+                        f'one available surveyed stage: {sorted(offered_stages)}; '
+                        'the executor will not infer the intended stage from prose or sorting')
+            if requested in permitted and not stale_revision and not action_argument_error:
                 latest = self.state_store.load()
                 latest_revision = int((latest or {}).get("decision_revision") or 0)
                 if latest_revision != base_revision:
@@ -6175,6 +7554,7 @@ class Preparation:
                         "method_selection": method_selection}
             rejection = (f"state_revision must equal {base_revision}, got "
                          f"{proposed_revision!r}" if stale_revision else
+                         action_argument_error if action_argument_error else
                          f"{requested!r} is not currently permitted")
             if repair == 0:
                 safe_rejected_decision = _controller_model_value(
@@ -6235,6 +7615,7 @@ class Preparation:
                     process_ref == f"agent/processes/{turn_id}.json"):
                 used.extend((f"agent/events.jsonl#turn_id={turn_id}", process_ref))
         used = list(dict.fromkeys(used))
+        from .runtime_freshness import controller_identity
         wall_remaining = self.budget.remaining() if self.budget else None
         return self.decisions.record(ResearchDecision(
             activity=activity, by=maker,
@@ -6249,8 +7630,9 @@ class Preparation:
                 "model_proposal": (contract.get("resource_limits")
                                    if isinstance(contract.get("resource_limits"), dict) else {}),
                 "enforced": {"wall_seconds_remaining": wall_remaining,
+                             "controller_runtime_id": controller_identity(),
                              "controller_actions_remaining": max(
-                                 0, self._step_budget - len(self.steps))}},
+                                 0, self._remaining_actions())}},
             expected_outputs=list(contract.get("expected_outputs") or []),
             postconditions=list(contract.get("postconditions") or []),
             stop_condition=str(contract.get("stop_condition") or "")[:600],
@@ -6286,7 +7668,7 @@ class Preparation:
                  "<!-- AUTOSIM_LIVE_START -->", f"Status: {status}",
                  f"Current action: {current or 'none'}", "<!-- AUTOSIM_LIVE_END -->",
                  f"Latest progress: {redact(str(latest_progress))[:300]}",
-                 f"Preparation budget: {len([row for row in self.steps if not str(row.get('step', '')).startswith('derive:')])}/{self._step_budget} steps",
+                 f"Preparation segment budget: {self._step_budget-self._remaining_actions()}/{self._step_budget} actions; historical records {len(self.steps)}",
                  f"Highest verified level: {level}", "",
                  f"Repository identity: `{source_repository.name}`",
                  f"Source repository: `{source_repository}`",
@@ -6430,12 +7812,22 @@ class Preparation:
             from . import recorder
             view = recorder.read(self.output, "report/view.json")
             context = {"actions": [{key: row.get(key) for key in (
-                "step", "outcome", "because", "why", "receipt_ref")}
+                "step", "outcome", "because", "why", "receipt_ref", "failure_domain",
+                "repair_owner", "evidence_id", "evidence_refs", "replayed_step",
+                "original_outcome", "recovery_parent_ref", "recovery_owner")}
                 for row in self.steps[-8:] if row.get("step") != "confirm_best"],
                 "plan": self.main_agent.get("plan") or {},
+                "recovery_transaction": self._recovery_transaction(),
                 "native_jobs": self._native_job_view(), "agent_tasks": self._agent_task_view()}
             remaining = self.budget.remaining() if self.budget else 60
             writer = self.client if remaining >= 10 and self.steps else None
+            native_milestone = bool(self.interpreter) or any(
+                row.get("step") in {"build_the_environment", "derive_a_command", "run_the_loop"}
+                and row.get("outcome") == "done" for row in self.steps)
+            if not native_milestone:
+                # During onboarding the free factual renderer carries all native
+                # progress. Save paid prose/skill rounds for an actual milestone.
+                writer = None
             if status == "infrastructure_blocked":
                 writer = None
             presentation = recorder.refresh(self.output, view, context=context,
@@ -6480,7 +7872,9 @@ class Preparation:
         not a judgement. Reaching this segment's action cap is a resumable yield, not evidence
         that the research goal has completed or that the repository is infeasible.
         """
+        from .runtime_freshness import controller_identity
         steps_before_cycle = len(self.steps)
+        self._cycle_step_start = steps_before_cycle
         self._say(f"preparing {self.repo}")
         self._step_budget = max_steps
         self.output.mkdir(parents=True, exist_ok=True)
@@ -6552,6 +7946,10 @@ class Preparation:
                 infrastructure_blocked = agent_status == "infrastructure_blocked"
                 from .agent_client import run_model_budget_exhausted
                 is_model_budget = run_model_budget_exhausted(exc)
+                if is_model_budget and self._await_model_settlement():
+                    self.steps.append({'step':'budget_wait', 'outcome':'allowance_available',
+                                       'because':'settled allowance permits retry; historical usage retained'})
+                    continue
                 outcome = "exhausted" if is_model_budget else "could not be asked"
                 failure = {"step": "choose", "outcome": outcome, "because": because}
                 runtime_failure = getattr(exc, "runtime_failure", {}) or {}
@@ -6597,6 +7995,14 @@ class Preparation:
                 if (not is_model_budget and not self.state_persistence_error and
                         callable(getattr(self.client, "as_role", None))):
                     if self._handoff_scheduler_decision_failure(failure=failure):
+                        # The handoff mutates failure with the recovery receipt. The
+                        # prior last_action was a shallow copy made before recovery;
+                        # persist the outcome before asking Scheduler again, rather
+                        # than presenting the repaired startup fault as unresolved.
+                        self.last_action = {**failure, "finished_at": now()}
+                        self._persist_run_state(status="running")
+                        if self.state_persistence_error:
+                            return self._state_failure_report()
                         continue
                     if (failure.get("recovery") or {}).get("status") == "blocked":
                         failure["outcome"] = "infrastructure_blocked"
@@ -6630,6 +8036,13 @@ class Preparation:
                 if self.state_persistence_error:
                     return self._state_failure_report()
                 break
+            choice = self._review_environment_stop(choice)
+            if choice.get("resource_boundary_review_budget_exhausted"):
+                self.steps.append({"step": "choose", "outcome": "exhausted", "because": choice["why"]})
+                self.last_action = dict(self.steps[-1])
+                self.current_action = {}
+                self._persist_run_state(status="budget_exhausted")
+                break
             decision_failure = choice.get("decision_failure")
             if (isinstance(decision_failure, dict) and
                     callable(getattr(self.client, "as_role", None))):
@@ -6641,6 +8054,10 @@ class Preparation:
                                              "decision_rejected")[:100],
                     "attempts": decision_failure.get("attempts", 1),
                 }
+                if decision_failure.get("kind") == "resource_boundary_unproven":
+                    failure.update(evidence_id=decision_failure.get("evidence_id"),
+                        resource_inventory_ref="installation_recovery_inventory.json",
+                        failure_domain="resource_boundary", repair_owner="environment_executor")
                 runtime_refs = _safe_agent_trace_refs(
                     decision_failure.get("runtime_evidence_refs"))
                 if runtime_refs:
@@ -6650,6 +8067,11 @@ class Preparation:
                     continue
                 if self.state_persistence_error:
                     return self._state_failure_report()
+                if failure.get('failure_category') in {'resource_boundary_unproven','invalid_stop_scope'}:
+                    self.steps[-1]['outcome'] = 'paused'
+                    self.last_action = {**self.last_action, 'outcome':'paused'}
+                    self._persist_run_state(status='paused')
+                    break
                 if self.monitor_observation.get("status") == "budget_exhausted":
                     break
                 # The structured decision still says `stop`; if Monitor is unavailable,
@@ -6672,18 +8094,21 @@ class Preparation:
             if choice.get("method_selection"):
                 self.last_decision["method_selection"] = choice["method_selection"]
             if step == "stop":
-                self.steps.append({"step": "stop", "outcome": "stopped",
+                scope = arguments.get('stop_scope', 'resource')
+                terminal = 'paused' if scope == 'pause' else 'infrastructure_blocked' if scope == 'framework' else 'stopped'
+                self.steps.append({"step": "stop", "outcome": terminal,
+                                   'stop_scope':scope,
                                    "because": choice["why"]})
                 self.current_action = {}
-                self.last_action = {**self.last_decision, "outcome": "stopped",
+                self.last_action = {**self.last_decision, "outcome": terminal,
                                     "finished_at": now()}
                 self._resolve_controller_decision(decision_id, {
-                    "step": "stop", "outcome": "stopped", "because": choice["why"]})
-                self._persist_run_state(status="stopped")
+                    "step": "stop", "outcome": terminal, "because": choice["why"]})
+                self._persist_run_state(status=terminal)
                 if self.state_persistence_error:
                     return self._state_failure_report()
                 self._say(f"stop — {choice['why']}")
-                self._refresh_document(status="stopped", current=choice["why"])
+                self._refresh_document(status=terminal, current=choice["why"])
                 break
             if (self.budget and self.budget.remaining() <= 0 and
                     step != "reconcile_interrupted_action"):
@@ -6728,7 +8153,10 @@ class Preparation:
                         "failure_category", "agent_status", "run_budget",
                         "delegated_role", "fix_handoff", "fix_attempt_id",
                         "replayed_step", "original_outcome", "evidence_id",
-                        "candidate_failure", "task_id", "study_id", "screening_result", "screening"):
+                        "candidate_failure", "task_id", "study_id", "screening_result", "screening",
+                        "failure_domain", "repair_owner", "recovery_parent_ref",
+                        "recovery_owner", "replayed_arguments", "original_failure_reason", "native_operation",
+                        "resume_scope"):
                 value = result.get(key)
                 if value:
                     step_result[key] = list(value) if isinstance(value, tuple) else value
@@ -6751,6 +8179,22 @@ class Preparation:
                 step_result["arguments"] = {"stage": arguments["stage"], **(
                     {"timeout_seconds": arguments["timeout_seconds"]}
                     if "timeout_seconds" in arguments else {})}
+            elif step == "build_the_environment":
+                step_result["arguments"] = {"max_operations": arguments.get("max_operations", 1)}
+            elif step == "propose_harness_repair":
+                step_result["arguments"] = {"evidence_id": arguments.get("evidence_id")}
+                for key in ("repair_id", "proposal_ref", "failure_evidence_id", "activation_allowed"):
+                    if key in result:
+                        step_result[key] = result[key]
+                step_result["evidence_refs"] = [ref for ref in (
+                    result.get("proposal_ref"),
+                    "evidence/" + str(result.get("failure_evidence_id")) + ".json"
+                    if result.get("failure_evidence_id") else None) if ref]
+            elif step == "capture_environment_demo":
+                step_result["arguments"] = {key: arguments[key] for key in
+                    ("request_id", "source_refs", "timeout_seconds", "resource") if key in arguments}
+                step_result["arguments"]["code_sha256"] = hashlib.sha256(
+                    str(arguments.get("code") or "").encode()).hexdigest()
             elif (step == "run_the_loop" and
                   isinstance(arguments.get("idea_label"), str) and
                   arguments["idea_label"]):
@@ -6801,9 +8245,10 @@ class Preparation:
                                            if isinstance(contract.get("resource_limits"), dict)
                                            else {}),
                         "enforced": {
+                            "controller_runtime_id": controller_identity(),
                             "wall_seconds_remaining_before": wall_remaining_before,
                             "controller_actions_remaining": max(
-                                0, self._step_budget - len(self.steps)),
+                                0, self._remaining_actions()),
                         }},
                     costs={"wall_seconds": elapsed, "gpu_seconds": None,
                            "gpu_seconds_status": "not_separately_metered"},
@@ -6811,7 +8256,18 @@ class Preparation:
                                    "trigger": "verified_environment_contradicted_by_native_stage",
                                    "failure": step_result.get("fix_handoff")}
                                   if step_result.get("delegated_role") == "fix" and
-                                  isinstance(step_result.get("fix_handoff"), dict) else {})))
+                                  isinstance(step_result.get("fix_handoff"), dict) else
+                                  {"to": step_result.get("recovery_owner"),
+                                   "trigger": "original_operation_revalidation",
+                                   "parent_receipt_ref": step_result["recovery_parent_ref"],
+                                   "original_step": step_result.get("replayed_step"),
+                                   "original_arguments": step_result.get("replayed_arguments") or {},
+                                   "original_outcome": step_result.get("original_outcome")}
+                                  if step_result.get("recovery_parent_ref") else
+                                  {"to": step_result.get("repair_owner"),
+                                   "trigger": "proposal_rejected_before_native_execution",
+                                   "evidence_id": step_result.get("evidence_id")}
+                                  if step_result.get("failure_domain") == "framework_plan" else {})))
             step_result["receipt_ref"] = receipt_ref
             step_result["receipt_sha256"] = receipt["receipt_sha256"]
             self.steps.append(step_result)
@@ -6831,7 +8287,9 @@ class Preparation:
                       + (f" — {str(result.get('because') or '')[:300]}"
                          if result.get("because") else ""))
             self._refresh_document(status="running", current=f"{step}: {result.get('outcome')}")
-            if (step_result["outcome"] in (_MONITORED_FAILURES | {"checkpoint failure"}) and
+            if (step_result.get("failure_domain") != "framework_plan" and
+                    step_result.get('failure_category') not in {'operation_arguments_invalid','candidate_input_required'} and
+                    step_result["outcome"] in (_MONITORED_FAILURES | {"checkpoint failure"}) and
                     step_result["outcome"] != "exhausted"):
                 observation = self._monitor_failed_action(
                     action_id=action_id,
@@ -6860,7 +8318,9 @@ class Preparation:
                         current="AgentMonitor assessment")
                     if observation.get("status") == "budget_exhausted":
                         break
-            if (((step_result["outcome"] in _FIX_ASSISTANCE_OUTCOMES and
+            if (step_result.get('failure_domain') != 'framework_plan' and
+                step_result.get('failure_category') not in {'operation_arguments_invalid','candidate_input_required'} and
+                ((step_result["outcome"] in _FIX_ASSISTANCE_OUTCOMES and
                   step in _FIX_ASSISTANCE_STEPS) or
                  (step == "run_the_loop" and step_result.get("candidate_failure"))) and
                     step_result.get("delegated_role") != "fix"):
@@ -6931,14 +8391,29 @@ class Preparation:
         interrupted_reconciled = last.get("step") == "reconcile_interrupted_action"
         if research_completed and measured and not confirmation_pending:
             report["status"] = "completed"
-        elif budget_exhausted:
-            report["status"] = "budget_exhausted"
         elif last.get("outcome") == "infrastructure_blocked":
             report["status"] = "infrastructure_blocked"
+        elif last.get('outcome') == 'paused':
+            report['status'] = 'paused'
+            report['termination_scope'] = 'unresolved_not_repository_impossibility'
+        elif budget_exhausted:
+            report["status"] = "budget_waiting" if getattr(self, '_budget_settlement_pending', False) and (
+                not self.budget or self.budget.remaining() > 0) else "budget_exhausted"
+            if report['status'] == 'budget_waiting':
+                report['termination_scope'] = 'allowance_blocked_by_usage_holds'
+                report['resume_requirement'] = 'provider-backed settlement or explicit additional budget; never clear unknown holds'
         elif last.get("outcome") == "raised":
             report["status"] = "internal_error"
         elif explicitly_stopped:
             report["status"] = "adaptation_unresolved"
+            latest_setup = next((row for row in reversed(self.steps)
+                                 if row.get("step") == "build_the_environment" or
+                                 row.get("replayed_step") == "build_the_environment"), {})
+            if latest_setup.get("failure_domain") == "framework_plan":
+                report["termination_scope"] = "framework_adaptation_unresolved"
+                report["termination_boundary"] = (
+                    "Rejected setup proposals do not establish that the benchmark cannot "
+                    "run. Inspect planning evidence and actual native receipts.")
         elif interrupted_reconciled:
             report["status"] = "paused"
         elif actions_in_cycle >= max_steps:
@@ -6999,6 +8474,11 @@ class Preparation:
         self._refresh_document(status=report["status"], current="finished")
         return report
 
+    def _remaining_actions(self) -> int:
+        used = sum(not str(row.get("step", "")).startswith("derive:")
+                   for row in self.steps[self._cycle_step_start:])
+        return max(0, self._step_budget-used)
+
     def _supervision_fingerprint(self) -> str:
         """Hash decision-relevant progress, excluding timestamps and runtime telemetry."""
         facts = self.state()
@@ -7010,7 +8490,11 @@ class Preparation:
             "interpreter": str(self.interpreter) if self.interpreter else None,
             "stages": self.stages,
             "verified": self.verified,
-            "environment": facts.get("environment"),
+            "environment": {key: (facts.get("environment") or {}).get(key) for key in (
+                "interpreter", "existing_unverified_interpreter", "verification_status",
+                "verdict_reason", "probe_contract_faults", "build_commands", "partial_status")},
+            "environment_attempt": {key: ((facts.get("environment") or {}).get("latest_installation_attempt") or {}).get(key)
+                for key in ("evidence_id", "ok", "returncode")},
             "metric_binding": facts.get("metric_binding"),
             "research_progress": {key: progress.get(key) for key in (
                 "status", "round_count", "measured_rounds", "best_candidate",
@@ -7036,6 +8520,8 @@ class Preparation:
         """
         if max_steps <= 0 or max_relaunch < 0:
             raise ValueError("max_steps must be positive and max_relaunch non-negative")
+        from .usage_reconciliation import due
+        due(self.output)
         cycles = 0
         waiting_segments = 0
         stagnant_cycles = 0
@@ -7053,6 +8539,14 @@ class Preparation:
                 waiting_segments += 1
                 continue  # Event waiting is not a fresh Scheduler/model relaunch.
             cycles += 1
+            if (report.get("status") == "paused" and cycle_steps and
+                    cycle_steps[-1].get("step") == "reconcile_interrupted_action" and
+                    cycle_steps[-1].get("resume_scope") == "preparation" and
+                    not self.recovery_after_interruption and cycles <= max_relaunch and
+                    self.budget and self.budget.remaining() > 0):
+                # Reconciliation closes the stale process, not the task. Ask Scheduler
+                # for the next action; do NOT blindly replay the interrupted operation.
+                continue
             if report.get("status") != "action_limit":
                 break
             after = self._supervision_fingerprint()

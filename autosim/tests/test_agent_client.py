@@ -17,6 +17,22 @@ def client_for(tmp_path: Path, *, total: float = 2.0) -> RoleAwareAgentClient:
                                 total_budget_usd=total, timeout=90)
 
 
+def test_stable_instructions_precede_dynamic_request_and_usage_tracks_bytes(tmp_path, monkeypatch):
+    calls = []
+    def run(**kwargs):
+        calls.append(kwargs)
+        return {"status": "completed", "final_text": "{}"}
+    monkeypatch.setattr("autosim.research.agent_runtime.run_coding_agent", run)
+    client = client_for(tmp_path)
+    client.set_research_context({"state_revision": 7, "budget": 2})
+    _, metadata = client.chat_with_metadata("stable role", '{"budget":2,"request":"A"}')
+    client.chat_with_metadata("stable role", '{"request":"B","budget":2}')
+    marker = "## Current request and evidence"
+    assert calls[0]["prompt"].split(marker)[0] == calls[1]["prompt"].split(marker)[0]
+    assert metadata["prompt_efficiency"]["deduplicated_fields"] == 1
+    assert metadata["prompt_efficiency"]["prompt_bytes"] == len(calls[0]["prompt"].encode())
+
+
 def test_large_role_context_rotates_without_changing_run_budget(tmp_path):
     client = client_for(tmp_path)
     from autosim.research.common import atomic_json
@@ -40,6 +56,23 @@ def test_only_verified_global_exhaustion_is_terminal():
     assert not run_model_budget_exhausted(local)
     assert run_model_budget_exhausted(AgentRuntimeClientError("total",
         status="budget_exhausted", failure_category="run_model_budget"))
+
+
+@pytest.mark.parametrize("category", ["missing_resume_session", "provider_or_tool_error"])
+def test_failed_role_session_rehydrates_without_erasing_evidence_or_budget(tmp_path, category):
+    client = client_for(tmp_path)
+    from autosim.research.common import atomic_json
+    key = "b" * 32
+    root = client.output / "agent"
+    atomic_json(root / "roles/fix.json", {
+        "role": "fix", "run_id": client.run_id, "session_key": key})
+    session = {"schema_version": 1, "status": "failed", "failure_category": category,
+               "session_id": "missing-provider-conversation", "total_cost_usd": 0.17}
+    atomic_json(root / f"sessions/{key}.json", session)
+    assert client._resume_role("fix") is False
+    assert client.total_budget_usd == 2.0
+    assert json.loads((root / f"sessions/{key}.json").read_text()) == session
+    assert json.loads((root / "context_rotation.json").read_text())["failure_category"] == category
 
 
 def test_agent_client_uses_independent_resumable_sessions_per_role(
@@ -99,6 +132,18 @@ def test_agent_client_returns_runtime_trace_identity_and_forwards_decision_attem
     assert metadata["process_ref"] == f"agent/processes/{turn_id}.json"
     assert metadata["decision_attempt_id"] == decision_attempt_id
     assert metadata["event_count"] == 7
+
+
+def test_agent_client_consumes_execution_not_display_projection(tmp_path, monkeypatch):
+    original = json.dumps({'commands': ['except Exception as e:\n    raise\n']})
+    monkeypatch.setattr('autosim.research.agent_runtime.run_coding_agent',
+        lambda **_: {'status': 'completed', 'execution_text': original,
+                     'final_text': '[DISPLAY ONLY]'})
+    client = client_for(tmp_path)
+    text, metadata = client.chat_with_metadata('system', 'user')
+    assert text == original
+    assert 'execution_text' not in metadata
+    assert 'final_text' not in metadata
 
 
 def test_agent_client_freezes_runtime_identity_and_budgets(tmp_path: Path) -> None:

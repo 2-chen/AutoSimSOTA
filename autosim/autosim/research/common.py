@@ -21,7 +21,8 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_local_environment(output: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+def run_local_environment(output: Path, base: dict[str, str] | None = None, *,
+                          read_native_context: bool = True) -> dict[str, str]:
     """Keep implicit home/cache writes inside a run, not in the operator's home.
 
     This is a path hygiene layer, not an OS sandbox: a command naming an absolute path can
@@ -36,11 +37,17 @@ def run_local_environment(output: Path, base: dict[str, str] | None = None) -> d
                PIP_CACHE_DIR=str(cache / "pip"), UV_CACHE_DIR=str(cache / "uv"),
                CONDA_PKGS_DIRS=str(cache / "conda"))
     context = root / "native_context.json"
-    if context.is_file() and not context.is_symlink():
+    if read_native_context and context.is_file() and not context.is_symlink():
         row = read_json(context)
         identity = {k: v for k, v in row.items() if k not in {"identity", "updated_at"}}
         if object_digest(identity) != row.get("identity") or not isinstance(row.get("paths"), dict):
             raise ValueError("native configuration identity changed")
+        if row.get('runtime_library_dirs'):
+            from .native_context import load_context
+            checked = load_context(root, Path(row['repo']))
+            paths = checked['runtime_library_dirs'] + [
+                item for item in env.get('LD_LIBRARY_PATH', '').split(':') if item]
+            env['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys(paths))
         for key, value in row["paths"].items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise ValueError("invalid native configuration mapping")
@@ -69,6 +76,7 @@ def isolated_argv(argv: list[str], *, output: Path, repo: Path,
                   require_pid_namespace: bool = False,
                   read_only_roots: tuple[Path, ...] = (),
                   allow_gpu: bool = True,
+                  native_environment: dict[str, str] | None = None,
                   writable_paths: tuple[Path, ...] | None = None) -> list[str]:
     """Run controlled commands in a PID namespace with explicit writable paths.
 
@@ -129,6 +137,13 @@ def isolated_argv(argv: list[str], *, output: Path, repo: Path,
         command.extend(("--bind", str(path), str(path)))
     from .environment_pool import store_for
     pool = store_for(output)
+    context_path = output/'native_context.json'
+    if context_path.is_file() and not context_path.is_symlink():
+        context = read_json(context_path)
+        if context.get('repo') == str(repo) and context.get('dependency_roots'):
+            from .native_context import load_context
+            native = load_context(output, repo)
+            read_only_roots = (*read_only_roots, *(Path(p) for p in native.get('dependency_roots', [])))
     for path in (*read_only_roots, *((pool,) if pool is not None else ())):
         resolved = Path(path).resolve(strict=True)
         if resolved == Path("/") or output.is_relative_to(resolved):
@@ -145,6 +160,38 @@ def isolated_argv(argv: list[str], *, output: Path, repo: Path,
     for binding in bindings_for(repo):
         command.extend(("--ro-bind", binding["source"], binding["source"]))
     command.extend(mount_args(repo))
+    if native_environment and native_environment.get('HOME'):
+        # Native SDKs may derive fixed-width identifiers from absolute cache
+        # paths. Use a short namespace alias of the SAME owned home, not a fresh
+        # cache, a relocated checkout or writable access to external resources.
+        home = Path(native_environment['HOME']).resolve()
+        if not home.is_relative_to(output) or home == output:
+            raise ValueError('native HOME must be confined to a run-owned subdirectory')
+        if writable_paths is not None and not any(
+                home.is_relative_to(Path(path).resolve()) for path in writable
+                if Path(path) != Path('/tmp')):
+            raise ValueError('native home alias cannot widen restricted writable paths')
+        home.mkdir(parents=True, exist_ok=True)
+        alias = Path('/tmp') / ('as-h-' + object_digest(str(home))[:16])
+        alias.mkdir(mode=0o700, exist_ok=True)
+        if (alias.is_symlink() or not alias.is_dir() or
+                alias.stat().st_uid != os.getuid() or alias.stat().st_mode & 0o077 or
+                any(alias.iterdir())):
+            raise ValueError('unsafe native home alias mount point')
+        command.extend(('--bind', str(home), str(alias)))
+        mapped = {}
+        for key in ('HOME', 'XDG_CACHE_HOME', 'HF_HOME', 'PIP_CACHE_DIR',
+                    'UV_CACHE_DIR', 'CONDA_PKGS_DIRS'):
+            value = native_environment.get(key)
+            if value and (value == str(home) or value.startswith(str(home) + '/')):
+                mapped[key] = str(alias) + value[len(str(home)):]
+                command.extend(('--setenv', key, mapped[key]))
+        mapping = {'schema_version': 1, 'source': str(home), 'namespace_alias': str(alias),
+                   'environment': mapped, 'authority': 'same run-owned native cache bytes'}
+        mapping_ref = output / 'native_home_mappings' / f'{object_digest(mapping)}.json'
+        if mapping_ref.parent.is_symlink() or mapping_ref.is_symlink():
+            raise ValueError('unsafe native home mapping receipt')
+        atomic_json(mapping_ref, mapping)
     command.extend(("--dev-bind", "/dev", "/dev") if allow_gpu else ("--dev", "/dev"))
     command.extend(("--unshare-pid",
                     "--die-with-parent", "--proc", "/proc", "--", *map(str, argv)))
@@ -297,6 +344,33 @@ _MODEL_UNC_PATH = re.compile(r"(?<![\w])\\\\[^\s\"'<>|?*]+")
 _MODEL_PARENT_PATH = re.compile(r"(?<![\w.])(?:\.\./){1,}[\w.@~+/-]+")
 
 
+def _sanitize_serialized_json(value: Any, scrub) -> str | None:
+    """Scrub decoded strings, never JSON escape sequences mistaken for paths."""
+    if not isinstance(value, str) or not value.lstrip().startswith(("{", "[")):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        return None
+
+    def walk(item, depth=0):
+        if depth > 24:
+            return "[NESTING_LIMIT]"
+        if isinstance(item, dict):
+            result = {}
+            for index, (key, child) in enumerate(item.items()):
+                name = scrub(key)
+                if name in result:
+                    name = f"{name}_{index + 1}"
+                result[name] = walk(child, depth + 1)
+            return result
+        if isinstance(item, list):
+            return [walk(child, depth + 1) for child in item]
+        return scrub(item) if isinstance(item, str) else item
+
+    return json.dumps(walk(parsed), ensure_ascii=False)
+
+
 def sanitize_model_text(text: Any, *, local_roots: tuple[Path, ...] = ()) -> str:
     """Remove credentials and private host paths before text crosses an LLM boundary.
 
@@ -305,6 +379,10 @@ def sanitize_model_text(text: Any, *, local_roots: tuple[Path, ...] = ()) -> str
     home/temp/runtime prefixes and caller-supplied checkout roots are hidden, while
     task-relevant paths such as a benchmark's configured ``/data`` mount remain usable.
     """
+    structured = _sanitize_serialized_json(text, lambda item: sanitize_model_text(
+        item, local_roots=local_roots))
+    if structured is not None:
+        return structured
     value = str(text if text is not None else "")
     roots = sorted((str(Path(root).expanduser().resolve()) for root in local_roots),
                    key=len, reverse=True)
@@ -328,7 +406,7 @@ _MODEL_LOCAL_RESOURCE_FIELDS = frozenset({
     "candidate_paths", "selected_path", "verified_artifact", "policy_artifact",
     "result_artifact", "metric_artifact_evidence", "checkpoint", "checkpoint_path",
     "checkpoint_paths", "dataset", "dataset_path", "demo", "demo_path", "asset_path",
-    "trajectory", "trajectory_path", "video_path", "media_path", "episode_ids",
+    "trajectory", "trajectory_path", "video_path", "media_path", "episode_id", "episode_ids",
     "episode_keys", "initial_state_hashes", "checkpoint_sha256", "artifact_sha256",
     "policy_sha256", "dataset_sha256", "demo_sha256", "trajectory_hashes",
     "relative_path", "sha256", "size_bytes", "mtime",
@@ -342,8 +420,14 @@ _MODEL_LOCAL_RESOURCE_REF = re.compile(
     r"pkl|pickle|h5|hdf5|msgpack|flax|mp4|mkv|avi|mov|npz|npy|jsonl|json|csv|"
     r"parquet)(?:[\w.+~-]*)?(?![\w.-])", re.IGNORECASE)
 _MODEL_ABSOLUTE_PATH = re.compile(r"(?<![\w:/])/(?:[\w.@+~-]+/)*[\w.@+~-]+/?")
+_MODEL_EXECUTION_HANDLE_END = re.compile(r"\{(?:repo|run_path_\d+)\}$")
 _MODEL_EPISODE_ID = re.compile(
-    r"(?i)\bepisode(?:[_ -]?id)?(?:\s*[:=#_-]\s*|\s+)[\w.-]+")
+    # A field identifier or ordinary prose is not an observed episode identity.
+    # Keep explicit assignments and concrete ID-like labels private, but do not
+    # corrupt `episode_id`, `episode_ids`, `episode_index` or `episode_keys` syntax.
+    r"(?i)\b(?:episode(?:[_ -]?id)?\s*[:=#]\s*[\w.-]+|"
+    r"episode(?:[_-]?id)?[_-](?!(?:id|ids|index|keys)\b)[\w.-]+|"
+    r"episode(?:[_ -]?id)?\s+(?=[\w.-]*\d)[\w.-]+)")
 _MODEL_RESOURCE_ARGUMENT = re.compile(
     r"(?i)(--?(?:checkpoint|ckpt|model(?:-path)?|policy(?:-path)?|dataset|data|demo|"
     r"trajectory|video|output|asset-path|file)(?:=|\s+))(?P<quote>['\"]?)"
@@ -352,6 +436,10 @@ _MODEL_RESOURCE_ARGUMENT = re.compile(
 
 def sanitize_model_payload_text(value: Any, *, local_roots: tuple[Path, ...] = ()) -> str:
     """Scrub a free-text prompt value, including relative local artifacts and episode IDs."""
+    structured = _sanitize_serialized_json(value, lambda item: sanitize_model_payload_text(
+        item, local_roots=local_roots))
+    if structured is not None:
+        return structured
     text = sanitize_model_text(value, local_roots=local_roots)
     # Preserve the argument name before the generic artifact matcher sees a joined token
     # such as ``--dataset=/private/data/episodes.hdf5``. Without this ordering it hides the
@@ -359,7 +447,13 @@ def sanitize_model_payload_text(value: Any, *, local_roots: tuple[Path, ...] = (
     text = _MODEL_RESOURCE_ARGUMENT.sub(r"\1\g<quote>[LOCAL_RESOURCE]\g<quote>", text)
     text = _MODEL_LOCAL_RESOURCE_REF.sub("[LOCAL_RESOURCE]", text)
     text = _MODEL_EPISODE_ID.sub("episode [LOCAL_ID]", text)
-    return _MODEL_ABSOLUTE_PATH.sub("[LOCAL_PATH]", text)
+    def absolute_path(match):
+        # Known handle suffixes are run-relative identities, not host paths.
+        # Repeated projection must retain the exact consumer/script distinction.
+        if _MODEL_EXECUTION_HANDLE_END.search(text, max(0, match.start()-64), match.start()):
+            return match.group()
+        return "[LOCAL_PATH]"
+    return _MODEL_ABSOLUTE_PATH.sub(absolute_path, text)
 
 
 def sanitize_model_payload(value: Any, *, local_roots: tuple[Path, ...] = (),
@@ -378,12 +472,18 @@ def sanitize_model_payload(value: Any, *, local_roots: tuple[Path, ...] = (),
     if normalized == "report_ref":
         return "state.research_progress.report" if value else None
     if normalized in _MODEL_LOCAL_RESOURCE_FIELDS:
+        # Schema previews may describe a private field's type, never its value.
+        # This narrow descriptor cannot contain identities, paths or results.
+        if (isinstance(value, dict) and set(value) == {"type"} and
+                isinstance(value.get("type"), str) and
+                value.get("type") in {"string", "integer", "number", "boolean", "null"}):
+            return dict(value)
         if normalized in {"artifact", "artifacts", "artifact_path", "artifact_paths",
                           "artifact_pattern", "checkpoint", "checkpoint_path",
                           "checkpoint_paths", "policy_artifact", "result_artifact",
                           "metric_artifact_evidence"}:
             return "[DECLARED_LOCAL_ARTIFACT]" if value else ""
-        if normalized in {"episode_ids", "episode_keys"}:
+        if normalized in {"episode_id", "episode_ids", "episode_keys"}:
             return {"present": bool(value), "values_omitted": True}
         return "[LOCAL_RESOURCE_IDENTITY_OMITTED]" if value else None
     if normalized in {"path", "repository_path", "local_path", "interpreter"}:

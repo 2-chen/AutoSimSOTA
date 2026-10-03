@@ -301,7 +301,7 @@ def test_recheck_uses_declared_score_stage_and_native_json_result(tmp_path):
     protocol.write_text(json.dumps(protocol_row))
     source = ("def stage_argv_score_native(i):\n"
               "    return [i['python'], '-c', "
-              "'import pathlib,json,sys; pathlib.Path(sys.argv[1],\"result.json\").write_text(json.dumps({\"summary\": {\"reward\": 2.5}}))', i['output']]\n")
+              "'import pathlib,json,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True); (p/\"result.json\").write_text(json.dumps({\"summary\": {\"reward\": 2.5}}))', i['output']]\n")
     (output / "derived_stages.json").write_text(json.dumps({
         "score_native": {"source": source, "parameters": {},
                          "row": {"available": True, "artifact": "result.json"}}}))

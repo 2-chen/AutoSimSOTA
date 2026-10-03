@@ -38,6 +38,7 @@ import textwrap
 import threading
 import time
 import uuid
+from dataclasses import replace
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -389,6 +390,7 @@ class DerivedResearch:
                              "why": redact(str(row.get("why") or ""))[:600]}
         return {
             "benchmark": self.benchmark,
+            "latest_development_measurements": self.development_evidence(),
             "repository": str(self.repo),
             "stages": stages,
             "selected_stage_parameters": {
@@ -407,6 +409,10 @@ class DerivedResearch:
                 query="benchmark task objective source stage entrypoint assets metric "
                       "evaluation protocol capabilities data collection training feasibility"),
         }
+
+    def development_evidence(self) -> list[dict[str, Any]]:
+        from .development_evidence import summaries
+        return summaries(self.run_root)
 
     def build_rubric(self, *, on_event: Any = None) -> Any:
         """The objective: the spine, plus this benchmark's own questions under it.
@@ -919,12 +925,9 @@ class DerivedResearch:
         """
         from .execution_derive import blank_inputs
         inputs = blank_inputs()
-        training_steps = settings.get("train.n_epochs")
-        if training_steps is None:
-            training_steps = settings.get("steps")
-        if training_steps is None:
-            from .execution_derive import TRAINING_VERIFICATION_STEPS
-            training_steps = TRAINING_VERIFICATION_STEPS
+        # Formal work is a research decision, not the environment probe's budget.
+        # Epochs retain their native setting name: they are not optimizer updates.
+        training_steps = settings.get("steps", 0)
         inputs.update({
             "python": str(self.interpreter), "repo": str(self.repo),
             "task": settings.get("task") or self._task() or "",
@@ -936,7 +939,7 @@ class DerivedResearch:
             # and recorded was silently replaced by the checkout path. The runner supplies
             # what it knows, which here is nothing; the derivation's own answer fills it.
             "dataset": "", "output": str(self.stage_directory(stage)),
-            "steps": int(training_steps),
+            "steps": training_steps,
             "episodes": int(settings.get("eval.n_eval") or settings.get("episodes") or 0),
             "seed": int(settings.get("seed") or 0),
             "device": str(settings.get("device") or ""),
@@ -1124,11 +1127,30 @@ class DerivedResearch:
                         "returncode": None, "why": "run wall-clock budget exhausted"}
             timeout = min(timeout, left)
         decision = self.compute_for(stage, settings)
+        attempt_id = uuid.uuid4().hex
+        # The stage root owns logs/receipts and may exist across retries. Native
+        # producers often require their output leaf NOT to exist (e.g. resume=False).
+        # Give every attempt a separate absent leaf; never delete or reuse old outputs.
+        native_output = self.stage_directory(stage) / "native_outputs" / attempt_id
+        native_output.parent.mkdir(parents=True, exist_ok=True)
         # The decision wins over the ambient environment and loses to what the stage itself
         # declares, because a benchmark that names a variable for its own reasons knows
         # something this table does not.
         inputs = self._inputs(stage, settings=settings, device=decision.device,
                               device_index=decision.device_index, **overrides)
+        if stage == 'train':
+            from .training_work import missing_formal_work
+            problem = missing_formal_work(self.backend.sources.get(stage) or '', inputs)
+            if problem:
+                return {'stage': stage, 'ran': False, 'status': 'blocked',
+                        'returncode': None, 'termination_reason': 'formal_training_work_required',
+                        'why': problem, 'training_progress': {'status': 'unknown'}}
+        if "output" not in overrides:
+            inputs["output"] = str(native_output)
+        else:
+            # Explicit callers still own their requested path; receipts/checks must
+            # describe that real consumer root rather than a guessed stage directory.
+            native_output = Path(str(inputs["output"]))
         policy_parent: Path | None = None
         if stage == "evaluate":
             policy_input = str(overrides.get("checkpoint") or inputs.get("checkpoint") or "")
@@ -1156,7 +1178,6 @@ class DerivedResearch:
                                                         "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")})
         started = time.monotonic()
         before = time.time()
-        attempt_id = uuid.uuid4().hex
         # Python's timestamp/size-based bytecode validation can accept a stale .pyc when a
         # source patch has the same length and lands in the same timestamp tick as the
         # baseline. Each attempt gets a fresh cache namespace so a code experiment measures
@@ -1168,7 +1189,7 @@ class DerivedResearch:
                    "node_id": stage, "status": "running", "started_at": now(),
                    "started_epoch": before,
                    "argv": safe_argv, "cwd": str(self.backend.directory(stage)),
-                   "output_directory": str(self.stage_directory(stage).resolve()),
+                   "output_directory": str(native_output.resolve()),
                    "policy_output_root": str(policy_parent) if policy_parent else "",
                    "gpu_lease_id": _gpu_lease_id,
                    "gpu_device_uuid": _gpu_uuid,
@@ -1234,6 +1255,7 @@ class DerivedResearch:
                 with _live_stage_document(self.run_root):
                     staged = bounded_run(isolated_argv(
                         ["sh", "-c", command], output=self.output, repo=self.repo,
+                        native_environment=surroundings,
                         require_pid_namespace=True),
                                          timeout=staging_timeout,
                                          cwd=self.backend.directory(stage),
@@ -1401,7 +1423,8 @@ class DerivedResearch:
         try:
             try:
                 execution_argv = isolated_argv(
-                    argv, output=self.output, repo=self.repo, require_pid_namespace=True)
+                    argv, output=self.output, repo=self.repo, require_pid_namespace=True,
+                    native_environment=surroundings)
             except (OSError, ValueError) as exc:
                 # An unavailable isolation boundary or invalid launcher is a refusal before
                 # benchmark start; it must not be recorded as a failed benchmark attempt.
@@ -1483,7 +1506,7 @@ class DerivedResearch:
         else:
             said = tail_of(log)
 
-        artifact = self.backend.check_artifact(stage, self.run_root / stage, since=before)
+        artifact = self.backend.check_artifact(stage, native_output, since=before)
         if not artifact.get("matched"):
             # The benchmark may write somewhere the caller has no way to name. LIBERO's
             # training tree is built from config values and its own working directory, so the
@@ -1498,10 +1521,10 @@ class DerivedResearch:
         metric_result_artifact: dict[str, Any] = {"status": "not_declared", "matched": 0}
         if stage == "evaluate" and self.metric_spec.source in {"json", "csv"}:
             if self.metric_spec.artifact_pattern:
-                metric_result_artifact = resolve_metric_artifact(
+                metric_result_artifact = self._resolve_bound_metric_artifact(
                     self.metric_spec,
                     roots={"working_directory": Path(str(self.backend.directory(stage))),
-                           "output": stage_directory,
+                           "output": native_output,
                            "policy_parent": policy_parent or
                            (self.run_root / "__missing_policy_parent__")},
                     started_at=before, allowed_roots=[self.repo, self.run_root])
@@ -1532,7 +1555,7 @@ class DerivedResearch:
                   # environment: the part the derivation established.
                   "environment": differing,
                   "working_directory": str(self.backend.directory(stage)),
-                  "output_directory": str(stage_directory.resolve()),
+                  "output_directory": str(native_output.resolve()),
                   "policy_output_root": str(policy_parent) if policy_parent else "",
                   "compute_environment": dict(decision.environment),
                   "gpu_device_uuid": _gpu_uuid,
@@ -1550,7 +1573,7 @@ class DerivedResearch:
             record["training_progress"] = training_progress(tail_of(log))
         media_capture_started = time.monotonic()
         captured_media = media_manifest.capture_attempt(
-            self.run_root, stage_directory, since=before)
+            self.run_root, native_output, since=before)
         # Some native evaluators put videos beside the frozen policy they consumed,
         # not in the stage output directory. `experiment_dir` is a run-owned policy
         # archive supplied by measure(); only that exact directory is additionally
@@ -1586,6 +1609,23 @@ class DerivedResearch:
             # An uninspectable native run cannot be used as a scientific score.
             record.update(status="failed", termination_reason="evidence_capture_failed",
                           evidence_error=f"{type(exc).__name__}: {exc}")
+        if (stage == 'train' and self.require_training_progress and
+                record.get('status') == 'completed' and code == 0 and
+                (record.get('training_progress') or {}).get('status') == 'unknown' and
+                artifact.get('matched') and not artifact.get('invalid_pattern') and
+                record.get('evidence_ref') and
+                getattr(self.client, 'supports_native_progress_audit', False)):
+            # Formal execution must accept the same source-backed metadata proof as
+            # command verification. Do not demand a log marker from quiet trainers,
+            # and never treat newly written weights or requested steps as proof.
+            from .training_progress_audit import audit
+            try:
+                record['training_progress'] = audit(self.client, repo=self.repo,
+                    root=self.output, output=native_output, argv=argv, since=before,
+                    native_evidence_ref=record['evidence_ref'])
+            except (OSError, ValueError, TypeError) as exc:
+                record['training_progress'] = {'status': 'unknown',
+                    'reason': f'progress audit failed: {type(exc).__name__}: {exc}'}
         canonical_log = (self.run_root / stage / "attempts" / attempt_id / "output.log")
         atomic_json(receipt_path, {**receipt, **record, "finished_at": now(),
                                    "log": str(canonical_log),
@@ -2296,7 +2336,9 @@ class DerivedResearch:
     def measure(self, *, settings: dict[str, Any], label: str, dataset: str | None = None,
                 confirmation: bool = False, _reuse_training_attempt_id: str = "",
                 _baseline_recovery: bool = False,
-                _reuse_policy_artifact: dict[str, Any] | None = None) -> dict[str, Any]:
+                _reuse_policy_artifact: dict[str, Any] | None = None,
+                _reference_checkpoint: Path | None = None,
+                _data_bindings: list | None = None) -> dict[str, Any]:
         """One arm of the run, noted in the selection record on the way out.
 
         Wrapped rather than instrumented. `_measure` returns from eight places -- a stage that
@@ -2312,10 +2354,20 @@ class DerivedResearch:
             return self._comparison_refusal(
                 label, settings, "search cannot resume after the held-out set was exposed")
         measurement_started = time.monotonic()
+        from .data_versions import resolve as resolve_data_versions
+        settings,data_bindings=resolve_data_versions(self.output,self.repo,settings)
+        if _data_bindings:
+            checked,rebound=resolve_data_versions(self.output,self.repo,
+                {b['setting']:'data-version:'+b['id'] for b in _data_bindings})
+            if rebound!=_data_bindings or any(settings.get(k)!=v for k,v in checked.items()):
+                raise ResearchStateError('selected data bindings changed before training')
+            data_bindings=rebound
         result = self._measure(settings=settings, label=label, dataset=dataset,
                                confirmation=confirmation,
                                reuse_training_attempt_id=_reuse_training_attempt_id,
-                               reuse_policy_artifact=_reuse_policy_artifact)
+                               reuse_policy_artifact=_reuse_policy_artifact,
+                               **({'reference_checkpoint': _reference_checkpoint} if _reference_checkpoint is not None else {}),
+                               **({'data_bindings':data_bindings} if data_bindings else {}))
         from .scheduling import policy, note
         if policy(self.output):
             note(self.output, kind="formal_measurement", identity=label,
@@ -2828,7 +2880,8 @@ class DerivedResearch:
             return {"status": "unverified", "because": redact(str(exc))[:500]}
 
     def _verified_training_receipt(self, attempt_id: str,
-                                   settings: dict[str, Any]) -> dict[str, Any] | None:
+                                   settings: dict[str, Any], *,
+                                   audit_progress: bool = False) -> dict[str, Any] | None:
         """Load one completed train receipt only when its identity still binds this run."""
         if not re.fullmatch(r"[a-f0-9]{32}", attempt_id):
             return None
@@ -2861,14 +2914,81 @@ class DerivedResearch:
             progress = receipt.get("training_progress") or {}
             if (artifact.get("checked") is not True or
                     not isinstance(artifact.get("matched"), int) or
-                    artifact.get("matched", 0) < 1 or
-                    progress.get("status") != "observed"):
+                    artifact.get("matched", 0) < 1):
                 return None
+            if progress.get('status') != 'observed':
+                receipt = self._review_detached_training_progress(
+                    receipt, path=path, allow_model=audit_progress)
+                if receipt is None:
+                    return None
             return receipt
         except (OSError, TypeError, ValueError, AttributeError):
             return None
 
-    def recover_unscored_baseline(self) -> dict[str, Any]:
+    def _review_detached_training_progress(self, receipt: dict[str, Any], *,
+                                          path: Path, allow_model: bool) -> dict[str, Any] | None:
+        """Parent-owned CPU review; never edit the worker's sealed receipt/result.
+
+        Detached native workers intentionally have no model client. Persist additional
+        proof next to their exact receipt and revalidate it on every later adoption.
+        Reading controller state cannot trigger a model call; an explicit adoption or
+        job inspection must opt in through allow_model.
+        """
+        from .training_progress_audit import audit, candidates, sources, validate
+        from .evidence_store import read_attempt_evidence
+        sidecar = path.with_name('training_progress_revalidation.json')
+        try:
+            original_hash = digest(path)
+            output = Path(str(receipt.get('output_directory') or '')).resolve(strict=True)
+            if not output.is_relative_to(self.run_root.resolve()):
+                return None
+            reference = str(receipt.get('evidence_ref') or '')
+            evidence_id = str(receipt.get('evidence_id') or Path(reference).stem)
+            native = read_attempt_evidence(self.output, evidence_id, limit=1)
+            if (native.get('status') != 'completed' or native.get('returncode') != 0 or
+                    native.get('receipt_ref') != path.relative_to(self.output).as_posix()):
+                return None
+            since = float(receipt.get('started_epoch') or 0)
+            if sidecar.exists():
+                if sidecar.is_symlink():
+                    return None
+                saved = read_json(sidecar)
+                if saved.get('native_receipt_sha256') != original_hash:
+                    return None
+                audit_path = self.output / str(saved.get('audit_ref') or '')
+                if (audit_path.is_symlink() or not audit_path.resolve().is_relative_to(
+                        (self.output/'training_progress_audits').resolve()) or
+                        digest(audit_path) != saved.get('audit_sha256')):
+                    return None
+                document = read_json(audit_path)
+                if document.get('native_evidence_ref') != reference:
+                    return None
+                progress = validate(document['answer'], output=output,
+                    docs=candidates(output, since),
+                    code=sources(self.repo, self.output, receipt['argv']))
+                progress['audit_ref'] = saved['audit_ref']
+            elif allow_model and getattr(self.client, 'supports_native_progress_audit', False):
+                progress = audit(self.client, repo=self.repo, root=self.output,
+                    output=output, argv=receipt['argv'], since=since,
+                    native_evidence_ref=reference)
+                if progress.get('status') != 'observed' or digest(path) != original_hash:
+                    return None
+                audit_path = self.output / str(progress.get('audit_ref') or '')
+                if (audit_path.is_symlink() or not audit_path.resolve().is_relative_to(
+                        (self.output/'training_progress_audits').resolve())):
+                    return None
+                atomic_json(sidecar, {'schema_version': 1, 'at': now(),
+                    'native_receipt_sha256': original_hash,
+                    'native_evidence_ref': reference,
+                    'audit_ref': progress['audit_ref'], 'audit_sha256': digest(audit_path)})
+            else:
+                return None
+            return {**receipt, 'training_progress': progress,
+                    'training_progress_revalidation_ref': sidecar.relative_to(self.output).as_posix()}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+    def recover_unscored_baseline(self, *, replacement_training_attempt_id: str = "") -> dict[str, Any]:
         """Finish a baseline from its exact train receipt without training a second time.
 
         Supported boundaries are a source-selection abstention and an evaluation refused
@@ -2944,13 +3064,33 @@ class DerivedResearch:
         resource_retry = original.get("where") == "evaluate"
         policy_retry = (original.get("where") == "policy_artifact" and
                         original.get("status") == "unscored")
-        if not (resource_retry or policy_retry):
+        training_retry = bool(replacement_training_attempt_id) and original.get('where') == 'train'
+        if training_retry:
+            old_id = str((original.get('train') or {}).get('attempt_id') or original.get('attempt_id') or '')
+            try:
+                old_path = self.run_root/'attempts'/old_id/'receipt.json'
+                if not re.fullmatch(r'[a-f0-9]{32}', old_id) or old_path.is_symlink():
+                    raise ValueError('failed training identity missing')
+                old = read_json(old_path)
+                if (old.get('run_id') != self.run_id or old.get('attempt_id') != old_id
+                        or old.get('stage') != 'train' or old.get('status') != 'failed'
+                        or not isinstance(old.get('returncode'), int) or old['returncode'] == 0
+                        or old.get('termination_reason') != 'nonzero_exit'
+                        or old.get('settings_digest') != object_digest(original.get('settings') or {})
+                        or original.get('evaluate')):
+                    raise ValueError('original train is not a proven terminal nonzero failure')
+            except (OSError, ValueError, TypeError, KeyError):
+                return {'ok': False, 'where': 'recovery', 'ran': False,
+                        'why': 'replacement requires exact terminal failed baseline training evidence'}
+        if not (resource_retry or policy_retry or training_retry):
             return {"ok": False, "where": "recovery", "ran": False,
                     "why": "baseline failure is not a supported recovery boundary"}
         outcome = original.get("training_outcome") or {}
         train_outcome = original.get("train") or {}
         attempt_id = str(outcome.get("attempt_id") or original.get("attempt_id") or
                          (train_outcome.get("attempt_id") if resource_retry else ""))
+        if training_retry:
+            attempt_id = replacement_training_attempt_id
         settings = original.get("settings")
         if not isinstance(settings, dict):
             return {"ok": False, "where": "recovery", "ran": False,
@@ -3009,7 +3149,7 @@ class DerivedResearch:
                 return {"ok": False, "where": "recovery", "ran": False,
                         "why": "the failed selection record is missing, changed, or not an "
                                "abstention; no policy can be safely rebound"}
-        else:
+        elif resource_retry:
             recovery_kind = "reevaluate_after_prestart_resource_block"
             from .devices import normalize_uuid
             selected_device = ((self.compute.evidence.get("selected_device") or {})
@@ -3053,6 +3193,8 @@ class DerivedResearch:
                 return {"ok": False, "where": "recovery", "ran": False,
                         "why": "the frozen baseline policy is not one of the exact fresh "
                                "outputs named by its train receipt"}
+        elif training_retry:
+            recovery_kind = 'adopt_completed_replacement_training_after_failed_baseline'
 
         session_path = self.run_root / "controller_session.json"
         report_path = self.run_root / "research_report.json"
@@ -3078,6 +3220,12 @@ class DerivedResearch:
                         for row in history[1:] if isinstance(row, dict))):
                 raise ValueError("controller state is not recoverable: it must contain the "
                                  "same paused/completed unscored baseline and no later score")
+            if training_retry and (session_status != 'paused' or len(history) != 1
+                    or len(rows) != 1 or history[0].get('measured') is True
+                    or isinstance(history[0].get('metric_value'), (int, float))
+                    or session.get('input_identity') != self._research_session_identity(
+                        rounds=session.get('rounds', 2), settings=session.get('base_settings') or {})):
+                raise ValueError('replacement is limited to unchanged, unscored round-zero inputs')
         except (OSError, TypeError, ValueError, AttributeError) as exc:
             return {"ok": False, "where": "recovery", "ran": False,
                     "why": f"baseline controller state cannot be safely resumed: "
@@ -3088,6 +3236,10 @@ class DerivedResearch:
                                if retry_after_archive_failure else
                                attempt_dir / "baseline_recovery.json")
         backup_path = attempt_dir / "baseline_unscored.json"
+        additive_retry = self.baseline_selection_retry_plan(original) if policy_retry else {'available':False}
+        if additive_retry.get('available'):
+            recovery_state_path = Path(additive_retry['state_path'])
+            backup_path = Path(additive_retry['backup_path'])
         if measurement_path.is_file():
             current = read_json(measurement_path)
             recovered = (current.get("recovery") or {}) if isinstance(current, dict) else {}
@@ -3123,6 +3275,7 @@ class DerivedResearch:
             "blocked_evaluation_attempt_id": blocked_evaluation_id,
             "settings_digest": object_digest(settings),
             "original_measurement_sha256": object_digest(original), "started_at": now(),
+            'selection_evidence_context_sha256': additive_retry.get('evidence_context_sha256'),
         })
         self._set_research_action("recover_unscored_baseline", details={
             "training_attempt_id": attempt_id, "training_reused": True})
@@ -3137,8 +3290,10 @@ class DerivedResearch:
             "recovery_attempt": 2 if retry_after_archive_failure else 1,
             "superseded_evaluation_attempt_id": blocked_evaluation_id,
             "original_measurement_ref":
-                f"attempts/{attempt_id}/baseline_unscored.json",
+                backup_path.relative_to(self.run_root).as_posix(),
         }
+        if training_retry:
+            result['recovery']['superseded_training_attempt_id'] = old_id
         atomic_json(measurement_path, result)
         atomic_json(recovery_state_path, {
             "schema_version": 1, "status": "completed" if result.get("ok") else "failed",
@@ -3146,6 +3301,8 @@ class DerivedResearch:
             "label": "baseline", "training_attempt_id": attempt_id,
             "training_reused": True,
             "recovery_kind": recovery_kind,
+            'original_measurement_sha256': object_digest(original),
+            'selection_evidence_context_sha256': additive_retry.get('evidence_context_sha256'),
             "superseded_evaluation_attempt_id": blocked_evaluation_id,
             "evaluation_attempt_id": (result.get("evaluate") or {}).get("attempt_id"),
             "measurement_sha256": object_digest(result), "finished_at": now(),
@@ -3165,8 +3322,7 @@ class DerivedResearch:
                          "success_rate": result.get("success_rate"),
                          "recovered_from": {
                              "measurement_ref":
-                                 f"research/{self.run_id}/attempts/{attempt_id}/"
-                                 "baseline_unscored.json",
+                                 f"research/{self.run_id}/"+backup_path.relative_to(self.run_root).as_posix(),
                              "training_attempt_id": attempt_id,
                              "training_reused": True,
                              "original_failure": prior_failure,
@@ -3203,7 +3359,7 @@ class DerivedResearch:
             "training_attempt_id": attempt_id,
             "evaluation_attempt_id": (result.get("evaluate") or {}).get("attempt_id"),
             "training_reused": True, "metric_value": result.get("metric_value"),
-            "original_measurement_ref": f"attempts/{attempt_id}/baseline_unscored.json",
+            "original_measurement_ref": backup_path.relative_to(self.run_root).as_posix(),
         })
         self._set_research_action("recover_unscored_baseline", status="completed",
                                   details={"training_attempt_id": attempt_id,
@@ -3217,7 +3373,9 @@ class DerivedResearch:
     def _measure(self, *, settings: dict[str, Any], label: str, dataset: str | None = None,
                  confirmation: bool = False,
                  reuse_training_attempt_id: str = "",
-                 reuse_policy_artifact: dict[str, Any] | None = None) -> dict[str, Any]:
+                 reuse_policy_artifact: dict[str, Any] | None = None,
+                 reference_checkpoint: Path | None = None,
+                 data_bindings: list | None = None) -> dict[str, Any]:
         """Train and score, which is what one arm of a comparison consists of.
 
         The two stages are run in the order the benchmark needs them, and the second is
@@ -3226,6 +3384,11 @@ class DerivedResearch:
         derivation has to guess.
         """
         if self.execution_graph:
+            if data_bindings:
+                return {'ok':False,'label':label,'why':'data versions require explicit graph consumer binding; not silently accepted'}
+            if reference_checkpoint is not None:
+                return {'label': label, 'ok': False, 'where': 'reference_graph_binding',
+                        'why': 'reference policy requires an explicit verified graph input edge; no training launched'}
             if dataset:
                 return {"label": label, "ok": False, "where": "graph_dataset_binding",
                         "why": "external dataset override is not declared as a graph edge",
@@ -3255,12 +3418,14 @@ class DerivedResearch:
         # and a released policy produces its own number instead of reporting that it has no
         # number, and the run knows what there is to beat. The record says which of the two
         # it scored, because a reader comparing two runs has to know.
-        scored_what = ("a checkpoint this run trained" if self.available("train")
+        train_available = self.available('train') and reference_checkpoint is None
+        scored_what = ('the explicitly selected released-reference checkpoint' if reference_checkpoint is not None
+                       else "a checkpoint this run trained" if self.available("train")
                        else "the checkpoint the benchmark ships" if self.checkpoint
                        else "a source-defined controller with no weight artifact"
                        if self.source_policy else "")
         missing = [name for name in ("train", "evaluate") if not self.available(name)]
-        if missing and not ((self.checkpoint or self.source_policy) and
+        if missing and not ((reference_checkpoint or self.checkpoint or self.source_policy) and
                             self.available("evaluate") and missing == ["train"]):
             why = (f"{' and '.join(missing)} cannot be run: no command was derived for "
                    f"{'it' if len(missing) == 1 else 'them'}. A measurement needs both halves, "
@@ -3280,7 +3445,10 @@ class DerivedResearch:
         # that no command could supply. RoboTwin's did, twice, with the diagnosis right both
         # times: "the config that would hold it is a file, not a field, and the stage must be
         # run so that key exists". A stage nothing runs is a stage the loop does not have.
-        if reuse_training_attempt_id:
+        if reference_checkpoint is not None:
+            trained = {'ran': False, 'returncode': None, 'origin': 'released_reference',
+                       'why': 'evaluation-only reference; no local training or claimed training progress'}
+        elif reuse_training_attempt_id:
             trained = self._verified_training_receipt(reuse_training_attempt_id, settings)
             if trained is None:
                 failed = {"label": label, "ok": False, "where": "policy_artifact",
@@ -3303,7 +3471,7 @@ class DerivedResearch:
                              if self.source_policy and not self.checkpoint else
                              "no command was derived for train, and the benchmark ships a "
                              "checkpoint, so that is what was scored"})
-        if self.available("train"):
+        if train_available:
             if not reuse_training_attempt_id:
                 trained = self._select_policy_artifact(trained)
         train_artifact = trained.get("artifact") or {}
@@ -3312,14 +3480,14 @@ class DerivedResearch:
         # explicitly says it planned zero iterations/updates, its zero-exit and fresh file
         # are insufficient evidence that the requested training actually happened.
         zero_work = explicitly_zero_training_work(train_readings)
-        progress_unverified = (self.require_training_progress and self.available("train") and
+        progress_unverified = (self.require_training_progress and train_available and
                                (trained.get("training_progress") or {}).get("status") !=
                                "observed")
         policy_artifact_unresolved = (
             trained.get("status") == "completed" and trained.get("returncode") == 0 and
             bool(train_artifact.get("matched")) and
             self._recorded_artifact(trained) is None)
-        if self.available("train") and (
+        if train_available and (
                 not trained.get("ran") or trained.get("returncode") != 0
                 or not train_artifact.get("checked") or not train_artifact.get("matched")
                 or zero_work or progress_unverified or policy_artifact_unresolved):
@@ -3336,7 +3504,11 @@ class DerivedResearch:
                                                "attempt_id": trained.get("attempt_id")}}
                          if policy_artifact_unresolved else {}),
                       "metric_value": None, "metric_utility": None,
-                      "why": ("trainer explicitly reported zero updates/iterations" if
+                      "train": trained,
+                      "why": ((trained.get('why') or trained.get('termination_reason') or
+                               'native training did not start or exit successfully')
+                              if not trained.get('ran') or trained.get('returncode') != 0 else
+                              "trainer explicitly reported zero updates/iterations" if
                               zero_work else "positive native training progress not verified" if
                               progress_unverified else
                               (trained.get("artifact_selection") or {}).get("why") or
@@ -3347,8 +3519,17 @@ class DerivedResearch:
                       "training_progress": trained.get("training_progress")}
             atomic_json(self.run_root / "measurements" / f"{label}.json", failed)
             return failed
-        produced = (self._recorded_artifact(trained) if trained.get("ran")
+        produced = (Path(reference_checkpoint) if reference_checkpoint is not None
+                    else self._recorded_artifact(trained) if trained.get("ran")
                     else Path(self.checkpoint) if self.checkpoint else None)
+        from .data_versions import verify_consumption
+        data_consumption=verify_consumption(self.output,data_bindings or [],trained)
+        if data_bindings and data_consumption['status']!='verified':
+            failed={'label':label,'ok':False,'where':'training_data','settings':settings,
+                    'metric_value':None,'train':trained,'data_consumption':data_consumption,
+                    'why':data_consumption.get('why'),'status':'unscored'}
+            atomic_json(self.run_root/'measurements'/f'{label}.json',failed)
+            return failed
         if not (self.source_policy and not self.available("train") and not self.checkpoint) and (
                 produced is None or not produced.exists()):
             policy_artifact_unresolved = (trained.get("status") == "completed" and
@@ -3522,6 +3703,9 @@ class DerivedResearch:
                           "evaluation did not exit normally or yield a verified native "
                           "metric result" if not scored_ok else ""),
                   "scored": scored_what,
+                  "baseline_origin": ('released_reference' if reference_checkpoint is not None else
+                                      'locally_trained' if train_available else 'source_policy'),
+                  'data_consumption':data_consumption,
                   "settings": {k: settings[k] for k in sorted(settings)},
                   "policy_artifact": archived,
                   "policy_consumption": policy_consumption,
@@ -3652,7 +3836,7 @@ class DerivedResearch:
             stage = str(record.get("stage") or "")
             base = (Path(str(record.get("cwd") or self.backend.directory(stage)))
                     if artifact.get("found_beside_the_command") else
-                    self.run_root / stage)
+                    Path(str(record.get("output_directory") or self.run_root / stage)))
             target = Path(pattern)
             target = target if target.is_absolute() else base / target
             paths = sorted(Path(path) for path in glob.glob(str(target), recursive=True))
@@ -3777,6 +3961,7 @@ class DerivedResearch:
                          for index, path in enumerate(candidates)}
         candidate_id_by_path = {path: candidate_id
                                 for candidate_id, path in candidate_ids.items()}
+        work_bindings, producer_sources, work_proof_sha = self._policy_work_evidence(record, candidate_ids)
 
         def redact_candidate_references(value: str) -> tuple[str, set[str]]:
             """Replace produced checkpoint references before constructing any model input."""
@@ -3820,11 +4005,15 @@ class DerivedResearch:
         selection_path = selection_dir / "artifact_selection.json"
         candidate_sha256 = object_digest(candidates)
         sources, source_error = self._policy_selection_sources(str(record.get("stage") or ""))
+        sources.extend(producer_sources)
+        if sources:
+            source_error = ''
         source_hashes = {source["path"]: source["sha256"] for source in sources}
 
         def same_inputs(saved: dict[str, Any]) -> bool:
             return (saved.get("candidate_paths_sha256") == candidate_sha256 and
-                    saved.get("source_hashes") == source_hashes)
+                    saved.get("source_hashes") == source_hashes and
+                    saved.get('completed_work_proof_sha256', '') == work_proof_sha)
 
         def transient_failure(saved: dict[str, Any]) -> bool:
             if saved.get("status") == "unavailable":
@@ -3846,9 +4035,12 @@ class DerivedResearch:
                 if previous.get("attempt_id") != attempt_id:
                     raise ValueError("persisted selection belongs to a different attempt")
                 if (revalidate_abstained and previous.get("status") == "abstained" and
-                        not same_inputs(previous)):
+                        not same_inputs(previous) and not (
+                            work_bindings and previous.get('candidate_paths_sha256') == candidate_sha256
+                            and all(source_hashes.get(k) == v for k,v in
+                                    (previous.get('source_hashes') or {}).items()))):
                     record["artifact_selection"] = {
-                        "status": "abstained", "selection_ref": selection_ref,
+                        "status": "abstained", "selection_ref": str(selection_path.relative_to(self.output)),
                         "why": "cannot revalidate the saved decision because its source or "
                                "candidate inputs changed"}
                     return record
@@ -3892,6 +4084,7 @@ class DerivedResearch:
                     "candidate_paths": candidates,
                     "candidate_paths_sha256": candidate_sha256,
                     "source_hashes": source_hashes,
+                    'completed_work_proof_sha256': work_proof_sha,
                     "selected_path": selected or None,
                     "native_rule": str((answer or {}).get("native_rule") or "")[:1000],
                     "evidence": (answer or {}).get("evidence") or [],
@@ -3910,6 +4103,11 @@ class DerivedResearch:
                     safe_source_texts[source["path"]]).splitlines())
             for source in sources
         }
+        for source in sources:
+            if source.get('verified_producer_quotes'):
+                safe_source_excerpt_texts[source['path']] += '\n' + '\n'.join(
+                    redact_candidate_references(quote)[0]
+                    for quote in source['verified_producer_quotes'])
 
         def validate(answer: dict[str, Any], *, allow_legacy: bool = False
                      ) -> tuple[str | None, str]:
@@ -3952,14 +4150,21 @@ class DerivedResearch:
                                            "why": str(citation.get("why") or "")[:500]})
             trace = str(answer.get("candidate_trace") or "").strip()
             safe_trace, _ = redact_candidate_references(trace)
-            if (not safe_trace or safe_trace not in safe_training_log or
+            metadata_choice = answer.get('selection_basis') == 'verified_completed_work_container'
+            if metadata_choice:
+                current_bindings, _, current_sha = self._policy_work_evidence(record, candidate_ids)
+                if (candidate_id not in current_bindings or current_sha != work_proof_sha):
+                    return None, 'selected policy has no unchanged audited completed-work container association'
+                answer['candidate_trace'] = f'{candidate_id}: source-backed completed-work container'
+            elif (not safe_trace or safe_trace not in safe_training_log or
                     candidate_id not in safe_trace or
                     candidate_id not in observed_candidate_ids):
                 return None, "training log does not identify the selected fresh candidate"
             answer["evidence"] = verified_citations
             answer["candidate_id"] = candidate_id
             answer.pop("selected_path", None)
-            answer["candidate_trace"] = safe_trace
+            if not metadata_choice:
+                answer["candidate_trace"] = safe_trace
             return selected, ""
 
         try:
@@ -4072,16 +4277,35 @@ class DerivedResearch:
             "never infer or invent a filesystem path or filename. Cite exact quotations from "
             "the supplied repository-source excerpts that establish the native save/load or "
             "best-policy rule, and quote a training-log trace naming the candidate ID. If the "
+            "trainer is quiet, verified_completed_work_bindings provides a locally verified "
+            "association between an opaque candidate and the checkpoint container carrying "
+            "the independently audited completed-update counter. Interpret the actual native "
+            "producer save flow in native_source excerpts; those are virtual source IDs, not "
+            "paths to grep. You may choose selection_basis=verified_completed_work_container "
+            "ONLY for a listed bound candidate when that source flow establishes this is its "
+            "completed trained policy. This alternative does not require a log trace. "
+            "If the native evaluator accepts a caller-supplied trained policy, this basis "
+            "does not require a repository-declared best-policy winner. equivalent_candidate_ids "
+            "means exact aliases of ONE locally verified physical target, not two distinct "
+            "models with tied counts. Any listed alias of that same target identifies the "
+            "same completed policy; alias enumeration is not a performance ranking. "
+            "Candidate IDs likewise are local aliases, not tokens the repository must print. "
+            "Do not claim a best-performance checkpoint from a completed-work counter. If the "
             "rule is ambiguous or evidence is insufficient, abstain. Return one JSON object "
             "with decision ('select' or 'abstain'), candidate_id, "
-            "native_rule, evidence ([{source_path, quote, why}]), candidate_trace, and why."
+            "native_rule, evidence ([{source_path, quote, why}]), selection_basis "
+            "('native_log' or 'verified_completed_work_container'), candidate_trace, and why."
         )
         safe_sources = [{"path": source["path"], "sha256": source["sha256"],
-                         "excerpt": self._selection_excerpt(safe_source_texts[source["path"]])}
+                         "excerpt": self._selection_excerpt(safe_source_texts[source["path"]])
+                             + ('\nAudited producer quotes:\n' + '\n'.join(
+                                redact_candidate_references(q)[0] for q in
+                                source.get('verified_producer_quotes') or []))}
                         for source in sources]
         payload = {"stage": record.get("stage"), "entrypoint":
                    (self.backend.stages.get(str(record.get("stage"))) or {}).get("entrypoint"),
                    "candidate_ids": list(candidate_ids),
+                   'verified_completed_work_bindings': work_bindings,
                    "training_log_tail": safe_training_log,
                    "repository_sources": safe_sources}
         user = sanitize_model_text(
@@ -4166,11 +4390,134 @@ class DerivedResearch:
                                              "why": why or "the model could not establish a native selection rule"}
         return record
 
+    def _policy_work_evidence(self, record: dict[str, Any], candidate_ids: dict[str, str]
+                              ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        """Expose audited native producer/metadata associations, never choose a policy.
+
+        A checkpoint-container association is structural (not a filename recipe), and
+        only exists below the attempt root. The Agent must interpret the exact save
+        flow; native load/rollout identity still independently verifies its selection.
+        """
+        from .training_progress_audit import candidates, sources, validate
+        from .evidence_store import read_attempt_evidence
+        try:
+            progress = record.get('training_progress') or {}
+            ref = str(progress.get('audit_ref') or '')
+            raw = self.output/ref
+            if (not ref or raw.is_symlink() or not raw.resolve().is_relative_to(
+                    (self.output/'training_progress_audits').resolve())):
+                return {}, [], ''
+            document = read_json(raw)
+            if document.get('native_evidence_ref') != record.get('evidence_ref'):
+                return {}, [], ''
+            native = read_attempt_evidence(self.output, str(record.get('evidence_id') or ''), limit=1)
+            if native.get('status') != 'completed' or native.get('returncode') != 0:
+                return {}, [], ''
+            output = Path(str(record['output_directory'])).resolve(strict=True)
+            code = sources(self.repo, self.output, record['argv'])
+            proof = validate(document['answer'], output=output,
+                docs=candidates(output, float(record['started_epoch'])), code=code)
+            counter = proof['evidence']['native_counter']
+            counter_path = (output/counter['path']).resolve(strict=True)
+            container = counter_path.parent.parent
+            if container == output or not container.is_relative_to(output):
+                return {}, [], ''
+            bindings = {}
+            physical_groups: dict[Path, list[str]] = {}
+            for alias, candidate in candidate_ids.items():
+                path = Path(candidate)
+                resolved = (path if path.is_absolute() else output/path).resolve(strict=True)
+                if resolved.is_relative_to(output):
+                    physical_groups.setdefault(resolved, []).append(alias)
+            for alias, candidate in candidate_ids.items():
+                path = Path(candidate)
+                path = path if path.is_absolute() else output/path
+                resolved = path.resolve(strict=True)
+                if (resolved.parent == container and resolved.is_relative_to(output)
+                        and resolved != counter_path):
+                    bindings[alias] = {'completed_work': counter['value'],
+                        'counter_field': counter['field'],
+                        'association': 'candidate and audited metadata share a native checkpoint container',
+                        'equivalent_candidate_ids': sorted(physical_groups[resolved]),
+                        'physical_identity_basis': 'exact same resolved target inside this attempt output',
+                        'not_a_score_or_best_checkpoint_claim': True}
+            cited = {entry['source_id'] for entry in proof['evidence']['source_evidence']}
+            producer_sources = [{'path': f'native_source_{row["id"]}', 'sha256': row['sha256'],
+                'text': row['content'], 'excerpt': self._selection_excerpt(row['content']),
+                'verified_producer_quotes': [entry['quote'] for entry in
+                    proof['evidence']['source_evidence'] if entry['source_id']==row['id']]}
+                for row in code if row['id'] in cited]
+            identity = object_digest({'bindings': bindings, 'audit_sha256': digest(raw),
+                'sources': {row['path']: row['sha256'] for row in producer_sources}})
+            return bindings, producer_sources, identity
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return {}, [], ''
+
+    def baseline_selection_retry_plan(self, measurement: dict[str, Any]) -> dict[str, Any]:
+        """One pre-evaluation retry per strictly additive verified producer evidence set."""
+        try:
+            recovery = measurement.get('recovery') or {}
+            attempt = str(recovery.get('training_attempt_id') or '')
+            if (measurement.get('where') != 'policy_artifact' or measurement.get('status') != 'unscored'
+                    or measurement.get('ok') is True or measurement.get('evaluate')
+                    or not re.fullmatch(r'[a-f0-9]{32}', attempt)):
+                return {'available': False}
+            directory = self.run_root/'attempts'/attempt
+            backup_ref = str(recovery.get('original_measurement_ref') or '')
+            old_path = directory/'baseline_recovery.json'
+            if backup_ref:
+                backup_path = self.run_root/backup_ref
+                if (backup_path.is_symlink() or backup_path.resolve().parent != directory.resolve()
+                        or not backup_path.is_file()):
+                    return {'available': False}
+                match = re.fullmatch(r'baseline_unscored_additive_([a-f0-9]{64})\.json', backup_path.name)
+                if match:
+                    old_path = directory/f'baseline_recovery_additive_{match.group(1)}.json'
+                elif backup_path.name != 'baseline_unscored.json':
+                    return {'available': False}
+            if old_path.is_symlink():
+                return {'available': False}
+            old = read_json(old_path)
+            if (old.get('status') != 'failed' or old.get('evaluation_attempt_id')
+                    or old.get('training_attempt_id') != attempt
+                    or old.get('measurement_sha256') != object_digest(measurement)):
+                return {'available': False}
+            trained = self._verified_training_receipt(attempt, measurement.get('settings') or {})
+            if trained is None:
+                return {'available': False}
+            paths, error = self._selection_candidates(trained)
+            aliases = {f'candidate_{i+1}': value for i,value in enumerate(paths)}
+            bindings, producer_sources, proof_sha = self._policy_work_evidence(trained, aliases)
+            if error or not bindings:
+                return {'available': False}
+            sources, _ = self._policy_selection_sources('train')
+            sources.extend(producer_sources)
+            hashes = {row['path']: row['sha256'] for row in sources}
+            ref = str((measurement.get('artifact_selection') or {}).get('selection_ref') or '')
+            raw = self.output/ref
+            if (not ref or raw.is_symlink() or not raw.resolve().is_relative_to(directory.resolve())):
+                return {'available': False}
+            prior = read_json(raw)
+            if (prior.get('status') not in {'abstained','unavailable'}
+                    or prior.get('candidate_paths_sha256') != object_digest(paths)
+                    or not all(hashes.get(k)==v for k,v in (prior.get('source_hashes')or{}).items())
+                    or prior.get('completed_work_proof_sha256','') == proof_sha):
+                return {'available': False}
+            identity = object_digest({'candidate_paths':paths, 'sources':hashes, 'work_proof':proof_sha})
+            state = directory/f'baseline_recovery_additive_{identity}.json'
+            if state.exists():
+                return {'available':False, 'why':'this additive evidence set was already tried'}
+            return {'available':True, 'attempt_id':attempt, 'evidence_context_sha256':identity,
+                    'state_path':str(state),
+                    'backup_path':str(directory/f'baseline_unscored_additive_{identity}.json')}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return {'available':False}
+
     def _metric_artifact_for_record(self, record: dict[str, Any]
                                     ) -> tuple[Path | None, dict[str, Any]]:
         """Find one result file from this score attempt, separate from its policy/media output."""
         if self.metric_spec.artifact_pattern:
-            resolved = resolve_metric_artifact(
+            resolved = self._resolve_bound_metric_artifact(
                 self.metric_spec,
                 roots={"working_directory": Path(str(record.get("working_directory") or
                                                        self.backend.directory("evaluate"))),
@@ -4194,6 +4541,60 @@ class DerivedResearch:
         except OSError as exc:
             return None, {"status": "unreadable", "matched": 0,
                           "why": type(exc).__name__}
+
+    def _resolve_bound_metric_artifact(self, spec: MetricSpec, **kwargs: Any) -> dict[str, Any]:
+        """Separate a verified specimen's location from its frozen producer's output role.
+
+        Old bindings stored an exact specimen path, including native timestamps. Only
+        a missing exact path may relocate, inside this attempt's output and the already
+        frozen Agent-declared producer glob. No new glob, metric mapping, or best-result
+        choice is inferred. The original binding bytes must still verify; ambiguity,
+        stale files and missing producer evidence remain failures.
+        """
+        exact = resolve_metric_artifact(spec, **kwargs)
+        if exact.get('status') != 'missing' or spec.artifact_root != 'output':
+            return exact
+        binding_path = self.output/'metric_binding.json'
+        protocol_path = self.run_root/'comparison_protocol.json'
+        try:
+            if binding_path.is_symlink() or protocol_path.is_symlink():
+                return exact
+            binding, protocol = read_json(binding_path), read_json(protocol_path)
+            bound_spec = MetricSpec.from_declaration({'research_goal': {
+                'primary_metric': binding.get('primary_metric')}})
+            if bound_spec != spec or protocol.get('metric') != spec.as_dict():
+                return exact
+            producer = str((protocol.get('evaluator_stage') or {}).get('artifact') or '')
+            if (producer != self.backend.artifact_pattern('evaluate') or
+                    not producer or artifact_pattern_problem(producer)):
+                return exact
+            original = binding.get('verified_artifact') or {}
+            raw = Path(str(original.get('path') or ''))
+            specimen = raw.resolve(strict=True)
+            if (raw.is_symlink() or not specimen.is_file() or
+                    not specimen.is_relative_to(self.output.resolve()) or
+                    not binding.get('evidence') or original.get('root') != 'output' or
+                    original.get('pattern') != spec.artifact_pattern or
+                    specimen.name != Path(spec.artifact_pattern).name or
+                    digest(specimen) != original.get('sha256') or
+                    any(char in spec.artifact_pattern for char in '*?[')):
+                return exact
+            # Resolve the producer rule first, never a recursive basename search over
+            # the repository. More than one declared product is not auto-selected.
+            relocated = resolve_metric_artifact(replace(spec, artifact_pattern=producer), **kwargs)
+            if (relocated.get('status') != 'matched' or
+                    Path(relocated['path']).name != specimen.name):
+                return {**exact, 'producer_resolution': relocated.get('status'),
+                        'producer_matched': relocated.get('matched', 0)}
+            return {**relocated, 'pattern': spec.artifact_pattern,
+                    'source': 'verified_binding_frozen_producer_relocation',
+                    'producer_pattern': producer,
+                    'binding_sha256': digest(binding_path),
+                    'comparison_protocol_sha256': digest(protocol_path),
+                    'specimen_sha256': original['sha256'],
+                    'metric_mapping_unchanged': True}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return exact
 
     def _attach_metric_artifact_evidence(self, record: dict[str, Any],
                                          evidence: dict[str, Any],
@@ -4261,7 +4662,8 @@ class DerivedResearch:
         if not path.is_absolute():
             base = (self.backend.directory(str(record.get("stage")))
                     if artifact.get("found_beside_the_command") else
-                    self.run_root / str(record.get("stage")))
+                    Path(str(record.get("output_directory") or
+                             self.run_root / str(record.get("stage")))))
             path = base / path
         try:
             resolved = path.resolve(strict=True)
@@ -4551,9 +4953,10 @@ class DerivedResearch:
         return success_rate(said)
 
     def baseline(self, *, settings: dict[str, Any] | None = None,
-                 training_attempt_id: str = "") -> dict[str, Any]:
+                 training_attempt_id: str = "", reference_checkpoint: Path | None = None) -> dict[str, Any]:
         return self.measure(settings=self._base_settings(settings), label="baseline",
-                            _reuse_training_attempt_id=training_attempt_id)
+                            _reuse_training_attempt_id=training_attempt_id,
+                            **({'_reference_checkpoint': reference_checkpoint} if reference_checkpoint is not None else {}))
 
     @staticmethod
     def _base_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
@@ -4819,6 +5222,10 @@ class DerivedResearch:
         candidates = [one for one in self.library.usable()
                       if execution_compatibility(
                           one, stage_parameters=self.backend.parameters.get("train"))[0]]
+        # The legacy autonomous loop applies patches through AgentFix, which can
+        # repair a stale literal using the actual source. Do not filter away that
+        # recovery path here. Main-controller options perform source preflight
+        # before handing an explicit candidate to this loop.
         if kinds_wanted is not None:
             candidates = [one for one in candidates if one.granularity in kinds_wanted]
         compatible_library = IdeaLibrary(self.library.path)
@@ -4832,8 +5239,13 @@ class DerivedResearch:
         system = ("Select exactly one previously audited research idea based on the current "
                   "benchmark evidence. Return JSON {\"label\":\"exact candidate label\","
                   "\"why\":\"evidence-based reason\"}. Only labels in candidates are "
-                  "allowed. Never change evaluation rules, metrics, seeds, or protected files.")
+                  "allowed. Prefer a causal score-improvement hypothesis once execution "
+                  "is verified; justify diagnostic or throughput work before spending a "
+                  "full training/evaluation round. Use current formal development scores "
+                  "and sample counts, not historical command smoke tests. Never change "
+                  "evaluation rules, metrics, seeds, or protected files.")
         material = {
+            "latest_development_measurements": self.development_evidence(),
             "evidence": evidence, "recent_kinds": history[-6:],
             "kinds_wanted": kinds_wanted,
             "candidates": [{"label": one.label, "kind": one.granularity,
@@ -5266,11 +5678,18 @@ class DerivedResearch:
         return {name: object_digest(value) for name, value in
                 self._research_session_inputs(rounds=rounds, settings=settings).items()}
 
+    def _performance_claims(self) -> dict[str, Any]:
+        from .baseline_reference import view as reference_view
+        return {'scope':'local_baseline_improvement',
+                'reference_status':reference_view(self.output).get('status'),
+                'global_sota_verified':False}
+
     def _controller_report(self, *, history: list[dict[str, Any]],
                            stopped_because: str, run_status: str,
                            next_round: int, rounds: int) -> dict[str, Any]:
         best = self.snapshots.best()
         return {"schema_version": 1, "created_at": now(), "repo": str(self.repo),
+                'performance_claims': self._performance_claims(),
                 "run_id": self.run_id, "run_status": run_status,
                 "rounds": [dict(row) for row in history],
                 **({"stopped_because": stopped_because} if stopped_because else {}),
@@ -5288,7 +5707,10 @@ class DerivedResearch:
             resume_interrupted: bool = False,
             selected_idea_label: str = "",
             main_controller_owns_selection: bool = False,
-            baseline_training_attempt_id: str = "") -> dict[str, Any]:
+            baseline_training_attempt_id: str = "",
+            baseline_reference_checkpoint: Path | None = None,
+            candidate_job: dict[str, Any] | None = None,
+            candidate_training_settings: dict[str, Any] | None = None) -> dict[str, Any]:
         """Baseline, then one idea per round, each measured against the last.
 
         A round that cannot be proposed or cannot run ends the loop rather than being
@@ -5317,7 +5739,20 @@ class DerivedResearch:
                 not yield_after_action or max_rounds_per_action != 1):
             raise ValueError("main-controlled idea selection requires one bounded action")
         base_settings = self._base_settings(settings)
+        if candidate_training_settings is not None:
+            from .candidate_settings import apply
+            if (not main_controller_owns_selection or not selected_idea_label or candidate_job
+                    or not (self.run_root/'controller_session.json').is_file()):
+                raise ResearchStateError('candidate training work requires one existing Main-selected round')
+            apply(self,base_settings,candidate_training_settings)
+        if candidate_job is not None:
+            from .candidate_jobs import adopt
+            if (not main_controller_owns_selection or not selected_idea_label
+                    or candidate_job != adopt(self, candidate_job.get('job_id', ''), selected_idea_label)):
+                raise ResearchStateError('candidate job adoption requires the exact main-controller selection')
         session_path = self.run_root / "controller_session.json"
+        if baseline_reference_checkpoint is not None and (session_path.exists() or baseline_training_attempt_id):
+            raise ResearchStateError('released-reference initialization cannot rewrite an existing baseline/session')
         if baseline_training_attempt_id:
             if session_path.exists() or not self._verified_training_receipt(
                     baseline_training_attempt_id, base_settings):
@@ -5492,7 +5927,9 @@ class DerivedResearch:
             current = (self.baseline(settings=base_settings,
                                      training_attempt_id=baseline_training_attempt_id)
                        if baseline_training_attempt_id else
-                       self.baseline(settings=base_settings))
+                       self.baseline(settings=base_settings,
+                                     **({'reference_checkpoint': baseline_reference_checkpoint}
+                                        if baseline_reference_checkpoint is not None else {})))
             baseline_measured = self._was_measured(current)
             self._set_research_action("baseline", status="completed",
                                       details={"measured": baseline_measured,
@@ -5620,7 +6057,7 @@ class DerivedResearch:
                 eligible = [one for one in self.library.usable()
                             if (kinds_wanted is None or one.granularity in kinds_wanted) and
                             execution_compatibility(
-                                one, stage_parameters=self.backend.parameters.get("train"))[0] and
+                                one, stage_parameters=self.backend.parameters.get("train"), repo=self.repo)[0] and
                             declared_space_compatibility(one, space=self.space)[0]]
                 if not any(one.label == selected_idea_label for one in eligible):
                     raise ResearchStateError(
@@ -5852,6 +6289,14 @@ class DerivedResearch:
                     varied.update({f"{key}.{k}": v for k, v in value.items()})
                 else:
                     varied[key] = value
+            from .data_versions import resolve as resolve_data_versions
+            if candidate_training_settings is not None:
+                from .candidate_settings import apply
+                varied=apply(self,varied,candidate_training_settings)
+            if candidate_job and candidate_job.get('training_settings') is not None:
+                from .candidate_settings import apply
+                varied=apply(self,varied,candidate_job['training_settings'])
+            varied, selected_data_versions = resolve_data_versions(self.output,self.repo,varied)
             checkpoint_session(pending_action={
                 "round": index, "phase": "prepared", "idea": idea.as_dict(),
                 "evidence_sha256": object_digest(evidence),
@@ -5929,8 +6374,14 @@ class DerivedResearch:
                 "settings": dict(varied), "asked_for": sorted(asked_for),
                 "collected": (dict(collected) if collected else None),
                 "updated_at": now()})
+            if candidate_job and (candidate_job['round'] != index or candidate_job['settings'] != varied
+                    or collected or idea.label != candidate_job['idea_label']):
+                raise ResearchStateError('prepared candidate differs from the paid training job; refusing retraining')
             result = self.measure(settings=varied, label=f"round_{index}",
-                                  dataset=collected.get("data") if collected else None)
+                                  dataset=collected.get("data") if collected else None,
+                                  **({'_data_bindings':selected_data_versions} if selected_data_versions else {}),
+                                  **({'_reuse_training_attempt_id':candidate_job['training_attempt_id']}
+                                     if candidate_job else {}))
             round_label = f"round_{index}"
             finalization_id = self._candidate_finalization_id(label=round_label)
             if self.last_proposal_decision:
@@ -6199,6 +6650,7 @@ class DerivedResearch:
         except (OSError, ValueError, RuntimeError) as exc:
             exported = {"status": "export_failed", "why": f"{type(exc).__name__}: {exc}"}
         report = {"schema_version": 1, "created_at": now(), "repo": str(self.repo),
+                  "performance_claims": self._performance_claims(),
                   "run_status": "completed",
                   "run_id": self.run_id, "rounds": history,
                   **({"stopped_because": stopped_because} if stopped_because else {}),

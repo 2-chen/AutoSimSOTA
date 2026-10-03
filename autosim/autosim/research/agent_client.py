@@ -56,6 +56,7 @@ class RoleAwareAgentClient:
     supports_agent_fix = True
     supports_main_agent = True
     supports_recorder = True
+    supports_native_progress_audit = True
 
     def __init__(self, *, workspace: Path, output: Path, run_id: str,
                  turn_budget_usd: float, total_budget_usd: float,
@@ -163,6 +164,12 @@ class RoleAwareAgentClient:
         # historical tool output. Old sessions and their receipts remain available.
         from .agent_runtime import _safe_session
         session = _safe_session(self.output, session_key=held.get("session_key"))
+        if session.get("failure_category") in {"stream_protocol", "missing_result_or_nonzero_exit", "provider_transport", "process_executor", "missing_resume_session", "provider_or_tool_error"}:
+            atomic_json(root / "context_rotation.json", {
+                "role": role, "previous_session_key": held.get("session_key"),
+                "reason": "rehydrate after failed protocol/transport/tool or missing CLI session; preserve original evidence and charges",
+                "failure_category": session.get("failure_category"), "at": now()})
+            return False
         relative = session.get("pricing_ref")
         if isinstance(relative, str) and relative.startswith("agent/pricing/"):
             path = self.output / relative
@@ -183,16 +190,32 @@ class RoleAwareAgentClient:
     def chat_with_metadata(self, system: str, user: str, **kwargs: Any
                            ) -> tuple[str, dict[str, Any]]:
         """Run one real coding-agent turn and return its final text and safe usage metadata."""
-        from .agent_runtime import run_coding_agent
+        from .agent_runtime import run_coding_agent, _worker_evidence_root
+        from .token_context import compact_json, project_context
 
         role = self._role
-        prompt = (str(system).strip() + "\n\n## Current request and evidence\n" +
-                  str(user).strip())
+        prompt = str(system).strip()
+        prompt += ("\n\n## Execution path safety\n"
+                   "Display placeholders such as {repo}, {output}, and [LOCAL_PATH] are not "
+                   "literal filesystem paths. Resolve the actual working directory through "
+                   "tools and use repository-relative paths. Use the bound native interpreter "
+                   "or the execution environment's PATH; do not create external interpreter "
+                   "symlinks inside the source checkout. Such links block every Agent role.")
+        # Stable instructions precede changing requests to preserve provider prefix reuse.
+        request = str(user).strip()
+        try:
+            request = compact_json(json.loads(request))
+        except (ValueError, TypeError):
+            pass
+        prompt += "\n\n## Current request and evidence\n" + request
+        context_metrics = {}
         if self._research_context and kwargs.get("include_research_context", True):
+            context, context_metrics = project_context(self._research_context, request,
+                _worker_evidence_root(self.output), pageable=role != "recorder")
             prompt += ("\n\n## Shared research context (latest controller snapshot)\n" +
                        "Prior role-session recollections do not override this snapshot or "
                        "native evidence. Working plans and handoffs are model claims.\n" +
-                       json.dumps(self._research_context, ensure_ascii=False, default=str))
+                       compact_json(context))
         decision_attempt_id = kwargs.get("decision_attempt_id")
         try:
             result = run_coding_agent(
@@ -204,6 +227,8 @@ class RoleAwareAgentClient:
                 resume=self._resume_role(role), role=role,
                 read_only=kwargs.get("read_only") is True or self.budget_output != self.output,
                 auto_skills=kwargs.get("auto_skills", True) is True,
+                decision_only=kwargs.get("decision_only") is True,
+                output_format=str(kwargs.get("output_format") or "stream-json"),
                 decision_attempt_id=(str(decision_attempt_id)
                                      if decision_attempt_id is not None else None),
                 **({"budget_output": self.budget_output}
@@ -220,7 +245,10 @@ class RoleAwareAgentClient:
                 decision_attempt_id=(str(decision_attempt_id)
                                      if decision_attempt_id is not None else None)) from exc
         status = str(result.get("status") or "unknown")
-        content = str(result.get("final_text") or "").strip()
+        # Execution proposals must retain original syntax; final_text is for display.
+        # Metadata intentionally does not include either text. Every external prompt
+        # is projected separately, and native operations retain their safety gates.
+        content = str(result.get("execution_text", result.get("final_text")) or "").strip()
         metadata = {
             "available": True,
             "model": result.get("model") or self.model,
@@ -237,8 +265,14 @@ class RoleAwareAgentClient:
             "run_budget": result.get("run_budget") or {},
             "returncode": result.get("returncode"),
             "failure_category": result.get("failure_category"),
+            "prompt_efficiency": {**context_metrics,
+                                  "prompt_bytes": len(prompt.encode("utf-8"))},
         }
         if status != "completed":
+            from .runtime_recovery import seal_turn_failure
+            from .agent_runtime import _worker_evidence_root
+            fault = seal_turn_failure(_worker_evidence_root(self.output), self.workspace,
+                result, role=role, timeout=min(self.timeout, float(kwargs.get("timeout", self.timeout))))
             raise AgentRuntimeClientError(
                 f"{role} coding-agent turn ended with status {status} "
                 f"({result.get('failure_category') or 'no category'}); "
@@ -248,7 +282,7 @@ class RoleAwareAgentClient:
                 run_budget=metadata["run_budget"],
                 decision_attempt_id=metadata["decision_attempt_id"],
                 turn_id=metadata["turn_id"], process_ref=metadata["process_ref"],
-                event_count=metadata["event_count"])
+                event_count=metadata["event_count"], runtime_failure=fault)
         if not content:
             raise AgentRuntimeClientError(
                 f"{role} coding-agent turn completed without a final response")

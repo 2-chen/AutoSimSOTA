@@ -17,6 +17,7 @@ import json
 import math
 import os
 import uuid
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,9 +29,37 @@ class AgentCostBudgetError(RuntimeError):
     """The persistent model-cost budget cannot safely admit another provider turn."""
 
 
+def recovery_floor(output: Path, limit_usd: float) -> float:
+    """Keep a configurable portion of the existing ceiling for execution/recovery."""
+    path = Path(output)/'scheduler_policy.json'
+    raw = read_json(path) if path.is_file() and not path.is_symlink() else {}
+    value = raw.get('recovery_model_reserve_usd', min(2.0, float(limit_usd)*.1))
+    if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value < 0:
+        raise AgentCostBudgetError('invalid recovery_model_reserve_usd')
+    return min(float(value), float(limit_usd))
+
+
 class AgentCostLedger:
     SCHEMA_VERSION = 1
     MAX_ENTRIES = 10_000
+
+    def wait_for_settlement(self, *, timeout: float = 30, minimum_usd: float = .25) -> dict:
+        """Read-only bounded admission wait; unknown costs are NEVER released here."""
+        if not math.isfinite(timeout) or not 0 <= timeout <= 60 or not math.isfinite(minimum_usd) or minimum_usd <= 0:
+            raise ValueError('invalid bounded settlement wait')
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._locked():
+                raw = self._read()
+                spent, held = self._totals(raw)
+                remaining = max(0.0, self.limit_usd-spent-held)
+                pending = any(row['status'] == 'reserved' for row in raw['entries'])
+            if remaining >= minimum_usd:
+                return {'status':'available', 'remaining_usd':remaining}
+            if not pending or time.monotonic() >= deadline:
+                return {'status':'waiting' if pending else 'blocked', 'remaining_usd':remaining,
+                        'reason':'insufficient safe allowance; usage holds preserved'}
+            time.sleep(min(.25, max(0, deadline-time.monotonic())))
 
     def __init__(self, output: Path, *, run_id: str, limit_usd: float,
                  cost_basis: str = "cli_reported"):
@@ -131,6 +160,8 @@ class AgentCostLedger:
             ledger = self._read()
             settled, held = self._totals(ledger)
             remaining = max(0.0, self.limit_usd - settled - held)
+            if role == 'recorder':
+                remaining = max(0.0, remaining-recovery_floor(self.output,self.limit_usd))
             requested = float(requested_usd)
             if allow_partial and remaining > 1e-9:
                 requested = min(requested, remaining)
@@ -167,7 +198,10 @@ class AgentCostLedger:
                 raise AgentCostBudgetError("only a live reservation can be extended")
             settled, held = self._totals(ledger)
             current = float(entry["reserved_usd"])
-            if required_usd > current + max(0.0, self.limit_usd - settled - held) + 1e-9:
+            free = max(0.0, self.limit_usd-settled-held)
+            if entry.get('role') == 'recorder':
+                free = max(0.0, free-recovery_floor(self.output,self.limit_usd))
+            if required_usd > current + free + 1e-9:
                 raise AgentCostBudgetError("run model-cost budget cannot reserve this request")
             entry["reserved_usd"] = max(current, required_usd)
             entry["provider_limit_usd"] = entry["reserved_usd"]
@@ -179,7 +213,8 @@ class AgentCostLedger:
             return float(entry["reserved_usd"])
 
     def settle(self, reservation_id: str, *, actual_usd: float | None,
-               launched: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
+               launched: bool, details: dict[str, Any] | None = None,
+               request_bound_usd: float | None = None) -> dict[str, Any]:
         if (actual_usd is not None and
                 (not isinstance(actual_usd, (int, float)) or isinstance(actual_usd, bool) or
                  not math.isfinite(float(actual_usd)) or float(actual_usd) < 0)):
@@ -191,6 +226,14 @@ class AgentCostLedger:
                           row.get("reservation_id") == reservation_id), None)
             if entry is None:
                 raise AgentCostBudgetError("model-cost reservation was not found")
+            if request_bound_usd is not None:
+                if (self.cost_basis != "deepseek_official_estimate_v1" or
+                        isinstance(request_bound_usd, bool) or
+                        not isinstance(request_bound_usd, (float, int)) or
+                        not math.isfinite(request_bound_usd) or request_bound_usd < 0 or
+                        request_bound_usd > float(entry["reserved_usd"]) + 1e-9 or
+                        not details or not details.get("pricing_ref")):
+                    raise ValueError("request bound requires a safe priced-gateway receipt")
             already_finalized = False
             if entry.get("status") in {"settled", "cancelled", "unknown"}:
                 if (entry.get("status") == "settled" and actual_usd is not None and
@@ -212,8 +255,11 @@ class AgentCostLedger:
                     entry.update(status="cancelled", reserved_usd=0.0, actual_usd=0.0,
                                  finished_at=now())
                 elif actual_usd is None:
-                    # Keep the full reservation charged until provider usage can be reconciled.
-                    entry.update(status="unknown", actual_usd=None, finished_at=now())
+                    # Preserve unknown usage, but the trusted request gate can prove
+                    # how much was actually admitted; unused turn allowance is not spend.
+                    entry.update(status="unknown", actual_usd=None, finished_at=now(),
+                                 reserved_usd=(float(request_bound_usd) if request_bound_usd
+                                     is not None else entry["reserved_usd"]))
                 else:
                     entry.update(status="settled", actual_usd=float(actual_usd),
                                  reserved_usd=0.0, finished_at=now())
@@ -263,8 +309,15 @@ class AgentCostLedger:
             return {"run_id": self.run_id, "limit_usd": self.limit_usd,
                     "cost_basis": self.cost_basis,
                     "spent_usd": settled, "reserved_usd": held,
+                    "active_reserved_usd": sum(r['reserved_usd'] for r in ledger['entries'] if r['status']=='reserved'),
+                    "unknown_reserved_usd": sum(r['reserved_usd'] for r in ledger['entries'] if r['status']=='unknown'),
+                    "recovery_reserve_usd": recovery_floor(self.output,self.limit_usd),
                     "remaining_usd": max(0.0, self.limit_usd - settled - held),
                     "unknown_entries": sum(row.get("status") == "unknown"
                                             for row in ledger["entries"]
                                             if isinstance(row, dict)),
                     "entry_count": len(ledger["entries"])}
+
+    def reconcile_receipts(self, *, apply: bool = False) -> dict:
+        from .budget_receipts import reconcile
+        return reconcile(self, apply=apply)

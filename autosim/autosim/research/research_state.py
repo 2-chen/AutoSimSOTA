@@ -16,7 +16,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .common import atomic_json, now, read_json
+from .common import atomic_json, digest, now, read_json
+
+# Cache only verified identities, never the potentially enormous parsed legacy history.
+_VERIFIED_BASES: dict[tuple, tuple[int, str]] = {}
 
 
 class ResearchStateError(RuntimeError):
@@ -38,10 +41,11 @@ def _canonical(value: Any) -> bytes:
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def verify_event_rows(rows: list[dict[str, Any]]) -> str:
+def verify_event_rows(rows: list[dict[str, Any]], *, start_sequence: int = 1,
+                      previous_hash: str = "") -> str:
     """Verify ordered sequence numbers and the hash chain; return its head hash."""
-    previous = ""
-    for expected, row in enumerate(rows, start=1):
+    previous = previous_hash
+    for expected, row in enumerate(rows, start=start_sequence):
         if row.get("sequence") != expected or row.get("previous_hash") != previous:
             raise ResearchStateError(f"run event chain breaks at sequence {expected}")
         material = {key: value for key, value in row.items() if key != "event_hash"}
@@ -62,6 +66,8 @@ class ResearchStateStore:
         self.state_path = self.root / "run_state.json"
         self.events_path = self.root / "run_events.json"
         self.lock_path = self.root / "run_state.lock"
+        self.journal_path = self.root / "run_events.jsonl"
+        self._journal_checkpoint = None
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -88,6 +94,12 @@ class ResearchStateStore:
             record = read_json(self.events_path)
         except (OSError, ValueError, TypeError) as exc:
             raise ResearchStateError(f"run event log cannot be read: {exc}") from exc
+        if isinstance(record, dict) and record.get("schema_version") == 2:
+            self._identity(record, path=self.events_path)
+            base = read_json(self.root / "run_events.legacy.json")
+            self._identity(base, path=self.root / "run_events.legacy.json")
+            rows = base["rows"] + self._journal_rows()
+            return rows, verify_event_rows(rows)
         if not isinstance(record, dict) or record.get("schema_version") != 1:
             raise ResearchStateError("run event log has an unsupported schema")
         self._identity(record, path=self.events_path)
@@ -96,6 +108,143 @@ class ResearchStateStore:
             raise ResearchStateError("run event log rows are invalid")
         head = verify_event_rows(rows)
         return rows, head
+
+    def _journal_rows(self, offset: int = 0) -> list[dict[str, Any]]:
+        if not self.journal_path.exists():
+            return []
+        rows = []
+        with self.journal_path.open("rb") as stream:
+            stream.seek(offset)
+            for line in stream:
+                # A torn append is not a committed event; never silently adopt it.
+                if not line.endswith(b"\n"):
+                    raise ResearchStateError("run journal has an incomplete append")
+                try:
+                    row = json.loads(line)
+                except ValueError as exc:
+                    raise ResearchStateError("run journal has an invalid record") from exc
+                if not isinstance(row, dict):
+                    raise ResearchStateError("run journal record is not an object")
+                self._identity(row, path=self.journal_path)
+                rows.append(row)
+        return rows
+
+    def _current(self) -> tuple[dict[str, Any], int, str]:
+        """Reconcile the append journal without repeatedly parsing the legacy history."""
+        manifest = read_json(self.events_path) if self.events_path.is_file() else {}
+        if manifest.get("schema_version") != 2:
+            rows, head = self._read_events()
+            return self._reconcile(self._read_snapshot(), rows), len(rows), head
+        self._identity(manifest, path=self.events_path)
+        base_path = self.root / "run_events.legacy.json"
+        stat = base_path.stat()
+        key = (str(base_path), stat.st_ino, stat.st_size, stat.st_mtime_ns,
+               stat.st_ctime_ns, self.run_id, str(self.repository))
+        base_rows = None
+        base_identity = _VERIFIED_BASES.get(key)
+        if base_identity is None:
+            if manifest.get("base_sha256"):
+                # Migration validated the chain before committing this manifest. Verify
+                # its immutable bytes in bounded memory on a cold process, not by loading
+                # the entire historic object graph again.
+                if digest(base_path) != manifest["base_sha256"]:
+                    raise ResearchStateError("legacy event hash is invalid")
+                base_identity = (manifest["base_sequence"], manifest["base_head"])
+            else:
+                base = read_json(base_path)
+                self._identity(base, path=base_path)
+                base_rows = base.get("rows")
+                if not isinstance(base_rows, list):
+                    raise ResearchStateError("legacy event rows are invalid")
+                base_identity = (len(base_rows), verify_event_rows(base_rows))
+            if len(_VERIFIED_BASES) >= 32:
+                _VERIFIED_BASES.clear()
+            _VERIFIED_BASES[key] = base_identity
+        count, head = base_identity
+        if (manifest.get("base_sequence"), manifest.get("base_head")) != (count, head):
+            raise ResearchStateError("journal base does not match its manifest")
+        state = self._read_snapshot()
+        if int(state.get("event_sequence") or 0) < count:
+            if base_rows is None:
+                base_rows = read_json(base_path)["rows"]
+            state = self._reconcile(state, base_rows)
+        offset = 0
+        checkpoint = self._journal_checkpoint
+        stat = self.journal_path.stat() if self.journal_path.exists() else None
+        if checkpoint and stat:
+            inode, size, modified, changed, sequence, previous = checkpoint
+            if (stat.st_ino == inode and stat.st_size == size
+                    and int(state.get("event_sequence") or 0) >= sequence
+                    and (stat.st_mtime_ns, stat.st_ctime_ns) == (modified, changed)):
+                offset, count, head = size, sequence, previous
+        rows = self._journal_rows(offset)
+        heads = {count: head}
+        for row in rows:
+            count += 1
+            if row.get("sequence") != count or row.get("previous_hash") != head:
+                raise ResearchStateError(f"run event chain breaks at sequence {count}")
+            actual = hashlib.sha256(_canonical({k: v for k, v in row.items()
+                                               if k != "event_hash"})).hexdigest()
+            if row.get("event_hash") != actual:
+                raise ResearchStateError(f"run event hash is invalid at sequence {count}")
+            head = actual
+            heads[count] = head
+        applied = int(state.get("event_sequence") or 0)
+        if applied > count or state.get("event_head_hash", "") != heads.get(applied):
+            raise ResearchStateError("run snapshot does not match its event chain")
+        for row in rows:
+            if row["sequence"] > applied:
+                self._apply_event(state, row)
+        if stat:
+            self._journal_checkpoint = (stat.st_ino, stat.st_size, stat.st_mtime_ns,
+                                        stat.st_ctime_ns, count, head)
+        state.update(schema_version=1, run_id=self.run_id, repository=str(self.repository))
+        return self._refresh_compat_fields(state), count, head
+
+    def _append(self, row: dict[str, Any]) -> None:
+        # Keep the old format for small histories and legacy tooling; switch once, before
+        # it can enter quadratic rewrite growth. Preserve old evidence byte-for-byte.
+        manifest = read_json(self.events_path) if self.events_path.is_file() else {}
+        if manifest.get("schema_version") != 2:
+            rows = manifest.get("rows", [])
+            if len(rows) < 128 and (not self.events_path.exists() or
+                                  self.events_path.stat().st_size < 1024 * 1024):
+                atomic_json(self.events_path, {"schema_version": 1, "run_id": self.run_id,
+                    "repository": str(self.repository), "rows": [*rows, row]})
+                return
+            base_path = self.root / "run_events.legacy.json"
+            if base_path.exists() and not os.path.samefile(base_path, self.events_path):
+                raise ResearchStateError("uncommitted legacy journal migration exists")
+            # Hard-link first: a crash before manifest replacement leaves the original
+            # readable. A retry may safely finish this migration only for identical files.
+            if not base_path.exists():
+                os.link(self.events_path, base_path)
+            atomic_json(self.events_path, {"schema_version": 2, "run_id": self.run_id,
+                "repository": str(self.repository), "base_sequence": len(rows),
+                "base_head": rows[-1]["event_hash"] if rows else "",
+                "base_sha256": digest(base_path),
+                "base_ref": base_path.name, "journal_ref": self.journal_path.name})
+        descriptor = os.open(self.journal_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            material = _canonical(row) + b"\n"
+            view = memoryview(material)
+            while view:
+                written = os.write(descriptor, view)
+                if not written:
+                    raise OSError("journal append made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        stat = self.journal_path.stat()
+        self._journal_checkpoint = (stat.st_ino, stat.st_size, stat.st_mtime_ns,
+                                    stat.st_ctime_ns, row["sequence"], row["event_hash"])
 
     def _read_snapshot(self) -> dict[str, Any]:
         if not self.state_path.is_file():
@@ -122,6 +271,12 @@ class ResearchStateStore:
     def _refresh_compat_fields(state: dict[str, Any]) -> dict[str, Any]:
         """Keep older readers working while preserving per-phase snapshots."""
         phases = state.get("phases") or {}
+        if state.get("phase") not in {"preparation", "research"}:
+            owners = [(name, value) for name, value in phases.items()
+                      if name in {"preparation", "research"} and isinstance(value, dict)]
+            if owners:
+                name, value = max(owners, key=lambda item: int(item[1].get("event_sequence") or 0))
+                state.update(phase=name, status=value.get("status"))
         active = phases.get(str(state.get("phase") or ""), {})
         preparation = phases.get("preparation", {})
         if not isinstance(active, dict):
@@ -138,18 +293,28 @@ class ResearchStateStore:
                 state.pop(key, None)
         return state
 
-    @staticmethod
-    def _apply_event(state: dict[str, Any], row: dict[str, Any]) -> None:
+    def _apply_event(self, state: dict[str, Any], row: dict[str, Any]) -> None:
         phase = str(row.get("phase") or "unknown")
         phases = state.setdefault("phases", {})
         phase_state = phases.setdefault(phase, {})
         patch = row.get("state_patch") or {}
+        if row.get("state_patch_digest"):
+            identity = row["state_patch_digest"]
+            if not isinstance(identity, str) or len(identity) != 64 or any(
+                    c not in "0123456789abcdef" for c in identity):
+                raise ResearchStateError("invalid state patch identity")
+            patch = read_json(self.root / "run_state_blobs" / f"{identity}.json")
+            if hashlib.sha256(_canonical(patch)).hexdigest() != identity:
+                raise ResearchStateError("state patch blob changed")
         if isinstance(patch, dict):
             phase_state.update(patch)
         phase_state.update(status=row.get("status"), updated_at=row.get("at"),
                            last_event_id=row.get("event_id"),
                            event_sequence=row.get("sequence"))
-        state.update(phase=phase, status=row.get("status"), updated_at=row.get("at"),
+        # Subtasks cannot declare the research completed or replace its active action.
+        if phase in {"preparation", "research"} or not state.get("phase"):
+            state.update(phase=phase, status=row.get("status"))
+        state.update(updated_at=row.get("at"),
                      last_event_id=row.get("event_id"),
                      event_head_hash=row.get("event_hash"),
                      event_sequence=row.get("sequence"))
@@ -192,12 +357,10 @@ class ResearchStateStore:
         if not self.state_path.is_file() and not self.events_path.is_file():
             return None
         with self._locked():
-            rows, head = self._read_events()
-            state = self._read_snapshot()
-            if not rows and not state:
+            before = int(self._read_snapshot().get("event_sequence") or 0)
+            state, count, head = self._current()
+            if not count and not state:
                 return None
-            before = int(state.get("event_sequence") or 0)
-            state = self._reconcile(state, rows)
             state["event_head_hash"] = head
             if int(state.get("event_sequence") or 0) != before:
                 atomic_json(self.state_path, state)
@@ -214,10 +377,9 @@ class ResearchStateStore:
         if not isinstance(decision_relevant, bool):
             raise ValueError("decision_relevant must be a bool")
         with self._locked():
-            rows, previous = self._read_events()
-            state = self._reconcile(self._read_snapshot(), rows)
+            state, count, previous = self._current()
             at = now()
-            sequence = len(rows) + 1
+            sequence = count + 1
             decision_revision = int(state.get("decision_revision") or 0) + int(
                 decision_relevant)
             row = {"sequence": sequence, "event_id": uuid.uuid4().hex,
@@ -234,24 +396,20 @@ class ResearchStateStore:
                    "state_patch": {"status": status, **dict(phase_state or {}),
                                    **dict(event_patch or {})},
                    "previous_hash": previous}
+            # Repeated phase projections are evidence references, not copies in the
+            # journal. The snapshot still exposes the full current phase to old readers.
+            for field, limit in (("state_patch", 65536), ("details", 16384)):
+                material = _canonical(row[field])
+                if len(material) > limit:
+                    identity = hashlib.sha256(material).hexdigest()
+                    destination = self.root / "run_state_blobs" / f"{identity}.json"
+                    if not destination.exists():
+                        atomic_json(destination, row[field])
+                    row[field + "_digest"] = identity
+                    row[field] = {}
             row["event_hash"] = hashlib.sha256(_canonical(row)).hexdigest()
-            rows.append(row)
-            atomic_json(self.events_path, {"schema_version": 1, "run_id": self.run_id,
-                                          "repository": str(self.repository),
-                                          "rows": rows})
-
-            phases = state.setdefault("phases", {})
-            existing = phases.get(phase) or {}
-            updated = {**existing, **dict(phase_state or {}),
-                       "status": status, "updated_at": at,
-                       "last_event_id": row["event_id"], "event_sequence": sequence}
-            phases[phase] = updated
-            state.update(schema_version=1, run_id=self.run_id,
-                         repository=str(self.repository), phase=phase, status=status,
-                         state_revision=int(state.get("state_revision") or 0) + 1,
-                         decision_revision=decision_revision,
-                         event_sequence=sequence, event_head_hash=row["event_hash"],
-                         last_event_id=row["event_id"], updated_at=at, phases=phases)
+            self._append(row)
+            self._apply_event(state, row)
             self._refresh_compat_fields(state)
             atomic_json(self.state_path, state)
             return state

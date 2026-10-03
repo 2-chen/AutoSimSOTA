@@ -17,6 +17,14 @@ def publish_context(output: Path, repo: Path, interpreter: Path, environment: di
     record = {"schema_version": 1, "repo": str(repo.resolve()),
               "interpreter": str(interpreter.absolute()), "paths": paths,
               "capability": "cpu_diagnostic_not_simulation_readiness"}
+    from .environment_overlay import readonly_roots, overlay_identity, runtime_library_dirs
+    record['dependency_roots'] = [str(p) for p in readonly_roots(interpreter.parent.parent, output, repo)]
+    identity = overlay_identity(interpreter.parent.parent)
+    if identity is not None:
+        record['overlay_identity'] = identity
+    libraries = runtime_library_dirs(interpreter.parent.parent, output, repo)
+    if libraries:
+        record['runtime_library_dirs'] = libraries
     record["identity"] = object_digest(record)
     atomic_json(output / "native_context.json", {**record, "updated_at": now()})
     return record
@@ -46,6 +54,14 @@ def load_context(output: Path, workspace: Path):
         target = Path(value)
         if not target.is_absolute() or target.is_symlink() or not target.resolve().is_relative_to(output.resolve()) or target == output:
             raise ValueError("native configuration path escaped this run")
+    from .environment_overlay import readonly_roots, overlay_identity, runtime_library_dirs
+    if row.get('dependency_roots', []) != [str(p) for p in readonly_roots(prefix, output, workspace)]:
+        raise ValueError('native dependency bindings changed; republish after controlled repair')
+    current_overlay = overlay_identity(prefix)
+    if row.get('overlay_identity') is not None and row['overlay_identity'] != current_overlay:
+        raise ValueError('native overlay identity changed; republish after controlled repair')
+    if row.get('runtime_library_dirs', []) != runtime_library_dirs(prefix, output, workspace):
+        raise ValueError('native loader bindings changed; republish and revalidate consumers')
     return row
 
 

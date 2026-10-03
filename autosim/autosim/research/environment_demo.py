@@ -20,8 +20,10 @@ def capture(output: Path, repo: Path, *, code: str, purpose: str, source_refs: l
         if not isinstance(relative, str) or not 1 <= len(relative) <= 512:
             raise ValueError("preview source reference must be a bounded path")
         path = Path(relative)
-        if path.is_absolute() or ".." in path.parts or not (repo / path).is_file() or not (repo / path).resolve().is_relative_to(repo.resolve()):
+        if not path.parts or path.is_absolute() or ".." in path.parts or not (repo / path).resolve().is_relative_to(repo.resolve()):
             raise ValueError("preview source reference escaped checkout")
+        if not ((repo / path).is_file() or (repo / path).is_dir()):
+            raise ValueError(f"preview source reference does not exist: {relative}")
     native = load_context(output, repo)
     identity = uuid.uuid4().hex
     directory = output / "environment_demos" / identity
