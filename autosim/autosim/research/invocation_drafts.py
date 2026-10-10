@@ -10,7 +10,8 @@ def save(output: Path, *, stage: str, base: dict, row: dict, reason: str,
     if not reason.strip():
         raise ValueError('an invocation draft needs an Agent rationale')
     payload = {'schema_version': 1, 'status': 'unverified', 'stage': stage,
-        'base_sha256': object_digest(base), 'row': row, 'reason': redact(reason)[:2000],
+        'base_sha256': object_digest(base), 'base_context': base,
+        'row': row, 'reason': redact(reason)[:2000],
         'native_evidence_ref': evidence_ref, 'created_at': now(),
         'authority': 'Agent revision; requires explicit selection and new native verification'}
     identity = object_digest(payload)
@@ -26,7 +27,14 @@ def save(output: Path, *, stage: str, base: dict, row: dict, reason: str,
     return {'id': identity, 'ref': path.relative_to(root).as_posix(), **payload}
 
 
-def load(output: Path, ref: str, *, stage: str, base: dict | None = None) -> dict:
+def load(output: Path, ref: str, *, stage: str, base: dict | None = None,
+         rebind_inputs: list[str] | None = None) -> dict:
+    if (rebind_inputs is not None and (not isinstance(rebind_inputs, list) or
+            any(key != 'checkpoint' for key in rebind_inputs) or
+            len(rebind_inputs) != len(set(rebind_inputs)))):
+        raise ValueError('draft rebind_inputs currently permits checkpoint only, once')
+    if rebind_inputs and base is None:
+        raise ValueError('draft rebind needs the current source/input/interpreter context')
     root = Path(output).resolve()
     if isinstance(ref, str) and re.fullmatch(r'[0-9a-f]{64}', ref):
         # The catalog publishes both id and ref. Either identifies the same
@@ -47,8 +55,17 @@ def load(output: Path, ref: str, *, stage: str, base: dict | None = None) -> dic
             record.get('stage') != stage or not isinstance(record.get('row'), dict)):
         raise ValueError('invocation draft identity changed')
     if base is not None and record.get('base_sha256') != object_digest(base):
-        raise ValueError('invocation draft belongs to changed source/input/interpreter context')
-    return {**record, 'ref': relative.as_posix()}
+        previous = record.get('base_context')
+        if (not rebind_inputs or not isinstance(previous, dict) or
+                object_digest(previous) != record.get('base_sha256') or
+                {k:v for k,v in previous.items() if k not in rebind_inputs} !=
+                {k:v for k,v in base.items() if k not in rebind_inputs}):
+            raise ValueError('invocation draft belongs to changed source/input/interpreter context')
+        # This transfers an unverified blueprint, never accepted execution/weights.
+        # Main still chooses the new producer; caller binding and native postconditions
+        # are enforced by make_runnable under the unchanged isolation/protocol.
+    return {**record, 'ref': relative.as_posix(),
+            'rebound_inputs': list(rebind_inputs or [])}
 
 
 def catalog(output: Path, limit: int = 6) -> list[dict]:
@@ -65,7 +82,8 @@ def catalog(output: Path, limit: int = 6) -> list[dict]:
             record = load(output, path.relative_to(output).as_posix(),
                           stage=candidate.get('stage'))
             rows.append({key: record.get(key) for key in ('id', 'ref', 'stage', 'status',
-                'base_sha256', 'row', 'reason', 'native_evidence_ref', 'authority')})
+                'base_sha256', 'row', 'reason', 'native_evidence_ref', 'authority')} |
+                {'rebindable_inputs': ['checkpoint'] if isinstance(record.get('base_context'), dict) else []})
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     return rows

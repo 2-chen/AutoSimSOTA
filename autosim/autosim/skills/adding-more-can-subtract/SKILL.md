@@ -1,9 +1,6 @@
 ---
 name: adding-more-can-subtract
 description: 新增数据后退步时检查质量、分布、采样和训练预算；更多数据可能有害也可能有益，需同口径对照。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 新增数据可能降低效果

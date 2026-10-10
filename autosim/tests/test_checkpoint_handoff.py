@@ -56,12 +56,46 @@ def test_agent_selects_bundle_not_largest_optimizer_file(tmp_path):
         ch.validate(root, selected)
 
 
+def test_multiple_native_snapshots_do_not_require_unique_declared_file(tmp_path):
+    root, _, bundle, _ = producer(tmp_path)
+    document = root/'derivation_attempts/train.json'
+    row = json.loads(document.read_text())
+    artifact = row['attempts'][0]['verified_artifact']
+    artifact.update(declared_path='', matched=48, pattern='snapshots/*/policy/**')
+    atomic_json(document, row)
+    offered = ch.catalog(root)
+    assert offered['status'] == 'available'
+    assert offered['declared_artifact_ref'] is None
+    chosen = ch.select(root, bundle.relative_to(root).as_posix(), offered)
+    ch.validate(root, chosen)
+    artifact['structured_candidates'] = []
+    atomic_json(document, row)
+    assert ch.catalog(root)['status'] == 'unavailable'
+
+
 @pytest.mark.parametrize('fault',['counter','config','native_log'])
 def test_changed_verified_producer_evidence_is_not_offered(tmp_path,fault):
     root, _, bundle, counter = producer(tmp_path)
     path = counter if fault == 'counter' else bundle/'configuration.json' if fault == 'config' else next((root/'derivation_native').glob('*/native.log'))
     path.write_text('changed')
     assert ch.catalog(root)['status'] == 'unavailable'
+
+
+@pytest.mark.parametrize('fault',['counter','config','native_log'])
+def test_multi_match_handoff_still_rejects_changed_producer_evidence(tmp_path, fault):
+    root, _, bundle, counter = producer(tmp_path)
+    document = root/'derivation_attempts/train.json'
+    row = json.loads(document.read_text())
+    row['attempts'][0]['verified_artifact'].update(
+        declared_path='', matched=48, pattern='snapshots/*/policy/**')
+    atomic_json(document, row)
+    path = (counter if fault == 'counter' else bundle/'configuration.json' if fault == 'config'
+            else next((root/'derivation_native').glob('*/native.log')))
+    path.write_text('changed')
+    offered = ch.catalog(root)
+    assert offered['status'] == 'unavailable'
+    assert offered['because']
+    assert offered['evidence_refs'] == ['derivation_attempts/train.json']
 
 
 @pytest.mark.parametrize('ref',['../elsewhere','/tmp/unowned','different_attempt/model'])

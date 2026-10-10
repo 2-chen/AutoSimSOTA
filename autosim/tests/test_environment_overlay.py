@@ -367,6 +367,48 @@ def test_crash_before_first_probe_continues_without_model_or_new_prefix(fixture,
     assert json.loads((output/'environment_bootstrap.json').read_text())['status'] == 'complete'
 
 
+@pytest.mark.parametrize('change', ['none', 'bindings', 'context'])
+def test_repair_may_reassert_only_exact_accepted_base(fixture, monkeypatch, change):
+    from autosim.research import native_context
+    base, site, output, repo, version = fixture
+    row, planned = provision_fixture(fixture, monkeypatch)
+    publish = native_context.publish_context
+    monkeypatch.setattr(native_context, 'publish_context',
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('crash')))
+    with pytest.raises(RuntimeError, match='crash'):
+        provision.build(repo, client=None, prefix=output/'env', output=output,
+                        manifests={}, assets={}, max_rounds=1,
+                        base_environment_id=row['id'], base_environment_mode='overlay',
+                        environment_selection_reason='initial explicit selection')
+    monkeypatch.setattr(native_context, 'publish_context', publish)
+    selection = (output/'environment_selection.json').read_bytes()
+    selected_prefix = Path(json.loads(selection)['prefix'])
+    prefixes = list((output/'environments').glob('*'))
+    kwargs = dict(client=None, prefix=output/'env', output=output, manifests={},
+                  assets={}, max_rounds=1, base_environment_id=row['id'],
+                  base_environment_mode='overlay', environment_selection_reason='keep existing base',
+                  repair_proposal={'failure_evidence_id':'fixture'})
+    if change == 'bindings':
+        kwargs['source_binding_ids'] = [next(b['id'] for b in
+            overlay.inspect(base, version, repo=repo)['bindings'] if b['module'] == 'addon')]
+    elif change == 'context':
+        kwargs['assets'] = {'research_context': {'changed':True}}
+    # The valid reassertion must reach ordinary repair validation, not plan or
+    # environment creation. Stop there to avoid faking native failure evidence.
+    def reached_existing_interpreter(python):
+        assert python == str(selected_prefix/'bin/python')
+        raise RuntimeError('existing interpreter reached')
+    monkeypatch.setattr(provision, 'interpreter_is_given', reached_existing_interpreter)
+    if change == 'none':
+        with pytest.raises(RuntimeError, match='existing interpreter reached'):
+            provision.build(repo, **kwargs)
+    else:
+        with pytest.raises(ValueError, match='exact accepted environment continuation'):
+            provision.build(repo, **kwargs)
+    assert (output/'environment_selection.json').read_bytes() == selection
+    assert list((output/'environments').glob('*')) == prefixes
+
+
 def test_same_base_accepts_corrected_bindings_but_rejects_identical_retry(fixture, monkeypatch):
     base, site, output, repo, version = fixture
     row, planned = provision_fixture(fixture, monkeypatch)

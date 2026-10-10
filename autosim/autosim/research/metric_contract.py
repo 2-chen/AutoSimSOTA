@@ -126,7 +126,8 @@ class MetricSpec:
         if self.name == "success_rate" and self.unit == "fraction":
             return success_reading(said)
         # Exact label, one line, final observation. `reward` must not match `best_reward`.
-        label = re.compile(r"(?<!best )(?<!max )(?<![A-Za-z0-9_])" + re.escape(self.name) +
+        label = re.compile(r"(?<!best )(?<!max )(?<![A-Za-z0-9_])(?P<quote>[\"']?)" +
+                           re.escape(self.name) + r"(?P=quote)" +
                            r"[ \t]*[:=][ \t]*(?P<number>[-+]?(?:\d+\.?\d*|\.\d+)"
                            r"(?:[eE][-+]?\d+)?)", re.IGNORECASE)
         found = [(line, match) for line in (said or "").splitlines()

@@ -15,6 +15,91 @@ from autosim.research.installation_recovery import inventory, review_boundary
 from autosim.research.prepare import Preparation
 
 
+def test_generated_asset_probe_accepts_equivalent_checkout_placeholder(tmp_path):
+    repo = tmp_path/'checkout'
+    context = {'repository_checkout':str(repo),
+               'stage_paths':{'train':{'entrypoint':'train.py'}}}
+    assets = [{'where':str(repo/'datasets/input.hdf5')}]
+    probe = pv.asset_probe('{repo}/datasets/input.hdf5')
+    assert not pv.consumer_or_asset_violation(probe, context, assets)
+    # Normalizing a known root is not permission to hide failure or check
+    # arbitrary resources instead of the native consumer.
+    assert pv.consumer_or_asset_violation(probe + '; true', context, assets)
+    assert pv.consumer_or_asset_violation(pv.asset_probe('{repo}/unbound'), context, assets)
+    assert pv.consumer_or_asset_violation(probe, {'stage_paths':context['stage_paths']}, assets)
+
+
+def test_rejected_queue_head_preserves_identity_and_is_not_replayed(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / 'train.py').write_text('print("fixture")\n')
+    template = '{python} train.py --help'
+    calls = []
+
+    def rejected(command, **kwargs):
+        assert kwargs.get('rejection', {}).get('failure_kind') == 'stage_boundary'
+        calls.append(command)
+        log = tmp_path / 'rejected.log'
+        log.write_text('fixture: selected stage was not launched')
+        capture_attempt_evidence(tmp_path, attempt_id='e'*32, log=log,
+            receipt_ref='fixture.json', status='rejected', returncode=None,
+            termination_reason='stage_boundary')
+        return {**kwargs['rejection'], 'command': command, 'evidence_id': 'e'*32,
+                'launched': False}
+
+    monkeypatch.setattr(pv, 'run', rejected)
+    monkeypatch.setattr(pv, 'resume', lambda *a, **k: ([], None))
+    # A cached legacy repair misplaced --help into its installer queue. Initial
+    # plan validation normally rejects this; replay must still preserve evidence.
+    monkeypatch.setattr(pv, 'plan', lambda *a, **k: {'python': sys.executable,
+        'commands': [template], 'probes': ['{python} -c "import math"'], 'assets': []})
+    context = {'stage_paths': {'train': {'entrypoint': 'train.py', 'artifact': 'model.pt'}}}
+    kwargs = dict(client=object(), prefix=tmp_path/'env', output=tmp_path,
+        python=sys.executable, manifests={}, assets={'research_context': context}, max_operations=1,
+        max_rounds=1)
+    for _ in range(3):
+        result = pv.build(repo, **kwargs)
+        failure = result['latest_failure']
+        assert failure['template'] == template and failure['evidence_id'] == 'e'*32
+        assert failure['environment_prefix'] and failure['plan_identity']
+        assert result['recovery_status'] == 'proposal_rejected'
+    assert len(calls) == 1
+
+
+def test_repair_help_in_installer_queue_is_rejected_before_review(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    class Client:
+        output = tmp_path
+    monkeypatch.setattr(observation, 'observe', lambda *a: {'identity': 'fixture'})
+    transcript = []
+    failure = {'evidence_id': 'e'*32, 'command': 'false', 'failure_kind': 'stage_boundary'}
+    result = pv.resume(Client(), repo, [], failure, manifests={}, transcript=transcript,
+        values={}, current_probes=['{python} train.py --help'], pending_commands=['false'],
+        research_context={'stage_paths': {'train': {'entrypoint': 'train.py'}}},
+        submitted_proposal={'failure_evidence_id': 'e'*32,
+            'commands': ['{python} train.py --help'], 'reasoning': 'fixture wrong field'})
+    assert result == ([], None)
+    assert 'repair.commands[0]' in str(transcript[-1])
+    assert 'belong in probes' in str(transcript[-1])
+
+
+def test_phase_refusal_cannot_be_declared_missing_resources(tmp_path, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    class Client:
+        output = tmp_path
+    monkeypatch.setattr(observation, 'observe', lambda *a: {'identity': 'fixture'})
+    monkeypatch.setattr('autosim.research.installation_recovery.review_boundary',
+        lambda *a, **k: pytest.fail('phase refusal cannot buy a resource boundary review'))
+    transcript = []
+    failure = {'evidence_id': 'e'*32, 'command': 'false', 'failure_kind': 'stage_boundary'}
+    assert pv.resume(Client(), repo, [], failure, manifests={}, transcript=transcript,
+        values={}, submitted_proposal={'failure_evidence_id': 'e'*32,
+            'unbuildable': 'fixture wrong boundary', 'reasoning': 'fixture'}) == ([], None)
+    assert 'not unavailable environment resources' in str(transcript[-1])
+
+
 @pytest.mark.parametrize('passed', [False, True])
 def test_interpreter_alone_is_not_a_passing_environment(tmp_path, monkeypatch, passed):
     prep = Preparation(repo=tmp_path / 'repo', output=tmp_path / 'run',

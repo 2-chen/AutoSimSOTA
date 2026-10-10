@@ -3,23 +3,15 @@ from functools import lru_cache
 from pathlib import Path
 
 from .common import digest, object_digest, read_json
+from .prompt_library import prompt_identity
 
 
 @lru_cache(maxsize=1)
 def controller_identity():
     root = Path(__file__).parent
-    return object_digest({name: digest(root/name) for name in (
-        'prepare.py', 'provision.py', 'agent_budget.py', 'agent_runtime.py',
-        'budget_amendment.py', 'harness_repair.py',
-        'execution_derive.py', 'stage_verification.py',
-        'training_progress_audit.py',
-        'checkpoint_handoff.py',
-        'invocation_drafts.py',
-        'common.py', 'derived_research.py', 'process_executor.py',
-        'main_agent.py', 'policy_consumption.py', 'experiment_bundle.py',
-        'environment_pool.py', 'environment_bases.py', 'environment_overlay.py',
-        'native_context.py', 'compute_decision.py',
-        'runtime_freshness.py', 'runtime_recovery.py')})
+    # Automatically cover new admission validators, never mutable run artifacts.
+    sources = {path.name: digest(path) for path in sorted(root.glob('*.py'))}
+    return object_digest({'sources': sources, 'prompts': prompt_identity()})
 
 
 def current_model_budget(output, run_id):
@@ -68,7 +60,17 @@ def failure_context(output, row):
                 recorded = (receipt.get('resource_limits') or {}).get('enforced', {}).get('controller_runtime_id')
         except (OSError, ValueError, TypeError, AttributeError):
             pass
+    if recorded is None and row.get('evidence_id'):
+        try:
+            import json
+            from .evidence_store import read_attempt_evidence
+            proof = read_attempt_evidence(output, row['evidence_id'], limit=12000)
+            recorded = (json.loads(proof['text']).get('context') or {}).get('controller_runtime_id')
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     return {'receipt_ref':ref, 'outcome':row.get('outcome'),
+            'evidence_id':row.get('evidence_id'), 'recorded_at':row.get('finished_at') or row.get('at'),
+            'failure_category':row.get('failure_category'), 'repair_owner':row.get('repair_owner'),
             'recorded_controller_runtime_id':recorded,
             'validity':'observed_in_current_runtime' if recorded == controller_identity()
                        else 'unverified_in_current_runtime',
@@ -86,10 +88,10 @@ def controller_context(output, steps):
     for row in reversed(steps):
         arguments = row.get('arguments') or {}
         key = (row.get('step'), arguments.get('stage') if isinstance(arguments, dict) else None)
-        if key[0] not in {'derive_a_command', 'bind_metric', 'run_the_loop', 'propose_harness_repair'} or key in seen:
+        if not key[0] or key in seen:
             continue
         seen.add(key)
-        if row.get('outcome') in {'raised','failed','rejected','no runnable command','checkpoint failure'}:
+        if row.get('outcome') in {'raised','failed','rejected','no runnable command','checkpoint failure','not attempted','blocked'}:
             failures.append({'step':key[0], 'stage':key[1], **failure_context(output,row)})
     result['previous_action_failures'] = failures[:8]
     for row in reversed(steps):

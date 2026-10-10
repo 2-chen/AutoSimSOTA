@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import fcntl
 import shutil
 import uuid
 from pathlib import Path
@@ -26,7 +27,22 @@ def artifact_identity(path: Path) -> tuple[str, str]:
     return "sha256", object_digest([(str(p.relative_to(path)), digest(p)) for p in files])
 
 
-def freeze_artifact(source: Path, destination: Path, *, max_bytes: int) -> dict[str, Any]:
+def _copy_file(source, destination):
+    """Independent copy-on-write clone when supported, ordinary copy otherwise.
+
+    Never hardlink mutable native weights to an immutable measured policy.
+    """
+    try:
+        with open(source,'rb') as origin, open(destination,'wb') as target:
+            fcntl.ioctl(target.fileno(),0x40049409,origin.fileno())
+        shutil.copystat(source,destination)
+    except OSError:
+        shutil.copy2(source,destination)
+    return destination
+
+
+def freeze_artifact(source: Path, destination: Path, *, max_bytes: int,
+                    store: Path | None = None) -> dict[str, Any]:
     """Copy a file or directory with a bounded size and verify the copied bytes."""
     source, destination = Path(source), Path(destination)
     if not source.exists() or source.is_symlink():
@@ -41,15 +57,51 @@ def freeze_artifact(source: Path, destination: Path, *, max_bytes: int) -> dict[
         raise ValueError(f"policy artifact is {total} bytes, above copy limit {max_bytes}")
     fingerprint = object_digest([(str(p.relative_to(source)) if source.is_dir() else source.name,
                                   digest(p)) for p in sorted(files)])
+    if store is not None:
+        store=Path(store)
+        if store.is_symlink() or any(p.is_symlink() for p in [store,*store.parents]):
+            raise ValueError('unsafe artifact store')
+        store.mkdir(parents=True,exist_ok=True)
+        lock=store/'lock'
+        if lock.is_symlink(): raise ValueError('unsafe artifact store lock')
+        with lock.open('a+b') as handle:
+            fcntl.flock(handle,fcntl.LOCK_EX)
+            slot=store/fingerprint
+            if slot.is_symlink(): raise ValueError('unsafe artifact slot')
+            target=slot/('policy'+(source.suffix if source.is_file() else ''))
+            manifest=slot/'manifest.json'
+            if manifest.is_symlink(): raise ValueError('unsafe artifact manifest')
+            if manifest.exists():
+                prior=read_json(manifest)
+                field,identity=artifact_identity(target)
+                if prior.get(field)!=identity or prior.get('sha256')!=fingerprint:
+                    raise ValueError('content-addressed artifact changed; do not reuse')
+                return {**prior,'source':str(source),'storage_backend':'content_addressed',
+                        'requested_destination':str(destination)}
+            if target.exists():
+                # A previous process may have completed the independent copy and
+                # died before publishing its manifest. Revalidate without overwriting.
+                field,identity=artifact_identity(target)
+                expected=(digest(source) if source.is_file() else
+                    object_digest([(str(p.relative_to(source)),digest(p)) for p in sorted(files)]))
+                if identity!=expected:
+                    raise ValueError('incomplete artifact-store slot conflicts with current source')
+                frozen={'path':str(target),'sha256':fingerprint,'bytes':total,'files':len(files),
+                        'source':str(source),**({'content_sha256':identity} if field=='content_sha256' else {})}
+                atomic_json(manifest,frozen)
+                return {**frozen,'storage_backend':'content_addressed','requested_destination':str(destination)}
+            frozen=freeze_artifact(source,target,max_bytes=max_bytes)
+            atomic_json(manifest,frozen)
+            return {**frozen,'storage_backend':'content_addressed','requested_destination':str(destination)}
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise FileExistsError(f"experiment artifact destination already exists: {destination}")
     temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         if source.is_file():
-            shutil.copy2(source, temporary)
+            _copy_file(source, temporary)
         else:
-            shutil.copytree(source, temporary, symlinks=False)
+            shutil.copytree(source, temporary, symlinks=False,copy_function=_copy_file)
         copied = [temporary] if temporary.is_file() else [p for p in temporary.rglob("*")
                                                         if p.is_file()]
         after = object_digest([(str(p.relative_to(temporary)) if temporary.is_dir() else
@@ -259,24 +311,23 @@ def export_best(run_root: Path, best: dict[str, Any] | None, *,
             workspace = read_json(workspace_path)
             snapshot_name = str(source_state.get("source_snapshot") or "")
             overlay_files = source_state.get("overlay_files")
-            expected = object_digest({
-                "schema_version": 1,
-                "source_tree_fingerprint": workspace.get("source_tree_fingerprint"),
-                "source_snapshot": snapshot_name,
-                "overlay_files": overlay_files,
-                "overlay_modes": source_state.get("overlay_modes") or {},
-                "overlay_directories": source_state.get("overlay_directories") or {},
-                "copy_mode": source_state.get("copy_mode", "full_worktree"),
-                "untracked_assets_omitted": bool(
-                    source_state.get("untracked_assets_omitted")),
-            }) if snapshot_name and isinstance(overlay_files, dict) else ""
+            from .workspace_snapshot import _state_identity
+            expected = _state_identity(
+                workspace, snapshot_name, overlay_files,
+                source_state.get("overlay_modes") or {},
+                source_state.get("overlay_directories") or {}
+            ) if snapshot_name and isinstance(overlay_files, dict) else ""
             from .snapshot import Snapshots
             snapshots = Snapshots(run_root / "snapshots")
             snapshot = snapshots.get(snapshot_name) if snapshot_name else None
             source_state_valid = bool(
                 expected and source_state.get("identity_sha256") == expected and
                 source_state.get("source_tree_fingerprint") ==
-                workspace.get("source_tree_fingerprint") and snapshot and
+                workspace.get("source_tree_fingerprint") and
+                source_state.get("copy_mode", "full_worktree") ==
+                workspace.get("copy_mode", "full_worktree") and
+                bool(source_state.get("untracked_assets_omitted")) ==
+                bool(workspace.get("untracked_assets_omitted")) and snapshot and
                 dict(snapshot.files) == overlay_files and
                 all(not key or ((snapshots.blobs / key).is_file() and
                                 digest(snapshots.blobs / key) == key)

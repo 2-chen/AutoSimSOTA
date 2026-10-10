@@ -62,7 +62,7 @@ def active_jobs(output: Path) -> list[str]:
     return _active(output)
 
 
-def source_identity(output: Path, repo: Path) -> str:
+def source_identity(output: Path, repo: Path, *, stage_scope: list[str] | None = None) -> str:
     """Bind pre-existing checkout files without treating new training outputs as source."""
     manifest_path = Path(output) / "workspace_snapshot.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -96,13 +96,131 @@ def source_identity(output: Path, repo: Path) -> str:
     original = {str(row[1]) for row in entries}
     materialized = [(str(name), digest(Path(repo) / name))
                     for name in materialized_files(Path(repo)) if str(name) not in original]
+    stages_path = Path(output) / 'derived_stages.json'
+    if stages_path.is_symlink():
+        raise ValueError('unsafe derived stage identity')
+    if stage_scope is None:
+        stages = digest(stages_path) if stages_path.is_file() else None
+    else:
+        if (not isinstance(stage_scope, list) or not 1 <= len(stage_scope) <= 64
+                or any(not isinstance(s, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', s)
+                       for s in stage_scope) or stage_scope != sorted(set(stage_scope))):
+            raise ValueError('invalid native job stage scope')
+        document = read_json(stages_path)
+        if not isinstance(document, dict) or any(s not in document for s in stage_scope):
+            raise ValueError('native job stage scope disappeared')
+        stages = {'scope_version': 1, 'stages': {s: document[s] for s in stage_scope}}
     return object_digest({"base": manifest["source_tree_fingerprint"],
                           "existing_files": current,
                           "materialized_source": materialized,
                           # Early source investigation precedes command derivation.
                           # Absence is part of identity, not a fabricated verified stage.
-                          "derived_stages": digest(Path(output) / "derived_stages.json")
-                          if (Path(output) / "derived_stages.json").is_file() else None})
+                          "derived_stages": stages})
+
+
+def request_source_identity(output: Path, repo: Path, request: dict) -> str:
+    """Old jobs retain the exact global contract; never silently migrate history.
+
+    New jobs bind the executed builder only. All inventoried/materialized checkout
+    source remains bound: this does not pretend to know Python's dynamic imports.
+    Upstream data identities, argv, settings and policy receipts are checked separately.
+    """
+    if 'source_stage_scope' not in request:
+        return source_identity(output, repo)
+    scope = request['source_stage_scope']
+    if scope != [request.get('stage')]:
+        raise ValueError('native job stage identity does not match its operation')
+    return source_identity(output, repo, stage_scope=scope)
+
+
+def source_matches(output: Path, repo: Path, request: dict) -> bool:
+    if not request.get('source_identity'):
+        return False
+    if request_source_identity(output, repo, request) == request['source_identity']:
+        return True
+    # Only explicit inspection can create an additive bridge while the ORIGINAL
+    # full identity still matches. Never reconstruct old dependencies after drift.
+    if 'source_stage_scope' in request:
+        return False
+    try:
+        from .experiment_transaction import safe
+        job = str(request.get('job_id') or '')
+        _path(output, job)
+        base = 'native_jobs/'+job+'/'
+        path = safe(output, base+'source_binding.json')
+        if not path.is_file() or path.stat().st_size>65536:
+            return False
+        bridge = read_json(path)
+        if (bridge.get('schema_version') != 1 or bridge.get('job_id') != job
+                or bridge.get('sha256') != object_digest({k:v for k,v in bridge.items() if k!='sha256'})
+                or bridge.get('original_source_identity') != request['source_identity']
+                or bridge.get('stage') != request.get('stage')
+                or bridge.get('request_sha256') != digest(safe(output,base+'request.json'))
+                or read_json(safe(output,base+'request.json')) != request
+                or bridge.get('result_sha256') != digest(safe(output,base+'result.json'))
+                or bridge.get('receipt_sha256') != digest(safe(output,bridge['receipt_ref']))):
+            return False
+        return bridge.get('scoped_source_identity') == source_identity(output,repo,stage_scope=[request['stage']])
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):
+        return False
+
+
+def bind_completed_source(output: Path, repo: Path, request: dict) -> dict:
+    """Additive legacy handoff proof at an explicit inspect, before ANY drift.
+
+    Raw request/result/native receipt are never edited. A missing original source
+    stamp, changed checkout, unresolved job or unsealed native exit cannot migrate.
+    """
+    from .experiment_transaction import safe
+    from .evidence_store import read_attempt_evidence
+    if 'source_stage_scope' in request:
+        return {'status':'already_scoped'}
+    job = str(request.get('job_id') or '')
+    _path(output,job)
+    base = 'native_jobs/'+job+'/'
+    target = safe(output,base+'source_binding.json')
+    if target.exists():
+        if not source_matches(output,repo,request):
+            raise ValueError('legacy source bridge no longer verifies')
+        return {'status':'previously_bound','ref':base+'source_binding.json'}
+    if (request.get('repo') != str(Path(repo).resolve(strict=True))
+            or not request.get('source_identity')
+            or source_identity(output,repo) != request['source_identity']):
+        raise ValueError('original global source identity is not intact; cannot bridge')
+    request_path = safe(output,base+'request.json')
+    result_path = safe(output,base+'result.json')
+    result = read_json(result_path)
+    native = result.get('stage_result') or {}
+    attempt = str(native.get('attempt_id') or '')
+    if (read_json(request_path) != request or result.get('job_id') != job
+            or result.get('status') != 'completed'
+            or result.get('source_identity_after') != request['source_identity']
+            or not _JOB_ID.fullmatch(attempt) or native.get('stage') != request.get('stage')):
+        raise ValueError('legacy job lacks stable completed source proof')
+    run_id = request.get('run_id')
+    if not isinstance(run_id,str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',run_id) or run_id in {'.','..'}:
+        raise ValueError('invalid source bridge run')
+    relative = f'research/{run_id}/attempts/{attempt}/receipt.json'
+    receipt_path = safe(output,relative)
+    receipt = read_json(receipt_path)
+    proof = read_attempt_evidence(output,attempt,limit=1)
+    if (receipt.get('attempt_id') != attempt or receipt.get('run_id') != run_id
+            or receipt.get('controller_decision_id') != job
+            or receipt.get('node_id') != request.get('stage')
+            or receipt.get('status') != 'completed' or type(receipt.get('returncode')) is not int
+            or receipt['returncode'] != 0 or proof.get('status') != 'completed'
+            or proof.get('receipt_ref') != relative or proof.get('returncode') != 0):
+        raise ValueError('legacy source bridge native receipt is not sealed and completed')
+    body = {'schema_version':1,'job_id':job,'stage':request['stage'],
+        'original_source_identity':request['source_identity'],
+        'request_sha256':digest(request_path),'result_sha256':digest(result_path),
+        'receipt_ref':relative,'receipt_sha256':digest(receipt_path),
+        'scoped_source_identity':source_identity(output,repo,stage_scope=[request['stage']]),
+        'authority':'additive dependency proof at explicit inspect; no score, work or protocol certification'}
+    if source_identity(output,repo) != request['source_identity']:
+        raise ValueError('source drifted while bridging the original job identity')
+    atomic_json(target,{**body,'sha256':object_digest(body)})
+    return {'status':'bound','ref':base+'source_binding.json'}
 
 
 def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
@@ -132,7 +250,8 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
     verified = read_json(output / "derived_stages.json")
     if not isinstance(verified, dict) or stage not in verified or not verified[stage].get("source"):
         raise ValueError("native stage has no verified command")
-    source_stamp = source_identity(output, repo)
+    stage_scope = [stage]
+    source_stamp = source_identity(output, repo, stage_scope=stage_scope)
     profile = resource_profile(resources, gpu=settings.get("device") != "cpu") if scheduling else None
     if profile and profile["gpu"] is False and str(settings.get("device", "auto")).startswith("cuda"):
         raise ValueError("CPU resource profile conflicts with CUDA settings")
@@ -159,6 +278,7 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
     request = {"schema_version": 1, "job_id": job_id, "run_id": run_id,
                "repo": str(repo), "stage": stage, "settings": settings,
                "source_identity": source_stamp,
+               "source_stage_scope": stage_scope,
                "requested_seconds": float(requested_seconds),
                "reason": reason.strip(), "submitted_at": now(),
                "submitted_epoch": started}
@@ -470,8 +590,8 @@ def _worker(output: Path, job_id: str) -> int:
         research.controller_decision_id = job_id
         research.job_control_path = directory / "control.json"
         research.job_resources = request.get("resources")
-        if request.get("source_identity") and source_identity(
-                output, Path(request["repo"])) != request["source_identity"]:
+        if request.get("source_identity") and request_source_identity(
+                output, Path(request["repo"]), request) != request['source_identity']:
             raise ValueError("source changed between job submission and native start")
         while True:
             result = research.run_stage(
@@ -499,7 +619,7 @@ def _worker(output: Path, job_id: str) -> int:
             host_lease = _admit(output, directory, request)
             if host_lease.cores and hasattr(os, "sched_setaffinity"):
                 os.sched_setaffinity(0, set(host_lease.cores))
-        after_source = source_identity(output, Path(request["repo"]))
+        after_source = request_source_identity(output, Path(request["repo"]), request)
         if request.get("source_identity") and after_source != request["source_identity"]:
             result = {**result, "status": "failed", "why":
                       "pre-existing source or derived command changed during native job"}

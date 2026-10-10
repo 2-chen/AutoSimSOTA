@@ -50,6 +50,7 @@ class ProcessAttempt:
     orphaned_children: bool = False
     containment_mode: str = "process_group_only"
     cleanup_diagnostics: dict[str, Any] = field(default_factory=dict)
+    capture_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def requested_containment(command: list[str] | str) -> str:
@@ -159,6 +160,24 @@ def inspect_process_identity(identity: dict[str, Any]) -> dict[str, Any]:
         boot_id = str(identity["boot_id"])
         command_sha256 = str(identity["command_sha256"])
     except (KeyError, TypeError, ValueError):
+        # Fast-exiting launchers may never expose start_ticks/cmdline. Lack of
+        # identity forbids signalling, but is not perpetual proof of liveness.
+        # Require an actual ENOENT, visible host /proc, the original isolated
+        # group ID and no surviving group members. Permission/inspection errors
+        # and a reused/live PID remain unverifiable.
+        try:
+            absent_pid, absent_group = int(identity['pid']), int(identity['pgid'])
+            if absent_pid > 0 and absent_group == absent_pid and identity.get('boot_id'):
+                Path('/proc/self/stat').read_text()
+                try:
+                    Path(f'/proc/{absent_pid}').stat()
+                except FileNotFoundError:
+                    remaining = _live_group_members(absent_group)
+                    if not remaining:
+                        return {'status':'not_running',
+                                'why':'incomplete recorded identity; leader and isolated process group are absent'}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         return {"status": "unverifiable", "why": "recorded process identity is incomplete"}
     try:
         current_boot = Path("/proc/sys/kernel/random/boot_id").read_text(
@@ -354,12 +373,17 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                        on_start: Callable[[subprocess.Popen[Any]], None] | None = None,
                        pass_fds: Iterable[int] = (),
                        decouple_callbacks: bool = False,
-                       stdout_line_filter: Callable[[str], bool] | None = None) -> ProcessAttempt:
+                       live_control: Callable[[], dict[str, Any]] | None = None,
+                       stdout_line_filter: Callable[[str], bool] | None = None,
+                       capture_stdout_line_filter: Callable[[str], bool] | None = None) -> ProcessAttempt:
     """Run one bounded process while delivering newline-delimited output as it arrives.
 
     The output cap applies to captured stdout plus stderr; the process is terminated when
     exceeded instead of silently truncating a structured protocol stream. Callback failures
     also terminate the process group and are returned as an error receipt.
+    An explicit capture filter may omit known non-authoritative stdout telemetry from
+    retained bytes. Omitted traffic is counted; unknown/malformed lines must be retained.
+    Native execution uses the default unfiltered capture. Per-line bounds always apply.
     """
     if timeout <= 0:
         raise ValueError("process timeout must be positive")
@@ -393,11 +417,35 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
     deadline = time.monotonic() + timeout
     last_heartbeat = time.monotonic()
     timed_out = False
+    cancelled = False
     failure: Exception | None = None
     overflow = False
     records: queue.Queue = queue.Queue(maxsize=8192)
     stop_reader = threading.Event()
     reader = None
+    capture_stats = {'stdout_observed_bytes':0, 'stderr_observed_bytes':0,
+                     'stdout_filtered_bytes':0, 'stdout_filtered_lines':0}
+
+    def capture(name: str, raw: bytes) -> None:
+        nonlocal overflow
+        remaining_bytes = max_output_bytes - sum(len(value) for value in output.values())
+        if len(raw) > remaining_bytes:
+            output[name].extend(raw[:max(0, remaining_bytes)])
+            overflow = True
+            raise ValueError(f"combined process output exceeded {max_output_bytes} bytes")
+        output[name].extend(raw)
+
+    def capture_stdout(raw: bytes, line: str) -> None:
+        try:
+            retained = capture_stdout_line_filter(line)
+        except Exception:
+            capture('stdout', raw)
+            raise
+        if retained:
+            capture('stdout', raw)
+        else:
+            capture_stats['stdout_filtered_bytes'] += len(raw)
+            capture_stats['stdout_filtered_lines'] += 1
 
     def dispatch(name, line):
         if callbacks[name] is None:
@@ -425,17 +473,34 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
             line = bytes(buffer[:newline])
             del buffer[:newline + 1]
             if len(line) > max_line_bytes:
+                if name == 'stdout' and capture_stdout_line_filter is not None:
+                    capture(name, line[:max_line_bytes])
                 raise ValueError(f"{name} line exceeded the {max_line_bytes}-byte limit")
-            dispatch(name, line.decode("utf-8", errors="replace"))
+            text = line.decode("utf-8", errors="replace")
+            if name == 'stdout' and capture_stdout_line_filter is not None:
+                capture_stdout(line + b'\n', text)
+            dispatch(name, text)
         if len(buffer) > max_line_bytes:
             raise ValueError(f"{name} line exceeded the {max_line_bytes}-byte limit")
         if final and buffer:
-            dispatch(name, bytes(buffer).decode("utf-8", errors="replace"))
+            raw_line = bytes(buffer)
             buffer.clear()
+            text = raw_line.decode("utf-8", errors="replace")
+            if name == 'stdout' and capture_stdout_line_filter is not None:
+                capture_stdout(raw_line, text)
+            dispatch(name, text)
 
     def read_loop():
-        nonlocal timed_out, overflow, last_heartbeat
+        nonlocal timed_out, cancelled, overflow, last_heartbeat, deadline
         while selector.get_map() and not stop_reader.is_set():
+            if live_control is not None and process.poll() is None:
+                control=live_control()
+                if control.get('cancelled') is True:
+                    cancelled=True
+                    break
+                local_deadline=control.get('deadline_epoch')
+                if isinstance(local_deadline,(int,float)):
+                    deadline=min(deadline,time.monotonic()+max(0,local_deadline-time.time()))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if process.poll() is None:
@@ -458,12 +523,9 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                     stream.close()
                     deliver(name, b"", final=True)
                     continue
-                remaining_bytes = max_output_bytes - sum(len(value) for value in output.values())
-                if len(chunk) > remaining_bytes:
-                    output[name].extend(chunk[:max(0, remaining_bytes)])
-                    overflow = True
-                    raise ValueError(f"combined process output exceeded {max_output_bytes} bytes")
-                output[name].extend(chunk)
+                capture_stats[name + '_observed_bytes'] += len(chunk)
+                if name != 'stdout' or capture_stdout_line_filter is None:
+                    capture(name, chunk)
                 deliver(name, chunk)
             current = time.monotonic()
             if (not decouple_callbacks and on_heartbeat is not None and
@@ -478,7 +540,7 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
         except Exception as exc:
             failure = exc
         finally:
-            if failure is not None or timed_out:
+            if failure is not None or timed_out or cancelled:
                 terminate_group(process)
 
     try:
@@ -527,7 +589,7 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
                 failure = failure or RuntimeError("stream receiver failed to stop")
         selector.close()
 
-    if timed_out or failure is not None:
+    if timed_out or cancelled or failure is not None:
         terminate_group(process)
     try:
         process.wait(timeout=2)
@@ -541,13 +603,25 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
         if stream is not None and not stream.closed:
             stream.close()
 
+    # Preserve an incomplete critical record on timeout/callback/line-limit failure;
+    # it must not disappear merely because filtered capture waits for newlines.
+    if capture_stdout_line_filter is not None and partial['stdout'] and not overflow:
+        try:
+            raw_line = bytes(partial['stdout'])
+            capture_stdout(raw_line, raw_line.decode('utf-8', errors='replace'))
+        except Exception as exc:
+            failure = failure or exc
     stdout_text = output["stdout"].decode("utf-8", errors="replace")
     stderr_text = output["stderr"].decode("utf-8", errors="replace")
     if overflow and failure is None:
         failure = ValueError("process output limit exceeded")
     orphaned, cleanup = _audit_group_cleanup(process, containment_mode)
     return ProcessAttempt(True, process.returncode, stdout_text, stderr_text,
-                          timed_out=timed_out, error=failure,
+                          timed_out=timed_out, cancelled=cancelled,error=failure,
                           orphaned_children=orphaned,
                           cleanup_diagnostics=cleanup,
+                          capture_diagnostics={**capture_stats,
+                              'stdout_capture_filtered':capture_stdout_line_filter is not None,
+                              'retained_stdout_bytes':len(output['stdout']),
+                              'retained_stderr_bytes':len(output['stderr'])},
                           containment_mode=containment_mode)

@@ -18,7 +18,7 @@ from .evidence_store import capture_attempt_evidence
 
 def seal_protocol_stream(output: Path, workspace: Path, *, turn_id: str, attempt,
                          secrets=()) -> dict:
-    """Keep bounded raw protocol evidence before lossy event projection."""
+    """Keep bounded protocol evidence; explicitly account for omitted telemetry."""
     directory = output / "agent" / "stream_failures"
     from .agent_runtime import _worker_evidence_root
     evidence_root = _worker_evidence_root(output)
@@ -29,6 +29,7 @@ def seal_protocol_stream(output: Path, workspace: Path, *, turn_id: str, attempt
             stdout, stderr = stdout.replace(secret, "[REDACTED]"), stderr.replace(secret, "[REDACTED]")
     record = {"turn_id": turn_id, "returncode": attempt.returncode,
         "timed_out": attempt.timed_out,
+        "capture_diagnostics":getattr(attempt, 'capture_diagnostics', {}),
         "stdout_bytes": len(str(attempt.stdout or "").encode("utf-8")),
         "stderr_bytes": len(str(attempt.stderr or "").encode("utf-8")),
         "stdout_newline_terminated": not stdout or stdout.endswith("\n"),

@@ -1,3 +1,7 @@
+> 历史模板（停用）：当前 research 路径没有调用方，新 prompt 加载器不接受此模板名。
+> 下文保留旧方案记录；接口、idea 配额、参数范围和手工评分流程不适用于当前全局合同。
+> 以 scheduler / repository-scout / ideator 模板、当前执行器 schema 和冻结协议为准。
+
 # Robot Task Idea Generation Mission
 
 You are an AI robotics engineer. Based on the task analysis in `{OUTPUT_DIR}/memory/task_analysis.md` and the research report in `{OUTPUT_DIR}/memory/research_report.md`, generate a comprehensive library of optimization ideas for **{TASK_NAME}**.

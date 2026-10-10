@@ -1,6 +1,9 @@
 schema_version: 1
 defaults: &defaults
   version: "1.1.0"
+  scope: general
+  confidence: unspecified
+  evidence: ""
   inputs:
     - Current repository/run evidence relevant to the described decision.
   outputs:
@@ -14,9 +17,64 @@ defaults: &defaults
 
 skills:
   - <<: *defaults
+    id: autosimsota.curating-simulation-datasets
+    file: curating-simulation-datasets/SKILL.md
+    version: "1.1.0"
+    scope: general
+    confidence: Methodological guidance from primary research; current-run validation required.
+    evidence: 2026-10-06 native data-card and exposure contracts plus CPU pipeline tests; not a robot collection or policy improvement.
+    capabilities: [data.curation, data.quality, data.mixture, data.coverage, experiment.design]
+    keywords: [curation, dataset, quantity, quality, exposure, mixture, DataMIL, QoQ, 数据整理, 质量, 数量, 清洗, 混合, 曝光]
+    inputs: [Native data/loader semantics, legal training and development evidence, producer counts and available experiment budget.]
+    outputs: [A reversible type/quantity/selection/mixture intervention with cost, consumption and same-protocol comparison evidence.]
+    preconditions: [Data can be produced or loaded and a data intervention or quality uncertainty needs investigation.]
+    invalid_when: [Used to invent expert labels, alter held-out rules, delete raw data or claim a selection algorithm is already implemented.]
+    verification: [Trace observed production and processing to actual batches and exposure, preserved raw identities and measured development outcomes.]
+
+  - <<: *defaults
+    id: autosimsota.preserving-research-data
+    file: preserving-research-data/SKILL.md
+    version: "1.1.0"
+    scope: general
+    confidence: Engineering guidance; metadata, ownership and recovery must be verified.
+    evidence: 2026-10-06 data registration and retention source audit; not a deployed data store or backup.
+    capabilities: [data.lineage, data.preservation, data.reuse, resource.storage]
+    keywords: [raw, provenance, lineage, archive, backup, shards, dataset, 数据资产, 原始数据, 保管, 血缘, 归档, 备份, 复用, 分片]
+    inputs: [Current data locations and identities, producer and consumer records, ownership and storage observations.]
+    outputs: [A source-backed preservation or reuse assessment with protected objects, missing lineage and explicitly authorized next actions.]
+    preconditions: [Data is being created, converted, reused or investigated under storage pressure.]
+    invalid_when: [Used to authorize raw deletion, external publication, unsafe mutable links or clearing shared resources.]
+    verification: [Recheck source and parent identities, legal use and semantic compatibility, native readability and recoverability.]
+
+  - <<: *defaults
+    id: autosimsota.accelerating-policy-experiments
+    file: accelerating-policy-experiments/SKILL.md
+    version: "1.1.0"
+    capabilities: [experiment.efficiency, inference.efficiency, training.profiling, resource.budget]
+    keywords: [throughput, profile, cache, AMP, compile, batching, inference, 提效, 效率, 缓存, 吞吐, 批处理, 计算瓶颈]
+    preconditions: [Repeated experimental work or a runtime bottleneck is evidenced and current native semantics are inspectable.]
+    invalid_when: [Used to weaken formal evaluation, reuse stale identities, alter frozen physics or authorize unsupported tools and resource deletion.]
+    outputs: [Bottleneck-backed reversible candidate, cost and break-even estimate, identity-preserving comparison and stopping condition.]
+    verification: [Compare actual equal work, total cost, data and policy identities, memory and development outcomes; retain formal confirmation.]
+
+  - <<: *defaults
+    id: autosimsota.managing-research-artifacts
+    file: managing-research-artifacts/SKILL.md
+    scope: "general"
+    confidence: "engineering-method — source and runtime verification required"
+    evidence: "2026-10-03 lifecycle implementation and fixture tests; not evidence of a benchmark score improvement."
+    version: "1.0.0"
+    capabilities: [resource.storage, checkpoint.retention, training.recovery, evidence.validation]
+    keywords: [disk, storage, checkpoint, retention, ENOSPC, optimizer, 磁盘, 保存, 中间产物, 空间, 清理]
+    preconditions: [Native save/load semantics and run-owned producer evidence are available for review.]
+    invalid_when: [Used to authorize arbitrary deletion, remove data/evidence or weaken evaluator and recovery rules.]
+    outputs: [Source-reviewed saving controls, protected payload groups and exact authorized retention transactions.]
+    verification: [Recheck source identity, references, bytes, active work and resumability before executing an exact GC plan.]
+
+  - <<: *defaults
     id: autosimsota.data-first-score-optimization
     file: data-first-score-optimization/SKILL.md
-    version: "1.2.0"
+    version: "1.4.0"
     capabilities: [research.direction, data.collection, data.consumer_validation, experiment.design]
     keywords: [score, baseline, improve, data-first, SOTA, 自动刷指标, 提分, 数据优先, 数据闭环]
     preconditions: [A native benchmark score is to be improved under a fixed evaluation protocol.]
@@ -26,15 +84,16 @@ skills:
   - <<: *defaults
     id: autosimsota.targeting-simulation-data
     file: targeting-simulation-data/SKILL.md
-    version: "1.2.0"
+    version: "1.3.0"
     capabilities: [data.collection, data.correction, yield.analysis, experiment.design]
-    keywords: [targeted, failure, recovery, coverage, DAgger, MimicGen, self-bootstrap, 针对性采集, 失败状态, 覆盖, 纠错, 自举]
+    keywords: [targeted, failure, recovery, coverage, DAgger, DART, MimicGen, self-bootstrap, 针对性采集, 恢复示范, 扰动, 失败状态, 覆盖, 纠错, 自举]
     preconditions: [Legal development failures or training-coverage evidence can guide a data acquisition target.]
     invalid_when: [Uses held-out feedback or invents an expert, successful labels or collector compatibility.]
     verification: [Trace real production and accepted labels to native loader consumption and comparable policy scores.]
   - <<: *defaults
     id: autosimsota.choosing-simulation-improvements
     file: choosing-simulation-improvements/SKILL.md
+    version: "1.2.0"
     capabilities: [research.direction, experiment.design, skill.routing]
     keywords: [SOTA, improve, optimization, hypothesis, policy, research, 提分, 优化, 假设, 方法, 研究方向]
     preconditions: [A research direction must be selected using current protocol and resource evidence.]
@@ -53,6 +112,7 @@ skills:
   - <<: *defaults
     id: autosimsota.tuning-action-chunks-and-feedback
     file: tuning-action-chunks-and-feedback/SKILL.md
+    version: "1.2.0"
     capabilities: [policy.control, inference.efficiency, experiment.design]
     keywords: [chunk, horizon, temporal, latency, replan, diffusion, 分块, 抖动, 时序, 推理延迟]
     preconditions: [Current policy supports or can legally implement the proposed temporal change.]
@@ -62,15 +122,17 @@ skills:
   - <<: *defaults
     id: autosimsota.validating-policy-training
     file: validating-policy-training/SKILL.md
+    version: "1.2.0"
     capabilities: [training.diagnosis, policy.identity, checkpoint.selection]
     keywords: [training, checkpoint, optimizer, loss, update, resume, EMA, 训练, 权重, 长作业, 加载]
     preconditions: [Training progress or the relation between an artifact and scored policy needs verification.]
     invalid_when: [Used to claim convergence from a smoke test or bypass formal scoring.]
-    verification: [Bind actual data and training updates to saved artifact and evaluator loading and metric receipts.]
+    verification: [Review the complete counter inventory and source-backed terminal or native-best selection; bind planned and completed work to the selected artifact and actual loading; reuse verified training before retraining.]
 
   - <<: *defaults
     id: autosimsota.improving-observations-and-memory
     file: improving-observations-and-memory/SKILL.md
+    version: "1.2.0"
     capabilities: [policy.perception, policy.memory, experiment.design]
     keywords: [augmentation, crop, camera, depth, pointcloud, history, RNN, 视觉, 记忆, 增强, 点云, 遮挡]
     preconditions: [Development evidence suggests a perception or partial-observability limitation.]
@@ -98,7 +160,7 @@ skills:
   - <<: *defaults
     id: autosimsota.connecting-native-data-collection
     file: connecting-native-data-collection/SKILL.md
-    version: "1.2.0"
+    version: "1.4.0"
     capabilities: [data.collection, workflow.mapping, data.consumer_validation, experiment.design]
     keywords: [collect, collector, collection, expert, planner, demonstrations, data root, loader, 采集, 专家, 数据根目录, 训练数据]
     inputs: [Current producer source and configuration, native stage receipts, trainer loader and data protocol.]
@@ -110,6 +172,9 @@ skills:
   - <<: *defaults
     id: autosimsota.adapting-an-unfamiliar-benchmark
     file: adapting-an-unfamiliar-benchmark/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [repository.discovery, evidence.validation, capability.mapping]
     keywords: [repository, unfamiliar, survey, source, evidence, task, asset, declaration]
     preconditions: [A benchmark checkout or bounded source snapshot is available to inspect.]
@@ -118,6 +183,9 @@ skills:
   - <<: *defaults
     id: autosimsota.adding-more-can-subtract
     file: adding-more-can-subtract/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [research.data_selection, data.quality, generalization]
     keywords: [data, dataset, quality, low-quality, augmentation, generalization, curated]
     preconditions: [A candidate data addition and meaningful quality or coverage distinction exist.]
@@ -126,6 +194,9 @@ skills:
   - <<: *defaults
     id: autosimsota.benchmark-shapes
     file: benchmark-shapes/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [repository.discovery, benchmark.contract, metric.selection]
     keywords: [task, metric, success, asset, simulator, workflow, benchmark, contract]
     preconditions: [The repository's task, evaluator, and data sources can be inspected.]
@@ -134,6 +205,9 @@ skills:
   - <<: *defaults
     id: autosimsota.budget-attempts-not-episodes
     file: budget-attempts-not-episodes/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.collection, resource.budget, yield.analysis]
     keywords: [collect, collection, attempts, episodes, yield, partial, filtering]
     preconditions: [A producer may reject, filter, or fail to complete requested attempts.]
@@ -142,6 +216,9 @@ skills:
   - <<: *defaults
     id: autosimsota.building-an-environment-that-runs
     file: building-an-environment-that-runs/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [environment.provision, dependency.diagnosis, runtime.validation]
     keywords: [environment, dependency, package, version, install, build, import, runtime]
     preconditions: [A bounded environment probe or command produced a concrete dependency failure.]
@@ -150,6 +227,10 @@ skills:
   - <<: *defaults
     id: autosimsota.control-same-budget
     file: control-same-budget/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
+    version: "1.3.0"
     capabilities: [experiment.comparison, budget.control, causal.attribution]
     keywords: [baseline, control, budget, steps, compute, comparison, intervention]
     preconditions: [A candidate is compared with a baseline and consumes additional compute or data.]
@@ -158,6 +239,9 @@ skills:
   - <<: *defaults
     id: autosimsota.diversity-before-volume
     file: diversity-before-volume/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.coverage, research.data_selection, generalization]
     keywords: [diversity, volume, environments, objects, scenes, demonstrations, coverage]
     preconditions: [Data can be grouped by distinct environments, objects, or task configurations.]
@@ -166,6 +250,9 @@ skills:
   - <<: *defaults
     id: autosimsota.finding-how-a-benchmark-runs
     file: finding-how-a-benchmark-runs/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [repository.discovery, execution.entrypoints, workflow.mapping]
     keywords: [train, evaluate, collect, entrypoint, command, cli, invocation, source]
     preconditions: [Native source, CLI help, or repository documentation is available.]
@@ -174,6 +261,9 @@ skills:
   - <<: *defaults
     id: autosimsota.generator-success-is-not-data-value
     file: generator-success-is-not-data-value/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.quality, data.collection, outcome.analysis]
     keywords: [generator, success, collection, data value, usefulness, quality]
     preconditions: [Generated episodes can be evaluated for downstream policy value separately from yield.]
@@ -182,6 +272,9 @@ skills:
   - <<: *defaults
     id: autosimsota.hold-one-variable
     file: hold-one-variable/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [experiment.design, confound.diagnosis, harness.audit]
     keywords: [confound, harness, sampler, mixture, data, variable, ablation]
     preconditions: [An intervention changes multiple components of the training/evaluation pipeline.]
@@ -190,6 +283,9 @@ skills:
   - <<: *defaults
     id: autosimsota.make-your-prior-earn-it
     file: make-your-prior-earn-it/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [experiment.design, prior.validation, causal.attribution]
     keywords: [prior, heuristic, arbitrary, baseline, legal, comparison, justification]
     preconditions: [A preferred strategy is justified by prior belief rather than direct comparison.]
@@ -197,15 +293,22 @@ skills:
 
   - <<: *defaults
     id: autosimsota.making-a-stage-run
+    version: 1.2.0
     file: making-a-stage-run/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [execution.command_derivation, failure.diagnosis, runtime.validation]
     keywords: [stage, command, error, invocation, argv, run, failure, retry]
-    preconditions: [A native stage invocation has been located and a bounded attempt produced output.]
+    preconditions: [A source-backed stage invocation has been located and native evidence or an identified preflight refusal is available.]
     invalid_when: [The entrypoint lacks source support or the failure is unrelated to command execution.]
 
   - <<: *defaults
     id: autosimsota.more-of-the-same-saturates
     file: more-of-the-same-saturates/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [research.data_selection, sample.efficiency, generalization]
     keywords: [saturation, scaling, more data, same distribution, diminishing returns]
     preconditions: [The proposed data addition resembles an already-covered distribution.]
@@ -214,6 +317,9 @@ skills:
   - <<: *defaults
     id: autosimsota.progress-beats-binary
     file: progress-beats-binary/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [evaluation.metric, sample.efficiency, progress.measurement]
     keywords: [progress, binary, success, metric, partial credit, evaluation]
     preconditions: [A task has a source-supported graded progress signal in addition to binary outcome.]
@@ -222,6 +328,9 @@ skills:
   - <<: *defaults
     id: autosimsota.quality-needs-reweighting
     file: quality-needs-reweighting/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.quality, training.design, mixture]
     keywords: [quality, reweighting, mixture, behavior cloning, curation, demonstrations]
     preconditions: [Training combines data with distinguishable quality or provenance.]
@@ -230,6 +339,9 @@ skills:
   - <<: *defaults
     id: autosimsota.read-your-failures
     file: read-your-failures/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [failure.diagnosis, experiment.adaptation, retry.control]
     keywords: [failure, crash, retry, error, configuration, resource ceiling]
     preconditions: [A completed/interrupted attempt has an attributable receipt, log, or signature.]
@@ -238,6 +350,9 @@ skills:
   - <<: *defaults
     id: autosimsota.report-paired-and-intervaled
     file: report-paired-and-intervaled/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [evaluation.statistics, uncertainty.reporting, experiment.comparison]
     keywords: [paired, confidence interval, uncertainty, sample size, statistical significance]
     preconditions: [Comparable sample identities or a justified sampling model are available.]
@@ -246,6 +361,9 @@ skills:
   - <<: *defaults
     id: autosimsota.resolution-before-repetition
     file: resolution-before-repetition/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [evaluation.design, measurement.power, experiment.adaptation]
     keywords: [resolution, overlap, repetition, measurement, signal, sample size]
     preconditions: [Current measurements can be inspected for signal overlap or limited resolution.]
@@ -254,6 +372,9 @@ skills:
   - <<: *defaults
     id: autosimsota.robosynchallenge-measurements
     file: robosynchallenge-measurements/SKILL.md
+    scope: "benchmark:RoboSynChallenge"
+    confidence: "historical report — original receipts were not re-audited in the 2026-09-29 library review"
+    evidence: "All figures from controlled arms run through policy/act/eval.sh with 100 episodes,\nthe random setting and paired seeds, on one machine. The machine does not reproduce\nthe organiser's absolute published rates (the same released checkpoint scored 51-56%\nlocally across four master seeds against 37% published, z=6.2), so these numbers are\nvalid for comparing arms against each other and not as absolute claims."
     capabilities: [benchmark.evidence, result.interpretation]
     keywords: [RoboSynChallenge, measured values, click_bell, sampling mass]
     preconditions: [The active benchmark and protocol match the declared RoboSynChallenge scope.]
@@ -262,6 +383,10 @@ skills:
   - <<: *defaults
     id: autosimsota.spending-a-budget-across-ideas
     file: spending-a-budget-across-ideas/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
+    version: "1.2.0"
     capabilities: [experiment.screening, resource.budget, multi.fidelity]
     keywords: [budget, ideas, screening, successive halving, fidelity, promotion]
     preconditions: [A cheap early signal is available and evidence suggests it predicts the final objective.]
@@ -270,6 +395,9 @@ skills:
   - <<: *defaults
     id: autosimsota.the-declaration-is-a-claim
     file: the-declaration-is-a-claim/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [interface.validation, search_space.audit, evidence.validation]
     keywords: [declaration, parameter, axis, search space, validation, unsupported value]
     preconditions: [A proposed parameter space/capability declaration will control later execution.]
@@ -277,8 +405,11 @@ skills:
 
   - <<: *defaults
     id: autosimsota.using-the-method-library
-    version: "1.2.0"
+    version: "1.6.0"
     file: using-the-method-library/SKILL.md
+    scope: "general"
+    confidence: "orientation — not an experimental result"
+    evidence: "2026-09-29 library audit and 2026-10-06 score-efficiency and data-centric primary-source surveys; no new simulator run."
     capabilities: [skill.library_orientation, evidence.weighting]
     keywords: [skill, method, evidence, confidence, scope, library]
     preconditions: [The method library contains at least one candidate entry.]
@@ -287,6 +418,9 @@ skills:
   - <<: *defaults
     id: autosimsota.weight-the-small-set
     file: weight-the-small-set/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.mixture, training.design, intervention.analysis]
     keywords: [small dataset, sampling weight, mixture, local data, mass]
     preconditions: [A small additional dataset is mixed with a larger base and sampling mass is controllable.]
@@ -295,6 +429,9 @@ skills:
   - <<: *defaults
     id: autosimsota.what-the-benchmark-does-not-ship
     file: what-the-benchmark-does-not-ship/SKILL.md
+    scope: "general"
+    confidence: "methodological — requires current source and runtime verification"
+    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
     capabilities: [asset.discovery, environment.provision, dependency.audit]
     keywords: [asset, dataset, checkpoint, missing, external dependency, download]
     preconditions: [A required asset/dependency is named by source, configuration, or runtime failure.]
@@ -303,6 +440,9 @@ skills:
   - <<: *defaults
     id: autosimsota.where-successes-come-from
     file: where-successes-come-from/SKILL.md
+    scope: "general"
+    confidence: "methodological-or-borrowed — applicability must be verified in the current run"
+    evidence: "Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run."
     capabilities: [data.collection, capability.mapping, trajectory.provenance]
     keywords: [successful trajectories, expert, policy rollout, teleoperation, collection]
     preconditions: [A workflow needs trajectories and their producer or success criterion is uncertain.]

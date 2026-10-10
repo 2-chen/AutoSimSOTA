@@ -98,8 +98,30 @@ def validate_paused_research_resume(output: Path, *, rounds: int,
             raise ValueError("paused research session repository identity differs; "
                              "resume with the original repository or start a new output")
     if prior_settings != settings:
-        raise ValueError("paused research session has different frozen rounds/settings; "
-                         "resume with the original inputs or start a new output directory")
+        # Main may have supplied learning/evaluation work absent from the CLI.
+        # A narrower launcher input can assert its original constraints without
+        # rewriting the complete baseline settings, but only with sealed proof.
+        subset = all(key in prior_settings and prior_settings[key] == value
+                     for key, value in settings.items())
+        baseline_path = root / 'measurements/baseline.json'
+        verified_main_baseline = False
+        if subset and baseline_path.is_file() and not baseline_path.is_symlink():
+            from .receipt_verifier import verify_measurement
+            baseline = read_json(baseline_path)
+            if (isinstance(baseline, dict) and baseline.get('ok') is True and
+                    baseline.get('settings') == prior_settings and
+                    verify_measurement(root, 'baseline').get('status') == 'consistent'):
+                attempt = str((baseline.get('evaluate') or {}).get('attempt_id') or '')
+                receipt_path = root / 'attempts' / attempt / 'receipt.json'
+                if (len(attempt) == 32 and all(c in '0123456789abcdef' for c in attempt)
+                        and not receipt_path.is_symlink()):
+                    receipt = read_json(receipt_path)
+                    decision = receipt.get('controller_decision_id')
+                    verified_main_baseline = (isinstance(decision, str) and len(decision) == 16
+                        and all(c in '0123456789abcdef' for c in decision))
+        if not verified_main_baseline:
+            raise ValueError("paused research session has different frozen rounds/settings; "
+                             "resume with the original inputs or start a new output directory")
     if session['rounds']!=rounds:
         from .round_extension import resume_rounds
         return resume_rounds(root,session,rounds)
@@ -143,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="disable catalog, package cache and snapshot reuse for a fresh run")
     parser.add_argument('--publish-environment-snapshots', action='store_true', default=None,
                         help='opt in to large conda snapshot copies; default publishes small base/delta templates only')
+    parser.add_argument('--storage-auto-gc',action='store_true',default=None,
+                        help='operator opt-in: permit independently reviewed unscored obsolete run-native payload GC; never source/data/scored/final/resume artifacts')
     parser.add_argument("--max-actions", type=int, default=8,
                         help="maximum Scheduler actions per supervised segment; the AutoSOTA "
                              "Monitor resumes additional segments within the frozen budgets")
@@ -171,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="RELATIVE_TARGET=/ABSOLUTE/SOURCE",
                         help="attach a file/directory read-only inside the isolated checkout; "
                              "repeat for multiple resources; never overlays copied code")
+    parser.add_argument('--research-brief', type=Path,
+                        help='UTF-8 study intent, frozen separately from native settings; new runs only')
     parser.add_argument("--copy-limit-bytes", type=int, default=4 * 1024**3,
                         help="maximum source bytes copied with --isolated-copy")
     parser.add_argument("--framework", choices=("legacy_v1", "autosota_sim_v1"),
@@ -229,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
 
     load_credential_file(project_root=PROJECT_ROOT)
     output.mkdir(parents=True, exist_ok=True)
+    from .research_brief import persist as persist_brief
+    try:
+        persist_brief(output, args.research_brief)
+    except (OSError, ValueError, UnicodeError) as exc:
+        parser.error(str(exc))
     for amendment_path in (output / 'budget_amendments').glob('*.json'):
         if amendment_path.is_symlink() or read_json(amendment_path).get('status') != 'applied':
             parser.error('unfinished/unsafe explicit budget amendment; reconcile before resume')
@@ -285,6 +316,11 @@ def main(argv: list[str] | None = None) -> int:
                     atomic_text(output / "RUN.md", message)
                 print(message)
                 return 2
+            # A resumed successful launch must supersede a stale failure report.
+            # This says only that the runner is ready, not that native stages passed.
+            atomic_text(output / "STARTUP.md", "# 运行器启动检查通过\n\n"
+                        "模型运行器、计费网关与进程隔离已通过启动预检。\n\n"
+                        "[检查详情](runtime_preflight.json) · [当前研究进展](RUN.md)\n")
         interpreter_hint = None
         if args.rederive:
             for name in ("derived_stages.json", "environment.json", "execution.json"):
@@ -334,6 +370,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.framework == "autosota_sim_v1" and not (output / "run_state.json").exists():
             from .scheduling import configure as configure_scheduler
             configure_scheduler(output)
+        if args.storage_auto_gc is True:
+            from .storage_lifecycle import configure as configure_storage
+            configure_storage(output,auto_gc=True)
         client: Any = LLMClient()
         if args.framework == "autosota_sim_v1":
             from .agent_client import RoleAwareAgentClient

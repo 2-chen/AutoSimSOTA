@@ -56,7 +56,8 @@ def test_best_export_keeps_a_separate_policy_and_overlay(tmp_path):
     assert result["native_load_verified"] is False
 
 
-def test_best_export_carries_a_source_controller_overlay_without_fake_weights(tmp_path):
+@pytest.mark.parametrize('bind_resource', [False, True])
+def test_best_export_carries_a_source_controller_overlay_without_fake_weights(tmp_path, bind_resource):
     from autosim.research.snapshot import Snapshots
     from autosim.research.workspace_snapshot import capture_state, create
 
@@ -65,7 +66,11 @@ def test_best_export_carries_a_source_controller_overlay_without_fake_weights(tm
     source.mkdir()
     (source / "controller.py").write_text("score = 0.1\n", encoding="utf-8")
     checkout = output / "checkout"
-    workspace = create(source, checkout)
+    data = tmp_path / 'existing-data'
+    data.mkdir()
+    (data / 'sample.txt').write_text('existing data, not copied into code')
+    workspace = create(source, checkout,
+        resources=[{'source': str(data), 'target': 'data'}] if bind_resource else None)
     (checkout / "controller.py").write_text("score = 0.9\n", encoding="utf-8")
     (checkout / "controller.py").chmod(0o755)
     run = output / "research" / "derived"

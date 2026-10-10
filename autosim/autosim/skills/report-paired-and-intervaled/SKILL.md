@@ -1,9 +1,6 @@
 ---
 name: report-paired-and-intervaled
 description: 比较候选成功率时保留 episode 对应关系、报告差值不确定性，并区分开发选优与独立确认。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 报告配对结果与不确定性

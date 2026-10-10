@@ -32,6 +32,15 @@ def test_checkpoint_probe_preserves_exact_discovered_artifact(tmp_path):
     assert surveyed["path"] == str(checkpoint)
 
 
+def test_neighbour_policy_is_not_an_implicit_checkpoint(tmp_path):
+    repo=tmp_path/'repo';repo.mkdir()
+    policy=tmp_path/'other_repo/policy.pt';policy.parent.mkdir();policy.write_bytes(b'other policy')
+    report={'repo':str(repo),'model_artifacts':[{'path':str(policy),'found_under':str(tmp_path)}]}
+    assert execution_derive.checkpoint_for_verification(report)['path']==''
+    assert execution_derive.checkpoint_for_verification(report,
+        declaration={'assets':{'checkpoint':{'path':str(policy)}}})['path']==str(policy)
+
+
 def answer(**stages):
     value = {"stages": {name: {"available": False, "why": "not in this fixture"}
                         for name in STAGES}, "reasoning": "read the docs"}
@@ -518,6 +527,171 @@ def test_verification_caller_checkpoint_overrides_declared_checkpoint_parameter(
                            "checkpoint": "/frozen/candidate.pt"}, attempts=1)
     assert source is not None
     assert seen == [[sys.executable, "--checkpoint", "/frozen/candidate.pt"]]
+
+
+def test_generated_config_bridge_preserves_native_file_consumer(tmp_path):
+    """CPU contract fixture, not benchmark training or a measured policy score."""
+    (tmp_path/'template.json').write_text(json.dumps({'batch_size':2, 'steps':9999}))
+    (tmp_path/'native.py').write_text(
+        "import argparse,json\nfrom pathlib import Path\n"
+        "p=argparse.ArgumentParser();p.add_argument('--config',required=True)\n"
+        "cfg=json.loads(Path(p.parse_args().config).read_text())\n"
+        "Path(cfg['output'],'consumed.json').write_text(json.dumps(cfg))\n")
+    (tmp_path/'bridge.py').write_text(
+        "import argparse,json,subprocess,sys\nfrom pathlib import Path\n"
+        "p=argparse.ArgumentParser();p.add_argument('--template');p.add_argument('--steps',type=int)\n"
+        "p.add_argument('--batch-size',type=int);p.add_argument('--output');a=p.parse_args()\n"
+        "cfg=json.loads(Path(a.template).read_text());cfg.update(steps=a.steps,batch_size=a.batch_size,output=a.output)\n"
+        "out=Path(a.output);out.mkdir(parents=True,exist_ok=True);path=out/'native.json'\n"
+        "path.write_text(json.dumps(cfg))\n"
+        "subprocess.run([sys.executable,str(Path(__file__).with_name('native.py')),'--config',str(path)],check=True)\n")
+    template = (tmp_path/'template.json').read_bytes()
+    source = ("def stage_argv_train(i):\n"
+              "    return [i['python'], i['repo']+'/bridge.py', '--template', "
+              "i['repo']+'/template.json', '--steps', str(i['steps']), '--batch-size', "
+              "str(i['settings'].get('train.batch_size',2)), '--output', i['output']]\n")
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            assert 'NOT proof' in system and 'config bridge' in system
+            return json.dumps({'source':source}), {}
+    def verify(argv):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        return {'ok':done.returncode == 0, 'error':done.stderr}
+    inputs = {'python':sys.executable, 'repo':str(tmp_path), 'steps':2,
+              'output':str(tmp_path/'first'), 'settings':{}}
+    accepted, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='native.py', invocation='python native.py --config template.json',
+        repository_files=['native.py','bridge.py','template.json'],
+        declared_parameters={'train.batch_size':'2'}, inputs_for_verify=inputs,
+        verify=verify, attempts=1, require_step_control=True)
+    assert accepted is not None, log
+    assert json.loads((tmp_path/'first/consumed.json').read_text())['steps'] == 2
+    from autosim.research.declarative_backend import DeclarativeBackend
+    backend = DeclarativeBackend(repo=tmp_path, answer={'stages':{'train':{}}},
+        sources={'train':accepted}, parameters={'train':{'train.batch_size':{'value':'2'}}})
+    argv = backend.argv('train', {**inputs, 'steps':4, 'output':str(tmp_path/'second'),
+                                'settings':{'train.batch_size':5}})
+    assert verify(argv)['ok']
+    cfg = json.loads((tmp_path/'second/consumed.json').read_text())
+    assert (cfg['steps'],cfg['batch_size']) == (4,5)
+    assert (tmp_path/'template.json').read_bytes() == template
+    assert not any(part.startswith('train.batch_size=') for part in argv)
+
+
+@pytest.mark.parametrize('flag', ['--agent', '--weights-file', '--native-input'])
+def test_native_checkpoint_alias_keeps_caller_binding_in_verification_and_formal_backend(tmp_path, flag):
+    from autosim.research.declarative_backend import DeclarativeBackend
+    source = "def stage_argv_evaluate(i): return [i['python'], 'eval.py', '" + flag + "', i['checkpoint'], '--n_rollouts', str(i['episodes'])]"
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'source':source}), {}
+    seen = []
+    inputs = {'python':sys.executable,'checkpoint':'/selected/policy.pth','episodes':1}
+    accepted, params, log = execution_derive.generate_argv(Client(), 'evaluate',
+        entrypoint='eval.py',invocation='python eval.py ' + flag + ' template.pth',
+        repository_files=[],declared_parameters={flag:'template.pth','--n_rollouts':'50'},
+        inputs_for_verify=inputs,attempts=1,
+        verify=lambda argv:seen.append(argv) or {'ok':True})
+    assert accepted is not None, log
+    assert seen[0][seen[0].index(flag)+1] == '/selected/policy.pth'
+    assert seen[0][seen[0].index('--n_rollouts')+1] == '1'
+    backend = DeclarativeBackend(repo=tmp_path,answer={'stages':{'evaluate':{}}},
+        sources={'evaluate':accepted},parameters={'evaluate':{k:{'value':v} for k,v in params.items()}})
+    argv = backend.argv('evaluate',{**inputs,'checkpoint':'/frozen/candidate.pth','episodes':3})
+    assert argv[argv.index(flag)+1] == '/frozen/candidate.pth'
+    assert argv[argv.index('--n_rollouts')+1] == '3'
+
+
+def test_evaluate_cannot_ignore_selected_checkpoint_under_an_unrecognized_native_alias():
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'source':"def stage_argv_evaluate(i): return ['python','eval.py','--agent','template.pth']"}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'evaluate',
+        entrypoint='eval.py',invocation='python eval.py --agent template.pth',
+        repository_files=[],inputs_for_verify={'checkpoint':'/selected/policy.pth'},attempts=1,
+        verify=lambda argv:pytest.fail('ignored selected checkpoint must not launch'))
+    assert source is None and 'ignored the caller' in log[-1]['error']
+
+
+def test_source_backed_basename_checkpoint_interface_remains_admissible():
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'source':"def stage_argv_evaluate(i): return ['python','eval.py','--agent',i['checkpoint'].split('/')[-1]]"}), {}
+    seen = []
+    source, _, log = execution_derive.generate_argv(Client(),'evaluate',entrypoint='eval.py',
+        invocation='python eval.py --agent native-name',repository_files=[],attempts=1,
+        declared_parameters={'--agent':'template.pth'},
+        inputs_for_verify={'checkpoint':'/selected/policy.pth'},
+        verify=lambda argv:seen.append(argv) or {'ok':True})
+    assert source is not None, log
+    assert seen[0][-1] == 'policy.pth'
+
+
+def test_zero_seed_and_native_output_alias_are_not_overwritten_by_declared_prose(tmp_path):
+    from autosim.research.declarative_backend import DeclarativeBackend
+    source = ("def stage_argv_evaluate(i): return ['python','eval.py','--agent',i['checkpoint'],"
+              "'--seed',str(i['seed']),'--dataset_path',i['output']+'/rollouts.hdf5']")
+    declared = {'--seed':'caller seed from input', '--dataset_path':'caller output + /rollouts.hdf5',
+                '--agent':'template.pth'}
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'source':source}), {}
+    inputs = {'checkpoint':'/selected/policy.pth','seed':0,'output':'/run/first'}
+    seen = []
+    accepted, params, log = execution_derive.generate_argv(Client(),'evaluate',
+        entrypoint='eval.py',invocation='python eval.py --agent template.pth',
+        repository_files=[],declared_parameters=declared,inputs_for_verify=inputs,
+        attempts=1,verify=lambda argv:seen.append(argv) or {'ok':True})
+    assert accepted is not None, log
+    assert seen[0][-4:] == ['--seed','0','--dataset_path','/run/first/rollouts.hdf5']
+    backend = DeclarativeBackend(repo=tmp_path,answer={'stages':{'evaluate':{}}},
+        sources={'evaluate':accepted},parameters={'evaluate':{k:{'value':v} for k,v in params.items()}})
+    argv = backend.argv('evaluate',{**inputs,'seed':5,'output':'/run/second'})
+    assert argv[-4:] == ['--seed','5','--dataset_path','/run/second/rollouts.hdf5']
+
+
+def test_documented_repo_parameter_handle_is_resolved_before_both_execution_paths(tmp_path):
+    from autosim.research.declarative_backend import DeclarativeBackend
+    repo = tmp_path/'非 ASCII checkout'
+    repo.mkdir()
+    asset = repo/'native_input.txt'
+    asset.write_text('native fixture asset')
+    source = "def stage_argv_evaluate(i): return ['python','eval.py','--native_asset',i['repo']+'/native_input.txt']"
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'source':source}), {}
+    seen = []
+    accepted, params, log = execution_derive.generate_argv(Client(),'evaluate',
+        entrypoint='eval.py',invocation='python eval.py --native_asset {repo}/native_input.txt',
+        repository_files=[],declared_parameters={'--native_asset':'{repo}/native_input.txt'},
+        inputs_for_verify={'repo':str(repo)},attempts=1,
+        verify=lambda argv:seen.append(argv) or {'ok':Path(argv[-1]).is_file()})
+    assert accepted is not None, log
+    assert seen[0][-1] == str(asset)
+    backend = DeclarativeBackend(repo=repo,answer={'stages':{'evaluate':{}}},
+        sources={'evaluate':accepted},parameters={'evaluate':{k:{'value':v} for k,v in params.items()}})
+    assert backend.argv('evaluate',{})[-1] == str(asset)
+    assert execution_derive.expand_parameters({'x':"<i['repo']>/x"},repo=repo)['x'] == "<i['repo']>/x"
+
+
+def test_missing_argv_response_field_is_not_diagnosed_as_repository_config(tmp_path, monkeypatch):
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            return json.dumps({'finding':'inspect a source field in the dataset'}), {}
+    monkeypatch.setattr(execution_derive,'diagnose',
+        lambda *a,**k: pytest.fail('model response contract is not a native repository failure'))
+    monkeypatch.setattr(execution_derive,'revise_invocation',
+        lambda *a,**k: pytest.fail('invalid response must not mutate native invocation'))
+    source, _, log, row = execution_derive.make_runnable(Client(),'train',
+        {'entrypoint':'native.py','invocation':'python native.py','parameters':[]},
+        repo=tmp_path,repository_files=[],inputs_for_verify={'python':sys.executable},
+        rounds=3,attempts=2)
+    assert source is None
+    assert log[-1]['failure_domain'] == 'agent_contract'
+    assert log[-1]['native_operation_launched'] is False
+    assert 'NOT a repository config key' in log[-1]['error']
+    assert not log[-1]['previous_native_evidence_refs']
+    assert row['invocation'] == 'python native.py'
 
 
 def test_training_verification_requires_a_bound_step_budget():
@@ -1060,6 +1234,36 @@ def test_agent_can_yield_failed_native_to_invocation_repair_without_replay():
     assert log[-1]['argv'] == calls[0] and log[-1]['native_evidence_ref'] == 'evidence/owned.json'
 
 
+def test_executor_binds_owned_current_failure_for_explicit_handoff_missing_only_reference():
+    replies = iter([{'source':"def stage_argv_evaluate(i): return ['python','eval.py']"},
+        {'invocation_handoff':{'reason':'native writer needs a source-backed output launcher'}}])
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps(next(replies)), {}
+    calls = []
+    source, _, log = execution_derive.generate_argv(Client(),'evaluate',entrypoint='eval.py',
+        invocation='python eval.py',repository_files=[],attempts=2,
+        verify=lambda argv:calls.append(argv) or {'ok':False,'error':'native writer ENOENT',
+            'native_evidence_ref':'evidence/owned.json'})
+    assert source is None and len(calls) == 1
+    assert log[-1]['status'] == 'Agent requested invocation repair'
+    assert log[-1]['native_evidence_ref'] == 'evidence/owned.json'
+    assert log[-1]['handoff_identity_source'] == 'executor_bound_current_native_failure'
+
+
+def test_missing_reference_never_defaults_to_historical_failure_without_current_attempt():
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff':{'reason':'repair some old failure'}}), {}
+    source, _, log = execution_derive.generate_argv(Client(),'evaluate',entrypoint='eval.py',
+        invocation='python eval.py',repository_files=[],attempts=1,
+        verification_context={'previous_native_verifications':[{'stage':'evaluate',
+            'status':'failed','returncode':1,'evidence_verified':True,
+            'evidence_ref':'evidence/owned.json'}]},
+        verify=lambda argv:pytest.fail('no current native operation'))
+    assert source is None and log[-1]['status'] == 'rejected'
+
+
 def test_handoff_cannot_claim_success_or_foreign_evidence_before_native_execution():
     class Client:
         def chat_with_metadata(self, *args, **kwargs):
@@ -1069,6 +1273,147 @@ def test_handoff_cannot_claim_success_or_foreign_evidence_before_native_executio
         entrypoint='train.py', invocation='python train.py', repository_files=[], attempts=1,
         verify=lambda argv: pytest.fail('invalid handoff must not execute'))
     assert source is None and 'exact latest failed native evidence' in log[-1]['error']
+
+
+@pytest.mark.parametrize('bare_id', [False, True])
+def test_handoff_reuses_sealed_prior_native_failure_without_replay(bare_id):
+    identity = 'a' * 32
+    ref = 'evidence/' + identity + '.json'
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff': {'reason':'native parser needs a config bridge',
+                'native_evidence_ref':identity if bare_id else ref}}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py', invocation='python train.py', repository_files=[], attempts=1,
+        verification_context={'previous_native_verifications':[{
+            'stage':'train','evidence_ref':ref,'status':'failed','returncode':2,
+            'evidence_verified':True,'argv':['python','train.py','bad=value'],
+            'excerpt':'unrecognized arguments: bad=value'}]},
+        verify=lambda argv: pytest.fail('historical failure must not be replayed for handoff'))
+    assert source is None
+    assert log[-1]['status'] == 'Agent requested invocation repair'
+    assert log[-1]['native_evidence_ref'] == ref
+    assert any(item.get('handoff_origin') == 'previous_sealed_native_verification' for item in log)
+    assert log[-1]['native_operation_launched'] is False
+
+
+@pytest.mark.parametrize('bare_id', [False, True])
+def test_addressed_historical_failure_requires_new_verification(bare_id):
+    identity = 'a' * 32
+    ref = 'evidence/' + identity + '.json'
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff':{'reason':'old runtime failed',
+                'native_evidence_ref':identity if bare_id else ref}}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py', invocation='python train.py', repository_files=[], attempts=1,
+        verification_context={'addressed_native_evidence_refs':[ref],
+            'previous_native_verifications':[{'stage':'train','evidence_ref':ref,
+                'status':'failed','returncode':2,'evidence_verified':True}]},
+        verify=lambda argv:pytest.fail('handoff refusal must not launch a command'))
+    assert source is None
+    assert 'already led to a current invocation revision' in log[-1]['error']
+    assert not any(entry['status']=='Agent requested invocation repair' for entry in log)
+
+
+@pytest.mark.parametrize('prior_context', [None, 'b' * 64, 'a' * 64])
+def test_historical_handoff_requires_same_declared_execution_context(prior_context):
+    ref = 'evidence/' + 'c' * 32 + '.json'
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff': {'reason':'native failed', 'native_evidence_ref':ref}}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train', entrypoint='train.py',
+        invocation='python train.py', repository_files=[], attempts=1,
+        verification_context={'current_execution_context_sha256':'a' * 64,
+            'previous_native_verifications':[{'stage':'train','evidence_ref':ref,
+                'status':'failed','returncode':2,'evidence_verified':True,
+                'execution_context_sha256':prior_context}]})
+    assert source is None
+    if prior_context == 'a' * 64:
+        assert log[-1]['status'] == 'Agent requested invocation repair'
+    else:
+        assert 'changed or unknown invocation/input context' in log[-1]['error']
+
+
+def test_declared_context_tracks_checkpoint_runtime_and_entry_not_disposable_output(tmp_path):
+    entry = tmp_path/'eval.py'
+    entry.write_text('print("native")')
+    row = {'entrypoint':'eval.py', 'environment':{'RUNTIME_MODE':'first'}}
+    inputs = {'checkpoint':'old-policy', 'output':'disposable-a'}
+    def identity(row=row, inputs=inputs, environment=None):
+        return execution_derive.invocation_context_identity('evaluate', row, inputs, repo=tmp_path,
+            environment=environment or {'RUNTIME_MODE':'first'}, directory=str(tmp_path))
+    original = identity()
+    assert identity(inputs={**inputs, 'output':'disposable-b'}) == original
+    assert identity(inputs={**inputs, 'checkpoint':'new-policy'}) != original
+    assert identity(environment={'RUNTIME_MODE':'second'}) != original
+    assert identity(row={**row, 'staging':['source-backed preparation']}) != original
+    entry.write_text('print("changed source")')
+    assert identity() != original
+
+
+def test_invocation_revision_marks_owned_failure_addressed_not_all_history(tmp_path, monkeypatch):
+    seen = []
+    def generate(*args, **kwargs):
+        seen.append(list(kwargs['verification_context']['addressed_native_evidence_refs']))
+        if len(seen) == 1:
+            return None, {}, [{'status':'rejected','error':'native environment failed',
+                'native_evidence_ref':'evidence/owned.json'}]
+        return 'verified builder', {}, [{'status':'accepted','native_evidence_ref':'evidence/new.json'}]
+    monkeypatch.setattr(execution_derive, 'generate_argv', generate)
+    monkeypatch.setattr(execution_derive, 'diagnose', lambda *a, **k: {'finding':'runtime fix'})
+    monkeypatch.setattr(execution_derive, 'revise_invocation', lambda *a, **k: {
+        'environment':{'RUNTIME_MODE':'corrected'}, 'working_directory':'{repo}', 'why':'native source'})
+    source, _, _, _ = execution_derive.make_runnable(None, 'evaluate',
+        {'entrypoint':'eval.py', 'invocation':'python eval.py'}, repo=tmp_path,
+        repository_files=[], inputs_for_verify={'python':sys.executable}, rounds=3)
+    assert source == 'verified builder'
+    assert seen == [[], ['evidence/owned.json']]
+
+
+@pytest.mark.parametrize('change', [
+    {'stage':'evaluate'}, {'evidence_verified':False}, {'status':'completed','returncode':0},
+    {'returncode':None}, {'evidence_ref':'evidence/foreign.json'}])
+def test_handoff_does_not_accept_unverified_wrong_stage_or_successful_history(change):
+    prior = {'stage':'train','evidence_ref':'evidence/owned.json','status':'failed',
+             'returncode':2,'evidence_verified':True, **change}
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff':{'reason':'repair',
+                'native_evidence_ref':'evidence/owned.json'}}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py',invocation='python train.py',repository_files=[],attempts=1,
+        verification_context={'previous_native_verifications':[prior]},
+        verify=lambda argv: pytest.fail('invalid handoff must not execute'))
+    assert source is None and log[-1]['status'] == 'rejected'
+
+
+@pytest.mark.parametrize('exact', [False, True, None])
+def test_preflight_proposal_can_request_bridge_without_faking_native_evidence(exact):
+    class Client:
+        calls = 0
+        def chat_with_metadata(self, system, user, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return json.dumps({'source':"def stage_argv_train(i): return ['python', 'train.py', '--config', 'cfg_' + str(i['steps']) + '.json']"}), {}
+            # Retry includes the original JSON request followed by bounded feedback.
+            request = execution_derive._objects(user)[0]
+            ref = request['latest_rejected_proposal']['response_sha256']
+            handoff = {'reason':'config path does not carry effective work; stage executable bridge'}
+            if exact is not None:
+                handoff['proposal_sha256'] = ref if exact else 'wrong'
+            return json.dumps({'invocation_handoff':handoff}), {}
+    source, _, log = execution_derive.generate_argv(Client(), 'train',
+        entrypoint='train.py',invocation='python train.py',repository_files=[],attempts=2,
+        inputs_for_verify={'steps':4},require_step_control=True,
+        verify=lambda argv: pytest.fail('static failure must not launch native'))
+    assert source is None
+    if exact is not False:
+        assert log[-1]['status'] == 'Agent requested invocation repair'
+        assert log[-1]['handoff_origin'] == 'preflight_rejected_proposal'
+        assert not log[-1]['native_evidence_ref']
+    else:
+        assert log[-1]['failure_domain'] == 'agent_contract'
 
 
 def test_successful_native_artifact_failure_keeps_stable_execution_evidence(tmp_path, monkeypatch):
@@ -1095,6 +1440,149 @@ def test_successful_native_artifact_failure_keeps_stable_execution_evidence(tmp_
     assert log[0]['native_diagnostics']['returncode'] == 0
     assert 'native evaluation finished' in log[0]['native_diagnostics']['stdout_tail']
     assert 'fresh declared artifact' in log[0]['error']
+
+
+def test_verification_staging_receives_fresh_caller_output(tmp_path, monkeypatch):
+    repo = tmp_path/'中文仓库 with spaces'
+    repo.mkdir()
+    code = ("import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+            "assert p.is_dir(); (p/'marker.json').write_text('{}')")
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            return json.dumps({'source': "def stage_argv_evaluate(i):\n"
+                f"    return [i['python'], '-c', {code!r}, i['output']]\n"}), {}
+    monkeypatch.setattr(execution_derive, 'isolated_argv', lambda argv, **kw: argv)
+    monkeypatch.setattr(execution_derive, 'bounded_run',
+        lambda argv, **kw: subprocess.run(argv, capture_output=True, text=True,
+                                        cwd=kw.get('cwd'), env=kw.get('env')))
+    source, _, log, _ = execution_derive.make_runnable(Client(), 'evaluate',
+        {'entrypoint':'eval.py', 'invocation':'python eval.py', 'artifact':'marker.json',
+         'staging':['mkdir -p "$AUTOSIM_STAGE_OUTPUT"']},
+        repo=repo, repository_files=[],
+        inputs_for_verify={'python':sys.executable,'repo':str(repo),
+                           'output':str(tmp_path/'run/verify')},
+        rounds=1, attempts=1, unique_verification_outputs=True)
+    assert source is not None, log
+    markers = list((tmp_path/'run/verification_outputs').glob('*/marker.json'))
+    assert len(markers) == 1
+    assert not (repo/'marker.json').exists()
+
+
+@pytest.mark.parametrize('field,reason,valid', [
+    ('checkpoint','native loader requires a file, caller selected a directory',True),
+    ('unknown','source says no',False), ('checkpoint','',False)])
+def test_reviser_can_return_caller_selection_to_main(tmp_path, field, reason, valid):
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'caller_input_handoff':{'input':field,'reason':reason}}), {}
+    result = execution_derive.revise_invocation(Client(), 'evaluate',
+        {'entrypoint':'eval.py'},repo=tmp_path, argv=['python','eval.py'],
+        failure='native failed',attempts=1)
+    if valid:
+        assert result == {'caller_input_handoff':{'input':field,'reason':reason}}
+    else:
+        assert result is None
+
+
+def test_caller_input_handoff_does_not_regenerate_or_modify_selection(tmp_path, monkeypatch):
+    calls = []
+    def generate(*args, **kwargs):
+        calls.append('generate')
+        return None, {}, [{'status':'rejected','failure_domain':'native_or_invocation',
+            'error':'loader requires a file, supplied directory',
+            'native_evidence_ref':'evidence/owned.json'}]
+    monkeypatch.setattr(execution_derive, 'generate_argv', generate)
+    monkeypatch.setattr(execution_derive, 'diagnose', lambda *a,**k:{'finding':'caller selection wrong'})
+    monkeypatch.setattr(execution_derive, 'revise_invocation', lambda *a,**k:{
+        'caller_input_handoff':{'input':'checkpoint','reason':'loader requires a file'}})
+    inputs = {'python':sys.executable,'checkpoint':'selected_directory'}
+    original = {'entrypoint':'eval.py','invocation':'python eval.py'}
+    source, _, log, row = execution_derive.make_runnable(None, 'evaluate',original,
+        repo=tmp_path,repository_files=[],inputs_for_verify=inputs,rounds=4)
+    assert source is None and calls == ['generate']
+    assert inputs['checkpoint'] == 'selected_directory'
+    assert row['invocation'] == original['invocation']
+    assert log[-1]['status'] == 'caller input correction required'
+    assert log[-1]['repair_owner'] == 'main_agent'
+    assert log[-1]['native_evidence_ref'] == 'evidence/owned.json'
+    assert not any(r['status'] == 'no command can fix this' for r in log)
+
+
+@pytest.mark.parametrize('handoff,valid', [
+    ({'reason': 'selected runtime lacks a native consumer dependency'}, True),
+    ({'reason': ''}, False), ({'reason': 7}, False),
+    ({'reason': 'missing import', 'command': 'pip install anything'}, False),
+    ({'reason': 'x' * 2001}, False)])
+def test_environment_handoff_is_advisory_not_an_install_command(tmp_path, handoff, valid):
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'environment_handoff': handoff}), {}
+    result = execution_derive.revise_invocation(Client(), 'evaluate',
+        {'entrypoint': 'eval.py'}, repo=tmp_path, argv=['python', 'eval.py'],
+        failure='native failed', attempts=1)
+    assert result == ({'environment_handoff': handoff} if valid else None)
+
+
+def test_environment_repair_yields_once_with_owned_evidence_not_more_argv(tmp_path, monkeypatch):
+    calls = []
+    def generate(*args, **kwargs):
+        calls.append('generate')
+        return None, {}, [{'status': 'rejected', 'error': 'native runtime import failed',
+            'native_evidence_ref': 'evidence/owned.json', 'argv': ['python', 'eval.py']}]
+    monkeypatch.setattr(execution_derive, 'generate_argv', generate)
+    monkeypatch.setattr(execution_derive, 'diagnose', lambda *a, **k: {'finding': 'runtime dependency'})
+    monkeypatch.setattr(execution_derive, 'revise_invocation', lambda *a, **k: {
+        'environment_handoff': {'reason': 'source and native trace require environment repair'}})
+    original = {'entrypoint': 'eval.py', 'invocation': 'python eval.py'}
+    source, _, log, row = execution_derive.make_runnable(None, 'evaluate', original,
+        repo=tmp_path, repository_files=[], inputs_for_verify={'python': sys.executable}, rounds=4)
+    assert source is None and calls == ['generate']
+    assert row['invocation'] == original['invocation']
+    assert log[-1]['status'] == 'environment repair required'
+    assert log[-1]['repair_owner'] == 'environment_planner'
+    assert log[-1]['native_evidence_ref'] == 'evidence/owned.json'
+    assert not any(r['status'] == 'no command can fix this' for r in log)
+
+
+def test_environment_handoff_without_native_evidence_cannot_claim_owned_repair(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_derive, 'generate_argv', lambda *a, **k: (
+        None, {}, [{'status': 'rejected', 'error': 'preflight only'}]))
+    monkeypatch.setattr(execution_derive, 'diagnose', lambda *a, **k: {})
+    monkeypatch.setattr(execution_derive, 'revise_invocation', lambda *a, **k: {
+        'environment_handoff': {'reason': 'model suspects environment'}})
+    source, _, log, _ = execution_derive.make_runnable(None, 'evaluate',
+        {'entrypoint': 'eval.py', 'invocation': 'python eval.py'}, repo=tmp_path,
+        repository_files=[], inputs_for_verify={'python': sys.executable}, rounds=1)
+    assert source is None
+    assert not any(r.get('repair_owner') == 'environment_planner' for r in log)
+
+
+def test_historical_handoff_reason_reaches_invocation_diagnosis(tmp_path, monkeypatch):
+    from autosim.research import stage_verification
+    prior = {'stage':'train','evidence_ref':'evidence/owned.json',
+             'status':'failed','returncode':2,'evidence_verified':True,
+             'argv':['python','native.py','bad=value'],'excerpt':'native parser refused',
+             'execution_context_sha256':'a' * 64}
+    monkeypatch.setattr(execution_derive, 'invocation_context_identity', lambda *a, **k:'a' * 64)
+    monkeypatch.setattr(stage_verification, 'recent_attempts', lambda *args, **kwargs:[prior])
+    class Client:
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'invocation_handoff':{'reason':'stage executable bridge for file-only work',
+                'native_evidence_ref':'evidence/owned.json'}}), {}
+    captured = []
+    def diagnose(*args, **kwargs):
+        captured.append(kwargs['failure'])
+        return {'finding':'bridge missing','about':'the invocation'}
+    monkeypatch.setattr(execution_derive, 'diagnose', diagnose)
+    monkeypatch.setattr(execution_derive, 'revise_invocation',
+        lambda *args, **kwargs:{'obstacle':'needs a source-reviewed bridge'})
+    source, _, log, _ = execution_derive.make_runnable(Client(), 'train',
+        {'entrypoint':'native.py','invocation':'python native.py'},repo=tmp_path,
+        repository_files=[],inputs_for_verify={'python':sys.executable,
+            'output':str(tmp_path/'run/verify')},rounds=1,attempts=1)
+    assert source is None and len(captured) == 1
+    assert 'stage executable bridge' in captured[0]
+    assert any(item.get('handoff_origin') == 'previous_sealed_native_verification' for item in log)
 
 
 def test_exhausted_wall_budget_stops_command_derivation_rounds(tmp_path):

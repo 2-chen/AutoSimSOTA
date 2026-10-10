@@ -63,6 +63,28 @@ def test_partial_line_waits_for_delimiter_then_emits_without_duplicate(tmp_path)
     assert writer.poll()["sample_count"] == 1
 
 
+@pytest.mark.parametrize('diagnostic', [
+    '/site-packages/video.py:5: UserWarning: removed in version 0.24',
+    'WARNING encoder version=0.24 loss=0.9',
+    '[WARN] fallback version=2',
+    'ERROR retries=3',
+    'RuntimeError: code=42 loss=0.9',
+    'ValueError: shape=64',
+    'File "/native/train.py", line 25, in train',
+    'raise RuntimeError("code=42")',
+])
+def test_diagnostic_numbers_are_not_training_curves_and_raw_log_is_preserved(tmp_path, diagnostic):
+    writer, log, _ = _writer(tmp_path)
+    text = diagnostic + '\nglobal_step=5 loss=0.75 warning_count=2 vendor_margin=3\n'
+    log.write_text(text, encoding='utf-8')
+    state = writer.poll()
+    assert {row['metric_name'] for row in state['series']} == {
+        'loss', 'warning_count', 'vendor_margin'}
+    assert all(sample['native_step'] == 5
+               for row in state['series'] for sample in row['samples'])
+    assert log.read_text(encoding='utf-8') == text
+
+
 def test_truncated_log_starts_a_new_segment(tmp_path):
     writer, log, _ = _writer(tmp_path)
     log.write_text("global_step=1 loss=1.0\n", encoding="utf-8")

@@ -1,9 +1,6 @@
 ---
 name: quality-needs-reweighting
 description: 混合质量或来源的数据表现不稳定时，比较原样训练、过滤与重加权；质量标签和收益都必须验证。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 验证质量干预，而非默认必须重加权

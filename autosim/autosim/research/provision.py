@@ -50,6 +50,8 @@ the transcript. The keyword test is gone and `classify` reports only whether the
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import json
 import os
 import re
@@ -86,287 +88,14 @@ PLACEHOLDERS = {
     "workdir": "a scratch directory the build may use and discard",
 }
 
-PLAN_SYSTEM = (
-    "First compare the supplied runtime-family bases. base_verification records actual "
-    "CUDA/backward or engine step/frame evidence, with version variants and stale status. "
-    "Prefer a compatible verified base and an empty-install consumer probe; selection is "
-    "YOUR decision with a reason, not a repository-name mapping or catalog ranking. "
-    "A verified Torch base does not certify rendering; an engine frame does not certify "
-    "the task, datasets, collector or policy. Match the actual Python/ABI/engine versions. "
-    "successful_incremental_pins are previous small fixes, not a command to install them "
-    "all. Preserve separately bound resources, test current entrypoints, then repair only "
-    "evidenced gaps. Explain why no supplied compatible base can be reused before scratch. "
-    "If the supplied run-owned interpreter is compatible, prefer mode=existing, commands=[], "
-    "and a short native consumer probe before any installation. If the probe fails, propose "
-    "only evidence-backed incremental fixes. Reuse supplied workflow/handoff memory; "
-    "do not re-investigate unchanged source or require future training outputs during setup. "
-    "Prefer mode=overlay when an existing environment has compatible dependencies but is "
-    "not cloneable because of editable installs or venv hooks. Overlay borrows installed "
-    "third-party packages read-only, creates a run-owned writable prefix, skips inherited "
-    "startup hooks and rebinds task imports to the current checkout. Select necessary "
-    "external dependency sources with source_binding_ids from source_binding_options; "
-    "never guess host paths. First try native consumer probes (commands may be empty), "
-    "then install only evidence-backed missing/incompatible dependencies. Overlay is a "
-    "live reference, not a portable snapshot or proof of benchmark readiness. "
-    "An explicit required_environment_selection must be honored. base_environment_mode=clone "
-    "uses a relocatable isolated conda copy. mode=reconstruct uses portable dependency pins "
-    "and fresh prefix creation commands, NEVER copying old venv/site hooks. rebind_packages "
-    "must be sourced from the current isolated checkout (or explicitly connected resources), "
-    "not editable pointers into the old checkout. reconstruction_pins are compatibility "
-    "leads: install only the selected consumers' needed dependencies, reuse verified wheels, "
-    "and explain source-supported version differences. Do not install an entire unrelated "
-    "environment inventory. Native consumers must pass under the new interpreter. "
-    "Before reinstalling dependencies, compare all supplied reusable environments using "
-    "declared_package_matches and Python/ABI constraints, not just torch versions. Explain "
-    "why overlay AND clone are unsuitable if you choose reconstruction. Existing "
-    "run-local prefixes must be repaired incrementally, not recreated. Reuse is not "
-    "readiness: retain the repository's native consumer probes after cloning. "
-    "Your job is a minimal executable setup, not exhaustive repository research. "
-    "Use the supplied manifests, environment catalog and prior handoffs first; investigate "
-    "only uncertainties that change the next installation/probe. Return a compact plan "
-    "Prioritize the selected baseline policy and evaluator, not every optional policy in "
-    "the repository. Reuse verified setup. A minimal probe should establish the actual "
-    "native capability without launching full training or evaluation. Add collection "
-    "dependencies only when that producer is selected and source-supported. "
-    "within this turn; unresolved optional details belong in reasoning and can be tested "
-    "incrementally. CPU diagnostic run_command cannot install the real environment or "
-    "certify it: return commands for the trusted provision executor. "
-    "Commands default to CPU with no accelerator devices. Request accelerator access "
-    "explicitly with resource_requests=[{command: exact command/probe template, "
-    "resource: cpu|gpu, why: evidence-backed reason}]. Native GPU operations use the "
-    "same lease and total task GPU budget as training. Probes retain the selected-device "
-    "default for old plans; prefer explicit CPU grants for import/config/loader checks. "
-    "Prepare noninteractive repository configuration before import/reset probes. Read "
-    "the native config initialization and keep run-local config paths consistent across "
-    "install, probe and native stages. EOFError/input prompts mean missing unattended "
-    "configuration, not an impossible benchmark. After fixing it replay the failed probe. "
-    "You are building the environment a benchmark repository needs in order to run. You are "
-    "given what the repository declares about its dependencies and how it is laid out, and "
-    "you return a plan: which Python version to build the environment with, and the sequence "
-    "of shell commands that installs what the repository needs.\n\n"
-    "Commands are run one at a time, in a shell, and each is recorded only if it succeeds, "
-    "so order them "
-    "the way a person would: create the environment first, then install, then anything the "
-    "repository needs done to itself. Use the placeholders given in `placeholders`, which are "
-    "substituted before running. Do not write a command whose success you cannot tell from "
-    "its output, and do not include a step you know will fail. Shell-quote every pip version "
-    "constraint containing `>` or `<`; unquoted constraints are redirections and can "
-    "silently write into the checkout.\n\n"
-    "The repository's own requirements are the starting point, not the whole answer: a file "
-    "lists what its authors used, which is not always everything a component needs, and a "
-    "library imported by the code that runs is a dependency whether or not it is listed. "
-    "Where you add something the repository does not mention, say so in the reasoning.\n\n"
-    "`research_context` names the selected task and runnable stages. Provision only assets "
-    "required by that path: an online simulator trainer does not need offline demonstration "
-    "data or a pretrained checkpoint merely because the README mentions them. An unknown "
-    "asset source belongs in reasoning, not in `assets`. Likewise, do not install optional "
-    "baseline families, trainer frameworks, or their dependencies merely because they are "
-    "listed in repository manifests: the selected stage entrypoints are the scope. "
-    "`installed_packages` describes what the supplied interpreter already sees. If a "
-    "compatible package is already importable, verify it with a probe instead of "
-    "reinstalling large framework wheels.\n\n"
-    "environment_candidates is a short catalog, not a readiness certificate. You may return "
-    "base_environment_id, base_environment_mode (overlay|clone|reconstruct) and environment_selection_reason to choose a supported candidate "
-    "by dependency/version/hardware evidence, not by repository name. The executor connects "
-    "it read-only or clones it into the run prefix; never install into a public candidate. Use normal placeholders "
-    "in commands. Prefer capability probes and incremental installation; do not reinstall "
-    "already compatible large frameworks. For clone, include creation commands which "
-    "the executor skips after a successful clone. Overlay may have no install commands. "
-    "A failed reuse never silently falls back to scratch. A null ID means build "
-    "from scratch. Built-in profiles are advisory recipes, not downloaded environments.\n\n"
-    "When `observed_stage_failure` is present, use its stage and failure evidence to propose "
-    "a runtime capability probe or a necessary environment repair. It is evidence, not a "
-    "verdict: do not assume every command failure is an environment problem, and do not "
-    "replace the failed capability check with package acquisition or another shell fact.\n\n"
-    "Never synthesize a replacement module in site-packages to make a missing dependency "
-    "importable. A stub is not the dependency, even if an import probe passes; report the "
-    "build failure or repair the real package installation.\n\n"
-    "The environment builder installs dependencies and obtains EXTERNAL prerequisites. "
-    "It must not run any `research_context.stage_paths` stage itself: training, evaluation, "
-    "data conversion and collection belong to the later execution graph, where their "
-    "budget, inputs and artifacts are tracked. A checkpoint produced by train is not an "
-    "environment asset. Probes may use a selected entrypoint with --help only.\n\n"
-    "Where the repository pins a version, use it even if a newer one exists -- the repository "
-    "was written against what it pins. The exception is a pin that cannot work on "
-    "`machine`: a build for a compute capability this GPU does not report installs and then "
-    "cannot execute, which is worse than failing, because the build looks successful. Where "
-    "that is so, say which pin you are departing from and why, and what the departure risks.\n\n"
-    "An environment is not the only thing a benchmark needs. Most of them also need "
-    "something that is not in the repository: scene assets, demonstration data, a released "
-    "checkpoint, a simulator's binary distribution. Two facts decide what to do about it, and "
-    "both are given to you: `data_the_repository_ships_or_this_machine_already_has` lists "
-    "opaque local asset IDs and formats found by the survey, and `readme` is what the "
-    "benchmark says about obtaining the rest. For a surveyed local asset, use its exact "
-    "`asset_id` as `where` and set `produced_by` to `already present`; the local verifier "
-    "maps that ID to its actual path. Do not return paths, file names or hashes.\n\n"
-    "`where` is **one path**, not a description of where things are. A model that knows a "
-    "dataset lives under two directories, or that a policy adapter sits under a path with a "
-    "placeholder in it, is tempted to write both -- `.../data/ and .../data/`, or "
-    "`.../policy/<name>/`. That is not a path and cannot be checked: it becomes a probe for "
-    "something that cannot exist, and the build fails on a fault no command can fix. If two "
-    "locations matter, give two entries. **If you do not know the exact path, put that in "
-    "`reasoning` and leave the asset out** -- a named absence is worth more than a sentence "
-    "that looks like an answer.\n\n"
-    "For each such thing, say where it has to end up and what produces it. If it is already "
-    "there -- an opaque local asset ID from the survey -- then `produced_by` "
-    "is `already present` and nothing is run: an unnecessary download is gigabytes and "
-    "minutes, and on a machine without a network it is a failure. If it is not there and the "
-    "benchmark documents how to get it, that command goes in `produced_by`. If it is not "
-    "there and nothing documents how to get it, say so in the reasoning rather than inventing "
-    "a URL -- a wrong download is worse than a missing one, because the build continues.\n\n"
-    "`python` is usually a version to build the environment with. If "
-    "`interpreter_already_present` is true, return `existing`; the caller retains and uses the "
-    "supplied interpreter locally without disclosing its path. A simulator distributed as a "
-    "binary, or a framework that ships its own Python, is used where it was installed rather "
-    "than built here. "
-    "The supplied interpreter is what every command uses -- "
-    "`{python}` and `{pip}` already resolve to it -- so plan the dependencies, the assets and "
-    "the probes as usual and **do not create an environment**. When it is a path, the commands "
-    "should install into that interpreter instead of creating one -- and if that interpreter "
-    "is not on this machine, say so in the reasoning, because this is a finding about the "
-    "environment and not something a command can fix.\n\n"
-    "Return one JSON object: {\"python\": \"<version, e.g. 3.9, or `existing` when "
-    "interpreter_already_present is true>\", \"commands\": [\"<command>\", "
-    "...], \"probes\": [\"<one command per stage the environment has to support, using "
-    "{python}>\"], \"assets\": [{\"what\": \"<what it is>\", \"where\": \"<the path the "
-    "benchmark reads it from>\", \"produced_by\": \"<a command, or `already present`>\", "
-    "\"evidence\": \"<where in the repository that comes from>\"}], \"reasoning\": \"<what you "
-    "based this on, and anything you added or could not determine>\"}.\n\n"
-    "**A probe verifies a capability; it does not install one.** A probe must invoke the "
-    "selected repository's own Python/package/entry point and exercise an import or real "
-    "native operation. `pip install`, package downloads, file listings, printing a constant, "
-    "or a shell pipeline are not probes: their success says nothing about the stage and a "
-    "pipeline can hide the failing command's exit code. Put installation in `commands`, "
-    "then test the resulting runtime here. Do not rewrite the probe into another easy command "
-    "just to make the plan pass. Import the task module the repository declares, call the "
-    "entry point with `--help`, open one of the repository's own files. Do "
-    "not write a fresh exercise of a third-party library's API: you would be asserting an API "
-    "you expect rather than the one that is installed, and when the two differ the build "
-    "cannot tell a wrong probe from a wrong environment -- it installs and reinstalls a "
-    "package that was never the problem. A build spent nineteen attempts on a call the "
-    "library's own current version had removed, while importing one of the repository's own "
-    "modules would have answered the question in one -- and that module is what the stages "
-    "will import anyway.\n\n"
-    "There is one probe per stage, and all of them have to pass. An environment that "
-    "constructs a simulator is not an environment that trains a policy, and a single probe "
-    "for the most visible thing certifies only that thing: a build here passed by showing the "
-    "simulator could be stepped, while the training stack it would be stepped for was never "
-    "installed, because nothing asked for it.\n\n"
-    "A probe must *do* the thing, not ask about it. `torch.cuda.is_available()` is a driver "
-    "check and answers yes on hardware the installed build cannot actually execute on; a "
-    "tensor multiplication on that device answers the question that matters. A probe that "
-    "cannot fail certifies nothing, and one written as a question passes on a broken "
-    "environment -- which is worse than failing, because it is believed."
-)
+PLAN_SYSTEM = load_prompt("environment-plan")
 
-RESUME_SYSTEM = (
-    "Explicitly classify original_operation_disposition as replay_after_repair or "
-    "replace_invalid_operation. Never call a corrected cwd/path/cache copy a prerequisite "
-    "if the original operation itself is invalid: the framework would replay it. "
-    "Use resource *_execution_ref aliases, not bare run-relative metadata paths. "
-    "Wheel import_name_hints are packaging metadata, not readiness: distribution names "
-    "may differ from import names. Verify against source and the actual selected runtime. "
-    "For acquisition prefer compatible wheels when available. pip download --no-deps "
-    "does NOT prevent isolated build dependency installation for source archives; global "
-    "--no-binary :all: can recursively build tools such as ninja. Choose source-only "
-    "acquisition/build deliberately, inspect progress and bound it; do not assume it is "
-    "a simple download. Retire invalid old operations via reviewed replacement rather "
-    "than indefinitely inserting successful prerequisites ahead of them. "
-    "Inspect installation_recovery_inventory before declaring resources unavailable. "
-    "A failed install may have downloaded complete wheels. For unbuildable provide "
-    "resource_assessment={inventory_digest, local_artifacts, environment_reuse, "
-    "alternative_sources}; explain evidence ruling out each remaining route. A read-only "
-    "Objective must approve this boundary. Short network failures alone are insufficient. "
-    "Use bounded package-manager timeouts/retries and separate vendor-only packages from "
-    "ordinary dependency resolution. Changing source/arguments for the same real dependency "
-    "may use evidence-backed replace_operation; it is not limited to misspelled commands. "
-    "Installation repairs have two modes: repair_mode='prerequisites' installs prerequisites "
-    "and replays the original; repair_mode='replace_operation' corrects a wrong installer, "
-    "path or arguments. Replacement requires install_replacement_evidence={same_capability, "
-    "source_refs, failure_evidence_id} and independent source-quoted approval. Native capability "
-    "probes remain unchanged and must still pass; an approved replacement is not recovery. "
-    "If the probe itself calls a nonexistent/wrong API, provide probe_replacement_evidence "
-    "with source_refs (checkout-relative files) and same_capability (explanation). An "
-    "independent read-only Objective review must approve dropping the invalid original "
-    "invocation. Valid original operations with missing prerequisites still require replay. "
-    "CPU setup commands cannot access GPUs. If the original operation genuinely needs "
-    "an accelerator, return resource_requests with its exact template, resource='gpu' "
-    "and why; do not install another CUDA stack just to bypass the executor's CPU grant. "
-    "For EOF/input initialization failures, read native config code, prepare a run-local "
-    "config and preserve its environment variables across subsequent probes/stages; do "
-    "not simply suppress input or replace the failed probe with a weaker one. "
-    "You are continuing to build an environment. Commands are run one at a time and only the "
-    "ones that succeed are kept, so you are shown the commands that have already survived and "
-    "the failure of the one that did not.\n\n"
-    "Change as little as possible. If the failing command is wrong, return a corrected "
-    "version of it. If it failed because something it needs is not installed yet, return the "
-    "missing command followed by the one that failed. Use the placeholders in `placeholders`.\n\n"
-    "Do not re-create the environment. Recreating the prefix removes everything installed "
-    "into it, and the commands already recorded are not re-run, so the result is an empty "
-    "environment and a recipe that claims otherwise.\n\n"
-    "Do not write a fake module into site-packages to satisfy an import probe. If the real "
-    "dependency cannot be built, report unbuildable with the evidence.\n\n"
-    "**A probe can be the thing that is wrong.** The failing command above may be a probe: a "
-    "check that the environment works, written earlier by you or by the plan. When it is, no "
-    "installation fixes it and installing anyway is how a build spends its whole budget on a "
-    "fault that is in the question rather than the answer. The signs are that the traceback's "
-    "deepest frame is the probe's own command rather than the repository's code, and that the "
-    "exception is about *how the probe called something* -- `attempted relative import with no "
-    "known parent package`, an `AttributeError` for a method the installed library does not "
-    "have, a `TypeError` about arguments. Say so by returning `probes`: the corrected list, "
-    "replacing the current one.\n\n"
-    "A probe should call the code the way the repository calls it. A task module that begins "
-    "`from ._base_task import ...` is part of a package and cannot be run as a file; the "
-    "repository imports it by name, and so should the probe.\n\n"
-    "Return one JSON object: {\"commands\": [\"<the commands to run next, in order>\"], "
-    "\"reasoning\": \"<what the failure told you>\", \"probes\": [\"<the replacement probes, "
-    "only when the existing ones are wrong>\"], \"unbuildable\": \"<if this cannot be "
-    "fixed by installing something, say why; otherwise omit>\"}."
-)
+RESUME_SYSTEM = load_prompt("environment-resume")
 
 
-RECONSIDER_SYSTEM = (
-    "You are building an environment and the approach is not working: a whole round of "
-    "commands produced nothing that survived. Fixing the failing command one more time has "
-    "not helped, so reconsider the constraint instead.\n\n"
-    "The usual cause is a requirement that cannot be satisfied as stated on this machine -- "
-    "a version that is no longer published, a build for hardware this machine does not have, "
-    "a pin that predates something it now has to coexist with. When that is so, the useful "
-    "move is to name the constraint that is failing and substitute it, saying what you are "
-    "giving up and what would have to be checked afterwards. A package whose pinned build "
-    "targets hardware the machine does not have will install and then fail at first use; "
-    "substituting a build that targets it is the fix, and the risk is that the rest of the "
-    "stack was written against the old one.\n\n"
-    "You are given everything tried so far, with what each attempt reported, and "
-    "`installed_now`: what the environment actually contains, asked of it directly. Compare "
-    "that against the commands that survived -- a command can exit zero and leave the old "
-    "version in place, so what a command reported and what is present are different "
-    "questions, and the second is the one that decides what runs.\n\n"
-    "Do not repeat an approach that has already failed.\n\n"
-    "Return one JSON object: {\"constraint\": \"<the requirement that cannot hold, as it was "
-    "stated>\", \"substitute\": \"<what to use instead>\", \"why\": \"<what makes the "
-    "original impossible here>\", \"cost\": \"<what this gives up, and what would have to "
-    "be checked>\", \"commands\": [\"<the commands to run now>\"], \"unbuildable\": \"<if "
-    "no substitution can work, why not; otherwise omit>\"}"
-)
+RECONSIDER_SYSTEM = load_prompt("environment-reconsider")
 
-DIAGNOSE_SYSTEM = (
-    "An environment build has stopped. Say what is in the way, in terms someone can act on, "
-    "and do not overstate what is known.\n\n"
-    "A dependency that is missing is not the same finding as a requirement that cannot be "
-    "satisfied on this machine, and neither is the same as the machine itself being unable to "
-    "host the workload -- a driver, a rendering backend, a compute capability the installed "
-    "builds do not target. They have different remedies and only the first is a matter of "
-    "installing something.\n\n"
-    "The record is what survived; the transcript is everything tried. A command in the record "
-    "has run successfully and is not evidence about the blocker unless it is the one that "
-    "failed.\n\n"
-    "Return one JSON object: {\"blocker\": \"<dependency | requirement-not-satisfiable | "
-    "platform | unresolved>\", \"what\": \"<the specific thing in the way>\", \"evidence\": "
-    "\"<the commands and output that show it>\", \"tried\": [\"<approaches attempted>\"], "
-    "\"would_unblock\": \"<what a person would do, and what it would cost>\", "
-    "\"confidence\": \"<high | medium | low>\"}"
-)
+DIAGNOSE_SYSTEM = load_prompt("environment-diagnose")
 
 
 def platform_facts(*, timeout: int = 60) -> dict[str, Any]:
@@ -833,8 +562,11 @@ def asset_commands(assets: list[dict[str, Any]]) -> list[str]:
 
 def consumer_or_asset_violation(probe: str, context: dict | None, assets=None) -> str:
     """Controller-generated resource checks supplement, never replace, consumers."""
+    checkout = str((context or {}).get('repository_checkout') or '')
+    def local(text):
+        return text.replace('{repo}', checkout) if checkout else text
     if any(isinstance(asset, dict) and isinstance(asset.get('where'), str)
-           and probe == asset_probe(asset['where']) for asset in (assets or [])):
+           and local(probe) == local(asset_probe(asset['where'])) for asset in (assets or [])):
         return future_stage_output_violation(probe, context)
     return probe_stage_violation(probe, context)
 
@@ -1264,8 +996,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
     if base_environment_id is not None:
         if (not isinstance(base_environment_id, str) or base_environment_mode not in {'overlay', 'clone', 'reconstruct'}
                 or not isinstance(environment_selection_reason, str) or not environment_selection_reason.strip()
-                or len(environment_selection_reason) > 2000 or repair_proposal is not None):
-            raise ValueError('base switch requires catalog ID, overlay/clone/reconstruct mode and reason; submit separately from repair')
+                or len(environment_selection_reason) > 2000):
+            raise ValueError('base selection requires catalog ID, overlay/clone/reconstruct mode and reason')
         available = catalog(output, manifests, platform_facts())
         explicit_base = next((row for row in available if row['id'] == base_environment_id), None)
         capability = {'clone':'cloneable', 'reconstruct':'reconstructable', 'overlay':'overlay_reusable'}[base_environment_mode]
@@ -1292,6 +1024,12 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             previous_selection.get('request_identity') == same_definition and
             saved_cursor.get('prefix') == previous_selection.get('prefix') and
             saved_cursor.get('context_identity') == current_identity)
+        # Reasserting the accepted selection is not a switch. Permit a repair
+        # only after the persisted base, bindings, context and prefix all match;
+        # never create a new prefix or overwrite selection evidence for a repair.
+        if repair_proposal is not None and not continuation:
+            raise ValueError('base switch must be submitted separately from repair; '
+                             'combined repair requires the exact accepted environment continuation')
         if continuation:
             existing = Path(saved_cursor['prefix'])
             if (existing.is_symlink() or existing.resolve() == output.resolve() or
@@ -1699,6 +1437,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             more, replacement = resume(client, repo, record, failed,
                 manifests=manifests, transcript=transcript, values=values,
                 current_probes=probes, pending_commands=pending,
+                research_context=research_context, plan_assets=plan_assets,
                 **({"submitted_proposal": repair_proposal} if repair_proposal is not None else {}))
             if not more and not replacement:
                 if transcript and transcript[-1].get("kind") == "unbuildable":
@@ -1731,6 +1470,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         more, replacement = resume(client, repo, record, failed_probe,
             manifests=manifests, transcript=transcript, values=values, probing=True,
             current_probes=probes, pending_commands=pending,
+            research_context=research_context, plan_assets=plan_assets,
             **({"submitted_proposal": repair_proposal} if repair_proposal is not None else {}))
         if not more and not replacement:
             if transcript and transcript[-1].get("kind") == "unbuildable":
@@ -1786,11 +1526,14 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                 # The command as the plan wrote it, before this build's paths went into it.
                 # What is worth keeping is the lesson, and the lesson does not contain the
                 # prefix it was learned under.
-                result = {**result, "template": pending[index], "environment_prefix":str(prefix),
-                          "plan_identity":context_identity}
             if display_path or missing or stage_violation:
                 result = run(command, env=environment, cwd=repo, timeout=1,
                              output=output / "build.log", rejection=result)
+            # A rejected operation has the same queue identity requirements as an
+            # executed installer. Without these fields current_queue_failure cannot
+            # associate its sealed evidence with the pending head and replays it.
+            result = {**result, "template": pending[index], "environment_prefix": str(prefix),
+                      "plan_identity": context_identity}
             operations += 1
             transcript.append(result)
             atomic_json(output / "transcript.json", {"rows": transcript})
@@ -1843,7 +1586,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             more, replacement = resume(client, repo, record, result,
                                        manifests=manifests, transcript=transcript,
                                        values=values, current_probes=probes,
-                                       pending_commands=pending[index:])
+                                       pending_commands=pending[index:],
+                                       research_context=research_context, plan_assets=plan_assets)
             if transcript and transcript[-1].get("kind") == "unbuildable":
                 atomic_json(cursor_path, {})
                 return _finish(output, repo, python, record, transcript, probes,
@@ -1947,7 +1691,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
             pending, replacement = resume(client, repo, record,
                                           failed_probe,
                                           manifests=manifests, transcript=transcript,
-                                          values=values, probing=True, current_probes=probes)
+                                          values=values, probing=True, current_probes=probes,
+                                          research_context=research_context, plan_assets=plan_assets)
             if transcript and transcript[-1].get("kind") == "unbuildable":
                 atomic_json(cursor_path, {})
                 return _finish(output, repo, python, record, transcript, probes,
@@ -2172,6 +1917,8 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
            probing: bool = False, attempts: int = 3,
            current_probes: list[str] | None = None,
            pending_commands: list[str] | None = None,
+           research_context: dict[str, Any] | None = None,
+           plan_assets: list[dict[str, Any]] | None = None,
            submitted_proposal: dict | None = None) -> tuple[list[str], list[str] | None]:
     """What to do next, given what survived and what just failed.
 
@@ -2214,6 +1961,7 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
         "actual_environment_observation": prompt_view(observation,
             json.dumps([executable_manifests, failure, current_probes, pending_commands])),
         "required_existing_probes": [paths.encode_text(item) for item in (current_probes or [])],
+        "selected_stage_paths": (research_context or {}).get("stage_paths") or {},
         "pending_installation_operations": [paths.encode_text(item) for item in (pending_commands or [])[:64]],
         "successful_operation_receipts": [{key: row.get(key) for key in (
             "evidence_id", "template", "kind", "excerpt")} for row in record[-20:] if row.get("ok")],
@@ -2222,6 +1970,13 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
         "repair_contract": "Commands and probes are independent outputs and may both be "
             "required. For an invalid installation return commands plus replace_operation "
             "and install_replacement_evidence even if probes also need correction. Probe "
+            "checks (including selected entrypoint --help) belong in probes, not commands. "
+            "Use {python} for the selected interpreter; {repo} is CHECKOUT, not RUN ROOT. "
+            "Do not guess environments/... paths relative to either root. "
+            "A standalone probe must preserve the native consumer's in-process initialization "
+            "and API postconditions; inspect that chain before treating a reset/API failure "
+            "as missing packages. No installation needed is not unbuildable: an invalid "
+            "probe needs an evidence-backed equivalent replacement, not a resource boundary. "
             "replacement must preserve every required_existing_probes capability; correct "
             "only invalid invocations. Prefer a valid native postcondition on the existing "
             "prefix when recorded successful operations already satisfied the dependency. "
@@ -2293,6 +2048,11 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
             paths.operations(value)
             validate_resource_requests(value)
             if str(value.get("unbuildable", "")).strip():
+                if failure.get("failure_kind") in {"stage_boundary", "execution_path_unresolved"}:
+                    raise ValueError("a non-executed phase/path refusal is not unavailable "
+                                     "environment resources; correct command/probe placement "
+                                     "or executable path, preserve every consumer, and propose "
+                                     "an evidence-backed replacement instead of unbuildable")
                 review = review_boundary(client, resources=resources, reason=value["unbuildable"],
                     assessment=value.get("resource_assessment"), failure={
                         "evidence_id": failure.get("evidence_id"),
@@ -2306,6 +2066,16 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
             commands = [str(c) for c in (value.get("commands") or []) if str(c).strip()]
             if not commands and not replacement:
                 raise ValueError("commands must be a non-empty list, or probes a replacement")
+            for index, command in enumerate(commands):
+                violation = (stage_command_violation(command, research_context) or
+                             future_stage_output_violation(command, research_context))
+                if violation:
+                    raise ValueError(f"repair.commands[{index}]: {violation}; native --help "
+                                     "checks belong in probes, not the installer queue")
+            for index, probe in enumerate(replacement):
+                violation = consumer_or_asset_violation(probe, research_context, plan_assets or [])
+                if violation:
+                    raise ValueError(f"repair.probes[{index}]: {violation}")
             failed_command = failure.get("command") or substitute(
                 failure.get("probe") or failure.get("template") or "", values)
             successful = {row.get("command") for row in record if row.get("ok")}

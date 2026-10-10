@@ -11,6 +11,30 @@ from autosim.research.runtime_freshness import (
 from tests.test_main_agent import make
 
 
+@pytest.mark.parametrize('filename', [
+    'candidate_execution_review.py', 'monitor_findings.py', 'native_runtime_summary.py', 'telemetry.py',
+    'agent_client.py', 'deepseek_gateway.py',
+    'measurement_adoption.py', 'frozen_policy_trial.py', 'receipt_verifier.py',
+    'run_record.py', 'selection.py', 'experiment_bundle.py',
+    'baseline_reference.py', 'confirmation_reservation.py', 'framework_stop_review.py',
+    'operation_contracts.py', 'native_source_citations.py',
+])
+def test_new_admission_and_evidence_modules_change_controller_identity(monkeypatch, filename):
+    from autosim.research import runtime_freshness
+
+    original_digest = runtime_freshness.digest
+    controller_identity.cache_clear()
+    try:
+        before = controller_identity()
+        monkeypatch.setattr(runtime_freshness, 'digest',
+            lambda path: 'changed-module-content' if path.name == filename else original_digest(path))
+        controller_identity.cache_clear()
+        assert controller_identity() != before
+    finally:
+        # Other tests must not inherit the identity of a simulated source edit.
+        controller_identity.cache_clear()
+
+
 def old_observation():
     return {'status':'budget_exhausted','failure_category':'run_model_budget',
         'recorded_at':'2026-10-02T04:23:30Z',
@@ -49,9 +73,12 @@ def test_preparation_refreshes_monitor_and_fix_before_context_and_report(tmp_pat
     assert ledger.path.read_bytes()==before
     monkeypatch.setattr(real,'choose',lambda:{'do':'stop','why':'current independent framework fault',
         'arguments':{'stop_scope':'framework'}})
-    result = real._run_cycle(max_steps=1)
-    assert result['status']=='infrastructure_blocked'
-    assert result['steps'][-1]['stop_scope']=='framework'
+    result = real._run_cycle(max_steps=3)
+    # A mere Main assertion with no current sealed failure cannot authorize a
+    # permanent framework boundary. One correction then a safe unresolved pause.
+    assert result['status']=='paused'
+    assert result['steps'][-1]['stop_scope']=='pause'
+    assert list((real.output/'framework_stop_reviews').glob('*.json'))
 
 
 @pytest.mark.parametrize('outcome', ['raised', 'repair proposal rejected'])

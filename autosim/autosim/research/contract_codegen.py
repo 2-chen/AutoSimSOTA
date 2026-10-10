@@ -30,6 +30,8 @@ fails on the others rather than passing on one.
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import json
 import os
 import subprocess
@@ -65,36 +67,10 @@ def function_name(field: str) -> str:
     return f"field_{field}"
 
 
-SYSTEM = (
-    "You write one small pure Python function that reads a benchmark's configuration "
-    "documents and returns a single value from them -- one field of a task's contract.\n\n"
-    "You will be shown the shape of the documents (asked for, in pieces), the field you are "
-    "responsible for, worked examples of the answer, and the tasks whose answers you are not "
-    "shown. Your function is run against all of them and must reproduce the value exactly "
-    "everywhere, including where you were not shown the answer.\n\n"
-    "Constraints, enforced by a validator that rejects the draft outright:\n"
-    "* exactly one function, named for the field, taking one positional argument `d`\n"
-    "* no imports, no decorators, no nested functions, no recursion, no exception handling\n"
-    "* no attribute access of any kind: `d[\"key\"]`, never `d.get(\"key\")`, and never a "
-    "method on a value -- no .get(), .values(), .keys(), .startswith(), .append()\n"
-    "* to collect values use `xs = xs + [v]` and `d[k] = d[k] + [v]`; there is no append, "
-    "and this is the idiom most often missed\n"
-    "* the only callable names are: int, float, len, sum, min, max, range, enumerate, zip, "
-    "abs, list, dict, tuple, set, sorted, bool, all, any\n"
-    "* no f-strings, no lambda, no while\n"
-    "* lists and dicts keep their document order -- do not sort unless the expected value is "
-    "sorted\n\n"
-    "Return only {\"source\": \"<the function>\", \"reasoning\": \"<one sentence>\"}."
-)
+SYSTEM = load_prompt("contract-codegen")
 
 
-PATHS_SYSTEM = (
-    "You are deciding what to read. You are given the top of a benchmark's configuration "
-    "documents and must name the subtrees that would let you write a reader for a task's "
-    "contract. Return only one JSON object of the form {\"paths\": [\"<dotted path>\", ...]}, "
-    "with between four and twelve entries, each naming a subtree by its dotted path as "
-    "listed. Ask for what you need to find the values, not for the whole document."
-)
+PATHS_SYSTEM = load_prompt("contract-paths")
 
 
 def request_paths(client: Any, index: list[tuple[str, str]], *,
@@ -551,4 +527,3 @@ def gold_cases(repo: Path, oracle: dict[str, Any], *,
 
 def oracle(path: Path) -> dict[str, Any]:
     return read_json(path)
-

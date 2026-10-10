@@ -1,9 +1,6 @@
 ---
 name: what-the-benchmark-does-not-ship
 description: 核对仓库外的数据、权重、资产与许可证；优先复用显式资源，再查官方来源并验证下载后的真实消费者。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 补齐源码之外的资源

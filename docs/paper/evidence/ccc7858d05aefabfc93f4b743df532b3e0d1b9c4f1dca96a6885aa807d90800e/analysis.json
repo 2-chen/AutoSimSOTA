@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "phase": "development",
+  "formal_paper_eligible": false,
+  "rows": [],
+  "comparisons": [],
+  "seed_summaries": [],
+  "costs": {
+    "scope": "entire development run; not per-arm cost or equal-compute certification",
+    "gpu_lease_hours": 0.0010032788420923883,
+    "gpu_cost_complete": true,
+    "elapsed_wall_hours": 0.5613620772626665,
+    "model_settled_usd": 0.49426736999999993,
+    "unknown_usage_entries": 0,
+    "pending_entries": 1,
+    "model_cost_complete": false,
+    "operator_intervention_recorded": true,
+    "autonomy_status": "development_operator_interventions"
+  },
+  "issues": [],
+  "pending_campaigns": [],
+  "limitations": [
+    "Formal tables require frozen harness/skills, preregistered protocols and independent held-out runs.",
+    "Episode-level CIs do not quantify variability across independently trained policies.",
+    "Run-level cost must not be labelled per-arm or used as proof of equal-compute comparisons."
+  ],
+  "snapshot_id": "ccc7858d05aefabfc93f4b743df532b3e0d1b9c4f1dca96a6885aa807d90800e"
+}

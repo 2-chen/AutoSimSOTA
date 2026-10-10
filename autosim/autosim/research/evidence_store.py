@@ -20,7 +20,8 @@ _MAX_LOG = 64 * 1024 * 1024
 def capture_attempt_evidence(output: Path, *, attempt_id: str, log: Path,
                              receipt_ref: str, status: str, returncode: int | None,
                              termination_reason: str, artifact: dict[str, Any] | None = None,
-                             metric_artifact: dict[str, Any] | None = None) -> dict[str, Any]:
+                             metric_artifact: dict[str, Any] | None = None,
+                             native_context: dict[str, str] | None = None) -> dict[str, Any]:
     """Seal an already run-owned log; never accept an external /tmp file as evidence."""
     if not _ID.fullmatch(attempt_id):
         raise ValueError("unsafe evidence id")
@@ -33,6 +34,10 @@ def capture_attempt_evidence(output: Path, *, attempt_id: str, log: Path,
         raise ValueError("stage log exceeds evidence store limit")
     data = resolved.read_bytes()
     relative = resolved.relative_to(output).as_posix()
+    if native_context is not None and (not isinstance(native_context,dict)
+            or set(native_context) != {'stage','output_directory','working_directory'}
+            or any(not isinstance(v,str) or not v or len(v)>4000 for v in native_context.values())):
+        raise ValueError('native evidence context requires bounded stage/output/working directory')
     record = {
         "schema_version": 1, "evidence_id": attempt_id,
         "log_ref": relative, "log_sha256": hashlib.sha256(data).hexdigest(),
@@ -40,6 +45,7 @@ def capture_attempt_evidence(output: Path, *, attempt_id: str, log: Path,
         "status": status, "returncode": returncode,
         "termination_reason": termination_reason,
         "artifact": artifact or {}, "metric_artifact": metric_artifact or {},
+        **({'native_context':native_context} if native_context is not None else {}),
         "excerpt": sanitize_model_text(data[-3000:].decode("utf-8", "replace"))[-3000:],
     }
     destination = output / "evidence" / f"{attempt_id}.json"
@@ -90,6 +96,7 @@ def read_attempt_evidence(output: Path, evidence_id: str, *, offset: int = 0,
             "receipt_ref": record.get("receipt_ref"),
             "artifact": record.get("artifact"),
             "metric_artifact": record.get("metric_artifact"),
+            "native_context": record.get("native_context") or {},
             "log_bytes": len(data), "offset": offset,
             "next_offset": min(len(data), offset + limit),
             "text": sanitize_model_text(excerpt)}

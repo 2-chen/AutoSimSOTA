@@ -26,6 +26,8 @@ than a run that fails eight hours later.
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import argparse
 import json
 from pathlib import Path
@@ -44,74 +46,14 @@ from .survey import peek_many, summarise, summarise_for_model, survey
 #: to answer `unknown` -- is method knowledge and lives in the skill library, offered
 #: alongside this. Keeping it there means it can be extended without touching this string,
 #: and that the same reading applies whether a scout, a planner or a person is doing it.
-SYSTEM = (chr(10) + chr(10)).join([
-    "You are onboarding an unfamiliar robotics simulation benchmark into a research "
-    "system, by reading its repository. You have no prior knowledge of this project. "
-    "Everything you assert may be checked against the filesystem, and what you write down "
-    "becomes the shape of every experiment that follows -- so assert only what the "
-    "supplied facts support, and read the method library you were given before answering.",
-    "The system needs seven things from a benchmark, described in `capabilities_needed`. "
-    "Answer every one of them, including by saying `unsupported` or `unknown`.",
-    "A field you cannot determine from the material is left as null, and a null is an "
-    "answer: it says the material did not state it. Do not fill one in with a plausible "
-    "number, and do not copy a placeholder. In `task_contract` every dimension is stated by "
-    "`dataset_structure` in the survey, which is a recording of the actual file -- read the "
-    "shapes there rather than inferring one.\n\n"
-    "`benchmark`, `evidence`, `repo_markers`, `tasks` and `task_contract` are answered in "
-    "one pass; `capabilities` and `optimization_space` in a second.",
-    "For `optimization_space` you declare what the system may vary within this benchmark's "
-    "own implementation -- training parameters its trainer accepts, and any collection "
-    "setting its collector accepts. Declare only settings the source shows are implemented; "
-    "the ranges are what the system will later be allowed to explore, so a range wider than "
-    "the code supports becomes a run that dies at the trainer. Keep this executable core "
-    "small: at most six training axes and four collection axes. Every numeric axis needs "
-    "finite low and high bounds with low < high and a default inside them; omit a knob if "
-    "you cannot justify safe bounds. Use an empty list, not null, for a section with no "
-    "supported axes; omit `extra` unless a real third section exists. Every capability "
-    "status must be `declared`, `unsupported` or `unknown`, never null. A declared "
-    "capability needs a source-backed entrypoint and evidence; when unsure, use unknown "
-    "with a reason rather than a guess.",
-    "Investigate data acquisition before the optimization space is frozen. Trace the native "
-    "collector's action provider (expert/planner, policy, or human), asset requirements, "
-    "output/converter and actual trainer loader. Missing resources mean a conditional or "
-    "unverified path, not proof that no collector exists. Include source-supported collection "
-    "axes when the protocol permits data changes; do not silently omit them because shipped "
-    "data already suffices for a baseline. Source discovery is not a successful runtime probe.",
-    "In `task_contract.policy_representation`, answer `source` only when the native "
-    "evaluator runs a source-defined controller or planner without loading trained weights; "
-    "answer `artifact` when it loads a policy artifact; otherwise use null. This changes "
-    "whether an evaluation with no training stage can be a measurement.",
-    "If the repository establishes an official primary score, describe it in "
-    "`task_contract.primary_metric` with name, maximize/minimize direction, unit and "
-    "source (`log`, `json` or `csv`); otherwise leave it null. Do not assume every "
-    "benchmark uses success rate. If a native CSV contains one row per completed episode, "
-    "state its metric column, aggregation, task/episode identity columns, and optionally "
-    "an initial-state SHA-256 column only when repository code shows where those bytes "
-    "come from. A shared seed or invented hash is not proof of paired initial states.",
-    "If repository source and experiment constraints establish important secondary "
-    "objectives, optionally supply research_goal.guardrail_metrics with explicit name, "
-    "direction, unit, source, source-backed evidence and max_regression in native units. "
-    "Use the primary result artifact or an exact native log label. Do not guess tolerances; "
-    "secondary mappings are rechecked before binding and frozen before optimization.",
-    "Return exactly one JSON object and nothing else.",
-]) + chr(10)
+SYSTEM = load_prompt("repository-scout")
 
 
 def _capability_lines() -> dict[str, str]:
     return dict(CAPABILITIES)
 
 
-TRIAGE_SYSTEM = (
-    "You are deciding what to read. A repository survey has been taken and is given to "
-    "you; it contains file names, sizes, the structure of one representative recorded "
-    "trajectory, and the signals found in each source -- but not the contents of files. "
-    "Return exactly one JSON object with the key `files_to_read`: up to twelve "
-    "repository-relative paths whose contents would let you answer what this benchmark can "
-    "and cannot do. Prefer the files that decide capability -- anything that generates or "
-    "records trajectories, evaluates a policy, or trains one -- over generic utilities and "
-    "data files. Include at most one representative task definition. Do not ask for a file "
-    "only to confirm its name."
-)
+TRIAGE_SYSTEM = load_prompt("repository-triage")
 
 
 def _section(name: str, payload: Any) -> str:
@@ -413,7 +355,7 @@ def declared_content(declaration: dict[str, Any]) -> tuple[int, int]:
 
 def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
             output: Path | None = None, feedback: dict[str, Any] | None = None,
-            repair_attempts: int = 5) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            repair_attempts: int = 5, research_context: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Draft a declaration in two passes and check it as one document.
 
     Every attempt is written to disk as it happens, including the raw response. A rejected
@@ -439,6 +381,7 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
         IDENTITY_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
         METHODS=identity_methods,
+        OPERATOR_RESEARCH_CONTEXT=research_context,
         SURVEY=summarise_for_model(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
         FAILED_CHECKS_ON_YOUR_PREVIOUS_ANSWER=feedback,
@@ -467,6 +410,7 @@ def propose(report: dict[str, Any], files: list[dict[str, Any]], client: Any, *,
         DECISION_KEYS,
         WHAT_THE_SYSTEM_NEEDS=_capability_lines(),
         METHODS=capability_methods,
+        OPERATOR_RESEARCH_CONTEXT=research_context,
         ALREADY_ESTABLISHED=identity,
         SURVEY=summarise_for_model(report),
         FILES_YOU_ASKED_FOR=_files_section(files),
@@ -539,7 +483,7 @@ def path_faults(result: dict[str, Any]) -> dict[str, Any]:
 
 def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] = (),
         read_limit: int = 12, peek_lines: int = 80,
-        verification_repairs: int = 1) -> dict[str, Any]:
+        verification_repairs: int = 1, research_context: dict[str, Any] | None = None) -> dict[str, Any]:
     """Survey, ask, propose, check -- and write every step down.
 
     The artifacts are written as they are produced rather than at the end, because the
@@ -562,7 +506,7 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
                 {"requested": requested,
                  "read": [row for row in files if row.get("readable")]})
 
-    declaration, attempts = propose(report, files, client, output=output)
+    declaration, attempts = propose(report, files, client, output=output, research_context=research_context)
     result = verify(declaration, repo, survey_report=report)
     result["surveyed_assets"] = [row["path"] for row in
                                  report["datasets"] + report["model_artifacts"]]
@@ -579,6 +523,7 @@ def run(repo: Path, *, client: Any, output: Path, extra_roots: tuple[Path, ...] 
         try:
             repair, more = propose(
                 report, files, client, output=output,
+                research_context=research_context,
                 feedback={"round": round_index + 1, "what_was_looked_for": faults})
         except ValueError as exc:
             # A repair is an attempt to improve an answer that already exists. Treating its

@@ -1,9 +1,6 @@
 ---
 name: resolution-before-repetition
 description: 测量差异不明确时区分噪声、样本不足、错误指标和真实小效应；分布重叠不代表增加样本无用。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 判断下一次测量能回答什么

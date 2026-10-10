@@ -1,9 +1,6 @@
 ---
 name: weight-the-small-set
 description: 少量新增数据混入大数据集后无效果时，检查实际抽样曝光，再比较合法采样比例；不预设固定混合权重。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 检查小数据集的真实曝光

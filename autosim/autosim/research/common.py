@@ -320,7 +320,7 @@ def atomic_text(path: Path, value: str) -> None:
 
 
 def redact(text: str) -> str:
-    return re.sub(r"(?:hf_|sk-)[A-Za-z0-9_-]{16,}", "[REDACTED]", text)
+    return re.sub(r"(?<![A-Za-z0-9_])(?:hf_|sk-)[A-Za-z0-9_-]{16,}", "[REDACTED]", text)
 
 
 _MODEL_SECRET_ASSIGNMENT = re.compile(
@@ -328,7 +328,7 @@ _MODEL_SECRET_ASSIGNMENT = re.compile(
     r"PASSWORD|PASSWD|CREDENTIALS?)[A-Z0-9_.-]*)['\"]?\s*([=:])\s*"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;}\]]+)")
 _MODEL_SECRET_TOKEN = re.compile(
-    r"(?i)(?:hf_[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{12,}|"
+    r"(?i)(?:(?<![A-Za-z0-9_])(?:hf_|sk-)[A-Za-z0-9_-]{12,}|"
     r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})")
 _MODEL_BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*")
@@ -348,8 +348,17 @@ def _sanitize_serialized_json(value: Any, scrub) -> str | None:
     """Scrub decoded strings, never JSON escape sequences mistaken for paths."""
     if not isinstance(value, str) or not value.lstrip().startswith(("{", "[")):
         return None
+    duplicate_keys = False
+    def pairs(items):
+        nonlocal duplicate_keys
+        result = {}
+        for key, item in items:
+            if key in result:
+                duplicate_keys = True
+            result[key] = item
+        return result
     try:
-        parsed = json.loads(value)
+        parsed = json.loads(value, object_pairs_hook=pairs)
     except (ValueError, RecursionError):
         return None
 
@@ -368,7 +377,43 @@ def _sanitize_serialized_json(value: Any, scrub) -> str | None:
             return [walk(child, depth + 1) for child in item]
         return scrub(item) if isinstance(item, str) else item
 
-    return json.dumps(walk(parsed), ensure_ascii=False)
+    projected = walk(parsed)
+    # Public source literals and their exact quoting/spacing are evidence too.
+    # Do not reformat them unless actual redaction is necessary. Canonicalize
+    # duplicate keys rather than preserving a shadowed, unscrubbed value.
+    if not duplicate_keys and projected == parsed:
+        return value
+    return json.dumps(projected, ensure_ascii=False)
+
+
+def _sanitize_embedded_json(value: Any, scrub) -> str | None:
+    """Protect JSON escapes in request blocks embedded after prompt headings.
+
+    The final transport scrub still covers every surrounding prose segment and
+    every decoded string. A shell backslash/newline encoded as JSON must not be
+    confused with a private UNC path by the prose-level regular expressions.
+    Malformed blocks stay on the conservative plain-text redaction path.
+    """
+    if not isinstance(value,str):
+        return None
+    decoder=json.JSONDecoder()
+    chunks=[]
+    cursor=0
+    for match in re.finditer(r'(?m)^[ \t]*([\[{])',value):
+        start=match.start(1)
+        if start<cursor:
+            continue
+        try:
+            _,end=decoder.raw_decode(value,start)
+        except (ValueError,RecursionError):
+            continue
+        chunks.append(scrub(value[cursor:start]))
+        chunks.append(_sanitize_serialized_json(value[start:end],scrub))
+        cursor=end
+    if not chunks:
+        return None
+    chunks.append(scrub(value[cursor:]))
+    return ''.join(chunks)
 
 
 def sanitize_model_text(text: Any, *, local_roots: tuple[Path, ...] = ()) -> str:
@@ -383,6 +428,10 @@ def sanitize_model_text(text: Any, *, local_roots: tuple[Path, ...] = ()) -> str
         item, local_roots=local_roots))
     if structured is not None:
         return structured
+    embedded = _sanitize_embedded_json(text, lambda item: sanitize_model_text(
+        item, local_roots=local_roots))
+    if embedded is not None:
+        return embedded
     value = str(text if text is not None else "")
     roots = sorted((str(Path(root).expanduser().resolve()) for root in local_roots),
                    key=len, reverse=True)
@@ -440,6 +489,10 @@ def sanitize_model_payload_text(value: Any, *, local_roots: tuple[Path, ...] = (
         item, local_roots=local_roots))
     if structured is not None:
         return structured
+    embedded = _sanitize_embedded_json(value, lambda item: sanitize_model_payload_text(
+        item, local_roots=local_roots))
+    if embedded is not None:
+        return embedded
     text = sanitize_model_text(value, local_roots=local_roots)
     # Preserve the argument name before the generic artifact matcher sees a joined token
     # such as ``--dataset=/private/data/episodes.hdf5``. Without this ordering it hides the

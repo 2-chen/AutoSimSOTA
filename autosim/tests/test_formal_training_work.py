@@ -49,6 +49,41 @@ def test_source_candidate_requires_literal_unique_patch_before_a_round(tmp_path,
     assert ok==(find=='unique')
 
 
+def test_idea_evidence_distinguishes_requested_training_and_scored_intermediate(tmp_path):
+    from tests.test_handoff_correction import fixture
+    root, _ = fixture(tmp_path)
+    before = (root/'measurements/round_4.json').read_bytes()
+    rows = summaries(root)
+    item = next(row for row in rows if row['label']=='round_4')
+    assert item['training_settings']['steps'] == 8192
+    assert item['training_handoff']['selected_completed_work'] == 1000
+    assert item['training_handoff']['other_counter_max'] == 8192
+    assert 'not proof' in item['training_settings_meaning']
+    assert 'terminal training policy score' in item['interpretation_warning']
+    assert item['metric_value'] == 0
+    assert (root/'measurements/round_4.json').read_bytes() == before
+
+
+@pytest.mark.parametrize('consumption,expected', [
+    (None, 'unknown'), ('invalid receipt', 'unknown'),
+    ({'status': 'not_required'}, 'not_required'),
+    ({'status': 'verified', 'private_samples': ['DO_NOT_EXPORT']}, 'verified'),
+    ({'status': 'invented'}, 'unknown'),
+])
+def test_development_evidence_reports_data_consumption_without_inventing_collection(
+        tmp_path, consumption, expected):
+    root = tmp_path/'research'
+    path = root/'measurements/baseline.json'
+    atomic_json(path, {'label': 'baseline', 'ok': True, 'metric_value': 0,
+                       'data_consumption': consumption})
+    before = path.read_bytes()
+    evidence = summaries(root)
+    assert evidence[0]['data_consumption_status'] == expected
+    assert 'private_samples' not in json.dumps(evidence)
+    assert 'DO_NOT_EXPORT' not in json.dumps(evidence)
+    assert path.read_bytes() == before
+
+
 def test_missing_formal_work_never_launches_a_native_process(tmp_path):
     from tests.test_derived_research import research
     from autosim.research.declarative_backend import DeclarativeBackend
@@ -176,5 +211,108 @@ def test_public_loop_dispatch_preserves_explicit_training_settings(tmp_path,monk
         seen.append(kwargs)
         return {'outcome':'done'}
     monkeypatch.setattr(real,'_step_run_the_loop',run_the_loop)
-    result=real.do('run_the_loop',training_settings={'steps':8192})
-    assert result['outcome']=='done' and seen==[{'training_settings':{'steps':8192}}]
+    result=real.do('run_the_loop',training_settings={'steps':8192},
+                   evaluation_settings={'episodes':50,'seed':0})
+    assert result['outcome']=='done' and seen==[{'training_settings':{'steps':8192},
+                                               'evaluation_settings':{'episodes':50,'seed':0}}]
+
+
+@pytest.mark.parametrize('value',[None,0,-1,True,1.0,'50'])
+def test_formal_evaluation_work_requires_positive_integral_episodes(value):
+    from autosim.research.training_work import missing_formal_evaluation_work
+    source='def score(i):\n    return [str(i.get("episodes"))]'
+    assert missing_formal_evaluation_work(source,{'episodes':value})
+    assert not missing_formal_evaluation_work(source,{'episodes':50})
+    assert not missing_formal_evaluation_work('def score(i):\n    return ["native-config"]',{})
+
+
+def evaluation_controller(tmp_path,monkeypatch):
+    from tests.test_prepare import preparation
+    from autosim.research.adapter_protocol import OptimizationSpace
+    real=preparation(tmp_path)
+    monkeypatch.setattr(real,'_research_loop_ready',lambda:True)
+    monkeypatch.setattr(real,'_score_target',lambda:'evaluate')
+    seen=[]
+    class Controller:
+        run_root=real.output/'research'/real.run_id
+        execution_graph=None
+        space=OptimizationSpace()
+        sources={'evaluate':'def score(i):\n    return [str(i["episodes"]), str(i["seed"])]'}
+        def _inputs(self,stage,*,settings):return {'episodes':settings.get('eval.n_eval',settings.get('episodes',0))}
+        def run(self,**kwargs):
+            seen.append(kwargs)
+            return {'rounds':[],'run_status':'paused','objective':{}}
+    monkeypatch.setattr(real,'_research_controller',lambda:(Controller(),{}))
+    return real,Controller,seen
+
+
+def test_evaluation_work_is_chosen_before_any_formal_training(tmp_path,monkeypatch):
+    real,_,seen=evaluation_controller(tmp_path,monkeypatch)
+    result=real._step_run_the_loop()
+    assert result['failure_category']=='evaluation_input_required' and not seen
+    assert result['native_operation_status']=='not_started'
+    real._step_run_the_loop(evaluation_settings={'episodes':50,'seed':0})
+    assert seen[-1]['settings']=={'episodes':50,'seed':0}
+    assert real.base_settings=={}  # Never mutate original CLI settings.
+
+
+@pytest.mark.parametrize('settings',[{},[],{'episodes':0},{'episodes':True},
+    {'episodes':'50'},{'episodes':1.5},{'seed':-1},{'horizon':400},{'metric':'fake'},
+    {'task':'easier'},{'episodes':50,'threshold':0}])
+def test_evaluation_settings_refuse_invalid_or_scientific_rule_controls(tmp_path,monkeypatch,settings):
+    real,_,seen=evaluation_controller(tmp_path,monkeypatch)
+    assert real._step_run_the_loop(evaluation_settings=settings)['outcome']=='not attempted'
+    assert not seen
+
+
+@pytest.mark.parametrize('explicit',[{'episodes':10},{'eval.n_eval':10},{'seed':5}])
+def test_evaluation_settings_preserve_explicit_user_settings(tmp_path,monkeypatch,explicit):
+    real,_,seen=evaluation_controller(tmp_path,monkeypatch)
+    real.base_settings=explicit
+    result=real._step_run_the_loop(evaluation_settings={'episodes':50,'seed':0})
+    assert 'conflicts' in result['because'] and not seen
+
+
+def test_evaluation_settings_cannot_rewrite_protocol_even_without_session(tmp_path,monkeypatch):
+    real,controller,seen=evaluation_controller(tmp_path,monkeypatch)
+    atomic_json(controller.run_root/'comparison_protocol.json',{'frozen':True})
+    result=real._step_run_the_loop(evaluation_settings={'episodes':50})
+    assert 'frozen' in result['because'] and not seen
+
+
+def test_evaluation_count_cannot_be_silently_ignored_by_native_configuration(tmp_path,monkeypatch):
+    real,controller,seen=evaluation_controller(tmp_path,monkeypatch)
+    controller.sources={'evaluate':'def score(i):\n    return ["fixed-config"]'}
+    result=real._step_run_the_loop(evaluation_settings={'episodes':50})
+    assert 'does not consume' in result['because'] and not seen
+
+
+def test_evaluation_alias_uses_only_dedicated_input_channel(tmp_path):
+    from tests.test_derived_research import research
+    real=research(tmp_path)
+    inputs=real._inputs('evaluate',settings={'eval.n_eval':50,'seed':0})
+    assert inputs['episodes']==50 and 'eval.n_eval' not in inputs['settings']
+
+
+def test_evaluation_guidance_keeps_main_prompt_template_renderable():
+    from autosim.research.prepare import STEP_SYSTEM, OPERATIONS
+    prompt=STEP_SYSTEM.format(operations=json.dumps(OPERATIONS))
+    assert 'evaluation_settings={episodes: positive integer' in prompt
+
+
+def test_requested_confirmation_is_declared_before_any_baseline_or_native_work(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.test_prepare import preparation
+    real=preparation(tmp_path)
+    real.client=SimpleNamespace(supports_main_agent=True)
+    real.base_settings={'_confirm':True}
+    real.declaration={'benchmark':'toy'}
+    monkeypatch.setattr(real,'_research_controller',lambda:pytest.fail('no formal work before reservation'))
+    result=real._step_run_the_loop()
+    assert result['failure_category']=='confirmation_protocol_required'
+    assert result['native_operation_status']=='not_started'
+    # Missing reservation is repaired through the reviewed pre-search operation,
+    # not repeated whole-repository discovery. The native-work guard stays intact.
+    assert 'configure_confirmation_protocol' in result['because']
+    assert real._declaration_refresh_is_justified() is False
+    assert real._declaration_refresh_is_justified(research_progress={'status':'paused'}) is False

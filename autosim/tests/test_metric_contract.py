@@ -23,6 +23,18 @@ def test_minimizing_metric_uses_negative_utility():
     assert spec.utility(4) > spec.utility(7)
 
 
+@pytest.mark.parametrize('name', ['Success_Rate', 'mean_reward', 'success_rate'])
+@pytest.mark.parametrize('quote', ['"', "'"])
+def test_exact_log_labels_accept_quoted_numeric_keys_without_guessing(name, quote):
+    spec = MetricSpec.from_declaration({'research_goal':{'primary_metric':{
+        'name':name,'direction':'maximize','unit':'fraction','min':0,'max':1}}})
+    assert spec.read_log(f'{quote}{name}{quote}: 0.75,')['value'] == 0.75
+    assert spec.read_log(f'{quote}best_{name}{quote}: 0.99')['value'] is None
+    assert spec.read_log(f'best {quote}{name}{quote}: 0.99')['value'] is None
+    assert spec.read_log(f'{quote}{name}{quote}: "0.75"')['value'] is None
+    assert spec.read_log(f'{quote}{name}{quote}:\n0.75')['value'] is None
+
+
 def test_json_result_is_preferred_when_declared_and_requires_a_scalar(tmp_path):
     spec = MetricSpec.from_declaration({"research_goal": {"primary_metric": {
         "name": "return", "direction": "maximize", "source": "json",

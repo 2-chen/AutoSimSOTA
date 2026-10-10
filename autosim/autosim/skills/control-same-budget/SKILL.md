@@ -1,9 +1,6 @@
 ---
 name: control-same-budget
 description: 区分超过发布基线与解释改进原因；因果归因需要计算/数据成本清楚的对照，不强求同时匹配所有预算口径。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 选择回答研究问题的对照
@@ -13,3 +10,11 @@ evidence: Reviewed 2026-09-29; literature links and limitations are stated in th
 要解释数据改进，可比较原数据继续训练与数据候选，尽量匹配更新量、模型和评测；要解释计算效率，应比较 GPU 时间/总成本下的效果。不同模型每 step 成本不同，通常无法同时严格匹配 steps 和 GPU 时间，应预先选择主要口径并同时报告其他成本。
 
 连续多轮训练需计入累计预算、筛选成本和初始化历史，不能只算最后一次。额外数据采集也有成本。必要时保留发布策略、同预算继续训练、最终候选三者；预算不足时明确缺少哪种因果对照，仍可报告合规本地提升，不夸大机制。
+
+## 算力之外也要规划存储
+
+长作业前从原生配置和已有产物估计一次保存的权重、optimizer/RNG 状态大小、保存次数、冻结副本和视频体积，并检查实际输出所在文件系统的可用空间。启动预检只是最低安全余量，不是整个作业的容量保证。把预计所需字节提供给执行器的存储预检；不要把 GPU 可用当作可以直接开跑。
+
+保存间隔和保留数是工程决策：在原生代码支持且不改变评测选择规则的前提下，避免每隔很少更新永久保存一套大型 optimizer 状态。保留正式计分产物、实际终点与必要续训点；清理未使用中间快照需明确授权、内容清单及元数据留存，不删除数据集、源仓库或其他 run。发现 ENOSPC 时先修复存储前提，再复验原保存/训练操作，不能用增加超时、重复训练或更换算法解决。
+
+需要落实时按需选读 [managing-research-artifacts](../managing-research-artifacts/SKILL.md)：主 Agent 决定保存参数与保留理由，独立 Supervisor 审核，执行器校验引用/字节/活动作业/授权并提交事务。预估字节进入保守协作预留；运行期观测不调用模型。没有自动回收授权不能绕过接口删除。

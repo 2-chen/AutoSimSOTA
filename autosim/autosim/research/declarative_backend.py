@@ -38,6 +38,18 @@ from .patch_validation import checked_function
 ARTIFACT_CANDIDATE_LIMIT = 128
 
 
+def staging_environment(environment: dict[str, str], inputs: dict[str, Any]) -> dict[str, str]:
+    """Give explicit staging the same paths as this attempt's native command.
+
+    Do not create directories: some consumers require an absent output leaf.
+    These executor-owned values override stale ambient values, without changing
+    the native environment or expanding arbitrary agent expressions.
+    """
+    return {**environment, **{
+        "AUTOSIM_STAGE_" + key.upper(): str(inputs.get(key) or "")
+        for key in ("output", "python", "repo")}}
+
+
 def artifact_pattern_problem(pattern: str) -> str:
     """Reject recursive wildcards that are not complete path components."""
     value = str(pattern or "").strip()
@@ -221,10 +233,18 @@ class DeclarativeBackend:
         # of their name: a function reads them by whatever key it chose, which is usually
         # the bare word rather than the `--flag` the command line uses.
         from .execution_derive import (blank_inputs, bind_step_budget_placeholders,
-                                       coalesce_dynamic_overrides, expand_parameters)
+                                       coalesce_dynamic_overrides, expand_parameters,
+                                       caller_bound_work_options)
         declared = expand_parameters({name: row.get("value") for name, row in
-                                     (self.parameters.get(stage) or {}).items()})
+                                     (self.parameters.get(stage) or {}).items()},
+                                     repo=Path(str(inputs.get('repo') or self.repo)))
         supplied = {**blank_inputs(), **declared, **dict(inputs)}
+        # The canonical data slot uses empty string to mean "not supplied", not
+        # "erase the verified data root". Explicit nonempty selections still win.
+        # Do not guess aliases, substitute the checkout, or relax checkpoint rules.
+        if (inputs.get('dataset') == '' and isinstance(declared.get('dataset'), str)
+                and declared['dataset']):
+            supplied['dataset'] = declared['dataset']
         supplied["repo"] = supplied.get("repo") or str(self.repo)
         # The stage's own interpreter, when it declared one, over the caller's.
         #
@@ -247,16 +267,19 @@ class DeclarativeBackend:
         # boundary; validating only the one-time command probe leaves the later research
         # stage free to emit two conflicting values. Preserve precedence: repository facts,
         # then current research settings, then stage-specific extras.
-        dynamic_overrides: dict[str, Any] = dict(declared)
+        bound_options = caller_bound_work_options(self._functions[stage], supplied, argv)
+        dynamic_overrides: dict[str, Any] = {
+            key:value for key,value in declared.items()
+            if str(key).lstrip('-').split('=',1)[0].lower().replace('_','-') not in bound_options}
         for input_name in ("settings", "extra"):
             rows = supplied.get(input_name)
             if isinstance(rows, dict):
                 dynamic_overrides.update(rows)
-        argv = coalesce_dynamic_overrides(argv, dynamic_overrides)
+        argv = coalesce_dynamic_overrides(argv, dynamic_overrides, cwd=self.directory(stage))
         if stage == "train":
             argv = bind_step_budget_placeholders(argv, supplied.get("steps"))
         from .execution_derive import conflicting_option_problem
-        conflict = conflicting_option_problem(argv)
+        conflict = conflicting_option_problem(argv, cwd=self.directory(stage))
         if conflict:
             raise ValueError(f"{argv_name(stage)} produced an ambiguous command: {conflict}")
         return argv

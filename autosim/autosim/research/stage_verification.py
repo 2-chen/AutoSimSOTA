@@ -2,6 +2,7 @@
 from contextlib import nullcontext
 from pathlib import Path
 import json
+import re
 import subprocess
 import os
 import time
@@ -87,6 +88,11 @@ def recent_attempts(output: Path, limit: int = 6) -> list[dict]:
                 row.update(status=verified['status'],returncode=verified['returncode'],
                     evidence_id=identity,evidence_ref=f'evidence/{identity}.json',
                     excerpt=verified['text'],evidence_verified=True)
+                context_sha = record.get('execution_context_sha256')
+                if (isinstance(context_sha, str) and re.fullmatch(r'[0-9a-f]{64}', context_sha)
+                        and verified['text'].rstrip().endswith(
+                            '[AutoSim invocation context; not a metric] ' + context_sha)):
+                    row['execution_context_sha256'] = context_sha
             else:
                 row.update(status='running_unverified',evidence_verified=False)
                 # Live output is deliberately separate from sealed evidence and
@@ -121,11 +127,25 @@ def recent_attempts(output: Path, limit: int = 6) -> list[dict]:
 
 def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
                timeout: float, stdin: str | None, window=None,
-               stage: str = '', verification_output: str = ''):
+               stage: str = '', verification_output: str = '', execution_context_sha256: str = ''):
+    from .storage_lifecycle import stage_lease
+    from .storage_reservations import reserve
+    with stage_lease(output),reserve(output,stage=stage,path=verification_output or output):
+        return _execute_native(argv,repo=repo,output=output,cwd=cwd,env=env,
+                               timeout=timeout,stdin=stdin,window=window,
+                               stage=stage,verification_output=verification_output,
+                               execution_context_sha256=execution_context_sha256)
+
+
+def _execute_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
+                    timeout: float, stdin: str | None, window=None,
+                    stage: str='',verification_output: str='',execution_context_sha256: str=''):
     """Stream the real output to a receipt-backed log, including partial timeout output."""
     from .common import isolated_argv
     from .process_executor import run_process_stream
     from .evidence_store import capture_attempt_evidence
+    if execution_context_sha256 and not re.fullmatch(r'[0-9a-f]{64}', execution_context_sha256):
+        raise ValueError('invalid invocation context identity')
     identity = uuid.uuid4().hex
     directory = output / 'derivation_native' / identity
     directory.mkdir(parents=True, exist_ok=False)
@@ -136,9 +156,14 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
               'stage':stage, 'verification_output':verification_output,
               'argv':list(argv), 'cwd':str(cwd), 'timeout_seconds':timeout,
               'log_ref':log.relative_to(output).as_posix()}
+    if execution_context_sha256:
+        record['execution_context_sha256'] = execution_context_sha256
     atomic_json(receipt_path, record)
     started = time.monotonic()
     attempt = None
+    from .storage_runtime import StorageWatch
+    watch=StorageWatch(output,stage=stage,attempt_id=identity,path=output,
+                       deadline_epoch=time.time()+timeout)
     context = window(timeout) if window is not None else nullcontext((timeout, False, {}))
     try:
         with log.open('w', encoding='utf-8') as stream, context as (allowed, gpu, device_env):
@@ -153,6 +178,7 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
                               require_pid_namespace=True, allow_gpu=gpu),
                 cwd=cwd, env={**env, **device_env, 'PYTHONUNBUFFERED':'1'}, timeout=allowed,
                 input_bytes=stdin.encode() if stdin is not None else None,
+                live_control=watch,
                 on_stdout_line=line, on_stderr_line=line)
         if attempt.error is not None:
             attempt.error.evidence_ref = f'evidence/{identity}.json'
@@ -161,7 +187,7 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
             error = subprocess.TimeoutExpired(argv, timeout, attempt.stdout, attempt.stderr)
             error.evidence_ref = f'evidence/{identity}.json'
             raise error
-        result = subprocess.CompletedProcess(argv, 125 if attempt.orphaned_children else
+        result = subprocess.CompletedProcess(argv, 125 if attempt.orphaned_children or attempt.cancelled else
                                              attempt.returncode, attempt.stdout, attempt.stderr)
         result.evidence_ref = f'evidence/{identity}.json'
         result.native_returncode = attempt.returncode
@@ -172,7 +198,7 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
     finally:
         record.update(finished_at=now(), seconds=time.monotonic()-started,
             status=('interrupted' if attempt is None else 'timed_out' if attempt.timed_out else
-                    'failed' if attempt.error or attempt.orphaned_children or attempt.returncode else 'completed'),
+                    'failed' if attempt.error or attempt.orphaned_children or attempt.cancelled or attempt.returncode else 'completed'),
             returncode=attempt.returncode if attempt else None)
         if attempt is not None:
             record.update(effective_returncode=125 if attempt.orphaned_children else attempt.returncode,
@@ -184,6 +210,8 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
                                if attempt.error is not None else None),
                 stdout_tail=redact(str(attempt.stdout or ''))[-2000:],
                 stderr_tail=redact(str(attempt.stderr or ''))[-4000:])
+            if watch.critical:
+                record.update(termination_reason='storage_pressure',storage_pressure=getattr(watch,'observation',{}))
             if attempt.error is not None or attempt.orphaned_children:
                 # Seal the controller-side reason alongside native output: a zero
                 # native exit otherwise leaves the next Agent only an unexplained
@@ -195,7 +223,11 @@ def run_native(argv, *, repo: Path, output: Path, cwd: Path, env: dict,
                     stream.write('\n[AutoSim execution audit; not a metric] ' +
                                  json.dumps(audit, ensure_ascii=False) + '\n')
         if log.is_file():
+            if execution_context_sha256:
+                with log.open('a', encoding='utf-8') as stream:
+                    stream.write('\n[AutoSim invocation context; not a metric] ' +
+                                 execution_context_sha256 + '\n')
             record.update(capture_attempt_evidence(output, attempt_id=identity, log=log,
                 receipt_ref=receipt_ref, status=record['status'], returncode=record['returncode'],
-                termination_reason=record['status']))
+                termination_reason=record.get('termination_reason',record['status'])))
         atomic_json(receipt_path, record)

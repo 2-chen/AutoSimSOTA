@@ -1537,6 +1537,11 @@ def publish_document(destination: Path, content: str) -> Path:
     """Atomically publish a full report under the same lock as its live strip."""
     destination = Path(destination)
     with _report_lock(destination):
+        try:
+            from .storage_runtime import report_panel
+            content=report_panel(content,destination.parent)
+        except (OSError,ValueError,TypeError,KeyError):
+            pass  # report projection must not interrupt execution
         # A background Recorder can finish between the main publisher's render and lock.
         # Rehydrate its newest fact snapshot/narrative inside the publication transaction.
         from .scheduling import policy
@@ -1583,6 +1588,18 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
     """Build the deterministic local view and record the revisions it projects."""
     root = Path(root)
     research = root / "research" / run_id
+    session_record = _load(research / 'controller_session.json')
+    history_rows = {}
+    if (isinstance(session_record, dict) and session_record.get('run_id') == run_id
+            and isinstance(session_record.get('history'), list)):
+        history_rows = {r['label']: r for r in session_record['history']
+                        if isinstance(r, dict) and isinstance(r.get('label'), str)}
+    from .candidate_source_guard import historical_mismatches
+    invalid_candidates = {r.get('label') for r in historical_mismatches(research)}
+    research_report = _load(research / 'research_report.json') or {}
+    best_label = (research_report.get('best') or {}).get('name')
+    if isinstance(best_label, str):
+        best_label = best_label.replace('-', '_', 1)
     measurements: list[dict[str, Any]] = []
     receipt_paths: list[Path] = []
     measurement_paths = sorted((research / "measurements").glob("*.json")) \
@@ -1600,6 +1617,8 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
         # The presentation consumes recorded facts, not numbers invented by narration.
         from . import recorder
         stages_cost = {}
+        stage_attempt_ids = {}
+        reused_stages = []
         protocol_hash = None
         for stage in ("collect", "prepare_data", "train", "evaluate"):
             stage_row = record.get(stage) or {}
@@ -1608,6 +1627,10 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
                 receipt = recorder.read(root, f"research/{run_id}/attempts/{attempt_id}/receipt.json")
                 receipt_paths.append(root / f"research/{run_id}/attempts/{attempt_id}/receipt.json")
                 if receipt.get("attempt_id") == attempt_id:
+                    stage_attempt_ids[stage] = attempt_id
+                    if stage_row.get('reused') is True or (stage=='train' and
+                            (record.get('handoff_correction') or {}).get('training_reused') is True):
+                        reused_stages.append(stage)
                     if recorder.finite(receipt.get("seconds")):
                         stages_cost[stage] = receipt["seconds"]
                     if stage == "evaluate":
@@ -1617,13 +1640,57 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
         dataset = record.get("dataset") or {}
         dataset_summary = {key: dataset[key] for key in ("samples", "episodes", "version", "sha256")
                            if isinstance(dataset, dict) and key in dataset}
+        consumption = record.get('data_consumption') or {}
+        data_reads = (consumption.get('exposure') or []) if consumption.get('status') == 'verified' else []
+        data_ids = (consumption.get('versions') or []) if consumption.get('status') == 'verified' else []
+        data_text = '；'.join(str(i) for i in data_ids[:16]) if isinstance(data_ids,list) else ''
+        if isinstance(data_reads,list):
+            details = []
+            for item in data_reads[:16]:
+                if not isinstance(item,dict):continue
+                samples_read = item.get('samples_read')
+                if isinstance(samples_read,int) and not isinstance(samples_read,bool) and samples_read>0:
+                    details.append(f"{item.get('data_version_id','未知版本')} 实读 {samples_read} 样本次")
+            if details:data_text = '；'.join(details)
+        label = str(record.get('label') or path.stem)
+        history_row = history_rows.get(label, {})
+        linked_history = {}
+        correction = record.get('handoff_correction') or {}
+        original_ref = correction.get('original_measurement_ref')
+        if isinstance(original_ref, str) and original_ref.startswith(f'research/{run_id}/measurements/'):
+            relative = Path(original_ref)
+            original_path = root/relative
+            if (len(relative.parts)==4 and '..' not in relative.parts
+                    and not original_path.is_symlink() and original_path.is_file()
+                    and digest(original_path)==correction.get('original_measurement_sha256')):
+                original_record = _load(original_path) or {}
+                linked_history = history_rows.get(original_record.get('label'), {})
+        samples = reading.get('episodes_completed', reading.get('samples')) if isinstance(reading, dict) else None
+        lineage = record.get('metric_lineage') or {}
+        if samples is None and isinstance(lineage, dict) and lineage.get('status') == 'verified':
+            samples = lineage.get('episodes_completed')
+        disposition = record.get('verdict') or record.get('why_not') or history_row.get('verdict')
+        reuse_record = record.get('policy_reuse')
+        policy_reuse = {key: value for key, value in (reuse_record.items() if isinstance(reuse_record, dict) else [])
+            if key in {'mode', 'label', 'measurement_sha256', 'training_attempt_id',
+                       'policy_sha256', 'no_new_training_or_data_claim'}
+            and (isinstance(value, bool) or isinstance(value, str) and len(value) <= 128)}
+        policy = record.get('policy_artifact') or {}
+        policy_digest = policy.get('sha256') if isinstance(policy, dict) else None
+        policy_identity = policy_digest if isinstance(policy_digest, str) and re.fullmatch(r'[0-9a-f]{64}', policy_digest) else None
+        if label in invalid_candidates:
+            disposition = '候选修改未实际生效；保留原测量，不作为有效优化比较'
+        elif label == best_label:
+            disposition = '当前最佳；保留' + (('；' + str(disposition)) if disposition else '')
+        elif history_row.get('undone') is True:
+            disposition = '已回退；' + str(disposition or '未超过原基线')
         measurements.append({
             "label": str(record.get("label") or path.stem),
             "status": str(record.get("status") or
                           ("measured" if record.get("ok") is True else "unscored")),
             "metric_name": str(metric_contract.get("name") or record.get("metric_name") or ""),
             "metric_value": float(metric) if valid_value else None,
-            "samples": reading.get("episodes_completed", reading.get("samples")) if isinstance(reading, dict) else None,
+            "samples": samples,
             "attempt_id": (evaluation.get("attempt_id")
                            if isinstance(evaluation, dict) else None),
             "measurement_ref": f"research/{run_id}/measurements/{path.name}",
@@ -1632,10 +1699,25 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
             "metric_direction": metric_contract.get("direction"),
             "metric_unit": metric_contract.get("unit"),
             "protocol_sha256": protocol_hash,
-            "changes": record.get("varied") or {},
-            "data_summary": dataset_summary,
+            "changes": record.get("varied") or history_row.get('mechanism') or
+                       history_row.get('varied') or linked_history.get('mechanism') or
+                       linked_history.get('varied') or ('原始基线' if label == 'baseline' else {}),
+            "idea": history_row.get('idea') or linked_history.get('idea'),
+            "candidate_validity": 'source_mismatch' if label in invalid_candidates else 'not_invalidated',
+            "is_incumbent": label==best_label and valid_value and label not in invalid_candidates,
+            "data_consumption_status": consumption.get('status','unknown'),
+            "data_versions": data_ids if isinstance(data_ids,list) else [],
+            "data_exposure": data_reads if isinstance(data_reads,list) else [],
+            "data_summary": data_text or dataset_summary or ('未选择新数据版本' if
+                (record.get('data_consumption') or {}).get('status') == 'not_required' else {}),
             "stage_seconds": stages_cost,
-            "disposition": record.get("verdict") or record.get("why_not"),
+            'stage_attempt_ids':stage_attempt_ids, 'reused_stages':reused_stages,
+            'new_stage_attempt_ids':{stage: identity for stage, identity in stage_attempt_ids.items()
+                                     if stage not in reused_stages},
+            'policy_reuse':policy_reuse, 'policy_sha256':policy_identity,
+            'candidate_rollback_applied':history_row.get('undone')
+                if isinstance(history_row.get('undone'), bool) else None,
+            "disposition": disposition,
         })
 
     telemetry_attempts: list[dict[str, Any]] = []
@@ -1835,14 +1917,20 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
     reference = reference_view(root)
     lifecycle = experiment_view(root,run_id)
     versions = catalog(root)
+    from .data_campaign import view as campaign_view
+    campaigns = campaign_view(root, run_id)
+    campaign_sources = [root/row['plan_ref'] for row in campaigns if row.get('plan_ref')]
+    campaign_sources += [root/arm['record_ref'] for row in campaigns for arm in row['observations']]
     job_sources=[root/row['request_ref'] for row in lifecycle['experiments']]
     version_sources=[root/'data_versions'/(row['id']+'.json') for row in versions]
     candidates = [root / "baseline_reference.json", *sorted((root/'baseline_references').glob('*.json')),
                   root / "run_state.json", root / "run_events.json", root / "budget.json",
                   root / f"preparation_{run_id}.json", research / "research_report.json",
                   research / "controller_session.json", research / "media" / "manifest.json",
+                  research / 'snapshots/snapshots.json',
+                  *sorted((research / 'code_changes').glob('round-*.json')),
                   *measurement_paths, *receipt_paths, *telemetry_files, *telemetry_chart_files,
-                  *job_sources,*[p.with_name('result.json') for p in job_sources],*version_sources]
+                  *job_sources,*[p.with_name('result.json') for p in job_sources],*version_sources,*campaign_sources]
     revisions: dict[str, str | None] = {}
     for path in candidates:
         try:
@@ -1875,12 +1963,24 @@ def build_report_view(root: Path, run_id: str, *, status: str = "",
         "source_revision_vector": revisions,
         "status": resolved_status,
         "current_action": current_action or None,
+        "research_progress": ({
+            'status':session.get('status'), 'next_round':session['next_round'],
+            'planned_rounds':session['rounds'],
+            'remaining_candidate_rounds':max(0,session['rounds']-session['next_round']+1),
+            'pending_round':(session.get('pending_action') or {}).get('round'),
+            'source_ref':f'research/{run_id}/controller_session.json',
+            'authority':'observed controller cursor; not experiment completion or scientific validation'}
+            if session.get('run_id') == run_id and type(session.get('next_round')) is int
+            and type(session.get('rounds')) is int and session['rounds'] >= 0
+            and session['next_round'] >= 1 and isinstance(session.get('pending_action') or {}, dict)
+            else {'status':'unavailable','authority':'no valid current controller cursor; do not infer it from an old plan'}),
         "budget": budget,
         "verified_level": report.get("verified_level"),
         "measurements": measurements,
         "baseline_reference": reference,
         "experiment_lifecycle": lifecycle,
         "data_versions": versions,
+        "data_campaigns": campaigns,
         "telemetry_attempts": telemetry_attempts[-12:],
         "verified_media": verified_media[:12],
         "unverified_media_count": pending_media,
@@ -2088,8 +2188,14 @@ def refresh_live_status(root: Path, *, destination: Path | None = None,
             panel_at = 0
         if time.time() - panel_at >= 15:
             try:
-                from .recorder import refresh_native_panel
+                from .recorder import refresh_native_panel, refresh_active_candidate_panel, refresh_narrative_scope
                 updated = refresh_native_panel(updated, root)
+                updated = refresh_active_candidate_panel(updated, root, status=status,
+                                                         destination_root=destination.parent)
+                updated = refresh_narrative_scope(updated, destination.parent,
+                    status=status, current_action=current)
+                from .storage_runtime import report_panel
+                updated = report_panel(updated,destination.parent)
                 panel_at = time.time()
             except (OSError, ValueError, TypeError, KeyError):
                 pass  # presentation failures must not interrupt execution

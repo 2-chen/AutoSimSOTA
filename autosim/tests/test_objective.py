@@ -221,3 +221,39 @@ def test_answering_never_raises():
 
 def test_a_rubric_with_no_children_asks_nothing():
     assert answer_children(_AnsweringClient([]), plain(), material={}) == 0
+
+
+def test_rubric_interpretation_is_objective_fact_only_turn():
+    from contextlib import contextmanager
+    class Client(_AnsweringClient):
+        role = 'scheduler'
+        @contextmanager
+        def as_role(self, role):
+            previous = self.role
+            self.role = role
+            try:
+                yield
+            finally:
+                self.role = previous
+        def chat_with_metadata(self, system, user, **kwargs):
+            assert self.role == 'objective'
+            assert kwargs['decision_only'] and kwargs['read_only']
+            assert not kwargs['auto_skills'] and kwargs['timeout'] == 90
+            return super().chat_with_metadata(system, user, **kwargs)
+    client = Client([{'name':'number','passed':False}])
+    assert answer_children(client, _with_children(), material={}) == 1
+    assert client.role == 'scheduler'
+
+
+def test_malformed_boolean_or_duplicate_does_not_partially_commit_rubric():
+    for invalid in ['false', 'no', 0, 1, [], {}]:
+        rubric = _with_children()
+        answers = [{'name':'own-states','passed':True},
+                   {'name':'number','passed':invalid}]
+        assert answer_children(_AnsweringClient(answers), rubric, material={}) == 0
+        assert all(child.by == '' and child.passed is None
+                   for child in rubric.checks[2].children)
+    rubric = _with_children()
+    duplicate = [{'name':'number','passed':True},{'name':'number','passed':False}]
+    assert answer_children(_AnsweringClient(duplicate), rubric, material={}) == 0
+    assert rubric.checks[2].children[1].by == ''

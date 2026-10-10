@@ -39,8 +39,12 @@ class TaskGPUBudget:
             if record is not None:
                 saved_cap = record.get('cap_seconds')
                 if (not isinstance(saved_cap, (int, float)) or isinstance(saved_cap, bool)
-                        or not math.isfinite(saved_cap) or not 0 < saved_cap <= 86400):
+                        or not math.isfinite(saved_cap) or not 0 < saved_cap):
                     raise ValueError('saved task GPU cap must remain within 24 hours')
+                if saved_cap > 86400:
+                    from .budget_amendment import authorizes_gpu_cap
+                    if not authorizes_gpu_cap(self.output, saved_cap):
+                        raise ValueError('above-default GPU cap requires audited operator renewal')
                 if record["repository"] != str(Path(repo).resolve()) or (cap_seconds is not None and record["cap_seconds"] != cap_seconds):
                     raise ValueError("cannot change a task's repository or GPU cap")
                 return

@@ -126,6 +126,33 @@ def test_native_output_is_streamed_and_sealed_on_success_or_timeout(tmp_path, mo
     assert sv.recent_attempts(tmp_path) == []
 
 
+def test_invocation_context_is_sealed_with_native_log_not_receipt_claim(tmp_path, monkeypatch):
+    repo = tmp_path/'checkout'
+    repo.mkdir()
+    monkeypatch.setattr(common, 'isolated_argv', lambda argv, **kw:argv)
+    context = 'a' * 64
+    sv.run_native([sys.executable,'-c','print("real native execution")'],
+        repo=repo, output=tmp_path, cwd=repo, env={}, timeout=5, stdin=None,
+        stage='evaluate', execution_context_sha256=context)
+    row = sv.recent_attempts(tmp_path)[0]
+    assert row['evidence_verified'] is True
+    assert row['execution_context_sha256'] == context
+    path = tmp_path/row['receipt_ref']
+    receipt = json.loads(path.read_text())
+    receipt['execution_context_sha256'] = 'b' * 64
+    atomic_json(path, receipt)
+    changed = sv.recent_attempts(tmp_path)[0]
+    assert changed['evidence_verified'] is True
+    assert 'execution_context_sha256' not in changed
+
+
+def test_bad_invocation_context_cannot_launch_native(tmp_path):
+    with pytest.raises(ValueError, match='context identity'):
+        sv.run_native(['must-not-run'], repo=tmp_path, output=tmp_path, cwd=tmp_path,
+            env={}, timeout=5, stdin=None, execution_context_sha256='forged')
+    assert not (tmp_path/'derivation_native').exists()
+
+
 def test_argv_generator_receives_explicit_resources_and_actual_input_slots(tmp_path):
     from autosim.research.execution_derive import generate_argv
     class Client:

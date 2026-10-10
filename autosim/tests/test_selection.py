@@ -14,10 +14,67 @@ exactly the direction that makes a result look better.
 import json
 
 from autosim.research.selection import note, rate_of, summary
+from autosim.research.common import atomic_json, digest
+import pytest
 
 
 def _run(tmp_path):
     return tmp_path / "run"
+
+
+def native_protocol_fixture(root, label, value, attempt, *, steps):
+    protocol = {'metric': {'name': 'generic_score', 'direction': 'maximize'}, 'settings': {}}
+    atomic_json(root / 'comparison_protocol.json', protocol)
+    identity = digest(root / 'comparison_protocol.json')
+    atomic_json(root / 'measurements' / f'{label}.json', {
+        'label': label, 'ok': True, 'metric_value': value, 'metric_utility': value,
+        'metric': protocol['metric'], 'settings': {'steps': steps},
+        'evaluate': {'attempt_id': attempt}})
+    atomic_json(root / 'attempts' / attempt / 'receipt.json', {
+        'attempt_id': attempt, 'node_id': 'evaluate', 'status': 'completed',
+        'returncode': 0, 'termination_reason': 'normal_exit', 'ran': True,
+        'comparison_protocol_sha256': identity, 'finished_at': '2020-01-01T00:00:00+00:00'})
+    note(root, protocol_sha256=identity, label=label, started=True,
+         metric_value=value, metric_utility=value, baseline=label == 'baseline',
+         settings={'steps': steps})
+
+
+def test_legacy_training_settings_do_not_split_verified_native_evaluation_protocol(tmp_path):
+    root = _run(tmp_path)
+    native_protocol_fixture(root, 'baseline', .1, 'a'*32, steps=10)
+    native_protocol_fixture(root, 'candidate', .2, 'b'*32, steps=20)
+    paths = [root / 'selection_record.json', * (root / 'measurements').glob('*.json')]
+    before = {path: path.read_bytes() for path in paths}
+    result = summary(root)
+    assert result['one_protocol'] and result['distinct_settings'] == 1
+    assert result['protocol_comparison_basis'] == 'completed_native_receipts'
+    assert all(path.read_bytes() == data for path, data in before.items())
+
+
+@pytest.mark.parametrize('fault', ['receipt_hash', 'running', 'failure', 'wrong_attempt',
+    'metric', 'reused_label', 'receipt_symlink'])
+def test_incomplete_native_protocol_proof_does_not_certify_matching_settings(tmp_path, fault):
+    root = _run(tmp_path)
+    native_protocol_fixture(root, 'baseline', .1, 'a'*32, steps=10)
+    native_protocol_fixture(root, 'candidate', .2, 'b'*32, steps=10)
+    path = root / 'attempts' / ('b'*32) / 'receipt.json'
+    receipt = json.loads(path.read_text())
+    if fault == 'receipt_hash': receipt['comparison_protocol_sha256'] = 'f'*64
+    if fault == 'running': receipt['status'] = 'running'
+    if fault == 'failure': receipt['returncode'] = 1
+    if fault == 'wrong_attempt': receipt['attempt_id'] = 'c'*32
+    if fault == 'reused_label': receipt['finished_at'] = '2100-01-01T00:00:00+00:00'
+    if fault == 'metric':
+        measured = root / 'measurements/candidate.json'
+        row = json.loads(measured.read_text()); row['metric_value'] = .3
+        atomic_json(measured, row)
+    atomic_json(path, receipt)
+    if fault == 'receipt_symlink':
+        replacement = root / 'other-receipt.json'
+        path.rename(replacement); path.symlink_to(replacement)
+    result = summary(root)
+    assert not result['one_protocol']
+    assert result['protocol_comparison_basis'] == 'incomplete_native_receipts'
 
 
 def test_the_best_number_arrives_with_what_it_is_the_maximum_of(tmp_path):

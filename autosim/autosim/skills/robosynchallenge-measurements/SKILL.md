@@ -1,14 +1,7 @@
 ---
 name: robosynchallenge-measurements
-description: Concrete numbers measured on RoboSynChallenge. Scoped to this benchmark — do not carry them to another one.
-scope: benchmark:RoboSynChallenge
-confidence: historical report — original receipts were not re-audited in the 2026-09-29 library review
-evidence: |
-  All figures from controlled arms run through policy/act/eval.sh with 100 episodes,
-  the random setting and paired seeds, on one machine. The machine does not reproduce
-  the organiser's absolute published rates (the same released checkpoint scored 51-56%
-  locally across four master seeds against 37% published, z=6.2), so these numbers are
-  valid for comparing arms against each other and not as absolute claims.
+description: Concrete numbers measured on RoboSynChallenge. Scoped to this benchmark — do not carry them to another
+  one.
 ---
 
 # RoboSynChallenge: measured numbers

@@ -85,3 +85,36 @@ PYTHONPATH=autosim .venv/bin/python -m pytest -q autosim/tests
 ```
 
 CPU 测试验证框架合同与部分真实本地隔离行为，不验证任意仿真器兼容性，更不是 SOTA 结果。
+
+### 数据生产、保管与实际训练曝光
+
+Agent 可使用 `register_data_version` 登记实际训练文件/目录，并通过已审核训练轴的 `data-version:<id>` 使用它。可选资产卡连接类型、封存 collect/prepare_data 回执、父版本、原生健康计数和处理配方；原始数据不覆盖，处理后的可读结果使用新位置。旧登记不要求补齐元数据，数量未知继续保持未知。
+
+原生代码在真实读写后发 `AUTOSIM_DATA_PROFILE`，loader 在实际 batch 读取后发消费/曝光事件；Supervisor 先看真实卡和精确源码再审核。框架复核身份与计数一致性，不替 Agent 猜字段、安装统一格式或决定采集数量。RUN.md 自动展示中文数据表、真实曝光及对应开发指标；有至少两份全量 episode 计数才画数量图，不把重复读取当作新增数据。
+
+字段、边界和示例见按需 [原生数据合同](../autosim/autosim/skills/curating-simulation-datasets/references/native-data-contract.md)。当前是单 run 的资产/消费链，不是跨 run 数据平台；分片续采、转换缓存、独立备份和数据回收尚未实现，现有 checkpoint 清理授权不包含 raw 数据。
+
+## 7. 串行真实验收
+
+`tools/run_acceptance_queue.py` 是操作者定义的启动队列，不是新的 benchmark 适配器。清单显式提供仓库、独立输出、任务设置、解释器、只读资源和用户服务名；每项仍由完整 AutoSim Main 流程执行，不预写训练/采集/评测代码。需要本机用户 systemd、可用的 Claude Code CLI 与正式运行隔离条件。
+
+```bash
+PYTHONPATH=autosim .venv/bin/python tools/run_acceptance_queue.py \
+  /absolute/project/autoresearch_runs/matrix/queue_manifest.json
+```
+
+清单 `jobs` 中每项字段为 `id`、`repo`、`output`、`unit`、`settings`、`interpreter`、`resources`、`adopt`。`adopt: true` 只监视已经启动且来源身份匹配的原 run，不创建第二个写入者。新项使用独立 task 账本、48 小时墙钟、24 GPU 小时、模型 $60 / 初始局部 $4、一轮候选和留出确认，自动 GC 默认关闭。任务在排队期间不启动自己的预算。
+
+队列只有在前项退出且具有真实 baseline、候选指标、独立留出确认与 Supervisor `real` 审核时才前进；零分不是缺失指标，验收也不表示提升或 SOTA。缺证据或失败时保留原 run，写入中文 `MATRIX.md` / `queue_state.json`，停止启动后续任务；不会自动追加预算、重建实验、修框架或清理文件。排查原 run 后重新启动队列可沿用原清单，不能更改已冻结输入。视频质量与采集→训练消费仍须检查各 run 的实际证据，不能凭排队状态宣称完成。
+# 数据研究任务书
+
+新 run 可使用 `--research-brief /absolute/path/study.md` 向主 Agent 提供 UTF-8 研究意图，
+最多 6000 字符/24KB，独立于 `settings-json` 和原生训练参数保存。首次启动冻结正文与身份；
+续跑可省略该参数，保留原意图。更改意图需要新的研究 run，不能给已初始化 run 偷加任务书。
+该文件不授予权限、不改指标或总预算，也不作为实验已完成的证据。
+
+失败驱动数据研究见 [方法与实验协议](FAILURE_DRIVEN_DATA_RESEARCH.md)，
+可行性试点任务书见 [PILOT_BRIEF](paper/PILOT_BRIEF.md)。主 Agent 调用
+`register_data_campaign` 保存开发失败假设/获取与筛选/targeted-random对照，
+原生采集、数据版本、真实训练消费及独立计分后用 `record_data_campaign_arm` 关联结果。
+旧数据处理不能当成新的自动采集；已暴露 held-out 的 run 不再注册开发实验。

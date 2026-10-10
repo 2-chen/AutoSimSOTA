@@ -188,6 +188,9 @@ def test_native_cpu_inspection_executes_actual_env_readonly_and_seals_evidence(t
     row = executor.native_probe({"code": code, "purpose": "核验实际解释器与只读边界"})
     assert row["status"] == "completed", row
     assert row["context_identity"] == ctx["identity"] and not row["gpu_access"]
+    from autosim.research.diagnostic_source_identity import source_identity
+    assert row['repository_source_stable'] is True
+    assert row['repository_source_identity'] == source_identity(repo)
     assert "selected-env-ok" in row["stdout"] and "source readonly" in row["stdout"]
     assert source.read_text() == "original"
     assert read_attempt_evidence(output, row["evidence_id"])["text"]

@@ -154,6 +154,40 @@ def test_readers_are_async_isolated_cancellable_stale_and_acknowledged(tmp_path)
     assert not agent_tasks.collect(output, repo)
 
 
+def test_async_data_agent_uses_own_prompt_and_readonly_snapshot(tmp_path):
+    output, repo = tmp_path / "run", tmp_path / "run/checkout"
+    repo.mkdir(parents=True)
+    inventory(output, repo)
+    scheduling.configure(output)
+    class DataReader(Reader):
+        def fork_readonly(self, **kwargs):
+            assert kwargs["role"] == "data"
+            child = DataReader(self.gate)
+            child.scope = kwargs
+            self.children.append(child)
+            return child
+        def chat_with_metadata(self, system, user, **kwargs):
+            if "skill_catalog" in json.loads(user):
+                assert kwargs["read_only"] and kwargs["auto_skills"] is False
+                return json.dumps({"skill_reads": []}), {}
+            assert "Dedicated Data Agent assignment" in system
+            assert json.loads(user)["assignment"]["role"] == "data"
+            return super().chat_with_metadata(system, user, **kwargs)
+    gate = threading.Event()
+    gate.set()
+    client = DataReader(gate)
+    row = agent_tasks.submit(output, repo, client,
+        {"role": "data", "task": "Trace producer to loader", "expected_result": "Probe and blockers",
+         "source_paths": ["train.py"]}, {"state_revision": 4}, 4)
+    finished = wait_tasks(output)
+    assert finished[0]["status"] == "completed"
+    assert client.children[0].scope["workspace"] != repo
+    assert (repo / "train.py").read_text() == "# native source\n"
+    collected = agent_tasks.collect(output, repo)
+    assert collected[0]["id"] == row["id"]
+    assert collected[0]["report"]["authority"] == "model_report_not_execution_verification"
+
+
 def test_lost_reader_is_not_silently_replayed_and_can_be_discarded(tmp_path):
     identity = "a"*32
     atomic_json(tmp_path / "agent_tasks" / identity / "task.json", {

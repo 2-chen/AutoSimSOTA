@@ -11,7 +11,11 @@ from typing import Any
 
 
 PRICE_CARD_ID = "deepseek-flash-v4.1-2026-09-10-usd"
-PRICE_CARD_EXPIRES = dt.datetime(2026, 10, 10, tzinfo=dt.timezone.utc)
+# Rates unchanged on the official page at this review. Keep the effective card
+# identity/history, but renew its bounded review window rather than disable expiry.
+PRICE_CARD_REVIEWED_AT = dt.datetime(2026, 10, 10, tzinfo=dt.timezone.utc)
+PRICE_CARD_SOURCE_URL = 'https://api-docs.deepseek.com/quick_start/pricing/'
+PRICE_CARD_EXPIRES = dt.datetime(2026, 11, 10, tzinfo=dt.timezone.utc)
 MAX_CONTEXT_TOKENS = 1_000_000
 MAX_OUTPUT_TOKENS = 384_000
 _RATES = {

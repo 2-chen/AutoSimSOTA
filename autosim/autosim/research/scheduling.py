@@ -84,8 +84,8 @@ def model_slot(output: Path, *, timeout: float, foreground: bool = True):
 
 def resource_profile(value: dict | None, *, gpu: bool = False) -> dict:
     raw = {} if value is None else value
-    if not isinstance(raw, dict) or set(raw) - {"cpu", "memory_mib", "gpu", "priority"}:
-        raise ValueError("resources admits cpu, memory_mib, gpu, priority only")
+    if not isinstance(raw, dict) or set(raw) - {"cpu", "memory_mib", "gpu", "priority", "storage_required_bytes"}:
+        raise ValueError("resources admits cpu, memory_mib, gpu, priority, storage_required_bytes only")
     answer = {"cpu": raw.get("cpu", 2), "memory_mib": raw.get("memory_mib", 4096),
               "gpu": raw.get("gpu", gpu), "priority": raw.get("priority", 0)}
     for key in ("cpu", "memory_mib", "priority"):
@@ -98,6 +98,11 @@ def resource_profile(value: dict | None, *, gpu: bool = False) -> dict:
     if not isinstance(answer["gpu"], bool):
         raise ValueError("resources.gpu must be a JSON boolean true/false, not a device count; "
                          "omit it to use the verified stage GPU requirement")
+    if 'storage_required_bytes' in raw:
+        value = raw['storage_required_bytes']
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError('resources.storage_required_bytes must be a positive integer')
+        answer['storage_required_bytes'] = value
     return answer
 
 

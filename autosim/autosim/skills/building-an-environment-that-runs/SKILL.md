@@ -1,9 +1,6 @@
 ---
 name: building-an-environment-that-runs
 description: 依赖已安装仍不能运行时，检查版本、硬件与真实执行；用隔离环境和最小验证修复，不套固定版本表。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 环境要能执行，而不仅是安装成功

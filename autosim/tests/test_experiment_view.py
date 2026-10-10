@@ -6,8 +6,9 @@ from autosim.research.recorder import render
 def setup_job(root):
     job=root/'native_jobs'/('a'*32)
     atomic_json(job/'request.json',dict(job_id='a'*32,run_id='derived',
+        stage='train',
         candidate_binding=dict(round=1,idea_label='data coverage')))
-    atomic_json(job/'result.json',dict(status='completed',stage_result=dict(attempt_id='b'*32)))
+    atomic_json(job/'result.json',dict(job_id='a'*32,status='completed',stage_result=dict(attempt_id='b'*32)))
     return job
 
 
@@ -15,7 +16,7 @@ def test_completed_training_is_not_scored_until_receipt_verified(tmp_path,monkey
     setup_job(tmp_path)
     assert view(tmp_path,'derived')['experiments'][0]['status']=='completed'
     atomic_json(tmp_path/'research/derived/measurements/round_1.json',
-        dict(ok=True,metric_value=.8,train=dict(attempt_id='b'*32)))
+        dict(label='round_1',ok=True,metric_value=.8,train=dict(attempt_id='b'*32)))
     monkeypatch.setattr('autosim.research.receipt_verifier.verify_measurement',
         lambda *a:dict(status='inconsistent'))
     row=view(tmp_path,'derived')['experiments'][0]

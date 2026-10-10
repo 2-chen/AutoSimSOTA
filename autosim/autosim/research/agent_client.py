@@ -57,6 +57,7 @@ class RoleAwareAgentClient:
     supports_main_agent = True
     supports_recorder = True
     supports_native_progress_audit = True
+    supports_candidate_execution_review = True
 
     def __init__(self, *, workspace: Path, output: Path, run_id: str,
                  turn_budget_usd: float, total_budget_usd: float,
@@ -224,10 +225,15 @@ class RoleAwareAgentClient:
                                                 float(kwargs.get("timeout", self.timeout))),
                 max_budget_usd=self.turn_budget_usd,
                 max_total_budget_usd=self.total_budget_usd,
-                resume=self._resume_role(role), role=role,
+                resume=(self._resume_role(role) if kwargs.get("resume_session", True) else False), role=role,
                 read_only=kwargs.get("read_only") is True or self.budget_output != self.output,
                 auto_skills=kwargs.get("auto_skills", True) is True,
                 decision_only=kwargs.get("decision_only") is True,
+                generation_policy=({"max_output_tokens": kwargs.get("max_tokens"),
+                                    "thinking": kwargs.get("thinking")}
+                    if kwargs.get("decision_only") is True and
+                       (kwargs.get("max_tokens") is not None or kwargs.get("thinking") is not None)
+                    else None),
                 output_format=str(kwargs.get("output_format") or "stream-json"),
                 decision_attempt_id=(str(decision_attempt_id)
                                      if decision_attempt_id is not None else None),
@@ -254,6 +260,7 @@ class RoleAwareAgentClient:
             "model": result.get("model") or self.model,
             "runtime": "claude_code",
             "role": role,
+            "generation_policy": result.get("generation_policy"),
             "status": status,
             "session_id": result.get("session_id"),
             "turn_id": result.get("turn_id"),

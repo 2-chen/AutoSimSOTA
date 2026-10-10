@@ -1,9 +1,6 @@
 ---
 name: diversity-before-volume
 description: 采集预算有限时比较新场景、物体、初态或任务覆盖与重复演示；适用于允许改变训练分布的协议。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 比较覆盖与重复数量

@@ -141,7 +141,7 @@ def evaluation_progress(said: str) -> dict[str, Any]:
 #: nothing, then the number. `AoC` is excluded rather than averaged in, and so is `best succ`,
 #: which is the best epoch so far rather than the last one.
 _SUCCESS = re.compile(
-    r"(?<!best )(?<!max )\b(?:success[ _]+rate|success|succ)"
+    r"(?<!best )(?<!max )(?<![A-Za-z0-9_])(?P<quote>[\"']?)(?:success[ _]+rate|success|succ)(?P=quote)"
     r"(?!\s*\.?\s*AoC)\s*[.:=]?\s*\]?\s*"
     r"(?P<values>\d+(?:\.\d+)?(?![0-9.eE])\s*%?"
     r"(?:[ \t]*\|[ \t]*\d+(?:\.\d+)?(?![0-9.eE])\s*%?)*[ \t]*\|?)",

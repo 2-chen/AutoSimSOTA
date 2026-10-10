@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from .common import atomic_json, digest, now, object_digest, read_json
 
 
-def source_evidence(repo: Path, refs: list) -> list[dict]:
+def source_evidence(repo: Path, refs: list, *, output: Path | None = None) -> list[dict]:
     if not isinstance(refs, list) or not 1 <= len(refs) <= 12:
         raise ValueError('reference requires 1..12 exact source citations')
     repo = Path(repo).resolve()
@@ -15,6 +15,12 @@ def source_evidence(repo: Path, refs: list) -> list[dict]:
     for row in refs:
         if not isinstance(row, dict):
             raise ValueError('source citations must be objects')
+        if isinstance(row.get('ref'),str) and row['ref'].startswith('native-source:'):
+            if output is None:
+                raise ValueError('installed source citations require a run-owned native source context')
+            from .native_source_citations import resolve
+            result.append(resolve(output,repo,row['ref'],row.get('quote')))
+            continue
         rel = Path(row.get('ref') or '')
         path = repo/rel
         quote = row.get('quote')
@@ -76,16 +82,62 @@ def resolve_checkpoint(output: Path, repo: Path, ref: str) -> Path:
     return checkpoint_location(output,repo,ref)[0]
 
 
-def validate(repo: Path, reference: dict) -> dict:
+def freeze_reference(source: Path, destination: Path, *, max_bytes: int) -> dict:
+    """Reconcile an interrupted reference copy without overwriting any bytes.
+
+    This is scoped to published-reference registration; general experiment archive
+    destinations still reject collisions. Reuse requires exact source identity,
+    independent files (no hardlink to mutable source), and confined nonlink paths.
+    """
+    import fcntl
+    from .experiment_bundle import artifact_identity, freeze_artifact
+    source, destination = Path(source), Path(destination)
+    if any(p.is_symlink() for p in [destination, *destination.parents]):
+        raise ValueError('unsafe reference archive path')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    lock = destination.parent/'copy.lock'
+    if lock.is_symlink():
+        raise ValueError('unsafe reference copy lock')
+    with lock.open('a+b') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        if not destination.exists():
+            return freeze_artifact(source, destination, max_bytes=max_bytes)
+        field, identity = artifact_identity(source)
+        if artifact_identity(destination) != (field, identity):
+            raise ValueError('existing reference archive conflicts with current source; not overwritten')
+        files = sorted(p for p in source.rglob('*') if p.is_file()) if source.is_dir() else [source]
+        total = sum(p.stat().st_size for p in files)
+        if total > max_bytes:
+            raise ValueError('reference archive exceeds copy limit')
+        for path in files:
+            archived = destination/path.relative_to(source) if source.is_dir() else destination
+            if path.samefile(archived):
+                raise ValueError('reference archive shares mutable source inode')
+        return {'path':str(destination), 'source':str(source), 'bytes':total,
+                'files':len(files), 'sha256':object_digest([
+                    (str(p.relative_to(source)) if source.is_dir() else source.name, digest(p))
+                    for p in files]),
+                **({'content_sha256':identity} if field == 'content_sha256' else {}),
+                'reconciled_existing_copy':True}
+
+
+def resolve_review_citations(original: list, shown: list, citations: list) -> list:
+    """Resolve only exact model-visible citations; never undo redaction heuristically."""
+    from .source_citations import resolve
+    return resolve(original, shown, citations)
+
+
+def validate(repo: Path, reference: dict, *, output: Path | None = None) -> dict:
     if not isinstance(reference, dict) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', str(reference.get('id') or '')):
         raise ValueError('reference requires a short path-safe id')
     kind = reference.get('kind')
     if kind not in {'released_checkpoint', 'unavailable'}:
         raise ValueError('reference kind must be released_checkpoint or unavailable')
-    refs = source_evidence(repo, reference.get('source_refs'))
+    refs = source_evidence(repo, reference.get('source_refs'), output=output)
     reason = reference.get('reason')
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
-        raise ValueError('reference requires a concise reason')
+        raise ValueError('reference requires a nonempty reason of at most 1000 characters; '
+                         'put source quotations in source_refs, not reason')
     if kind == 'released_checkpoint':
         episodes = reference.get('episodes')
         if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:

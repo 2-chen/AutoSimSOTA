@@ -7,6 +7,31 @@ from autosim.research.execution_paths import ExecutionPaths
 from autosim.research.execution_progress import execution_progress
 
 
+@pytest.mark.parametrize('scrub', [sanitize_model_text, sanitize_model_payload_text])
+def test_public_mask_labels_survive_but_standalone_credentials_remain_redacted(scrub):
+    labels = ['code-train-mask-padding-loss', 'code-train-dp-mask-padding-loss',
+              'task-mask-padding-loss-with-long-suffix']
+    payload = {'idea_labels': labels, 'source': 'do_mask_loss_for_padding=True',
+               'tokens': ['sk-abcdefghijklmnopqrstuvwxyz123456',
+                          '(hf_abcdefghijklmnopqrstuvwxyz123456)',
+                          'api_key=prefixsk-abcdefghijklmnopqrstuvwxyz123456',
+                          'Bearer sk-abcdefghijklmnopqrstuvwxyz123456']}
+    safe = json.dumps(payload)
+    for _ in range(3):
+        safe = scrub(safe)
+    projected = json.loads(safe)
+    assert projected['idea_labels'] == labels
+    assert projected['source'] == payload['source']
+    assert 'abcdefghijklmnopqrstuvwxyz' not in safe
+
+
+def test_report_redaction_does_not_match_key_prefix_inside_public_mask_word():
+    from autosim.research.common import redact
+    public = 'task-mask-padding-loss-with-long-suffix'
+    assert redact(public) == public
+    assert redact('key: sk-abcdefghijklmnopqrstuvwxyz123456') == 'key: [REDACTED]'
+
+
 def test_public_witness_syntax_survives_repeated_projection_without_episode_values():
     from autosim.research.common import sanitize_model_payload
     from autosim.research.policy_consumption import identity_contract
@@ -51,6 +76,38 @@ def test_json_still_hides_real_windows_paths_secrets_and_host_paths(scrub):
     assert safe['code'] == original['code']
     assert all('operator' not in item and 'abcdefghijklmnopqrstuvwxyz' not in item
                for item in safe['private'])
+
+
+@pytest.mark.parametrize('scrub',[sanitize_model_text,sanitize_model_payload_text])
+@pytest.mark.parametrize('fenced',[False,True])
+def test_final_prompt_embedded_json_preserves_source_quotes_and_redacts_real_secrets(scrub,fenced):
+    source='uv run python scripts/train.py \\\n    --output-dir "$OUTPUT_DIR" \\\n    "${EXTRA_ARGS[@]}"'
+    payload={'source':source,'private':['\\\\server\\private\\file','C:\\Users\\operator\\secret.txt',
+                                       '/home/operator/private','api_key=sk-abcdefghijklmnopqrstuvwxyz123456']}
+    start='Read supplied evidence only. /home/operator/private\n## Current request\n'
+    prompt=start+('```json\n' if fenced else '')+json.dumps(payload)+('\n```' if fenced else '')
+    prompt+='\nSurrounding prose api_key=sk-abcdefghijklmnopqrstuvwxyz123456\n'
+    for _ in range(3): prompt=scrub(prompt)
+    body=prompt.split('## Current request\n',1)[1]
+    if fenced: body=body.split('```json\n',1)[1]
+    answer,_=json.JSONDecoder().raw_decode(body)
+    assert answer['source']==source
+    assert 'operator' not in prompt and 'abcdefghijklmnopqrstuvwxyz' not in prompt and 'server' not in prompt
+
+
+def test_malformed_embedded_json_still_redacts_host_paths():
+    value='Header\n{"unfinished": "/home/operator/private"\n'
+    assert 'operator' not in sanitize_model_text(value)
+
+
+@pytest.mark.parametrize('scrub',[sanitize_model_text,sanitize_model_payload_text])
+def test_public_json_source_literals_keep_exact_formatting_but_shadowed_secrets_do_not(scrub):
+    code='def produce():\n    {"updates":1e3, "kind" : "native"}\n'
+    prompt='Header\n'+json.dumps({'source':code})
+    for _ in range(3): prompt=scrub(prompt)
+    assert json.loads(prompt.split('\n',1)[1])['source']==code
+    duplicate='Header\n{"same":"\\u002fhome/operator/private","same":"public"}'
+    assert 'operator' not in scrub(duplicate)
 
 
 def test_path_rejection_identifies_exact_field_and_does_not_rewrite(tmp_path):

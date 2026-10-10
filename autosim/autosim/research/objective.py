@@ -38,6 +38,8 @@ how a run knows it is getting closer to being able to give one.
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -193,25 +195,7 @@ def plain() -> Rubric:
 
 # -- the benchmark's own leaves ------------------------------------------------------------
 
-DECOMPOSE_SYSTEM = """You are breaking a research goal into sub-questions a run can answer \
-about itself, before it can answer the final one.
-
-You are given the benchmark, the stages it has, what it declares about its evaluation, and \
-what is known about how it runs. The top-level questions are fixed and given to you:
-
-{tops}
-
-For each of them, propose the benchmark-specific questions that sit underneath -- what has to \
-be true *for this benchmark* before that top-level question can be answered yes. Be concrete \
-and make each one answerable from what a run records: "the evaluator used the benchmark's own \
-initial states" is answerable; "the environment is good" is not.
-
-Do not propose anything about how a metric is computed, the evaluation entry point, the \
-splits, or the data. Those are not sub-goals; they are what must not change.
-
-Return one JSON object: {{"<top-level name>": [{{"name": "<short>", "question": "<yes/no, \
-answerable from the run's records>", "weight": <a number>}}]}}. Weight the children of one \
-top-level question against each other; their total is that question's weight, not more."""
+DECOMPOSE_SYSTEM = load_prompt("objective-decompose")
 
 
 def decompose(client: Any, material: dict[str, Any], *, attempts: int = 2,
@@ -258,28 +242,7 @@ def decompose(client: Any, material: dict[str, Any], *, attempts: int = 2,
     return plain()
 
 
-ANSWER_SYSTEM = """A research run wrote itself a list of yes/no questions about what has to be \
-true for its work to count, before it started. Answer them from what the run has recorded.
-
-You are given the questions and the run's records: what each round did, what it was refused \
-for, what came out of the measurements, and which stages exist.
-
-Every answer is one of three things, and they are not the same:
-
-* `"yes"` -- the records show it. Give `because` as the fact that shows it, and name where in \
-the records it is.
-* `"no"` -- the records show it is false, or show that a run happened without it.
-* `null` -- the run has not got far enough for this question to have an answer. **This is the \
-answer for anything the run has not reached**, and it is not a failure. A run that has not \
-yet evaluated anything has not failed to use the benchmark's own initial states.
-
-Do not answer `"yes"` from what the run *intends* to do, or from what it says it did. Answer \
-from what the records contain. If you cannot point at the record that shows it, the answer is \
-`null`.
-
-Return one JSON object: {"answers": [{"name": "<the question's name>", "passed": true | \
-false | null, "because": "<the record that shows it, or why there is none>"}]}. Answer every \
-question you were given."""
+ANSWER_SYSTEM = load_prompt("objective-answer")
 
 
 def answer_children(client: Any, rubric: Rubric, *, material: dict[str, Any],
@@ -309,14 +272,19 @@ def answer_children(client: Any, rubric: Rubric, *, material: dict[str, Any],
     }, ensure_ascii=False, default=str)[:60000]
     for attempt in range(attempts):
         try:
-            content, _ = client.chat_with_metadata(ANSWER_SYSTEM, payload, max_tokens=4000,
-                                                   timeout=300, thinking="disabled")
+            from .agent_client import role_scope
+            with role_scope(client, "objective"):
+                content, _ = client.chat_with_metadata(
+                    ANSWER_SYSTEM, payload, max_tokens=4000, timeout=90,
+                    thinking="disabled", decision_only=True, read_only=True,
+                    auto_skills=False)
             from .execution_derive import _object
             rows = _object(content).get("answers")
             if not isinstance(rows, list):
                 raise ValueError("`answers` has to be a list")
             by_name = {str(one.name): one for check in rubric.checks for one in check.children}
-            answered = 0
+            checked = []
+            seen = set()
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -324,12 +292,17 @@ def answer_children(client: Any, rubric: Rubric, *, material: dict[str, Any],
                 if one is None:
                     continue
                 passed = row.get("passed")
-                one.passed = None if passed is None else bool(passed)
-                one.because = str(row.get("because") or "")[:400]
+                if ("passed" not in row or passed is not None and type(passed) is not bool
+                        or one.name in seen):
+                    raise ValueError("each named answer needs one boolean or null passed value")
+                seen.add(one.name)
+                checked.append((one, passed, str(row.get("because") or "")[:400]))
+            for one, passed, because in checked:
+                one.passed = passed
+                one.because = because
                 one.by = "model"
-                answered += 1
-            if answered:
-                return answered
+            if checked:
+                return len(checked)
             raise ValueError("no answer named a question that was asked")
         except Exception as exc:                                     # noqa: BLE001
             if on_event:

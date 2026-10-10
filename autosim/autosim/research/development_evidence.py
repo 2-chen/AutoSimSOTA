@@ -3,7 +3,8 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from .common import digest, read_json
+from .common import digest, read_json, object_digest
+from .native_runtime_summary import stage_runtime
 
 
 def summaries(root: Path) -> list[dict]:
@@ -11,6 +12,8 @@ def summaries(root: Path) -> list[dict]:
     directory = root/'measurements'
     if directory.is_symlink():
         return []
+    from .handoff_correction import eligible
+    handoffs = {row['label']: row for row in eligible(root)}
     paths = [directory/'baseline.json']
     recent = []
     for path in directory.glob('round_*.json'):
@@ -40,6 +43,38 @@ def summaries(root: Path) -> list[dict]:
                         ['policy_consumption','rollout_evidence','metric_lineage']},
                     'training_settings':{k:v for k,v in (row.get('settings')or{}).items()
                         if isinstance(v,(bool,int,float))}}
+            consumption = row.get('data_consumption')
+            status = consumption.get('status') if isinstance(consumption, dict) else None
+            item['data_consumption_status'] = status if status in (
+                'verified', 'not_required', 'not_applicable', 'unverified', 'failed') else 'unknown'
+            if status == 'verified':
+                versions = consumption.get('versions') or []
+                item['data_versions'] = [v for v in versions[:16] if isinstance(v,str)] if isinstance(versions,list) else []
+                exposure = []
+                reads = consumption.get('exposure') or []
+                for read in (reads[:16] if isinstance(reads,list) else []):
+                    if not isinstance(read,dict):continue
+                    counters = {k:read[k] for k in ('samples_read','batches','unique_samples')
+                        if isinstance(read.get(k),int) and not isinstance(read[k],bool) and read[k]>=0}
+                    sources = read.get('source_samples') or {}
+                    sources = {k:v for k,v in (list(sources.items())[:16] if isinstance(sources,dict) else [])
+                               if isinstance(v,int) and not isinstance(v,bool) and v>=0}
+                    exposure.append({'data_version_id':read.get('data_version_id'),
+                                     'status':read.get('status'),**counters,'source_samples':sources})
+                item['data_exposure'] = exposure
+                item['data_exposure_digest'] = object_digest(exposure)
+                item['data_exposure_meaning'] = 'actual sample reads including repetition; not additional episodes or adequate learning'
+            item['training_settings_meaning'] = 'requested inputs, not proof of work in the evaluated policy'
+            timings = {stage: timing for stage in ('train', 'evaluate')
+                       if (timing := stage_runtime(root, row, stage)) is not None}
+            if timings:
+                item['native_stage_runtime'] = timings
+            if item['label'] in handoffs:
+                item['training_handoff'] = handoffs[item['label']]
+                item['interpretation_warning'] = (
+                    'The scored artifact has an incomplete completed-work selection. '
+                    'Do not interpret its score as the terminal training policy score; '
+                    'inspect or correct the handoff before claiming adequate training failed.')
             artifact = row.get('result_artifact') or {}
             raw = Path(str(artifact.get('path') or '__missing__'))
             raw = raw if raw.is_absolute() else root/raw

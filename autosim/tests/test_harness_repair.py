@@ -102,7 +102,9 @@ def test_rejected_probe_replacement_is_not_adopted(tmp_path, monkeypatch):
     class Client:
         output = tmp_path
         def chat_with_metadata(self, *args, **kwargs):
-            return json.dumps({"probes": ["true"]}), {}
+            # Syntactically valid native import, but insufficient for the original
+            # capability: reach the independent review instead of static rejection.
+            return json.dumps({"probes": ["{python} -c 'import native_fixture'"]}), {}
     monkeypatch.setattr(pv, "platform_facts", lambda: {})
     monkeypatch.setattr(pv, "review_probe_replacement", lambda *a, **kw: {"approved": False, "reason": "weaker"})
     transcript = []

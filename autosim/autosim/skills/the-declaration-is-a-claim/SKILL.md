@@ -1,9 +1,6 @@
 ---
 name: the-declaration-is-a-claim
 description: 验证声明的能力和参数是否对应真实 consumer、合法配置组及可运行值；候选失败后可修复，不静态封死搜索空间。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 声明是待验证的能力主张

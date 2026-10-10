@@ -1,9 +1,6 @@
 ---
 name: make-your-prior-earn-it
 description: 要声称 LLM 推理、针对性采集或启发式优于普通搜索时，加入合法的随机/简单对照；不是每轮增分的前置门槛。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 验证启发式是否真的带来额外价值

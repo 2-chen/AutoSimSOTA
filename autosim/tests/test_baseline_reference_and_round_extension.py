@@ -184,6 +184,138 @@ def test_released_reference_evaluation_never_invokes_trainer(tmp_path, monkeypat
     assert result['policy_artifact']['source'] == str(weight)
 
 
+def install_reference(real):
+    (real.repo/'README.md').write_text('Published same-family policy: success 0.50 over 100 episodes, revision abc.')
+    weight = real.output/'published.pth';weight.write_bytes(b'published native weights')
+    spec = refs.validate(real.repo, dict(id='published',kind='released_checkpoint',
+        source_refs=[dict(ref='README.md',quote='success 0.50 over 100 episodes')],
+        reason='Independent published-reference diagnosis',release_url='https://example.org/model',
+        revision='abc',checkpoint_ref='published.pth',episodes=100,expected_metric=0.5,tolerance=0.01))
+    frozen = freeze_artifact(weight,real.output/'baseline_references/published/policy',max_bytes=1000)
+    refs.register(real.output,spec,dict(sources_supported=True,protocol_matches=True,
+        tolerance_supported=True,release_identity_supported=True),frozen_checkpoint=frozen)
+    return Path(frozen['path'])
+
+
+@pytest.mark.parametrize('local_first',[False,True])
+def test_real_cpu_reference_evaluation_has_separate_protocol_and_no_training(tmp_path,monkeypatch,local_first):
+    real=research(tmp_path)
+    weight=install_reference(real)
+    local=real.run_root/'comparison_protocol.json'
+    if local_first:
+        assert not real._comparison_protocol_violation({'episodes':10,'seed':0},target='evaluate',freeze=True)
+    old=local.read_bytes() if local.exists() else None
+    calls=[];native=real.run_stage
+    def observed(stage,**kwargs):
+        calls.append(stage)
+        return native(stage,**kwargs)
+    monkeypatch.setattr(real,'run_stage',observed)
+    result=real.measure(settings={'episodes':100,'seed':0},label='reference_native',
+        _reference_checkpoint=weight,_reference_protocol_id='published')
+    assert result['ok'] and calls == ['evaluate']
+    assert local.read_bytes()==old if old is not None else not local.exists()
+    protocol=real.run_root/result['reference_protocol_ref']
+    assert read_json(protocol)['settings']['episodes']==100
+    attempt=result['evaluate']['attempt_id']
+    receipt=read_json(real.run_root/'attempts'/attempt/'receipt.json')
+    assert receipt['reference_protocol_ref']==result['reference_protocol_ref']
+    assert receipt['comparison_protocol_sha256']==digest(protocol)
+    from autosim.research.receipt_verifier import verify_measurement
+    checked=verify_measurement(real.run_root,'reference_native')
+    # This toy only exercises protocol/process integrity, not real policy identity.
+    assert checked['checks']['comparison_protocol']
+    assert checked['checks']['comparison_protocol_bytes']
+    assert not getattr(real,'_reference_protocol_id','')
+    if not local_first:
+        assert not real._comparison_protocol_violation({'episodes':10,'seed':0},target='evaluate',freeze=True)
+
+
+def test_reference_scope_still_refuses_local_evaluator_and_heldout_drift(tmp_path):
+    real=research(tmp_path)
+    weight=install_reference(real)
+    assert not real._comparison_protocol_violation({'episodes':10,'seed':0},target='evaluate',freeze=True)
+    old=(real.run_root/'comparison_protocol.json').read_bytes()
+    real.backend.sources['evaluate']+='\n# changed evaluator\n'
+    result=real.measure(settings={'episodes':100,'seed':0},label='reference_drift',
+        _reference_checkpoint=weight,_reference_protocol_id='published')
+    assert not result['ok'] and 'frozen local evaluator' in result['why']
+    assert (real.run_root/'comparison_protocol.json').read_bytes()==old
+    assert not list((real.run_root/'attempts').glob('*/receipt.json'))
+    assert not getattr(real,'_reference_protocol_id','')
+
+
+def test_reference_prelaunch_refusal_is_terminal_not_permanently_evaluating(tmp_path):
+    real=research(tmp_path)
+    weight=install_reference(real)
+    real.execution_graph={'score_target':'evaluate'}
+    label='reference_graph_boundary';rel=f'research/{real.run_id}/measurements/{label}.json'
+    refs.begin(real.output,'published',measurement_ref=rel)
+    result=real.measure(settings={'episodes':100},label=label,
+        _reference_checkpoint=weight,_reference_protocol_id='published')
+    assert not result['ok'] and result['where']=='reference_graph_binding'
+    assert read_json(real.output/rel)==result
+    assert refs.complete(real.output,'published',result,rel)['status']=='evaluation_failed'
+    assert not (real.run_root/'comparison_protocol.json').exists()
+
+
+def test_reference_exception_restores_local_protocol_scope(tmp_path,monkeypatch):
+    real=research(tmp_path);weight=install_reference(real)
+    def raised(**kwargs):
+        assert real._active_protocol_path().parent.name=='reference_protocols'
+        raise RuntimeError('native harness exception')
+    monkeypatch.setattr(real,'_measure',raised)
+    with pytest.raises(RuntimeError,match='native harness'):
+        real.measure(settings={'episodes':100},label='reference_exception',
+            _reference_checkpoint=weight,_reference_protocol_id='published')
+    assert real._active_protocol_path()==real.run_root/'comparison_protocol.json'
+
+
+def test_preparation_reference_uses_reviewed_samples_not_local_or_verification_defaults(tmp_path,monkeypatch):
+    from tests.test_prepare import preparation
+    controller=preparation(tmp_path/'controller');real=research(tmp_path/'native')
+    install_reference(real)
+    controller.output=real.output;controller.repo=real.repo;controller.run_id=real.run_id
+    controller.base_settings={'episodes':2,'eval.n_eval':2,'seed':0}
+    monkeypatch.setattr(controller,'_research_controller',lambda:(real,{}))
+    called=[]
+    def measured(**kwargs):
+        called.append(kwargs)
+        row={'ok':False,'why':'test terminal failure','settings':kwargs['settings']}
+        atomic_json(real.run_root/'measurements'/(kwargs['label']+'.json'),row)
+        return row
+    monkeypatch.setattr(real,'measure',measured)
+    result=controller._step_evaluate_baseline_reference(reference_id='published')
+    assert result['reference_status']=='evaluation_failed'
+    assert called[0]['settings']['episodes']==called[0]['settings']['eval.n_eval']==100
+    assert called[0]['_reference_protocol_id']=='published'
+    assert controller.base_settings['episodes']==2
+
+
+@pytest.mark.parametrize('receipt_created',[False,True])
+def test_reference_exception_has_fix_evidence_and_never_replays_unknown_native_work(tmp_path,monkeypatch,receipt_created):
+    from tests.test_prepare import preparation
+    from autosim.research.evidence_store import read_attempt_evidence
+    controller=preparation(tmp_path/'controller');real=research(tmp_path/'native')
+    install_reference(real)
+    controller.output=real.output;controller.repo=real.repo;controller.run_id=real.run_id
+    monkeypatch.setattr(controller,'_research_controller',lambda:(real,{}))
+    calls=[]
+    def failed(**kwargs):
+        calls.append(kwargs)
+        if receipt_created:
+            atomic_json(real.run_root/'attempts'/('a'*32)/'receipt.json',{'status':'running'})
+        raise RuntimeError('reference harness setup failed')
+    monkeypatch.setattr(real,'measure',failed)
+    result=controller._step_evaluate_baseline_reference(reference_id='published')
+    assert result['failure_category']=='reference_operation_failed' and result['repair_owner']=='fix'
+    assert 'reference harness setup failed' in read_attempt_evidence(real.output,result['evidence_id'])['text']
+    assert refs.view(real.output)['status']==('evaluating' if receipt_created else 'evaluation_failed')
+    if receipt_created:
+        again=controller._step_evaluate_baseline_reference(reference_id='published',retry_reason='inspect unknown outcome')
+        assert again['failure_category']=='reference_operation_failed'
+        assert len(calls)==1
+
+
 def test_reference_cannot_accept_unsealed_receipt(tmp_path):
     _, output, _, frozen = reference(tmp_path)
     row, rel = measurement(output, frozen)

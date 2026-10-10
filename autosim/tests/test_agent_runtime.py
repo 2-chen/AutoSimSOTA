@@ -24,6 +24,21 @@ from autosim.research.agent_roles import role_profile
 from autosim.research.agent_runtime import _role_skill_context
 
 
+@pytest.mark.parametrize('status,parent,expected', [
+    ('completed', {'step': 'choose', 'status': 'running'}, ('running', 'choose')),
+    ('completed', {'step': 'run_the_loop', 'status': 'running'}, ('running', 'run_the_loop')),
+    ('completed', None, ('completed', 'coding agent turn')),
+    ('completed', {'step': 'choose', 'status': 'paused'}, ('completed', 'coding agent turn')),
+    ('completed', {'step': 'choose'}, ('completed', 'coding agent turn')),
+    ('completed', {'step': '', 'status': 'running'}, ('completed', 'coding agent turn')),
+    ('budget_exhausted', {'step': 'choose', 'status': 'running'}, ('budget_exhausted', 'coding agent turn')),
+    ('failed', {'step': 'choose', 'status': 'running'}, ('failed', 'coding agent turn')),
+])
+def test_completed_model_turn_does_not_publish_parent_research_as_completed(status, parent, expected):
+    from autosim.research.agent_runtime import _live_turn_status
+    assert _live_turn_status(status, parent) == expected
+
+
 def test_missing_resume_session_requires_precise_cli_preexecution_evidence():
     from autosim.research.agent_runtime import _missing_resume_session
     session_id = str(uuid.uuid4())
@@ -182,10 +197,12 @@ def test_coding_agent_sends_large_prompt_via_stdin(tmp_path, monkeypatch):
     def fake_stream(command, **kwargs):
         captured["command"] = command
         captured["input_bytes"] = kwargs["input_bytes"]
+        assert kwargs['capture_stdout_line_filter'] is agent_runtime._critical_stream_line
         kwargs["on_stdout_line"](json.dumps({
             "type": "result", "total_cost_usd": 0.01, "duration_ms": 12,
             "usage": {"input_tokens": 10000}, "result": "bounded prompt accepted"}))
         return ProcessAttempt(launched=True, returncode=0, stdout="", stderr="",
+                              capture_diagnostics={'stdout_filtered_lines':4000},
                               containment_mode="fixture")
 
     monkeypatch.setattr(agent_runtime, "run_process_stream", fake_stream)
@@ -195,6 +212,10 @@ def test_coding_agent_sends_large_prompt_via_stdin(tmp_path, monkeypatch):
         workspace=workspace, output=output, prompt=prompt,
         run_id="large-prompt-test", max_budget_usd=0.05,
         max_total_budget_usd=0.05, cli="/usr/bin/claude", role="resource")
+    receipt = json.loads((output/result['process_ref']).read_text())
+    assert receipt['capture_diagnostics']['stdout_filtered_lines'] == 4000
+    session = json.loads((output/'agent/session.json').read_text())
+    assert session['capture_diagnostics']['stdout_filtered_lines'] == 4000
 
     assert result["status"] == "completed"
     assert prompt not in captured["command"]
@@ -257,6 +278,7 @@ def test_decision_only_json_has_no_tools_and_requires_complete_terminal(tmp_path
     assert command[command.index('--output-format')+1]=='json'
     assert '--verbose' not in command
     assert captured['options']['decouple_callbacks']
+    assert captured['options']['capture_stdout_line_filter'] is None
     if truncated:
         assert result['status']=='failed' and result['failure_category']=='stream_protocol'
         assert result['execution_text']==''
@@ -265,7 +287,8 @@ def test_decision_only_json_has_no_tools_and_requires_complete_terminal(tmp_path
         assert json.loads(result['execution_text'])['approved'] is True
 
 
-def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monkeypatch):
+@pytest.mark.parametrize('generation_policy',[None,{'max_output_tokens':1800,'thinking':'disabled'}])
+def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monkeypatch,generation_policy):
     from contextlib import contextmanager
     from autosim.research import agent_runtime
 
@@ -308,7 +331,8 @@ def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monk
     result = agent_runtime.run_coding_agent(
         workspace=workspace, output=output, prompt="hello", run_id="official-pricing",
         max_budget_usd=.05, max_total_budget_usd=.50,
-        cli="/usr/bin/claude", role="resource")
+        cli="/usr/bin/claude", role="supervisor" if generation_policy else "resource",
+        decision_only=bool(generation_policy),generation_policy=generation_policy)
     assert result["status"] == "completed"
     assert result["total_cost_usd"] == pytest.approx(.002)
     assert result["cli_estimate_usd"] == pytest.approx(.20)
@@ -318,6 +342,8 @@ def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monk
     assert captured["environment"]["ANTHROPIC_BASE_URL"] == FakeGateway.base_url
     assert captured["environment"]["ANTHROPIC_AUTH_TOKEN"] == FakeGateway.local_token
     assert captured["gateway_args"]["upstream_key"] == "fixture-secret"
+    assert captured['gateway_args']['generation_policy']==generation_policy
+    assert json.loads((output/'agent/session.json').read_text())['generation_policy']==generation_policy
     receipt = json.loads((output / result["pricing_ref"]).read_text())
     assert receipt["official_estimate_usd"] == pytest.approx(.002)
     assert receipt["cli_estimate_usd"] == pytest.approx(.20)

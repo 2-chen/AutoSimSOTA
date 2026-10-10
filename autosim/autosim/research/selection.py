@@ -28,9 +28,11 @@ against a different benchmark and is not pooled with these.
 from __future__ import annotations
 
 from pathlib import Path
+import re
+from datetime import datetime
 from typing import Any
 
-from .common import atomic_json, now, object_digest, read_json
+from .common import atomic_json, now, object_digest, read_json, digest
 from .significance import compare_proportions, proportion
 
 #: Where a run keeps this. Beside `comparison_protocol.json`, and mutable where that is
@@ -104,6 +106,7 @@ def _arms_from_files(root: Path) -> list[dict[str, Any]]:
                      # Kept, because whether the arms were measured the same way is a question
                      # about their settings and not about the file's contents otherwise.
                      "settings": settings,
+                     "from_measurement_file": True,
                      "from": "measurement file"})
     return arms
 
@@ -205,6 +208,20 @@ def summary(root: Path, *, alpha: float = 0.05) -> dict[str, Any]:
     digests = {object_digest(arm.get("settings") or {}) for arm in arms}
     result["one_protocol"] = len(digests) <= 1 and bool(result["protocol_sha256"])
     result["distinct_settings"] = len(digests)
+    # Legacy records sometimes stored all training settings when the valid
+    # frozen evaluation setting set was empty. Reconstruct only the protocol
+    # identity, never scores/counts/history, from exact completed native receipts.
+    # A later measurement of a reused label must not certify an earlier draw.
+    proofs = [_completed_protocol(root, arm) for arm in scored]
+    result["protocol_comparison_basis"] = "recorded_settings_fallback"
+    if proofs and all(proofs):
+        protocols = set(proofs)
+        result["one_protocol"] = len(protocols) == 1
+        result["distinct_settings"] = len(protocols)
+        result["protocol_comparison_basis"] = "completed_native_receipts"
+    elif any(proofs):
+        result["one_protocol"] = False
+        result["protocol_comparison_basis"] = "incomplete_native_receipts"
     result["best"] = strongest(scored)
     baseline = [arm for arm in scored if arm.get("baseline")]
     result["baseline"] = strongest(baseline)
@@ -292,6 +309,51 @@ def summary(root: Path, *, alpha: float = 0.05) -> dict[str, Any]:
                     "the best arm is the baseline, so there is nothing to compare"),
             "limitation": "nothing in this record establishes a difference"}
     return result
+
+
+def _completed_protocol(root: Path, arm: dict[str, Any]) -> str | None:
+    """Bounded read-only protocol proof; not a metric/artifact revalidation."""
+    def safe_read(relative: str) -> dict:
+        path = root / relative
+        if (any(p.is_symlink() for p in (path, *path.parents) if p.is_relative_to(root))
+                or not path.is_file() or path.stat().st_size > 2 * 1024**2):
+            raise ValueError("unsafe or unbounded protocol evidence")
+        value = read_json(path)
+        if not isinstance(value, dict):
+            raise ValueError("invalid protocol evidence")
+        return value
+
+    try:
+        label = arm.get("label")
+        if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", label):
+            return None
+        row = safe_read(f"measurements/{label}.json")
+        if (row.get("label") != label or row.get("ok") is not True
+                or row.get("metric_value") != arm.get("metric_value")
+                or row.get("metric_utility") != arm.get("metric_utility")):
+            return None
+        attempt = (row.get("evaluate") or {}).get("attempt_id")
+        if not isinstance(attempt, str) or not re.fullmatch(r"[a-f0-9]{32}", attempt):
+            return None
+        receipt = safe_read(f"attempts/{attempt}/receipt.json")
+        protocol = safe_read("comparison_protocol.json")
+        identity = digest(root / "comparison_protocol.json")
+        if (receipt.get("attempt_id") != attempt or receipt.get("node_id") != "evaluate"
+                or receipt.get("status") != "completed" or type(receipt.get("returncode")) is not int
+                or receipt["returncode"] != 0 or receipt.get("termination_reason") != "normal_exit"
+                or receipt.get("ran") is not True
+                or receipt.get("comparison_protocol_sha256") != identity
+                or not isinstance(protocol.get("metric"), dict) or not protocol["metric"]
+                or row.get("metric") != protocol.get("metric")):
+            return None
+        if arm.get("at"):
+            if datetime.fromisoformat(receipt["finished_at"]) > datetime.fromisoformat(arm["at"]):
+                return None
+        elif not arm.get("from_measurement_file"):
+            return None
+        return identity
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+        return None
 
 
 def rate_of(arm: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -142,6 +142,27 @@ def test_pid_with_different_start_identity_is_never_terminated():
         process.wait()
 
 
+def test_incomplete_exited_launcher_is_not_perpetually_live():
+    process = _sleeping_process()
+    full = capture_process_identity(process, run_id='fixture', attempt_id='fast', argv=process.args)
+    partial = {k:v for k,v in full.items() if k not in {'start_ticks','command_sha256'}}
+    try:
+        assert inspect_process_identity(partial)['status'] == 'unverifiable'
+        assert terminate_recorded_process(partial)['status'] == 'unverifiable'
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait()
+    assert inspect_process_identity(partial)['status'] == 'not_running'
+
+
+def test_incomplete_launcher_with_surviving_group_stays_unverifiable(monkeypatch):
+    import autosim.research.process_executor as module
+    monkeypatch.setattr(module, '_live_group_members', lambda group:[123])
+    assert inspect_process_identity({'pid':2147483646,'pgid':2147483646,
+                                    'boot_id':'fixture'})['status'] == 'unverifiable'
+
+
 def test_streaming_process_delivers_complete_lines_before_exit(tmp_path):
     observed = []
     started = time.monotonic()

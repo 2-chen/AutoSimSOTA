@@ -7,6 +7,15 @@ from autosim.research import media_manifest
 from tests.test_derived_research import research
 
 
+def test_missing_recording_stage_is_persisted_not_silently_discarded(tmp_path):
+    real = research(tmp_path)
+    result = real.capture_demo(trigger='first_native_baseline', measurement=None, settings={})
+    assert result['status'] == 'unavailable'
+    record = json.loads((real.run_root / 'media_events.json').read_text())
+    assert record['rows'][-1] == result
+    assert result['native_operation_status'] == 'not_started'
+
+
 def test_baseline_triggers_attributed_native_demo(tmp_path):
     real = research(tmp_path, stages=("train", "evaluate", "record_demo"))
     real.declaration = {"task_contract": {"demo_stage": "record_demo"}}

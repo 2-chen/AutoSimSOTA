@@ -1,4 +1,4 @@
-"""Explicit operator-only reduction; never reset historical usage or wall start time."""
+"""Audited operator budget amendments; never reset usage or wall start time."""
 from pathlib import Path
 import argparse
 import json
@@ -16,19 +16,31 @@ def reduce(output: Path, *, factor: float, reason: str, model_scope: str = 'rema
 
 
 def extend(output: Path, *, model_usd: float, wall_seconds: float, reason: str,
-           preserve_stopped_holds: bool = False) -> dict:
-    """Operator-authorized addition; no usage, GPU cap or start-time reset."""
+           preserve_stopped_holds: bool = False, gpu_seconds: float = 0,
+           operator_gpu_ceiling_seconds: float | None = None) -> dict:
+    """Operator additions; default 24h cap, explicit audited override for renewal.
+
+    This helper is not an Agent operation. It never clears historical charges.
+    """
     if (not math.isfinite(model_usd) or model_usd < 0 or
             not math.isfinite(wall_seconds) or wall_seconds < 0 or
-            model_usd + wall_seconds <= 0):
+            not math.isfinite(gpu_seconds) or gpu_seconds < 0 or
+            model_usd + wall_seconds + gpu_seconds <= 0):
         raise ValueError('extension requires finite nonnegative additions, at least one positive')
+    if operator_gpu_ceiling_seconds is not None and (
+            isinstance(operator_gpu_ceiling_seconds, bool) or
+            not math.isfinite(operator_gpu_ceiling_seconds) or
+            operator_gpu_ceiling_seconds <= 0 or gpu_seconds <= 0):
+        raise ValueError('operator GPU ceiling needs a finite positive cap and compute addition')
     return _amend(output, factor=1.0, reason=reason, model_scope='extension',
                   preserve_stopped_holds=preserve_stopped_holds,
-                  model_usd=model_usd, wall_seconds=wall_seconds)
+                  model_usd=model_usd, wall_seconds=wall_seconds, gpu_seconds=gpu_seconds,
+                  operator_gpu_ceiling_seconds=operator_gpu_ceiling_seconds)
 
 
 def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
-           preserve_stopped_holds: bool, model_usd: float = 0, wall_seconds: float = 0) -> dict:
+           preserve_stopped_holds: bool, model_usd: float = 0, wall_seconds: float = 0,
+           gpu_seconds: float = 0, operator_gpu_ceiling_seconds: float | None = None) -> dict:
     extension = model_scope == 'extension'
     if not math.isfinite(factor) or not (factor == 1 if extension else 0 < factor < 1) or not reason.strip() or model_scope not in {'total', 'remaining', 'extension'}:
         raise ValueError('explicit reduction requires 0<factor<1, reason and total/remaining scope')
@@ -36,6 +48,11 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
     request = {'factor':factor, 'reason':reason, 'model_scope':model_scope}
     if extension:
         request.update(model_add_usd=model_usd, wall_add_seconds=wall_seconds)
+        # Preserve identity/verification of existing model+wall-only amendments.
+        if gpu_seconds:
+            request['gpu_add_seconds'] = gpu_seconds
+        if operator_gpu_ceiling_seconds is not None:
+            request['operator_gpu_ceiling_seconds'] = operator_gpu_ceiling_seconds
     request_id = object_digest(request)
     path = output/'budget_amendments'/f'{request_id}.json'
     if path.parent.is_symlink() or path.is_symlink():
@@ -75,6 +92,12 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
                 row['status'] == 'active' for row in gpu_record['leases'].values()):
             raise ValueError('live/unreconciled reservations forbid budget amendment')
         wall, spec = read_json(paths[0]), read_json(paths[3])
+        if gpu_record['cap_seconds'] > 86400 and not authorizes_gpu_cap(output, gpu_record['cap_seconds']):
+            raise ValueError('existing above-default GPU cap lacks a valid operator authorization chain')
+        ceiling = (operator_gpu_ceiling_seconds if operator_gpu_ceiling_seconds is not None else
+                   max(86400, gpu_record['cap_seconds']))
+        if gpu_record['cap_seconds'] + gpu_seconds > ceiling:
+            raise ValueError('operator GPU addition exceeds the 24-hour task cap')
         if spec['total_budget_usd'] != raw['limit_usd']:
             raise ValueError('runtime and model ledger limits disagree')
         available = max(0.0, raw['limit_usd'] - spent - held)
@@ -86,7 +109,7 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
             'stopped_legacy_holds_preserved':preserve_stopped_holds,
             'before':{'wall_seconds':wall['wall_seconds'], 'gpu_seconds':gpu_record['cap_seconds'],
                 'model_usd':raw['limit_usd'], 'turn_usd':spec['turn_budget_usd']},
-            'after':{'wall_seconds':wall['wall_seconds'] + wall_seconds if extension else wall['wall_seconds']*factor, 'gpu_seconds':gpu_record['cap_seconds']*factor,
+            'after':{'wall_seconds':wall['wall_seconds'] + wall_seconds if extension else wall['wall_seconds']*factor, 'gpu_seconds':gpu_record['cap_seconds'] + gpu_seconds if extension else gpu_record['cap_seconds']*factor,
                 'model_usd':limit, 'turn_usd':spec['turn_budget_usd']*factor},
             'preserved':{'wall_started_epoch':wall['started_epoch'],
                 'charged_gpu_seconds':gpu_record['charged_seconds'],
@@ -95,6 +118,10 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
             'model_available_before':available, 'model_available_after':max(0.0, limit-spent-held)}
         if extension:
             amendment.update(model_add_usd=model_usd, wall_add_seconds=wall_seconds)
+            if gpu_seconds:
+                amendment['gpu_add_seconds'] = gpu_seconds
+            if operator_gpu_ceiling_seconds is not None:
+                amendment['operator_gpu_ceiling_seconds'] = operator_gpu_ceiling_seconds
         atomic_json(path, amendment)
         # Each write is atomic. A crash between them is fail-closed: frozen runtime/ledger
         # validation refuses inconsistent limits; prepared evidence retains all old limits.
@@ -125,6 +152,10 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
     extension = amendment.get('model_scope') == 'extension'
     if extension:
         keys += ('model_add_usd', 'wall_add_seconds')
+        if 'gpu_add_seconds' in amendment:
+            keys += ('gpu_add_seconds',)
+        if 'operator_gpu_ceiling_seconds' in amendment:
+            keys += ('operator_gpu_ceiling_seconds',)
     if object_digest({key:amendment[key] for key in keys}) != identity:
         raise ValueError('changed authorization')
     before, after, preserved = amendment['before'], amendment['after'], amendment['preserved']
@@ -133,11 +164,19 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
         raise ValueError('invalid amendment factor')
     if extension:
         model_add, wall_add = amendment['model_add_usd'], amendment['wall_add_seconds']
+        gpu_add = amendment.get('gpu_add_seconds', 0)
+        ceiling = amendment.get('operator_gpu_ceiling_seconds', max(86400, before['gpu_seconds']))
         if not (math.isfinite(model_add) and model_add >= 0 and
-                math.isfinite(wall_add) and wall_add >= 0 and model_add + wall_add > 0):
+                math.isfinite(wall_add) and wall_add >= 0 and
+                math.isfinite(gpu_add) and gpu_add >= 0 and
+                model_add + wall_add + gpu_add > 0 and
+                not isinstance(ceiling, bool) and math.isfinite(ceiling) and ceiling > 0 and
+                ('operator_gpu_ceiling_seconds' not in amendment or gpu_add > 0) and
+                0 < before['gpu_seconds'] + gpu_add <= ceiling):
             raise ValueError('invalid extension')
         expected = {**before, 'model_usd':before['model_usd'] + model_add,
-                    'wall_seconds':before['wall_seconds'] + wall_add}
+                    'wall_seconds':before['wall_seconds'] + wall_add,
+                    'gpu_seconds':before['gpu_seconds'] + gpu_add}
     else:
         if amendment['model_scope'] not in {'total', 'remaining'}:
             raise ValueError('invalid reduction scope')
@@ -152,6 +191,39 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
             or object_digest(ledger['entries'][:count]) != preserved['model_entries_digest']):
         raise ValueError('amendment does not preserve authorized history')
     return amendment
+
+
+def authorizes_gpu_cap(output: Path, cap_seconds: float) -> bool:
+    """Verify renewal back to the default-cap prefix, not a bare edited ledger cap."""
+    try:
+        output = Path(output).resolve(strict=True)
+        paths = [output/'agent/cost_ledger.json', output/'agent/runtime_spec.json',
+                 output/'task_gpu_budget.json', output/'budget.json']
+        if any(path.is_symlink() for path in paths):
+            return False
+        ledger, spec, gpu, wall = map(read_json, paths)
+        identity = gpu.get('budget_amendment_id')
+        if any(row.get('budget_amendment_id') != identity for row in (ledger,spec,wall)):
+            return False
+        current = _verified_amendment(output, identity, ledger, wall)
+        if (current['after']['gpu_seconds'] != cap_seconds or gpu['cap_seconds'] != cap_seconds
+                or current['after']['model_usd'] != ledger['limit_usd']
+                or current['after']['model_usd'] != spec['total_budget_usd']
+                or current['after']['wall_seconds'] != wall['wall_seconds']):
+            return False
+        seen = set()
+        while current['before']['gpu_seconds'] > 86400:
+            if current['id'] in seen or len(seen) >= 256:
+                return False
+            seen.add(current['id'])
+            previous = _verified_amendment(output, current['previous_amendment_id'], ledger, wall)
+            if (previous['after'] != current['before'] or previous['at'] >= current['at']
+                    or previous['preserved']['model_entry_count'] > current['preserved']['model_entry_count']):
+                return False
+            current = previous
+        return True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        return False
 
 
 def authorizes_transition(output: Path, *, old_limit: float, new_limit: float, run_id: str) -> bool:

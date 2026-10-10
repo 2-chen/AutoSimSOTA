@@ -36,8 +36,12 @@ exists.
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import json
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -52,6 +56,55 @@ GRANULARITIES = ("param", "code", "algo")
 #: high-risk one can leave the checkout in a state another round has to recover from, which is
 #: why risk orders the queue rather than being a label.
 RISKS = ("low", "medium", "high")
+
+
+def validate_main_proposal(candidate: Any, *, repo: Path | None = None) -> None:
+    """Validate proposal syntax without auditing, recording, or running an idea.
+
+    Both decision-format repair and the execution boundary use this contract. A rejected
+    enum or literal patch should be corrected in the same bounded decision window, not
+    rediscovered as an experiment failure after a new research turn.
+    """
+    required = {"label", "granularity", "mechanism", "change", "risk", "crosses",
+                "why", "evidence", "touches"}
+    if not isinstance(candidate, dict) or set(candidate) != required:
+        actual = set(candidate) if isinstance(candidate, dict) else set()
+        raise ValueError(f"idea fields must be exactly {sorted(required)}; "
+                         f"missing={sorted(required-actual)}; "
+                         f"unexpected={sorted(str(key) for key in actual-required)}")
+    label = candidate['label']
+    if not isinstance(label, str) or not label.strip() or len(label.strip()) > 160:
+        raise ValueError("label must be 1–160 characters")
+    if candidate['granularity'] not in GRANULARITIES:
+        raise ValueError("granularity must be param, code, or algo")
+    if candidate['risk'] not in RISKS:
+        raise ValueError("risk must be low, medium, or high")
+    for key in ('mechanism', 'why'):
+        if not isinstance(candidate[key], str) or not candidate[key].strip():
+            raise ValueError(f"{key} must be non-empty text")
+    if not isinstance(candidate['change'], dict):
+        raise ValueError("change must be a JSON object")
+    for key in ('evidence', 'touches'):
+        value = candidate[key]
+        if (not isinstance(value, list) or
+                any(not isinstance(item, str) or not item.strip() for item in value)):
+            raise ValueError(f"{key} must be a list of non-empty strings")
+    if not candidate['evidence']:
+        raise ValueError("evidence must cite at least one observed fact")
+    if candidate['touches'] and candidate['granularity'] != 'code':
+        raise ValueError("only code ideas may name touched files")
+    if candidate['granularity'] == 'code':
+        from .codepatch import check_many, patches_from_change
+        patches = patches_from_change(candidate['change'])
+        if not patches:
+            raise ValueError("code changes need {file, find, replace} or a bounded patches list")
+        if (candidate['touches'] and
+                set(item.strip() for item in candidate['touches']) != {p.file for p in patches}):
+            raise ValueError("touches must exactly match the file paths in change")
+        if repo is not None:
+            problems = check_many(patches, repo=repo)
+            if problems:
+                raise ValueError('; '.join(problems)[:600])
 
 #: What an idea's status can be. `rejected` is set by the audit and never by a run: an idea
 #: that met a red line did not run and did not fail.
@@ -250,6 +303,67 @@ class IdeaLibrary:
     def tried(self) -> list[Idea]:
         return [one for one in self.ideas if one.times_tried]
 
+    def related_trials(self, idea: Idea) -> list[dict[str, Any]]:
+        """Read-only, bounded hints: labels/comments are not new interventions.
+
+        Token equality is not proof of equal runtime behaviour: environment, data,
+        settings and the parent snapshot may differ. Keep admission and scientific
+        decisions with the Agent; never merge identities or copy a score here.
+        """
+        def signature(candidate: Idea) -> Any:
+            if candidate.granularity != 'code':
+                return None
+            changes = candidate.change
+            patches = changes if isinstance(changes, list) else [changes]
+            if not patches or len(patches) > 8:
+                return None
+            result = []
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    return None
+                file = patch.get('file')
+                before, after = patch.get('find'), patch.get('replace')
+                if (not isinstance(file, str) or not isinstance(before, str) or
+                        not isinstance(after, str) or max(len(before), len(after)) > 16000):
+                    return None
+                def tokens(value: str) -> Any:
+                    if not file.endswith('.py'):
+                        return ('literal', value)
+                    collected = []
+                    try:
+                        # A lexical wrapper suppresses artificial indentation errors
+                        # in partial dictionary/function blocks. Retain token columns:
+                        # unlike comments, indentation can change Python behaviour.
+                        for token in tokenize.generate_tokens(
+                                io.StringIO('(\n' + value + '\n)').readline):
+                            if token.type not in (tokenize.COMMENT, tokenize.NL):
+                                collected.append((token.type, token.string, token.start[1]))
+                    except tokenize.TokenError as exc:
+                        # Literal patches often start/end inside a container. Lexical
+                        # tokens remain usable only for unmatched statement delimiters;
+                        # an unfinished string must retain its exact bytes instead.
+                        if str(exc.args[0]) != 'EOF in multi-line statement':
+                            return ('literal', value)
+                    except (IndentationError, SyntaxError):
+                        return ('literal', value)
+                    return ('python_tokens', tuple(collected))
+                result.append((file, tokens(before), tokens(after)))
+            return tuple(sorted(result))
+
+        wanted = signature(idea)
+        if wanted is None:
+            return []
+        return [{'label': other.label, 'status': other.status,
+                 'times_tried': other.times_tried, 'outcome': other.outcome,
+                 'match': 'same_patch_tokens_or_literal',
+                 'guidance': 'Read this prior trial and compare settings, data, environment, '
+                    'parent snapshot and actual loaded artifact before allocating work. '
+                    'Different labels or Python comments alone do not justify retraining. '
+                    'An intentional replication needs an explicit new scientific question; '
+                    'this hint is not an admission verdict or transferable score.'}
+                for other in self.ideas if other.label != idea.label and
+                other.times_tried and signature(other) == wanted][:8]
+
     def summary(self) -> dict[str, Any]:
         by: dict[str, int] = {}
         for one in self.ideas:
@@ -392,82 +506,20 @@ def evidence_stalled(evidence: dict[str, Any], *, attempts: int = 3) -> bool:
 
 # -- the batch that fills the library ------------------------------------------------------
 
-LIBRARY_SYSTEM = """You are deciding what a research run could try, before it tries any of it.
+LIBRARY_SYSTEM = load_prompt("ideator")
 
-You are given a benchmark's declared optimisation space, what its stages are, what is known \
-about how it runs, and a library of methods. Produce a set of candidate changes, not one \
-change -- the run will choose from them and come back to them, and an idea that loses one \
-round is worth having on the list for the next.
 
-Every candidate carries two things that matter more than its description:
-
-`granularity` -- the KIND of move it is:
-  * `param` — a value from the declared space. An epoch count, a sampling mass, a policy family.
-  * `code`  — a change to the benchmark's own source. A path computed one way and read \
-another, a loader that opens a name the data does not use, a guard whose condition is subtly \
-wrong. This is where most real improvements are, and it is not reachable from the declared \
-space.
-  * `algo`  — a change to what the run does rather than to a value or a file: which stages it \
-runs, what data it trains on, in what order.
-
-`selected_stage_parameters` lists settings exposed by the verified execution path. A parameter \
-candidate must change one or more of those names. Do not borrow axes from an unselected trainer, \
-dataset path, or stage merely to fill the list. Suggest only interventions supported by the \
-selected workflow and its evidence; copy axis names verbatim from `declared_space` and never \
-synthesize a `train.` or `training.` prefix from the section name; fewer sound ideas are better \
-than a quota of unusable ones. \
-Code candidates must be non-no-op and causally relevant to an active stage.
-
-The user prioritizes data acquisition when a native autonomous producer is feasible, allowed \
-by the frozen data protocol and connected to the actual training loader. Include an early \
-bounded data candidate when the declared collection axes and verified path support it; cite \
-the producer/consumer evidence and explain the expected coverage or quality improvement. \
-Keep the original-data baseline and account for collection plus retraining cost. If no such \
-candidate is supported, state the missing prerequisite instead of inventing an axis or \
-equating collector success with a policy-score gain.
-
-`stages` says which stages this benchmark has, and `declared_space` says what its settings are \
-called. Both are facts about the thing you are looking at, not conventions: a stage marked \
-`"available": false` has no command to run, and an axis belongs to one section and no other.
-
-`risk` -- `low`, `medium` or `high`. Low is a lost round if it fails. High can leave the \
-checkout in a state later rounds have to recover from. Risk orders the queue; it is not a \
-reason to leave something out.
-
-For a `code` candidate, `change` is {"file": "<repository-relative path>", "find": "<the \
-exact text to replace>", "replace": "<what to put there>"}; a multi-file change uses \
-{"patches": [<one such object per file>]}. At most eight files are allowed, and all changes \
-must pass together or none are applied. Each `file` must be a path that is in \
-`files_in_the_checkout` -- the checkout's own files are listed there. `find` must occur \
-exactly once in that file, and the file must still parse afterwards. You have not been shown \
-the file's contents, so a `find` you cannot quote exactly will be refused -- it is then \
-corrected against the file itself, so name the file and say what the change is for. For a \
-`param` candidate, `change` is the settings as a map. For an `algo` candidate, `change` is a \
-map from section name to the axes to run under, e.g. {"<section>": {"<axis>": <value>}} -- \
-where the sections and the axes are the ones `declared_space` has, which are not always the \
-same two a benchmark like this usually has.
-
-**Every candidate says which red line it would cross.** The lines are listed in \
-`what_may_not_change`, and they are what must not change whatever else does. `crosses` is the \
-id of the one this change would cross, or `"none"` for a change that leaves all of them alone.
-
-Answer it against **what the change actually does**, not against what the idea is for. A \
-change that leaves the metric alone says `"none"` even if it is about measurement; a change \
-that makes an evaluation see ten episodes instead of a hundred crosses R1 however reasonable \
-its purpose. The audit reads this answer and refuses the idea on it, so a wrong `"none"` is \
-not a shortcut -- it is a false statement about the run, in a record a reader has to be able \
-to trust.
-
-`touches` means files the action will actually write, not source files cited as evidence. \
-For a `param` or `algo` value change that only passes settings, use an empty list. A `code` \
-change lists every file it will patch.
-
-Return one JSON object: {"ideas": [{"label": "<short and unique>", \
-"granularity": "<param|code|algo>", "mechanism": "<what it changes, one line>", \
-"change": {...}, "risk": "<low|medium|high>", "crosses": "<none|R1|R2|R3|R4|R5|R6>", \
-"why": "<the reasoning>", "evidence": ["<what in the material supports it>"], \
-"touches": ["<files it would change>"]}], \
-"reasoning": "<how you chose these>"}"""
+def _proposal_text_list(value: Any, *, field: str, limit: int,
+                        item_limit: int | None = None) -> list[str]:
+    """Preserve a scalar citation as one item, never as its individual characters."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or any(not isinstance(one, str) for one in value):
+        raise ValueError(f'{field} must be text or a list of strings, not an object or numeric value')
+    return [one[:item_limit] if item_limit is not None else one
+            for one in value[:limit] if one.strip()]
 
 
 def build(client: Any, material: dict[str, Any], *, attempts: int = 2,
@@ -478,12 +530,33 @@ def build(client: Any, material: dict[str, Any], *, attempts: int = 2,
     why, and the alternative -- losing the run to a parse failure in the step that was supposed
     to fill the library -- is the failure mode this whole module's neighbours keep finding.
     """
-    payload = json.dumps(material, ensure_ascii=False, default=str)[:60000]
+    import math
+    import time
+    window = getattr(client, 'timeout', 300)
+    if not isinstance(window, (int, float)) or isinstance(window, bool) or not math.isfinite(window) or window <= 0:
+        window = 300
+    started = time.monotonic()
+    # Material is already a bounded projection. Never cut JSON halfway through a
+    # source string; the client enforces its prompt and total resource limits.
+    payload = json.dumps(material, ensure_ascii=False, default=str)
     for attempt in range(attempts):
         try:
+            remaining = window - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError('original idea generation window exhausted')
             content, _ = client.chat_with_metadata(
-                LIBRARY_SYSTEM, payload, max_tokens=6000, timeout=300, thinking="disabled")
-        except Exception:                                            # noqa: BLE001
+                LIBRARY_SYSTEM, payload, max_tokens=6000, timeout=remaining,
+                thinking="disabled", resume_session=False)
+        except Exception as exc:                                    # noqa: BLE001
+            if on_event:
+                fault = getattr(exc, 'runtime_failure', {}) or {}
+                on_event('library', [{'status': 'idea_generation_failed',
+                    'error': redact(f'{type(exc).__name__}: {exc}')[:600],
+                    'runtime_status': getattr(exc, 'status', 'unavailable'),
+                    'failure_category': getattr(exc, 'failure_category', 'provider_or_tool_error'),
+                    'evidence_id': fault.get('evidence_id'), 'evidence_ref': fault.get('evidence_ref'),
+                    'process_ref': getattr(exc, 'process_ref', None),
+                    'timeout_seconds': window}])
             return []
         try:
             from .execution_derive import _object
@@ -505,12 +578,13 @@ def build(client: Any, material: dict[str, Any], *, attempts: int = 2,
                     if str(row.get("risk") or "").lower() in RISKS else "medium",
                     crosses=str(row.get("crosses") or "").strip(),
                     why=str(row.get("why") or "")[:2000],
-                    evidence=[str(one)[:300] for one in (row.get("evidence") or [])][:6],
+                    evidence=_proposal_text_list(row.get('evidence'), field='evidence',
+                                                 limit=6, item_limit=300),
                     # Param/algo actions pass validated settings and never patch a file.
                     # The model may cite the file defining an axis as `touches`; that is
                     # evidence, not a write target. Explicit `change.file`/patches still
                     # go through the red-line audit.
-                    touches=([str(one) for one in (row.get("touches") or [])][:12]
+                    touches=(_proposal_text_list(row.get('touches'), field='touches', limit=12)
                              if granularity == "code" else [])))
             if out:
                 return out
@@ -519,34 +593,14 @@ def build(client: Any, material: dict[str, Any], *, attempts: int = 2,
             if on_event:
                 on_event("library", [{"status": "the library draft was refused",
                                       "error": redact(f"{type(exc).__name__}: {exc}")[:400]}])
-            payload = payload + "\n\n### YOUR PREVIOUS ANSWER WAS REFUSED\n" + json.dumps(
+            payload = json.dumps({**material, 'format_correction':
                 {"error": redact(str(exc))[:300],
-                 "instruction": "Return one JSON object with a non-empty `ideas` list."},
-                ensure_ascii=False)
+                 "instruction": "Return one JSON object with a non-empty `ideas` list."}},
+                ensure_ascii=False, default=str)
     return []
 
 
-LEAP_SYSTEM = """A research run has made the same KIND of change several times and the stage \
-still does not run. Another change of that kind is the round that was already tried.
-
-You are given the run's situation, the ideas it has already tried and what happened, and its \
-library. **Produce one idea of a kind it has not been making** -- synthetically, from what the \
-material shows, and not by selecting from the library.
-
-Say why this kind of move is the one the evidence asks for, and what it would change.
-
-`crosses` is the id of the red line this change would cross, or `"none"`. The lines are in \
-`what_may_not_change`, and the audit refuses an idea on this answer -- so answer it against \
-what the change does, not against what it is for.
-
-`touches` lists files this action will write. A parameter or algorithm settings change does \
-not write the source file that defines the setting; use an empty list unless a file is patched.
-
-Return one JSON object: {"label": "<short and unique>", "granularity": "<param|code|algo>", \
-"mechanism": "<what it changes>", "change": {...}, "risk": "<low|medium|high>", \
-"crosses": "<none|R1|R2|R3|R4|R5|R6>", \
-"why": "<why this kind, from the evidence>", "evidence": ["<what supports it>"], \
-"touches": ["<files it would change>"]}"""
+LEAP_SYSTEM = load_prompt("ideator-leap")
 
 
 def leap(client: Any, material: dict[str, Any], *, avoid: str = "",
@@ -579,8 +633,9 @@ def leap(client: Any, material: dict[str, Any], *, avoid: str = "",
                         if str(row.get("risk") or "").lower() in RISKS else "medium",
                         crosses=str(row.get("crosses") or "").strip(),
                         why=str(row.get("why") or "")[:2000],
-                        evidence=[str(one)[:300] for one in (row.get("evidence") or [])][:6],
-                        touches=([str(one) for one in (row.get("touches") or [])][:12]
+                        evidence=_proposal_text_list(row.get('evidence'), field='evidence',
+                                                     limit=6, item_limit=300),
+                        touches=(_proposal_text_list(row.get('touches'), field='touches', limit=12)
                                  if granularity == "code" else []))
         except Exception as exc:                                     # noqa: BLE001
             if on_event:
@@ -599,29 +654,7 @@ def leap(client: Any, material: dict[str, Any], *, avoid: str = "",
 #: middle of the file is what gets dropped first.
 FILE_SHOWN = 24000
 
-REPAIR_SYSTEM = """A change was refused before anything ran. Nothing was applied and nothing \
-was written.
-
-You are given the change, why it was refused, and whatever you need to correct it: the file it \
-names, when it names one, and the sections and axes this benchmark's settings live in, always.
-
-There are two ways a change is refused, and the message says which.
-
-**It does not fit this benchmark's settings.** A `param` or `algo` change names axes, and the \
-axes belong to sections. The refusal names the section and lists the axes it does have. Read \
-the list you were given rather than the names such a benchmark usually uses: an axis belongs \
-to exactly one section, and the sections are not always the same two.
-
-**It does not fit the file it names.** `find` must be text that is in the file **exactly as \
-the file spells it** -- copy it from what you were shown, including indentation -- and it must \
-occur exactly once.
-
-Correct it. Do not change what the idea is for: if the file does not contain what the idea \
-assumed, or the benchmark has no axis for it, that is a fact about the idea and `give_up` is \
-the honest answer, not a reason to return something you have not checked.
-
-Return one JSON object: {"change": <the corrected change, in the same shape>, \
-"why": "<what you corrected>", "give_up": "<when it cannot be done>"}"""
+REPAIR_SYSTEM = load_prompt("idea-repair")
 
 
 def _excerpt(path: Path, *, limit: int = FILE_SHOWN) -> str:

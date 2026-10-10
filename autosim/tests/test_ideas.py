@@ -214,6 +214,46 @@ def test_a_batch_that_yields_nothing_is_a_library_that_says_so(tmp_path):
     assert ideas.leap(Broken(), {}, avoid="param") is None
 
 
+def test_library_provider_failure_keeps_sealed_handoff_without_retry():
+    from autosim.research.agent_client import AgentRuntimeClientError
+    class Broken:
+        timeout = 900
+        calls = 0
+        def chat_with_metadata(self, system, user, **options):
+            self.calls += 1
+            assert 899 < options['timeout'] <= 900
+            assert options['resume_session'] is False
+            raise AgentRuntimeClientError('local window elapsed', status='timed_out',
+                failure_category='agent_timeout', process_ref='agent/processes/receipt.json',
+                runtime_failure={'evidence_id':'a'*32, 'evidence_ref':'evidence/'+'a'*32+'.json'})
+    client=Broken();events=[]
+    assert ideas.build(client,{},on_event=lambda name,rows:events.extend(rows)) == []
+    assert client.calls == 1
+    assert events[0]['status']=='idea_generation_failed'
+    assert events[0]['runtime_status']=='timed_out'
+    assert events[0]['evidence_id']=='a'*32
+    assert events[0]['timeout_seconds']==900
+
+
+def test_library_material_is_valid_json_and_corrections_share_original_window(monkeypatch):
+    import time
+    clock=[100.0]
+    monkeypatch.setattr(time,'monotonic',lambda:clock[0])
+    class Writer:
+        timeout=900
+        windows=[]
+        def chat_with_metadata(self, system, user, **options):
+            material=json.loads(user)
+            assert material['source'].endswith('END') and len(material['source'])>60000
+            self.windows.append(options['timeout'])
+            clock[0]+=850
+            return 'not json', {}
+    client=Writer();events=[]
+    assert ideas.build(client,{'source':'source'*10001+'END'},
+                       on_event=lambda name,rows:events.extend(rows))==[]
+    assert client.windows==[900,50]
+
+
 def test_the_batch_is_typed_and_the_typing_is_not_guessed():
     """A list that is all `param` is the list the loop already had, and it is why the loop
     could only ever tune. The prompt now prefers a smaller applicable set over a quota; what
@@ -292,3 +332,84 @@ def test_the_library_reads_as_a_document_with_the_ideas_that_were_never_chosen(t
     rendered = ideas.render(library)
     assert "never reached" in rendered and "未采用" in rendered
     assert "共 2 条" in rendered and "code 1" in rendered
+
+
+@pytest.mark.parametrize('mode', ['build', 'leap'])
+def test_scalar_citation_and_touched_path_are_not_split_into_characters(mode):
+    candidate = {'label':'native feature', 'granularity':'code',
+                 'mechanism':'Enable observed feature',
+                 'change':{'file':'train.py', 'find':'N = 1', 'replace':'N = 2'},
+                 'evidence':'train.py:10 literal N = 1', 'touches':'train.py'}
+    response = {'ideas':[candidate]} if mode == 'build' else candidate
+    client = _Client([json.dumps(response)])
+    result = ideas.build(client, {})[0] if mode == 'build' else ideas.leap(client, {}, avoid='param')
+    assert result.evidence == ['train.py:10 literal N = 1']
+    assert result.touches == ['train.py']
+
+
+def test_object_citations_are_refused_instead_of_turning_keys_into_evidence():
+    candidate = {'label':'feature', 'granularity':'code',
+                 'change':{'file':'train.py', 'find':'N = 1', 'replace':'N = 2'},
+                 'evidence':{'config':'unverified'}, 'touches':['train.py']}
+    events = []
+    result = ideas.build(_Client([json.dumps({'ideas':[candidate]})]), {}, attempts=1,
+                         on_event=lambda kind, rows: events.extend(rows))
+    assert result == []
+    assert 'evidence must be text or a list' in events[0]['error']
+
+
+@pytest.mark.parametrize('before', [
+    '    options = {\n        "size": 3,\n    }',
+    '        "size": 3,\n    }',  # real patches can be a partial dictionary
+])
+def test_related_trials_are_advisory_and_ignore_python_comment_aliases(tmp_path, before):
+    library = _library(tmp_path)
+    original = ideas.Idea(label='observed', granularity='code', change={
+        'file':'train.py', 'find':before, 'replace':before.replace(
+            '"size": 3,', '"size": 3,\n        # first explanation\n        "mask": True,')})
+    alias = ideas.Idea(label='new name', granularity='code', status=ideas.CLEARED,
+        change={**original.change, 'replace':original.change['replace'].replace(
+            '# first explanation', '# different prose')})
+    library.add(original)
+    library.add(alias)
+    library.note('observed', worked=False, outcome='0.22 against retained 0.28')
+    saved = library.path.read_bytes()
+    hints = library.related_trials(alias)
+    assert len(hints) == 1 and hints[0]['label'] == 'observed'
+    assert hints[0]['outcome'] == '0.22 against retained 0.28'
+    assert 'not an admission verdict' in hints[0]['guidance']
+    assert alias.status == ideas.CLEARED and alias.times_tried == 0
+    assert library.path.read_bytes() == saved
+    assert library.related_trials(original) == []  # an untried alias has no outcome
+
+
+@pytest.mark.parametrize('file,old,new', [
+    ('train.py', 'value = "#old"', 'value = "#new"'),
+    ('train.py', 'value = True', 'value = False'),
+    ('train.py', 'if enabled:\n    work()', 'if enabled:\n    other()'),
+    ('train.py', 'if enabled:\n    work()\n    other()',
+                 'if enabled:\n    work()\nother()'),
+    ('train.sh', 'work #old', 'work #new'),
+])
+def test_related_trials_preserve_literal_strings_code_and_nonpython_comments(
+        tmp_path, file, old, new):
+    library = _library(tmp_path)
+    first = ideas.Idea(label='tried', granularity='code', change={
+        'file':file, 'find':'old()', 'replace':old})
+    other = ideas.Idea(label='other', granularity='code', change={
+        'file':file, 'find':'old()', 'replace':new})
+    library.add(first)
+    library.note(first.label, worked=True, outcome='observed result')
+    assert library.related_trials(other) == []
+
+
+def test_related_trials_bounded_and_never_match_another_file(tmp_path):
+    library = _library(tmp_path)
+    change = {'file':'train.py', 'find':'N=1', 'replace':'N=2'}
+    for index in range(12):
+        library.add(ideas.Idea(label=f'trial-{index}', granularity='code', change=change))
+        library.note(f'trial-{index}', worked=False)
+    candidate = ideas.Idea(label='candidate', granularity='code', change=change)
+    assert len(library.related_trials(candidate)) == 8
+    candidate.change = {**change, 'file':'different.py'}
+    assert library.related_trials(candidate) == []

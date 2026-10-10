@@ -19,6 +19,8 @@ that is the only ceiling.
 
 from __future__ import annotations
 
+from .prompt_library import load_prompt
+
 import json
 from typing import Any, Sequence
 
@@ -32,16 +34,7 @@ _BASE_FIELDS = ("decision", "proposal_id", "hypothesis", "expected_validation")
 #: benchmark keeps whatever name its recorded proposals already use.
 EVIDENCE_FIELD = "evidence_id"
 
-SYSTEM = (
-    "You are the research decision module for a simulator manipulation benchmark. Return "
-    "exactly one JSON object matching the supplied skeleton. The skeleton's values are a "
-    "workable starting point, not the whole space: each field is described with the values "
-    "or range this benchmark implements, and you may choose anywhere inside that. You may "
-    "not change observations, the success judge, evaluation seeds, the evaluator, or the "
-    "task's own definition -- those are what makes two rounds comparable. Treat evidence "
-    "with stated limitations as evidence, not as proof of cause. Choose decision=stop when "
-    "no further experiment is justified by the evidence you have; say why in the hypothesis."
-)
+SYSTEM = load_prompt("parameter-decision")
 
 
 def _axis_line(name: str, axis: Axis) -> str:

@@ -1,9 +1,6 @@
 ---
 name: using-the-method-library
 description: 技能库中文导航；按当前问题选择方法，区分文献、历史测量与方法建议，并按需读取正文和参考资料。
-scope: general
-confidence: orientation — not an experimental result
-evidence: 2026-09-29 library audit and primary-source survey; no new simulator run.
 ---
 
 # 按问题使用技能库
@@ -14,7 +11,9 @@ evidence: 2026-09-29 library audit and primary-source survey; no new simulator r
 
 技能提供可反驳的方法，不授予执行权限。可以说明为何不采用某条建议，但不能违背运行器的总预算、代码隔离、资源权限、正式评测协议与证据真实性。已有接口不能表达的方法，应明确能力缺口，不杜撰操作。
 
-读取 description 判断触发场景；读取 confidence 区分方法建议、借鉴证据和本地测量；读取 evidence 查来源/版本/局限；再用 method 设计当前实验。没有数字不代表无价值，有数字也不代表可泛化。新条目的细致证据写在正文，未设置 confidence 的元数据会显示 unspecified，不等于高置信度。
+读取 description 判断触发场景；读取 confidence 区分方法建议、借鉴证据和本地测量；读取 evidence 查来源/版本/局限；再用 method 设计当前实验。没有数字不代表无价值，有数字也不代表可泛化。内置技能的 name/description 放在 frontmatter；scope、confidence、evidence、版本和运行适用合同统一维护在 manifest，由加载器合并。外部/蒸馏技能则在自身 header 中携带完整合同。未设置 confidence 时显示 unspecified，不等于高置信度。
+
+全局 prompt 定义角色任务和输出形式，执行器合同定义操作与权限，技能提供方法建议；Idea 库保存具体仓库的候选与结果，运行记忆保存当前计划、问题和证据。不要把失败日志或仓库专用参数堆进全局 prompt；先判断是接口 bug、缺失资源，还是可复用且有适用条件的方法。
 
 benchmark scope 限制历史材料适用范围；general 只表示方法可跨仓库考虑，不表示其中结论普遍成立。官方文档也要与本地 revision 核对。
 
@@ -23,6 +22,7 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 - [data-first-score-optimization](../data-first-score-optimization/SKILL.md)：固定协议下先跑基线，再用小规模数据闭环提高指标；不把全面调研作为启动前提。
 - [choosing-simulation-improvements](../choosing-simulation-improvements/SKILL.md)：按失败、资源和协议选择下一假设；先区分修复、复现、本地增分与 SOTA。
 - [spending-a-budget-across-ideas](../spending-a-budget-across-ideas/SKILL.md)：低保真筛选、长期作业与局部预算分配；先验证代理指标。
+- [accelerating-policy-experiments](../accelerating-policy-experiments/SKILL.md)：复用已有产物、实测关键路径、缓存/并行/精度小试与回本；不降低正式计分要求。
 - [make-your-prior-earn-it](../make-your-prior-earn-it/SKILL.md)：何时需要随机/简单对照来检验 LLM 选法的价值。
 
 ## 2. 接入仓库与修复
@@ -35,6 +35,7 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 - [making-a-stage-run](../making-a-stage-run/SKILL.md)：参数/环境/路径/消费者故障分类和原操作复验。
 - [the-declaration-is-a-claim](../the-declaration-is-a-claim/SKILL.md)：检验声明的配置值、能力和实际可运行性。
 - [read-your-failures](../read-your-failures/SKILL.md)：稳定错误证据、诊断、有限重试与 Fix 交接。
+- [managing-research-artifacts](../managing-research-artifacts/SKILL.md)：保存/恢复源码、空间估算、原生存储控制与受授权的安全回收。
 
 ## 3. 数据供给与价值
 
@@ -43,6 +44,8 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 - [where-successes-come-from](../where-successes-come-from/SKILL.md)：谁提供动作，是否能自主产生训练轨迹？
 - [connecting-native-data-collection](../connecting-native-data-collection/SKILL.md)：原生采集→转换→真实 loader 如何接通？
 - [targeting-simulation-data](../targeting-simulation-data/SKILL.md)：从开发失败选择训练场景及正确动作来源，再核验成功、字段和消费；零成功不能自举。
+- [curating-simulation-datasets](../curating-simulation-datasets/SKILL.md)：采什么/多少、可逆清洗、来源混合、真实曝光与数据价值方法的成本。
+- [preserving-research-data](../preserving-research-data/SKILL.md)：raw/派生版本/缓存区分、来源血缘、复用条件、备份和数据保护；不授权删除或上传。
 - [budget-attempts-not-episodes](../budget-attempts-not-episodes/SKILL.md)：失败重试和接受目标实际花多少资源？
 - [generator-success-is-not-data-value](../generator-success-is-not-data-value/SKILL.md)：采集产出率与下游策略收益有何区别？
 - [diversity-before-volume](../diversity-before-volume/SKILL.md)：新增覆盖还是重复已有场景？
@@ -74,7 +77,9 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 
 [robosynchallenge-measurements](../robosynchallenge-measurements/SKILL.md) 仅适用于匹配范围的历史回顾；不是当前代码/资源仍具备相同能力的证明。新仓库不能使用其数值作先验阈值。
 
-需要论文和优先级依据时，读取 [方法调研](../choosing-simulation-improvements/references/literature-review.md)；需要了解删改依据时，读取 [技能审计](../choosing-simulation-improvements/references/library-audit.md)。参考文档不单独注册为技能，不自动注入上下文。
+需要论文和优先级依据时，读取 [方法调研](../choosing-simulation-improvements/references/literature-review.md) 或 [提分与提效增量调研](../choosing-simulation-improvements/references/score-efficiency-20261006.md)；需要了解删改依据时，读取 [技能审计](../choosing-simulation-improvements/references/library-audit.md)。参考文档不单独注册为技能，不自动注入上下文。
+
+涉及采集量、数据质量/混合、保管/版本/分片/复用的深层设计时，按需读 [数据中心研究与资产管理调研](../curating-simulation-datasets/references/data-centric-research-20261006.md)。它明确区别已有身份/消费/保护能力与尚未实现的数据资产基础设施，不是另一个必读大纲。
 
 当前显式选读接口返回技能正文，不递归读取这些链接。正文包含可独立使用的方法；参考文件只能在运行环境确实提供相应只读访问时打开，不能假定宿主技能路径已挂载到目标仓库，也不能虚构已读文献。无访问条件时使用正文的来源链接按已有权限调查，或说明未读细节。
 

@@ -3,10 +3,12 @@ from pathlib import Path
 from .common import read_json
 
 
-def view(output: Path) -> dict:
+def view(output: Path, *, lifecycle: dict | None = None) -> dict:
+    closure = (lifecycle or {}).get('metrics') or {}
+    closure_view = {'experiment_closure':closure} if closure else {}
     path=output/'scheduling_metrics.json'
     if not path.is_file() or path.is_symlink() or path.stat().st_size>4*1024**2:
-        return {'status':'not_recorded'}
+        return {'status':'not_recorded', **closure_view}
     try:
         doc=read_json(path)
         aggregates=doc.get('aggregates') or {}
@@ -16,7 +18,7 @@ def view(output: Path) -> dict:
         recent=doc.get('events') or []
         failures=sum(row.get('kind')=='controller_action' and row.get('status') in
             {'not attempted','raised','no runnable command'} for row in recent)
-        return {'status':'observed','totals':selected,'recent_event_count':len(recent),
+        return {'status':'observed', **closure_view,'totals':selected,'recent_event_count':len(recent),
                 'recent_rejected_or_failed_actions':failures,'source_ref':'scheduling_metrics.json',
                 'limitation':'durations may overlap; not wall/GPU/paid cost, '
                     'and rejected actions are not all native failures or duplicate work',

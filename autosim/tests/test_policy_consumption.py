@@ -103,3 +103,14 @@ def test_native_metric_lineage_binds_policy_episode_set_and_value(tmp_path):
                                  episode_ids=["one"], value=0.5)["status"] == "mismatch"
     assert verify_metric_lineage(log, policy_sha256=identity,
                                  episode_ids=["one", "two"], value=0.7)["status"] == "mismatch"
+def test_required_identity_schema_rejects_absent_and_partial_logging():
+    from autosim.research.policy_consumption import audit_identity_schema
+    absent = audit_identity_schema('native evaluation completed', required=True)
+    assert absent['status'] == 'incompatible'
+    assert len(absent['issues']) == 3
+    partial = audit_identity_schema('AUTOSIM_POLICY_LOADED {"path":"/file", "content_sha256":"'
+        + 'a'*64 + '"}', policy_kind='file', required=True)
+    assert partial['status'] == 'incompatible'
+    assert any('AUTOSIM_ROLLOUT_COMPLETED is missing' in value for value in partial['issues'])
+    assert any('AUTOSIM_METRIC_REPORTED is missing' in value for value in partial['issues'])
+    assert audit_identity_schema('native evaluation completed')['status'] == 'unavailable'

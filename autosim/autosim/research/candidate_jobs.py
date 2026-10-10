@@ -51,7 +51,7 @@ def allocation(research, idea_label: str, training_settings: dict | None = None)
 
 
 def adopt(research, job_id: str, idea_label: str) -> dict:
-    from .native_jobs import status, source_identity, _path
+    from .native_jobs import status, source_matches, _path
     job = status(research.output, job_id)
     request = read_json(_path(research.output, job_id)/'request.json')
     expected = allocation(research, idea_label,
@@ -59,8 +59,7 @@ def adopt(research, job_id: str, idea_label: str) -> dict:
     if (job.get('status') != 'completed' or request.get('candidate_binding') != expected
             or request.get('repo') != str(research.repo) or request.get('run_id') != research.run_id
             or request.get('stage') != 'train' or request.get('settings') != expected['settings']
-            or not request.get('source_identity')
-            or request['source_identity'] != source_identity(research.output, research.repo)):
+            or not source_matches(research.output, research.repo, request)):
         raise ValueError('completed job does not belong to this exact candidate/source/protocol/round')
     result = (job.get('result') or {}).get('stage_result') or {}
     attempt = result.get('attempt_id') or ''

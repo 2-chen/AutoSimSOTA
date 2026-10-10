@@ -6,6 +6,22 @@ from autosim.research.common import atomic_json
 from autosim.research.supervisor import build_audit_packet, validate_response
 
 
+def test_data_campaign_validity_is_independent_of_generic_measurement_validity():
+    packet = {'measurements': [{'receipt_verification': {'status': 'consistent'}}],
+              'data_campaigns': [{'id': 'data', 'observations': [{'metric_value': .4}]}]}
+    refs = ['measurement:round_1', 'data_campaign:data']
+    answer = {'verdict': 'real', 'summary': 'Score is real; comparison still needs audit.',
+              'findings': [], 'evidence_refs': ['measurement:round_1']}
+    review = validate_response(answer, allowed_refs=refs, packet=packet)
+    assert review['verdict'] == 'real'
+    assert review['data_campaign_reviews'][0]['verdict'] == 'uncertain'
+    answer['data_campaign_reviews'] = [{'id': 'data', 'verdict': 'real',
+        'why': 'Fixture independently checked.', 'evidence_refs': refs}]
+    assert validate_response(answer, allowed_refs=refs, packet=packet)['data_campaign_reviews'][0]['verdict'] == 'real'
+    packet['data_campaigns'][0]['observations'] = []
+    assert validate_response(answer, allowed_refs=refs, packet=packet)['data_campaign_reviews'][0]['verdict'] == 'uncertain'
+
+
 def test_audit_packet_omits_confirmation_values_and_uses_logical_refs(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -1,9 +1,6 @@
 ---
 name: more-of-the-same-saturates
 description: 增加同分布数据收益趋缓时，区分数据饱和、欠训练、采样稀释与评测噪声，再决定是否扩采。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 判断是否真的出现数据收益递减

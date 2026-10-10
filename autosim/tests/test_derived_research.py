@@ -820,6 +820,29 @@ def test_native_producer_gets_absent_output_leaf_on_every_attempt(tmp_path, monk
         assert log.is_file() and not log.resolve().is_relative_to(root.resolve())
 
 
+def test_explicit_staging_prepares_each_native_output_not_checkout(tmp_path, monkeypatch):
+    repo = tmp_path / '中文仓库 with spaces'
+    repo.mkdir()
+    monkeypatch.setenv('AUTOSIM_STAGE_OUTPUT', '/stale-ambient-value')
+    real = research(repo)
+    code = ("import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+            "assert p.is_dir(); (p/'model.pth').write_text('checkpoint')")
+    real.backend.sources['train'] = (
+        "def stage_argv_train(i):\n"
+        f"    return [i['python'], '-c', {code!r}, i['output']]\n")
+    real.backend.stages['train']['staging'] = ['mkdir -p "$AUTOSIM_STAGE_OUTPUT"']
+    real.backend.stages['train']['artifact'] = 'model.pth'
+    real.backend = DeclarativeBackend(repo=repo, answer=real.backend.answer,
+        sources=real.backend.sources, parameters={})
+    first = real.run_stage('train', settings={})
+    second = real.run_stage('train', settings={})
+    assert first['status'] == second['status'] == 'completed'
+    assert first['output_directory'] != second['output_directory']
+    for record in (first, second):
+        assert (Path(record['output_directory'])/'model.pth').read_text() == 'checkpoint'
+    assert not (repo/'model.pth').exists()
+
+
 @pytest.mark.parametrize('fault', ['', 'duplicate', 'changed_specimen', 'changed_producer', 'outside_producer', 'different_name', 'stale', 'symlink', 'changed_metric', 'exact_ambiguous'])
 def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_producer(tmp_path, fault):
     from autosim.research.common import atomic_json, digest
@@ -972,7 +995,7 @@ def test_parent_reviews_detached_progress_without_rewriting_native_receipt(tmp_p
         assert real.client.calls == 1
 
 
-@pytest.mark.parametrize('fault', ['', 'unbound', 'changed_proof'])
+@pytest.mark.parametrize('fault', ['', 'unbound', 'changed_proof', 'runtime_only'])
 def test_quiet_policy_selection_accepts_only_verified_metadata_association(tmp_path, monkeypatch, fault):
     real=ambiguous_policy_research(tmp_path)
     record=real.run_stage('train',settings={})
@@ -980,7 +1003,10 @@ def test_quiet_policy_selection_accepts_only_verified_metadata_association(tmp_p
     count=[0]
     def proof(*args):
         count[0]+=1
-        return ({'candidate_2':{'completed_work':17}} if fault!='unbound' else {}, [],
+        runtime='{"completed_work": 17}'
+        return ({'candidate_2':{'completed_work':17}} if fault!='unbound' else {},
+                [{'path':'runtime_completed_work','sha256':'runtime-proof',
+                  'text':runtime,'excerpt':runtime}],
                 'changed' if fault=='changed_proof' and count[0]>1 else 'proof')
     monkeypatch.setattr(real,'_policy_work_evidence',proof)
     original=real.client.chat_with_metadata
@@ -988,6 +1014,9 @@ def test_quiet_policy_selection_accepts_only_verified_metadata_association(tmp_p
         content,metadata=original(system,user,**kwargs)
         answer=json.loads(content);answer['selection_basis']='verified_completed_work_container'
         answer['candidate_trace']=''
+        if fault=='runtime_only':
+            answer['evidence']=[{'source_path':'runtime_completed_work',
+                                'quote':'"completed_work": 17','why':'actual counter'}]
         return json.dumps(answer),metadata
     real.client.chat_with_metadata=choose
     selected=real._select_policy_artifact(record)
@@ -995,7 +1024,8 @@ def test_quiet_policy_selection_accepts_only_verified_metadata_association(tmp_p
 
 
 @pytest.mark.parametrize('fault', ['', 'counter', 'source'])
-def test_policy_work_association_is_native_counter_container_not_filename(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize('nested', [False, True])
+def test_policy_work_association_is_native_counter_container_not_filename(tmp_path, monkeypatch, fault, nested):
     from autosim.research import training_progress_audit as pa
     from autosim.research.common import digest
     real=research(tmp_path);real.require_training_progress=True
@@ -1010,19 +1040,26 @@ def test_policy_work_association_is_native_counter_container_not_filename(tmp_pa
     real.backend.sources['train']='def stage_argv_train(i):\n'+f"    return [i['python'],'-c',{code!r},i['output']]\n"
     real.backend=DeclarativeBackend(repo=tmp_path,answer=real.backend.answer,sources=real.backend.sources,parameters={})
     record=real.run_stage('train',settings={})
+    counter_ref = 'areaA/proof/work.json'
+    if nested:
+        output = Path(record['output_directory'])
+        target = output/'areaA/proof/deeper/state/work.json'
+        target.parent.mkdir(parents=True)
+        (output/counter_ref).rename(target)
+        counter_ref = target.relative_to(output).as_posix()
     producer=tmp_path/'producer.py';producer.write_text('optimizer.step()\nstep += 1\nsave_checkpoint(model, step)\n')
     row={'id':'source-0','path':producer,'sha256':digest(producer),'content':producer.read_text(),'excerpt':producer.read_text()}
     monkeypatch.setattr(pa,'sources',lambda *args:[row])
     class Client:
         supports_native_progress_audit=True
         def chat_with_metadata(self,*args,**kwargs):
-            return json.dumps({'verdict':'verified','counter':{'path':'areaA/proof/work.json',
+            return json.dumps({'verdict':'verified','counter':{'path':counter_ref,
                 'field':['done','updates'],'value':17},'source_evidence':[{
                 'source_id':'source-0','quote':producer.read_text()}]}),{}
     real.client=Client()
     reviewed=real._verified_training_receipt(record['attempt_id'],{},audit_progress=True)
     assert reviewed is not None
-    if fault=='counter':(Path(record['output_directory'])/'areaA/proof/work.json').write_text('{"done":{"updates":18}}')
+    if fault=='counter':(Path(record['output_directory'])/counter_ref).write_text('{"done":{"updates":18}}')
     if fault=='source':producer.write_text('different producer')
     bindings,sources,proof=real._policy_work_evidence(reviewed,{
         'candidate_1':'areaA/policy_bundle','candidate_2':'areaB/policy_bundle',
@@ -1035,6 +1072,15 @@ def test_policy_work_association_is_native_counter_container_not_filename(tmp_pa
         assert bindings['candidate_1']['equivalent_candidate_ids']==['candidate_1','candidate_3']
         assert bindings['candidate_3']['equivalent_candidate_ids']==['candidate_1','candidate_3']
         assert sources[0]['path']=='native_source_source-0' and proof
+        runtime = next(row for row in sources if row['path']=='runtime_completed_work')
+        facts = json.loads(runtime['text'])
+        assert facts['completed_work']==17
+        assert facts['counter_field']==['done','updates']
+        assert facts['bound_candidate_ids']==['candidate_1','candidate_3']
+        assert facts['document_sha256']==digest(Path(record['output_directory'])/counter_ref)
+        assert facts['not_a_score_or_best_checkpoint_claim']
+        assert isinstance(facts['receipt_invocation_argv'], list)
+        assert counter_ref not in runtime['text']
 
 
 @pytest.mark.parametrize('fault', ['', 'changed_inputs', 'later_score', 'settings'])

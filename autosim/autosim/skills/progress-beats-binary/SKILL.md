@@ -1,9 +1,6 @@
 ---
 name: progress-beats-binary
 description: 正式成功率过于稀疏时，使用合法的分阶段进度辅助诊断和筛选；不能保证更少样本，也不能替换官方指标。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 用进度解释失败，保留正式指标

@@ -1,3 +1,7 @@
+> 历史模板（停用）：当前 research 路径没有调用方，新 prompt 加载器不接受此模板名。
+> 下文保留旧方案记录；接口、idea 配额、参数范围和手工评分流程不适用于当前全局合同。
+> 以 scheduler / repository-scout / ideator 模板、当前执行器 schema 和冻结协议为准。
+
 # Robot Task Onboarding Mission
 
 You are an AI robotics engineer. Your mission: explore the local robotics repository at `{REPO_PATH}`, discover the **{TASK_NAME}** manipulation task, understand its strategy, and extract all relevant information needed for optimization.

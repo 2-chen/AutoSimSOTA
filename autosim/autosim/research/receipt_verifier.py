@@ -43,11 +43,14 @@ def _metric(row: dict[str, Any]) -> MetricSpec:
     return spec
 
 
-def verify_measurement(root: Path, label: str) -> dict[str, Any]:
+def verify_measurement(root: Path, label: str, *, _policy_lineage: tuple[str,...]=()) -> dict[str, Any]:
     """Return structured checks; ``consistent`` is never a performance claim."""
     root = Path(root).resolve()
     checks: dict[str, bool] = {}
     issues: list[str] = []
+    if label in _policy_lineage or len(_policy_lineage)>=32:
+        return {'label':label,'status':'unverifiable','checks':{},
+                'issues':['frozen policy lineage cycle or bounded-depth limit reached']}
 
     def check(name: str, condition: bool, why: str) -> None:
         checks[name] = bool(condition)
@@ -117,6 +120,18 @@ def verify_measurement(root: Path, label: str) -> dict[str, Any]:
           "evaluation receipt is not bound to the measurement settings")
     try:
         protocol_path = root / "comparison_protocol.json"
+        reference_ref = measured.get('reference_protocol_ref')
+        if reference_ref is not None:
+            rel = Path(reference_ref)
+            if (measured.get('baseline_origin') != 'released_reference'
+                    or measured.get('confirmation') or len(rel.parts) != 2
+                    or rel.parts[0] != 'reference_protocols'
+                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}\.json', rel.name)
+                    or receipt.get('reference_protocol_ref') != reference_ref):
+                raise ValueError('invalid reference protocol ownership')
+            protocol_path = root/rel
+            if protocol_path.is_symlink() or protocol_path.parent.is_symlink():
+                raise ValueError('unsafe reference protocol')
         protocol = read_json(protocol_path)
         if not isinstance(protocol, dict):
             raise ValueError("comparison protocol is not an object")
@@ -277,6 +292,44 @@ def verify_measurement(root: Path, label: str) -> dict[str, Any]:
               reading.get("initial_state_hashes") and
               claimed_reading.get("successes") == reading.get("successes"),
               "native task/episode identities or success totals differ from the result bytes")
+    reuse=measured.get('policy_reuse')
+    if reuse is not None:
+        try:
+            from .frozen_policy_trial import _safe
+            if not isinstance(reuse,dict) or reuse.get('mode')!='evaluation_only_local_frozen_policy':
+                raise ValueError('invalid frozen policy trial identity')
+            parent_label=reuse['label']
+            if not isinstance(parent_label,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',parent_label):
+                raise ValueError('unsafe frozen policy parent label')
+            parent_path=_safe(root,'measurements/'+parent_label+'.json')
+            if parent_path.stat().st_size>2*1024*1024 or digest(parent_path)!=reuse['measurement_sha256']:
+                raise ValueError('frozen policy parent measurement changed')
+            parent=read_json(parent_path)
+            parent_train=parent.get('train') or {}
+            child_train=measured.get('train') or {}
+            parent_policy=parent.get('policy_artifact') or {}
+            train_id=parent_train.get('attempt_id')
+            if (not isinstance(train_id,str) or not re.fullmatch(r'[0-9a-f]{32}',train_id)
+                    or reuse.get('training_attempt_id')!=train_id
+                    or child_train.get('attempt_id')!=train_id or child_train.get('reused') is not True
+                    or measured.get('baseline_origin')!='locally_trained'
+                    or parent.get('baseline_origin')!='locally_trained'
+                    or measured.get('confirmation') or measured.get('dataset')
+                    or measured.get('settings')!=parent.get('settings')
+                    or measured.get('policy_artifact')!=parent_policy
+                    or reuse.get('policy_sha256')!=parent_policy.get('sha256')
+                    or reuse.get('no_new_training_or_data_claim') is not True
+                    or (parent.get('evaluate') or {}).get('attempt_id')==attempt):
+                raise ValueError('frozen policy trial does not bind the original local weights and settings')
+            train_path=_safe(root,'attempts/'+train_id+'/receipt.json')
+            if digest(train_path)!=reuse.get('training_receipt_sha256'):
+                raise ValueError('frozen policy native training receipt changed')
+            verdict=verify_measurement(root,parent_label,_policy_lineage=(*_policy_lineage,label))
+            check('frozen_policy_parent',verdict.get('status')=='consistent',
+                  'frozen policy parent independent verification failed')
+            check('frozen_policy_identity',True,'')
+        except (OSError,ValueError,TypeError,KeyError,RuntimeError,AttributeError) as exc:
+            check('frozen_policy_identity',False,'frozen policy reuse identity: '+str(exc)[:300])
     return {"label": label, "attempt_id": attempt,
             "status": "consistent" if all(checks.values()) else "inconsistent",
             "checks": checks, "reread_metric": reading.get("value"), "issues": issues,

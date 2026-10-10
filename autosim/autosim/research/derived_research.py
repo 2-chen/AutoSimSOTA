@@ -707,7 +707,7 @@ class DerivedResearch:
             suffix = raw.suffix if raw.is_file() else ""
             archived = freeze_artifact(
                 raw, self.run_root / "graph_runs" / attempt / "artifacts" / name /
-                f"policy{suffix}", max_bytes=cap)
+                f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store')
             frozen_artifacts[name] = archived
             return Path(archived["path"])
 
@@ -928,6 +928,12 @@ class DerivedResearch:
         # Formal work is a research decision, not the environment probe's budget.
         # Epochs retain their native setting name: they are not optimizer updates.
         training_steps = settings.get("steps", 0)
+        # This is the documented canonical data slot, not a guessed native flag.
+        # Resolved data-version handles already carry their authorized native path.
+        # Keep absence empty so the derivation's verified default remains intact.
+        selected_dataset = overrides.get("dataset", settings.get("dataset", ""))
+        if not isinstance(selected_dataset, str):
+            raise ValueError('canonical dataset input must be a string path; use the verified native setting name for other parameters')
         inputs.update({
             "python": str(self.interpreter), "repo": str(self.repo),
             "task": settings.get("task") or self._task() or "",
@@ -937,8 +943,8 @@ class DerivedResearch:
             # goes into `i`, the caller's inputs take precedence over the values the
             # derivation settled, and so a correct `folder` that the system had discovered
             # and recorded was silently replaced by the checkout path. The runner supplies
-            # what it knows, which here is nothing; the derivation's own answer fills it.
-            "dataset": "", "output": str(self.stage_directory(stage)),
+            # what it knows; without explicit selection the derivation's answer fills it.
+            "dataset": selected_dataset, "output": str(self.stage_directory(stage)),
             "steps": training_steps,
             "episodes": int(settings.get("eval.n_eval") or settings.get("episodes") or 0),
             "seed": int(settings.get("seed") or 0),
@@ -948,7 +954,7 @@ class DerivedResearch:
             # benchmark hyperparameters. Forwarding them through both channels makes a
             # generated trainer append invented flags such as --task or --episodes.
             "settings": {key: value for key, value in settings.items()
-                         if key not in {"task", "task_name", "steps", "episodes",
+                         if key not in {"task", "task_name", "dataset", "steps", "episodes", "eval.n_eval",
                                         "seed", "device", "device_index"}},
         })
         inputs.update(overrides)
@@ -967,12 +973,37 @@ class DerivedResearch:
                   timeout: int | None = None, _reconsidered: bool = False,
                   _protocol_guard: bool = False, confirmation: bool = False,
                   **overrides: Any) -> dict[str, Any]:
+        from .experiment_transaction import stage as record_stage
+        record_stage(self, stage)
+        result = self._scheduled_run_stage(stage, settings=settings, timeout=timeout,
+            _reconsidered=_reconsidered, _protocol_guard=_protocol_guard,
+            confirmation=confirmation, **overrides)
+        record_stage(self, stage, result=result)
+        return result
+
+    def _scheduled_run_stage(self, stage: str, *, settings: dict[str, Any],
+                  timeout: int | None = None, _reconsidered: bool = False,
+                  _protocol_guard: bool = False, confirmation: bool = False,
+                  **overrides: Any) -> dict[str, Any]:
         """Run one stage only after a fresh occupancy check and cooperative GPU lease."""
         if not self.available(stage) or (self.budget and self.budget.remaining() <= 0):
             return self._run_stage(stage, settings=settings, timeout=timeout,
                                    _reconsidered=_reconsidered,
                                    _protocol_guard=_protocol_guard,
                                    confirmation=confirmation, **overrides)
+        from .storage_guard import preflight
+        try:
+            storage = preflight(overrides.get('output') or self.stage_directory(stage),
+                                stage=stage, required_bytes=overrides.get('storage_required_bytes',
+                                (getattr(self, 'job_resources', None) or {}).get('storage_required_bytes')))
+        except (OSError, ValueError) as exc:
+            return self._record_resource_block(stage, settings, exc,
+                                               reason_code='storage_probe_unavailable')
+        if not storage['sufficient']:
+            return self._record_resource_block(stage, settings,
+                RuntimeError('insufficient filesystem headroom; review checkpoint retention '
+                             'or provide authorized storage before retrying'),
+                reason_code='storage_insufficient', evidence=storage)
         try:
             decision = self.compute_for(stage, settings)
         except NoCompatibleDevice as exc:
@@ -1080,10 +1111,10 @@ class DerivedResearch:
         atomic_json(self.run_root / "attempts" / attempt_id / "receipt.json", receipt)
         try:
             self.decisions.record(Decision(
-                activity=f"do not start {stage} without an exclusive GPU",
-                by="tool", agent="compute_decision",
+                activity=f"do not start {stage} without verified resource availability",
+                by="tool", agent="compute_decision" if reason_code.startswith('gpu_') else 'resource_guard',
                 why=why, used=["GPU occupancy table", "GPU lease"]
-                if reason_code.startswith("gpu_") else ["GPU occupancy table"],
+                if reason_code.startswith("gpu_") else ["filesystem headroom probe"],
                 produced=[f"attempts/{attempt_id}/receipt.json"],
                 outcome={"state": "known", "what": {"blocked": True,
                                                           "reason": reason_code,
@@ -1109,10 +1140,39 @@ class DerivedResearch:
                 "resource_block": receipt["resource_block"]}
 
     def _run_stage(self, stage: str, *, settings: dict[str, Any],
+                   **arguments: Any) -> dict[str, Any]:
+        from contextlib import ExitStack
+        from .storage_lifecycle import stage_lease
+        from .storage_reservations import reserve
+        from .storage_controls import apply
+        if not self.available(stage) or (self.budget and self.budget.remaining()<=0):
+            return self._execute_stage(stage,settings=settings,**arguments)
+        contexts=ExitStack()
+        try:
+            contexts.enter_context(stage_lease(self.output))
+            # Reviewed estimates supplement, never weaken, the caller's profile.
+            # Apply also revalidates native source bytes without executing the backend.
+            _,controls=apply(self.output,self.repo,stage=stage,argv=[])
+            estimates=[v for v in (arguments.get('storage_required_bytes'),
+                    (getattr(self,'job_resources',None) or {}).get('storage_required_bytes'),
+                    (controls or {}).get('projected_bytes')) if v is not None]
+            required=max(estimates) if estimates else None
+            admission=contexts.enter_context(reserve(self.output,stage=stage,required_bytes=required,
+                path=arguments.get('output') or self.stage_directory(stage)))
+        except (OSError,ValueError) as exc:
+            contexts.close()
+            return self._record_resource_block(stage,settings,exc,
+                                              reason_code='storage_admission_unavailable')
+        with contexts:
+            return self._execute_stage(stage,settings=settings,
+                                       _storage_admission=admission,**arguments)
+
+    def _execute_stage(self, stage: str, *, settings: dict[str, Any],
                    timeout: int | None = None, _reconsidered: bool = False,
                    _protocol_guard: bool = False, confirmation: bool = False,
                    _gpu_lease_id: str | None = None, _gpu_uuid: str | None = None,
                    _gpu_deadline: float | None = None,
+                   _storage_admission: dict | None = None,
                    **overrides: Any) -> dict[str, Any]:
         """Generate, run and report one stage, with what came out of it."""
         if not self.available(stage):
@@ -1136,41 +1196,62 @@ class DerivedResearch:
         # The decision wins over the ambient environment and loses to what the stage itself
         # declares, because a benchmark that names a variable for its own reasons knows
         # something this table does not.
-        inputs = self._inputs(stage, settings=settings, device=decision.device,
-                              device_index=decision.device_index, **overrides)
-        if stage == 'train':
-            from .training_work import missing_formal_work
-            problem = missing_formal_work(self.backend.sources.get(stage) or '', inputs)
-            if problem:
-                return {'stage': stage, 'ran': False, 'status': 'blocked',
-                        'returncode': None, 'termination_reason': 'formal_training_work_required',
-                        'why': problem, 'training_progress': {'status': 'unknown'}}
-        if "output" not in overrides:
-            inputs["output"] = str(native_output)
-        else:
-            # Explicit callers still own their requested path; receipts/checks must
-            # describe that real consumer root rather than a guessed stage directory.
-            native_output = Path(str(inputs["output"]))
-        policy_parent: Path | None = None
-        if stage == "evaluate":
-            policy_input = str(overrides.get("checkpoint") or inputs.get("checkpoint") or "")
-            experiment_input = str(overrides.get("experiment_dir") or "")
-            try:
-                policy_path = Path(policy_input).expanduser().resolve(strict=True)
-                experiment_path = Path(experiment_input).expanduser().resolve(strict=True)
-                parent = policy_path.parent.resolve(strict=True)
-                if (policy_path.is_file() and experiment_path == policy_path and
-                        parent.is_relative_to(self.run_root.resolve())):
-                    policy_parent = parent
-            except (OSError, RuntimeError, ValueError):
-                pass
-        surroundings = run_local_environment(
-            self.output, {**decision.environment, **self.backend.environment(stage)})
-        # Through the backend rather than through the generated function directly: the
-        # backend is what supplies the values the derivation settled for this repository --
-        # a benchmark's own flag names, its task name -- and calling the function without
-        # them asks it for something the runner has no way to spell.
-        argv = self.backend.argv(stage, inputs)
+        try:
+            # Input normalization and environment construction are also pre-launch.
+            # Their errors must seal a known non-start, not strand a running candidate.
+            inputs = self._inputs(stage, settings=settings, device=decision.device,
+                                  device_index=decision.device_index, **overrides)
+            if stage == 'train':
+                from .training_work import missing_formal_work
+                problem = missing_formal_work(self.backend.sources.get(stage) or '', inputs)
+                if problem:
+                    return {'stage': stage, 'ran': False, 'status': 'blocked',
+                            'returncode': None, 'termination_reason': 'formal_training_work_required',
+                            'why': problem, 'training_progress': {'status': 'unknown'}}
+            if "output" not in overrides:
+                inputs["output"] = str(native_output)
+            else:
+                # Explicit callers own their requested path; receipts describe it.
+                native_output = Path(str(inputs["output"]))
+            policy_parent: Path | None = None
+            if stage == "evaluate":
+                policy_input = str(overrides.get("checkpoint") or inputs.get("checkpoint") or "")
+                experiment_input = str(overrides.get("experiment_dir") or "")
+                try:
+                    policy_path = Path(policy_input).expanduser().resolve(strict=True)
+                    experiment_path = Path(experiment_input).expanduser().resolve(strict=True)
+                    parent = policy_path.parent.resolve(strict=True)
+                    if (policy_path.is_file() and experiment_path == policy_path and
+                            parent.is_relative_to(self.run_root.resolve())):
+                        policy_parent = parent
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            surroundings = run_local_environment(
+                self.output, {**decision.environment, **self.backend.environment(stage)})
+            # The backend supplies verified native names and stage parameters.
+            argv = self.backend.argv(stage, inputs)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            # Known pre-launch rejection is a failed operation, not an unknown live
+            # experiment. Return through measurement/finalization so source rollback,
+            # history and the idle Scheduler checkpoint still commit.
+            from .operation_failure import seal
+            evidence = seal(self.output, operation=f'stage_argv_{stage}', exc=exc,
+                            attempt_id=attempt_id,
+                            native_operation_status='not_started',
+                            context={'run_id': self.run_id,
+                                     'controller_decision_id': self.controller_decision_id,
+                                     'settings_digest': object_digest(settings)})
+            receipt = {'schema_version': 1, 'run_id': self.run_id,
+                       'attempt_id': attempt_id, 'node_id': stage,
+                       'status': 'blocked', 'started_at': now(), 'finished_at': now(),
+                       'returncode': None, 'ran': False, 'command_started': False,
+                       'argv': [], 'termination_reason': 'operation_contract_failed',
+                       'why': redact(f'{type(exc).__name__}: {exc}'),
+                       'settings_digest': object_digest(settings), **evidence}
+            atomic_json(self.run_root / 'attempts' / attempt_id / 'receipt.json', receipt)
+            return {'stage': stage, **receipt}
+        from .storage_controls import apply as apply_storage_controls
+        argv, storage_controls = apply_storage_controls(self.output,self.repo,stage=stage,argv=argv)
         resources = getattr(self, "job_resources", None)
         if resources:
             count = str(resources["cpu"])
@@ -1196,8 +1277,12 @@ class DerivedResearch:
                    "timeout_seconds": timeout,
                    "containment_requirement": "pid_namespace",
                    "settings_digest": object_digest(settings),
+                   "storage_admission": _storage_admission,
+                   "storage_controls_id": (storage_controls or {}).get('id'),
                    "controller_decision_id": self.controller_decision_id or None}
-        comparison_path = self.run_root / "comparison_protocol.json"
+        comparison_path = self._active_protocol_path()
+        if getattr(self, '_reference_protocol_id', ''):
+            receipt['reference_protocol_ref'] = comparison_path.relative_to(self.run_root).as_posix()
         if (stage == "evaluate" or _protocol_guard) and comparison_path.is_file():
             try:
                 receipt["comparison_protocol_sha256"] = digest(comparison_path)
@@ -1231,6 +1316,8 @@ class DerivedResearch:
         # not only at derivation, because this is where the stage actually runs and a stage
         # verified against an unstaged repository was verified against something else. The
         # commands are required to be safe to run twice; what they did is in the record.
+        from .declarative_backend import staging_environment
+        stage_environment = staging_environment({**os.environ, **surroundings}, inputs)
         for command in self.backend.staging(stage):
             staging_timeout = min(600, self.budget.remaining()) if self.budget else 600
             if _gpu_deadline is not None:
@@ -1255,11 +1342,11 @@ class DerivedResearch:
                 with _live_stage_document(self.run_root):
                     staged = bounded_run(isolated_argv(
                         ["sh", "-c", command], output=self.output, repo=self.repo,
-                        native_environment=surroundings,
+                        native_environment=stage_environment,
                         require_pid_namespace=True),
                                          timeout=staging_timeout,
                                          cwd=self.backend.directory(stage),
-                                         env={**os.environ, **surroundings})
+                                         env=stage_environment)
             except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
                 staged = None
                 self._append_local_event({"at": now(), "event": "staging_failed",
@@ -1289,6 +1376,18 @@ class DerivedResearch:
                 run_record.generate(self.run_root)
                 return {"stage": stage, "ran": False,
                         "why": f"staging could not finish: {redact(command)[:300]}"}
+        from .candidate_source_guard import preserve
+        try:
+            receipt['candidate_source_integrity'] = preserve(self.repo, self._held)
+        except (OSError, ValueError, RuntimeError) as exc:
+            why = f'candidate source integrity after staging refused: {exc}'
+            aw.ended(self.run_root)
+            atomic_json(receipt_path, {**receipt, 'status': 'blocked',
+                'termination_reason': 'candidate_source_changed_by_staging',
+                'finished_at': now(), 'returncode': None, 'why': why})
+            return {'stage': stage, 'ran': False, 'status': 'blocked',
+                    'returncode': None, 'why': why, 'attempt_id': attempt_id}
+        atomic_json(receipt_path, receipt)
         if stage == "evaluate" or _protocol_guard:
             violation = self._protocol_violation()
             if violation:
@@ -1436,6 +1535,10 @@ class DerivedResearch:
                 receipt["containment_mode"] = requested_containment(execution_argv)
                 atomic_json(receipt_path, receipt)
                 try:
+                    from .storage_runtime import StorageWatch
+                    storage_watch=StorageWatch(self.output,stage=stage,attempt_id=attempt_id,
+                        path=native_output,deadline_epoch=time.time()+timeout,
+                        checkpoint_bytes=(storage_controls or {}).get('checkpoint_bytes'))
                     attempt = run_process(
                         execution_argv,
                         cwd=self.backend.directory(stage),
@@ -1445,11 +1548,11 @@ class DerivedResearch:
                             self.run_root, telemetry_writer=telemetry_writer,
                             report_root=self.output, run_id=self.run_id),
                         on_start=record_process_start,
-                        live_control=(lambda: read_json(self.job_control_path))
-                        if self.job_control_path else None)
+                        live_control=lambda: storage_watch(read_json(self.job_control_path)
+                            if self.job_control_path else None))
                     code, timed_out = attempt.returncode, attempt.timed_out
                     if attempt.cancelled:
-                        refused = "job cancelled by controller"
+                        refused = "storage pressure; inspect retained recovery artifacts before retry" if storage_watch.critical else "job cancelled by controller"
                     if attempt.orphaned_children:
                         code = None
                         refused = "launcher exited while child processes were still running"
@@ -1542,7 +1645,7 @@ class DerivedResearch:
                   "process_identity": process_identity_record or None,
                   "status": "timed_out" if timed_out else
                             "failed" if refused or code != 0 else "completed",
-                  "termination_reason": "cancelled" if attempt.cancelled else
+                  "termination_reason": "storage_pressure" if attempt.cancelled and locals().get('storage_watch') and storage_watch.critical else "cancelled" if attempt.cancelled else
                                         "timeout" if timed_out else
                                         "orphaned_children" if attempt.orphaned_children else
                                         "launch_error" if refused else
@@ -1562,11 +1665,17 @@ class DerivedResearch:
                   "device": decision.device, "device_why": decision.why,
                   "seconds": round(time.monotonic() - started, 1),
                   "artifact": artifact,
+                  "storage_admission": _storage_admission,
+                  "storage_controls_id": (storage_controls or {}).get('id'),
                   "metric_result_artifact": metric_result_artifact,
                   # Every number the program gave a name to, so a later reader -- and a method
                   # that ranks candidates cheaply -- has more than one number at the end.
                   "readings": self._readings(said),
                   "said": said[-1500:]}
+        if locals().get('storage_watch'):
+            record['storage_observation_ref']=storage_watch.record_path.relative_to(self.output).as_posix()
+            if storage_watch.critical:
+                record['storage_pressure']=getattr(storage_watch,'observation',{})
         if telemetry_summary is not None:
             record["telemetry"] = telemetry_summary
         if stage == "train" and self.require_training_progress:
@@ -1602,7 +1711,9 @@ class DerivedResearch:
                 receipt_ref=receipt_ref, status=str(record["status"]),
                 returncode=code,
                 termination_reason=str(record["termination_reason"]),
-                artifact=artifact, metric_artifact=metric_result_artifact)
+                artifact=artifact, metric_artifact=metric_result_artifact,
+                native_context={key:record[key] for key in
+                    ('stage','output_directory','working_directory')})
             record.update(evidence_id=sealed_evidence["evidence_id"],
                           evidence_ref=sealed_evidence["evidence_ref"])
         except (OSError, ValueError, TypeError) as exc:
@@ -1754,17 +1865,27 @@ class DerivedResearch:
                                   "seconds": result.get("seconds"),
                                   "why": result.get("why")})
 
+    def _record_demo_boundary(self, *, trigger: str, status: str, why: str) -> dict[str, Any]:
+        """Keep missing recording capability visible; never invent a video or a score."""
+        row = {'at': now(), 'trigger': trigger, 'status': status, 'why': why,
+               'native_operation_status': 'not_started'}
+        path = self.run_root / 'media_events.json'
+        old = read_json(path) if path.is_file() and not path.is_symlink() else {}
+        atomic_json(path, {'schema_version': 1, 'rows': list(old.get('rows') or []) + [row]})
+        return row
+
     def capture_demo(self, *, trigger: str, measurement: dict[str, Any] | None,
                      settings: dict[str, Any]) -> dict[str, Any]:
         """Ask a declared native recording stage for one real demo and keep its lineage."""
         stage = str((self.declaration.get("task_contract") or {}).get("demo_stage") or
                     "record_demo")
         if not self.available(stage):
-            return {"status": "unavailable", "why": "no native recording stage was derived"}
+            return self._record_demo_boundary(trigger=trigger, status='unavailable',
+                why='no native recording stage was derived')
         policy = (measurement or {}).get("policy_artifact") or {}
         if not policy.get("path"):
-            return {"status": "policy_unavailable",
-                    "why": "a frozen measured policy is required for attributed demo capture"}
+            return self._record_demo_boundary(trigger=trigger, status='policy_unavailable',
+                why='a frozen measured policy is required for attributed demo capture')
         policy_path = Path(str(policy.get("path") or ""))
         if not policy_path.is_absolute():
             policy_path = self.run_root / policy_path
@@ -1775,11 +1896,11 @@ class DerivedResearch:
             if policy.get(identity_field) != actual:
                 raise ValueError("recording policy does not match a frozen measurement")
         except (OSError, ValueError):
-            return {"status": "policy_unavailable",
-                    "why": "a frozen measured policy is required for attributed demo capture"}
+            return self._record_demo_boundary(trigger=trigger, status='policy_unavailable',
+                why='a frozen measured policy is required for attributed demo capture')
         violation = self._protocol_violation()
         if violation:
-            return {"status": "blocked", "why": violation}
+            return self._record_demo_boundary(trigger=trigger, status='blocked', why=violation)
         evaluation = (measurement or {}).get("evaluate") or {}
         evaluation_attempt_id = str(evaluation.get("attempt_id") or "")
         evaluation_receipt_sha256 = ""
@@ -2337,8 +2458,12 @@ class DerivedResearch:
                 confirmation: bool = False, _reuse_training_attempt_id: str = "",
                 _baseline_recovery: bool = False,
                 _reuse_policy_artifact: dict[str, Any] | None = None,
+                _frozen_policy_request: dict[str, Any] | None = None,
                 _reference_checkpoint: Path | None = None,
-                _data_bindings: list | None = None) -> dict[str, Any]:
+                _selection_correction_ref: str = '',
+                _audit_training_progress: bool = False,
+                _data_bindings: list | None = None,
+                _reference_protocol_id: str = '') -> dict[str, Any]:
         """One arm of the run, noted in the selection record on the way out.
 
         Wrapped rather than instrumented. `_measure` returns from eight places -- a stage that
@@ -2350,6 +2475,9 @@ class DerivedResearch:
 
         So the counting happens where every return has to pass, whatever `_measure` decides.
         """
+        if (isinstance(_frozen_policy_request,dict)
+                and label==_frozen_policy_request.get('label')):
+            raise ResearchStateError('frozen policy trial cannot overwrite its parent measurement')
         if not confirmation and any((self.run_root / "confirmation_attempts").glob("*.json")):
             return self._comparison_refusal(
                 label, settings, "search cannot resume after the held-out set was exposed")
@@ -2362,12 +2490,45 @@ class DerivedResearch:
             if rebound!=_data_bindings or any(settings.get(k)!=v for k,v in checked.items()):
                 raise ResearchStateError('selected data bindings changed before training')
             data_bindings=rebound
-        result = self._measure(settings=settings, label=label, dataset=dataset,
+        # Published reference evaluation owns a separate protocol. It must neither
+        # freeze the local search prematurely nor rewrite an existing comparison.
+        from contextlib import ExitStack
+        from .experiment_transaction import track, finish as finish_transaction
+        with ExitStack() as scope:
+            if _reference_protocol_id:
+                if (_reference_checkpoint is None or confirmation or dataset or data_bindings
+                        or getattr(self, '_reference_protocol_id', '')):
+                    raise ValueError('reference protocol requires an exclusive evaluation-only reference')
+                from .baseline_reference import handoff
+                reference = handoff(self.output, _reference_protocol_id)
+                if Path(reference['selected_path']) != Path(_reference_checkpoint):
+                    raise ValueError('reference protocol is not bound to the reviewed checkpoint')
+                self._reference_protocol_id = _reference_protocol_id
+                scope.callback(setattr, self, '_reference_protocol_id', '')
+            journal = scope.enter_context(track(self, label=label, settings=settings,
+                confirmation=confirmation, reference=_reference_checkpoint is not None,
+                reused_attempt=_reuse_training_attempt_id))
+            result = self._measure(settings=settings, label=label, dataset=dataset,
                                confirmation=confirmation,
                                reuse_training_attempt_id=_reuse_training_attempt_id,
+                               **({'audit_training_progress':True} if _audit_training_progress else {}),
                                reuse_policy_artifact=_reuse_policy_artifact,
+                               **({'frozen_policy_request':_frozen_policy_request}
+                                  if _frozen_policy_request is not None else {}),
+                               **({'selection_correction_ref':_selection_correction_ref}
+                                  if _selection_correction_ref else {}),
                                **({'reference_checkpoint': _reference_checkpoint} if _reference_checkpoint is not None else {}),
                                **({'data_bindings':data_bindings} if data_bindings else {}))
+            protocol = self._active_protocol_path()
+            if _reference_protocol_id:
+                result['reference_protocol_ref'] = protocol.relative_to(self.run_root).as_posix()
+                measured_path = self.run_root/'measurements'/f'{label}.json'
+                # Pre-launch graph/input refusals also need a terminal measurement;
+                # otherwise reference reconciliation is stuck in "evaluating" forever.
+                if measured_path.is_symlink():
+                    raise ValueError('unsafe reference measurement destination')
+                atomic_json(measured_path, result)
+            finish_transaction(self, journal, result)
         from .scheduling import policy, note
         if policy(self.output):
             note(self.output, kind="formal_measurement", identity=label,
@@ -2375,7 +2536,7 @@ class DerivedResearch:
                  confirmation=confirmation, metric_value=result.get("metric_value"),
                  elapsed_since_run_start=max(0, time.time()-self.budget.started_epoch) if self.budget else None)
         try:
-            protocol = self.run_root / "comparison_protocol.json"
+            frozen_settings = None if _reference_protocol_id else self._frozen_search_settings()
             selection.note(
                 self.run_root,
                 protocol_sha256=(digest(protocol) if protocol.is_file() else ""),
@@ -2383,7 +2544,8 @@ class DerivedResearch:
                 metric_value=result.get("metric_value"),
                 metric_utility=self._metric_utility(result),
                 baseline=label == "baseline" or _baseline_recovery,
-                settings=self._frozen_search_settings() or result.get("settings") or settings,
+                settings=(frozen_settings if frozen_settings is not None else
+                          result.get("settings") or settings),
                 metric_kind=("binary" if self.metric_spec.name == "success_rate"
                              else "continuous"),
                 actual_episodes=(result.get("metric_reading") or {}).get("episodes_completed"),
@@ -2879,9 +3041,40 @@ class DerivedResearch:
         except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
             return {"status": "unverified", "because": redact(str(exc))[:500]}
 
+    def _training_settings_match(self, receipt: dict[str, Any], settings: dict[str, Any]) -> bool:
+        """Compare producer work, not the union of producer and consumer controls.
+
+        Non-identical settings require the exact job request and deterministic native
+        builder replay. Unknown/dynamic inputs are not guessed or filtered by names.
+        No process is started, and the original receipt/request are never rewritten.
+        """
+        if receipt.get('settings_digest') == object_digest(settings):
+            return True
+        try:
+            job_id = str(receipt.get('controller_decision_id') or '')
+            if not re.fullmatch(r'[0-9a-f]{32}', job_id):
+                return False
+            from .experiment_transaction import safe
+            request = read_json(safe(self.output, f'native_jobs/{job_id}/request.json'))
+            original = request.get('settings')
+            if (request.get('run_id') != self.run_id or request.get('repo') != str(self.repo)
+                    or request.get('stage') != 'train' or not isinstance(original,dict)
+                    or receipt.get('settings_digest') != object_digest(original)):
+                return False
+            argv = receipt.get('argv')
+            decision = self.compute_for('train', original)
+            overrides = {'output':receipt['output_directory'], 'device':decision.device,
+                         'device_index':decision.device_index}
+            old = self.backend.argv('train', self._inputs('train',settings=original,**overrides))
+            new = self.backend.argv('train', self._inputs('train',settings=settings,**overrides))
+            return old == new == argv
+        except (OSError,ValueError,TypeError,KeyError,AttributeError,RuntimeError):
+            return False
+
     def _verified_training_receipt(self, attempt_id: str,
                                    settings: dict[str, Any], *,
-                                   audit_progress: bool = False) -> dict[str, Any] | None:
+                                   audit_progress: bool = False,
+                                   failure_details: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Load one completed train receipt only when its identity still binds this run."""
         if not re.fullmatch(r"[a-f0-9]{32}", attempt_id):
             return None
@@ -2903,7 +3096,7 @@ class DerivedResearch:
                     receipt.get("node_id") != "train" or receipt.get("stage") != "train" or
                     receipt.get("status") != "completed" or receipt.get("returncode") != 0 or
                     receipt.get("termination_reason") != "normal_exit" or
-                    receipt.get("settings_digest") != object_digest(settings) or
+                    not self._training_settings_match(receipt, settings) or
                     not protocol_path.is_file() or
                     (recorded_protocol and recorded_protocol != digest(protocol_path)) or
                     not cwd.is_relative_to(self.repo.resolve()) or
@@ -2918,7 +3111,8 @@ class DerivedResearch:
                 return None
             if progress.get('status') != 'observed':
                 receipt = self._review_detached_training_progress(
-                    receipt, path=path, allow_model=audit_progress)
+                    receipt, path=path, allow_model=audit_progress,
+                    **({'failure_details':failure_details} if failure_details is not None else {}))
                 if receipt is None:
                     return None
             return receipt
@@ -2926,7 +3120,8 @@ class DerivedResearch:
             return None
 
     def _review_detached_training_progress(self, receipt: dict[str, Any], *,
-                                          path: Path, allow_model: bool) -> dict[str, Any] | None:
+                                          path: Path, allow_model: bool,
+                                          failure_details: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Parent-owned CPU review; never edit the worker's sealed receipt/result.
 
         Detached native workers intentionally have no model client. Persist additional
@@ -2934,59 +3129,13 @@ class DerivedResearch:
         Reading controller state cannot trigger a model call; an explicit adoption or
         job inspection must opt in through allow_model.
         """
-        from .training_progress_audit import audit, candidates, sources, validate
-        from .evidence_store import read_attempt_evidence
-        sidecar = path.with_name('training_progress_revalidation.json')
-        try:
-            original_hash = digest(path)
-            output = Path(str(receipt.get('output_directory') or '')).resolve(strict=True)
-            if not output.is_relative_to(self.run_root.resolve()):
-                return None
-            reference = str(receipt.get('evidence_ref') or '')
-            evidence_id = str(receipt.get('evidence_id') or Path(reference).stem)
-            native = read_attempt_evidence(self.output, evidence_id, limit=1)
-            if (native.get('status') != 'completed' or native.get('returncode') != 0 or
-                    native.get('receipt_ref') != path.relative_to(self.output).as_posix()):
-                return None
-            since = float(receipt.get('started_epoch') or 0)
-            if sidecar.exists():
-                if sidecar.is_symlink():
-                    return None
-                saved = read_json(sidecar)
-                if saved.get('native_receipt_sha256') != original_hash:
-                    return None
-                audit_path = self.output / str(saved.get('audit_ref') or '')
-                if (audit_path.is_symlink() or not audit_path.resolve().is_relative_to(
-                        (self.output/'training_progress_audits').resolve()) or
-                        digest(audit_path) != saved.get('audit_sha256')):
-                    return None
-                document = read_json(audit_path)
-                if document.get('native_evidence_ref') != reference:
-                    return None
-                progress = validate(document['answer'], output=output,
-                    docs=candidates(output, since),
-                    code=sources(self.repo, self.output, receipt['argv']))
-                progress['audit_ref'] = saved['audit_ref']
-            elif allow_model and getattr(self.client, 'supports_native_progress_audit', False):
-                progress = audit(self.client, repo=self.repo, root=self.output,
-                    output=output, argv=receipt['argv'], since=since,
-                    native_evidence_ref=reference)
-                if progress.get('status') != 'observed' or digest(path) != original_hash:
-                    return None
-                audit_path = self.output / str(progress.get('audit_ref') or '')
-                if (audit_path.is_symlink() or not audit_path.resolve().is_relative_to(
-                        (self.output/'training_progress_audits').resolve())):
-                    return None
-                atomic_json(sidecar, {'schema_version': 1, 'at': now(),
-                    'native_receipt_sha256': original_hash,
-                    'native_evidence_ref': reference,
-                    'audit_ref': progress['audit_ref'], 'audit_sha256': digest(audit_path)})
-            else:
-                return None
-            return {**receipt, 'training_progress': progress,
-                    'training_progress_revalidation_ref': sidecar.relative_to(self.output).as_posix()}
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        from .training_progress_audit import revalidate_detached
+        output = Path(str(receipt.get('output_directory') or '')).resolve()
+        if not output.is_relative_to(self.run_root.resolve()):
             return None
+        return revalidate_detached(receipt, path=path, root=self.output,
+            repo=self.repo, client=self.client, allow_model=allow_model,
+            failure_details=failure_details)
 
     def recover_unscored_baseline(self, *, replacement_training_attempt_id: str = "") -> dict[str, Any]:
         """Finish a baseline from its exact train receipt without training a second time.
@@ -3374,7 +3523,10 @@ class DerivedResearch:
                  confirmation: bool = False,
                  reuse_training_attempt_id: str = "",
                  reuse_policy_artifact: dict[str, Any] | None = None,
+                 frozen_policy_request: dict[str, Any] | None = None,
                  reference_checkpoint: Path | None = None,
+                 selection_correction_ref: str = '',
+                 audit_training_progress: bool = False,
                  data_bindings: list | None = None) -> dict[str, Any]:
         """Train and score, which is what one arm of a comparison consists of.
 
@@ -3383,6 +3535,21 @@ class DerivedResearch:
         evaluator scores, and carrying it is the runner's job rather than a name the
         derivation has to guess.
         """
+        frozen_trial=None
+        if frozen_policy_request is not None:
+            from .frozen_policy_trial import load
+            try:
+                if (dataset or data_bindings or confirmation or reference_checkpoint is not None
+                        or reuse_training_attempt_id or reuse_policy_artifact):
+                    raise ValueError('frozen policy trial cannot combine collection, confirmation or other reuse modes')
+                frozen_trial=load(self,frozen_policy_request)
+                if settings!=frozen_trial['settings']:
+                    raise ValueError('frozen policy trial cannot change the selected training/data/protocol settings')
+                reuse_training_attempt_id=frozen_trial['trained']['attempt_id']
+                reuse_policy_artifact=frozen_trial['policy_artifact']
+            except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+                return {'label':label,'ok':False,'where':'frozen_policy_identity',
+                        'settings':dict(settings),'ran':False,'why':str(exc)}
         if self.execution_graph:
             if data_bindings:
                 return {'ok':False,'label':label,'why':'data versions require explicit graph consumer binding; not silently accepted'}
@@ -3418,14 +3585,15 @@ class DerivedResearch:
         # and a released policy produces its own number instead of reporting that it has no
         # number, and the run knows what there is to beat. The record says which of the two
         # it scored, because a reader comparing two runs has to know.
-        train_available = self.available('train') and reference_checkpoint is None
+        train_available = bool(frozen_trial) or (self.available('train') and reference_checkpoint is None)
         scored_what = ('the explicitly selected released-reference checkpoint' if reference_checkpoint is not None
+                       else 'an existing locally trained frozen checkpoint; evaluation-only candidate' if frozen_trial
                        else "a checkpoint this run trained" if self.available("train")
                        else "the checkpoint the benchmark ships" if self.checkpoint
                        else "a source-defined controller with no weight artifact"
                        if self.source_policy else "")
         missing = [name for name in ("train", "evaluate") if not self.available(name)]
-        if missing and not ((reference_checkpoint or self.checkpoint or self.source_policy) and
+        if missing and not ((frozen_trial or reference_checkpoint or self.checkpoint or self.source_policy) and
                             self.available("evaluate") and missing == ["train"]):
             why = (f"{' and '.join(missing)} cannot be run: no command was derived for "
                    f"{'it' if len(missing) == 1 else 'them'}. A measurement needs both halves, "
@@ -3445,22 +3613,49 @@ class DerivedResearch:
         # that no command could supply. RoboTwin's did, twice, with the diagnosis right both
         # times: "the config that would hold it is a file, not a field, and the stage must be
         # run so that key exists". A stage nothing runs is a stage the loop does not have.
-        if reference_checkpoint is not None:
+        if frozen_trial:
+            trained=frozen_trial['trained']
+        elif reference_checkpoint is not None:
             trained = {'ran': False, 'returncode': None, 'origin': 'released_reference',
                        'why': 'evaluation-only reference; no local training or claimed training progress'}
         elif reuse_training_attempt_id:
-            trained = self._verified_training_receipt(reuse_training_attempt_id, settings)
+            review_failure: dict[str, Any] = {}
+            trained = self._verified_training_receipt(reuse_training_attempt_id, settings,
+                **({'audit_progress':True,'failure_details':review_failure}
+                   if audit_training_progress else {}))
             if trained is None:
                 failed = {"label": label, "ok": False, "where": "policy_artifact",
                           "settings": dict(settings), "metric_value": None,
-                          "why": "the completed training receipt no longer matches this "
-                                 "measurement's settings, protocol, or run identity",
+                          "why": ("completed training progress re-audit failed: " +
+                                  str(review_failure.get('reason') or 'insufficient source evidence')[:1200]
+                                  if review_failure else "the completed training receipt no longer matches this "
+                                 "measurement's settings, protocol, or run identity"),
+                          **({'training_progress_revalidation':review_failure,
+                              'evidence_refs':[review_failure['audit_ref']]
+                                  if review_failure.get('audit_ref') else []}
+                             if review_failure else {}),
                           "ran": False, "status": "unscored",
                           "training_outcome": {"status": "unverified",
                                                "attempt_id": reuse_training_attempt_id}}
                 atomic_json(self.run_root / "measurements" / f"{label}.json", failed)
                 return failed
-            trained = self._select_policy_artifact(trained, revalidate_abstained=True)
+            if selection_correction_ref and trained is not None:
+                raw = self.run_root/'attempts'/reuse_training_attempt_id/'receipt.json'
+                review_failure: dict[str, Any] = {}
+                trained = self._review_detached_training_progress(trained, path=raw,
+                    allow_model=True, failure_details=review_failure)
+                if trained is None:
+                    return {'ok':False, 'label':label, 'where':'policy_artifact',
+                            'why':'completed training could not be independently re-audited: ' +
+                                  str(review_failure.get('reason') or
+                                      'receipt identity or review prerequisites did not verify')[:1200],
+                            'training_progress_revalidation':review_failure,
+                            'evidence_refs':[review_failure['audit_ref']]
+                                if review_failure.get('audit_ref') else [],
+                            'training_reused':True}
+            trained = self._select_policy_artifact(trained, revalidate_abstained=True,
+                                                  retry_unavailable=audit_training_progress,
+                                                  correction_ref=selection_correction_ref)
         else:
             self._prepare_once(settings)
             trained = (self.run_stage("train", settings=settings,
@@ -3472,7 +3667,7 @@ class DerivedResearch:
                              "no command was derived for train, and the benchmark ships a "
                              "checkpoint, so that is what was scored"})
         if train_available:
-            if not reuse_training_attempt_id:
+            if not reuse_training_attempt_id and not frozen_trial:
                 trained = self._select_policy_artifact(trained)
         train_artifact = trained.get("artifact") or {}
         train_readings = trained.get("readings") or {}
@@ -3523,7 +3718,8 @@ class DerivedResearch:
                     else self._recorded_artifact(trained) if trained.get("ran")
                     else Path(self.checkpoint) if self.checkpoint else None)
         from .data_versions import verify_consumption
-        data_consumption=verify_consumption(self.output,data_bindings or [],trained)
+        data_consumption=verify_consumption(self.output,data_bindings or [],trained,
+                                            training_performed=train_available)
         if data_bindings and data_consumption['status']!='verified':
             failed={'label':label,'ok':False,'where':'training_data','settings':settings,
                     'metric_value':None,'train':trained,'data_consumption':data_consumption,
@@ -3558,7 +3754,7 @@ class DerivedResearch:
                 source_path = Path(str(reuse_policy_artifact.get("source") or ""))
                 if not source_path.is_absolute():
                     source_path = Path(str(trained.get("working_directory") or self.repo)) / source_path
-                if (raw_policy.is_symlink() or not archived_path.is_file() or
+                if (raw_policy.is_symlink() or not (archived_path.is_file() or archived_path.is_dir()) or
                         reuse_policy_artifact.get(identity_field) != identity or
                         produced is None or
                         source_path.resolve(strict=True) != produced.resolve(strict=True)):
@@ -3575,7 +3771,7 @@ class DerivedResearch:
                 attempt = str(trained.get("attempt_id") or uuid.uuid4().hex)
                 archived = freeze_artifact(
                     produced, self.run_root / "experiments" / label / attempt /
-                    f"policy{suffix}", max_bytes=cap)
+                    f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store')
             except (OSError, ValueError, RuntimeError) as exc:
                 archive_error = f"{type(exc).__name__}: {exc}"
         if produced is not None and not archived:
@@ -3703,6 +3899,7 @@ class DerivedResearch:
                           "evaluation did not exit normally or yield a verified native "
                           "metric result" if not scored_ok else ""),
                   "scored": scored_what,
+                  **({'policy_reuse':frozen_trial['identity']} if frozen_trial else {}),
                   "baseline_origin": ('released_reference' if reference_checkpoint is not None else
                                       'locally_trained' if train_available else 'source_policy'),
                   'data_consumption':data_consumption,
@@ -3722,6 +3919,7 @@ class DerivedResearch:
                   "result_archive_error": result_archive_error,
                   "restorable_policy": bool(archived),
                   **({"dataset": dataset} if dataset else {}),
+                  "data_consumption": data_consumption,
                   "train": {"returncode": trained.get("returncode"),
                             "attempt_id": trained.get("attempt_id"),
                             "evidence_id": trained.get("evidence_id"),
@@ -3820,9 +4018,18 @@ class DerivedResearch:
         artifact = record.get("artifact") or {}
         matched = int(artifact.get("matched") or 0)
         candidates = artifact.get("candidate_paths")
+        def retained(paths):
+            from .storage_lifecycle import pruned_refs
+            pruned=[(self.output/ref).resolve() for ref in pruned_refs(self.output)]
+            output=Path(str(record.get('output_directory') or self.run_root))
+            kept=[]
+            for path in paths:
+                resolved=(Path(path) if Path(path).is_absolute() else output/str(path)).resolve()
+                if not any(p==resolved or p.is_relative_to(resolved) for p in pruned): kept.append(str(path))
+            return kept, '' if kept else 'all producer payload candidates were explicitly retired'
         if (isinstance(candidates, list) and not artifact.get("candidate_paths_truncated")
                 and len(candidates) == matched):
-            return [str(path) for path in candidates], ""
+            return retained(candidates)
         if matched <= 1 or artifact.get("candidate_paths_truncated") or matched > 128:
             return [], "the complete candidate set is unavailable or exceeds the selection bound"
 
@@ -3873,7 +4080,7 @@ class DerivedResearch:
             artifact["candidate_paths"] = rendered
             artifact["candidate_paths_reconstructed"] = True
             record["artifact"] = artifact
-            return rendered, ""
+            return retained(rendered)
         except (KeyError, OSError, TypeError, ValueError) as exc:
             return [], f"could not reconstruct candidates from this attempt: " \
                        f"{type(exc).__name__}: {exc}"
@@ -3947,7 +4154,8 @@ class DerivedResearch:
 
     def _select_policy_artifact(self, record: dict[str, Any], *,
                                 retry_unavailable: bool = False,
-                                revalidate_abstained: bool = False) -> dict[str, Any]:
+                                revalidate_abstained: bool = False,
+                                correction_ref: str = '') -> dict[str, Any]:
         """Use the LLM to interpret native selection evidence, then verify its choice
         against the exact fresh files emitted by this attempt before evaluation."""
         artifact = dict(record.get("artifact") or {})
@@ -3957,6 +4165,21 @@ class DerivedResearch:
         record["artifact"] = artifact
         attempt_id = str(record.get("attempt_id") or "")
         candidates, candidate_error = self._selection_candidates(record)
+        if (self.require_training_progress and
+                (record.get('training_progress') or {}).get('status') != 'observed'):
+            why = ('completed native training lacks verified progress; explicitly re-audit '
+                   'this receipt before paying for policy selection or retraining')
+            deferred = self.run_root/'attempts'/attempt_id/'artifact_selection.json'
+            if (not re.fullmatch(r'[a-f0-9]{32}',attempt_id) or deferred.is_symlink()
+                    or deferred.parent.is_symlink()):
+                raise ValueError('unsafe deferred policy selection path')
+            if not deferred.exists():
+                immutable_json(deferred, {'attempt_id':attempt_id,'status':'unavailable',
+                    'why':why,'candidate_paths_sha256':object_digest(candidates),
+                    'source_hashes':{},'completed_work_proof_sha256':'','answer':{}})
+            record['artifact_selection'] = {'status':'awaiting_progress_audit','why':why,
+                'selection_ref':deferred.relative_to(self.output).as_posix()}
+            return record
         candidate_ids = {f"candidate_{index + 1}": path
                          for index, path in enumerate(candidates)}
         candidate_id_by_path = {path: candidate_id
@@ -4003,6 +4226,17 @@ class DerivedResearch:
         safe_training_log, observed_candidate_ids = redact_candidate_references(raw_training_log)
         selection_dir = self.run_root / "attempts" / attempt_id
         selection_path = selection_dir / "artifact_selection.json"
+        if correction_ref:
+            previous_path = self.output/correction_ref
+            if (previous_path.is_symlink() or previous_path.resolve().parent != selection_dir.resolve()
+                    or not previous_path.is_file()):
+                raise ValueError('correction must reference the same attempt original selection')
+            previous = read_json(previous_path)
+            if previous.get('attempt_id') != attempt_id or previous.get('status') != 'selected':
+                raise ValueError('correction requires an existing selected decision')
+            # New evidence and decision live in a separate namespace. Never rewrite
+            # the old selected result or change what its old score measured.
+            selection_path = selection_dir/f'artifact_selection_correction_{digest(previous_path)[:16]}.json'
         candidate_sha256 = object_digest(candidates)
         sources, source_error = self._policy_selection_sources(str(record.get("stage") or ""))
         sources.extend(producer_sources)
@@ -4010,10 +4244,17 @@ class DerivedResearch:
             source_error = ''
         source_hashes = {source["path"]: source["sha256"] for source in sources}
 
-        def same_inputs(saved: dict[str, Any]) -> bool:
+        def same_evidence(saved: dict[str, Any]) -> bool:
             return (saved.get("candidate_paths_sha256") == candidate_sha256 and
                     saved.get("source_hashes") == source_hashes and
                     saved.get('completed_work_proof_sha256', '') == work_proof_sha)
+
+        def same_inputs(saved: dict[str, Any]) -> bool:
+            # A valid historical selection is still revalidated, not silently replaced.
+            # Negative decisions made with a broken prompt projection get one new,
+            # separately sealed resolution under the corrected request contract.
+            return same_evidence(saved) and (saved.get('status')=='selected' or
+                                             saved.get('request_contract')=='source_quote_transport_v5')
 
         def transient_failure(saved: dict[str, Any]) -> bool:
             if saved.get("status") == "unavailable":
@@ -4035,7 +4276,7 @@ class DerivedResearch:
                 if previous.get("attempt_id") != attempt_id:
                     raise ValueError("persisted selection belongs to a different attempt")
                 if (revalidate_abstained and previous.get("status") == "abstained" and
-                        not same_inputs(previous) and not (
+                        not same_evidence(previous) and not (
                             work_bindings and previous.get('candidate_paths_sha256') == candidate_sha256
                             and all(source_hashes.get(k) == v for k,v in
                                     (previous.get('source_hashes') or {}).items()))):
@@ -4074,12 +4315,17 @@ class DerivedResearch:
             record["artifact_selection"] = {"status": "invalid", "why": reason}
             return record
         selection_ref = str(selection_path.relative_to(self.output))
+        responses: list[dict[str, Any]] = []
+        request_ref = ''
 
         def selection_record(status: str, *, answer: dict[str, Any] | None = None,
                              why: str = "", provider: dict[str, Any] | None = None,
                              response_sha256: str = "") -> dict[str, Any]:
             selected = str((answer or {}).get("selected_path") or "")
             return {"schema_version": 1, "attempt_id": attempt_id,
+                    'request_contract':'source_quote_transport_v5',
+                    'request_ref':request_ref, 'responses':responses,
+                    **({'corrects_selection_ref':correction_ref} if correction_ref else {}),
                     "stage": str(record.get("stage") or ""), "status": status,
                     "candidate_paths": candidates,
                     "candidate_paths_sha256": candidate_sha256,
@@ -4152,6 +4398,9 @@ class DerivedResearch:
             safe_trace, _ = redact_candidate_references(trace)
             metadata_choice = answer.get('selection_basis') == 'verified_completed_work_container'
             if metadata_choice:
+                if not any(c['source_path'] != 'runtime_completed_work'
+                           for c in verified_citations):
+                    return None, 'runtime counter alone does not establish native save/load semantics'
                 current_bindings, _, current_sha = self._policy_work_evidence(record, candidate_ids)
                 if (candidate_id not in current_bindings or current_sha != work_proof_sha):
                     return None, 'selected policy has no unchanged audited completed-work container association'
@@ -4281,7 +4530,17 @@ class DerivedResearch:
             "association between an opaque candidate and the checkpoint container carrying "
             "the independently audited completed-update counter. Interpret the actual native "
             "producer save flow in native_source excerpts; those are virtual source IDs, not "
-            "paths to grep. You may choose selection_basis=verified_completed_work_container "
+            "paths to grep. runtime_completed_work is a freshly revalidated native counter "
+            "snapshot, not repository code: its exact JSON facts may be cited for actual "
+            "completed work. Interpret update/save semantics using the supplied native code; "
+            "the independent Supervisor's counter_selection is an audited interpretation, "
+            "not an unaudited filename guess. Do not reject these supplied runtime facts "
+            "merely because they are not literals in source code. Neither a counter nor "
+            "that interpretation proves performance or general training adequacy. "
+            "receipt_invocation_argv records requested invocation arguments, NOT completed "
+            "work; interpret them through native producer code and compare with the actual "
+            "counter. An omitted oversized invocation is not evidence of its values. "
+            "You may choose selection_basis=verified_completed_work_container "
             "ONLY for a listed bound candidate when that source flow establishes this is its "
             "completed trained policy. This alternative does not require a log trace. "
             "If the native evaluator accepts a caller-supplied trained policy, this basis "
@@ -4295,6 +4554,8 @@ class DerivedResearch:
             "with decision ('select' or 'abstain'), candidate_id, "
             "native_rule, evidence ([{source_path, quote, why}]), selection_basis "
             "('native_log' or 'verified_completed_work_container'), candidate_trace, and why."
+            " Keep the explanation under 100 words and provide only 1..3 short exact source "
+            "quotations; retain original newlines/backslashes, not paraphrases or display markers."
         )
         safe_sources = [{"path": source["path"], "sha256": source["sha256"],
                          "excerpt": self._selection_excerpt(safe_source_texts[source["path"]])
@@ -4311,10 +4572,51 @@ class DerivedResearch:
         user = sanitize_model_text(
             json.dumps(payload, ensure_ascii=False, default=str),
             local_roots=(self.repo, self.run_root))
+        request_path = selection_dir/f'artifact_selection_request_{object_digest(user)}.json'
+        if request_path.is_symlink() or request_path.parent.is_symlink():
+            raise ValueError('unsafe policy selection request path')
+        if len(user.encode())>1024*1024:
+            raise ValueError('policy selection request exceeds bounded evidence size')
+        if not request_path.exists():
+            immutable_json(request_path,{'request_contract':'source_quote_transport_v5',
+                'payload':json.loads(user),'system':system,'at':now()})
+        request_ref=request_path.relative_to(self.output).as_posix()
         try:
-            content, provider = self.client.chat_with_metadata(
-                sanitize_model_text(system), user, max_tokens=1200, timeout=90,
-                thinking="disabled")
+            from .agent_client import role_scope
+            from .execution_derive import _object
+            deadline=time.monotonic()+90
+            request=user
+            for review_attempt in range(2):
+                remaining=deadline-time.monotonic()
+                if remaining<=1:
+                    raise TimeoutError('policy selection original review deadline exhausted')
+                with role_scope(self.client,'supervisor'):
+                    content, provider = self.client.chat_with_metadata(
+                        sanitize_model_text(system), request, max_tokens=1200, timeout=remaining,
+                        thinking="disabled", decision_only=True, read_only=True,
+                        auto_skills=False, include_research_context=False, resume_session=False)
+                reply={'text':sanitize_model_text(content)[:65536],
+                       'response_sha256':object_digest(content),
+                       'provider_turn':{k:provider[k] for k in
+                            ('turn_id','decision_attempt_id','agent_session_key')
+                            if isinstance(provider,dict) and k in provider}}
+                responses.append(reply)
+                try:
+                    proposed=_object(content)
+                    selected,reason=validate(proposed)
+                except ValueError as exc:
+                    proposed,selected,reason={},None,str(exc)
+                if selected or proposed.get('decision')=='abstain' or review_attempt:
+                    break
+                reply['validation_error']=reason[:1200]
+                atomic_json(selection_path,selection_record('reviewing',why=reason,provider=provider or {}))
+                request=sanitize_model_text(json.dumps({**payload,
+                    'format_feedback':reason[:1200],
+                    'previous_response':reply['text'][:12000],
+                    'correction_scope':'One bounded delivery/citation correction with original evidence. '
+                        'Quote an exact offered substring, retaining syntax. Do not invent '
+                        'a policy or weaken completed-work/source requirements.'}),
+                    local_roots=(self.repo,self.run_root))
         except Exception as exc:  # noqa: BLE001 - transport failure is recoverable, not a guess
             why = f"native artifact selection transport unavailable: {type(exc).__name__}: {exc}"
             result = selection_record("unavailable", why=why)
@@ -4415,13 +4717,10 @@ class DerivedResearch:
                 return {}, [], ''
             output = Path(str(record['output_directory'])).resolve(strict=True)
             code = sources(self.repo, self.output, record['argv'])
-            proof = validate(document['answer'], output=output,
-                docs=candidates(output, float(record['started_epoch'])), code=code)
+            docs = candidates(output, float(record['started_epoch']))
+            proof = validate(document['answer'], output=output, docs=docs, code=code)
             counter = proof['evidence']['native_counter']
             counter_path = (output/counter['path']).resolve(strict=True)
-            container = counter_path.parent.parent
-            if container == output or not container.is_relative_to(output):
-                return {}, [], ''
             bindings = {}
             physical_groups: dict[Path, list[str]] = {}
             for alias, candidate in candidate_ids.items():
@@ -4429,14 +4728,34 @@ class DerivedResearch:
                 resolved = (path if path.is_absolute() else output/path).resolve(strict=True)
                 if resolved.is_relative_to(output):
                     physical_groups.setdefault(resolved, []).append(alias)
+            # Find the nearest unambiguous shared container. Native repositories
+            # differ in metadata/weights nesting depth; parent.parent is not a
+            # portable checkpoint contract. Never broaden through another counter
+            # or bind several distinct policies using a root-level progress file.
+            peers = [(output/row['path']).resolve(strict=True) for row in docs
+                     if row['path'] != counter['path'] and any(
+                         item['field'] == counter['field'] for item in row['fields'])]
+            container = None
+            for ancestor in counter_path.parents:
+                if ancestor == output or not ancestor.is_relative_to(output):
+                    break
+                targets = [p for p in physical_groups if p.is_relative_to(ancestor)
+                           and p != counter_path]
+                if targets:
+                    if len(targets) == 1 and not any(p.is_relative_to(ancestor) for p in peers):
+                        container = ancestor
+                    break
+            if container is None:
+                return {}, [], ''
             for alias, candidate in candidate_ids.items():
                 path = Path(candidate)
                 path = path if path.is_absolute() else output/path
                 resolved = path.resolve(strict=True)
-                if (resolved.parent == container and resolved.is_relative_to(output)
+                if (resolved.is_relative_to(container) and resolved.is_relative_to(output)
                         and resolved != counter_path):
                     bindings[alias] = {'completed_work': counter['value'],
                         'counter_field': counter['field'],
+                        'counter_selection': proof['evidence'].get('counter_selection') or {},
                         'association': 'candidate and audited metadata share a native checkpoint container',
                         'equivalent_candidate_ids': sorted(physical_groups[resolved]),
                         'physical_identity_basis': 'exact same resolved target inside this attempt output',
@@ -4447,6 +4766,25 @@ class DerivedResearch:
                 'verified_producer_quotes': [entry['quote'] for entry in
                     proof['evidence']['source_evidence'] if entry['source_id']==row['id']]}
                 for row in code if row['id'] in cited]
+            # Transport actual runtime facts as citable evidence, not just an Agent's
+            # prose summary. validate() above re-reads the native document and verifies
+            # its digest, field/value, competing counters and producer citations.
+            # Keep paths opaque; no weights/data or unverified requested-work claim.
+            invocation = sanitize_model_text(json.dumps(record.get('argv') or [],
+                ensure_ascii=False), local_roots=(self.repo, self.run_root, self.output))
+            runtime_text = json.dumps({
+                'kind': 'revalidated_native_completed_work',
+                'counter_field': counter['field'], 'completed_work': counter['value'],
+                'document_sha256': proof['evidence']['document_sha256'],
+                'audit_sha256': digest(raw),
+                'bound_candidate_ids': sorted(bindings),
+                'receipt_invocation_argv': (json.loads(invocation)
+                    if len(invocation.encode()) <= 16000 else {'omitted': 'size bound'}),
+                'not_a_score_or_best_checkpoint_claim': True,
+            }, ensure_ascii=False, indent=2)
+            producer_sources.append({'path': 'runtime_completed_work',
+                'sha256': object_digest(runtime_text), 'text': runtime_text,
+                'excerpt': runtime_text})
             identity = object_digest({'bindings': bindings, 'audit_sha256': digest(raw),
                 'sources': {row['path']: row['sha256'] for row in producer_sources}})
             return bindings, producer_sources, identity
@@ -4697,6 +5035,17 @@ class DerivedResearch:
         atomic_json(self.run_root / "measurements" / f"{label}.json", failed)
         return failed
 
+    def _active_protocol_path(self) -> Path:
+        identity = getattr(self, '_reference_protocol_id', '')
+        if identity:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', identity):
+                raise ValueError('invalid reference protocol identity')
+            path = self.run_root/'reference_protocols'/(identity+'.json')
+            if path.is_symlink() or path.parent.is_symlink():
+                raise ValueError('unsafe reference protocol path')
+            return path
+        return self.run_root/'comparison_protocol.json'
+
     def _comparison_protocol_violation(self, settings: dict[str, Any], *,
                                        target: str, freeze: bool = False,
                                        confirmation: bool = False) -> str:
@@ -4706,7 +5055,7 @@ class DerivedResearch:
         evaluator switches must declare them as research_goal.protocol_keys; until then
         this is only a partial protocol guarantee, not independent confirmation.
         """
-        path = self.run_root / "comparison_protocol.json"
+        path = self._active_protocol_path()
         if not freeze and not path.exists():
             return ""
         goal = self.declaration.get("research_goal") or {}
@@ -4767,6 +5116,13 @@ class DerivedResearch:
         if getattr(self, "guardrail_specs", []):
             projection["guardrail_metrics"] = self.guardrail_specs
         try:
+            local = self.run_root/'comparison_protocol.json'
+            if getattr(self, '_reference_protocol_id', '') and local.exists():
+                # Different reference episode counts are allowed, not a different
+                # metric/evaluator/task or a backdoor to change the held-out split.
+                frozen = read_json(local)
+                if object_digest({**projection, 'settings':None}) != object_digest({**frozen, 'settings':None}):
+                    return 'reference evaluation changed the frozen local evaluator, metric, task or held-out split'
             if path.exists():
                 old = read_json(path)
                 if not isinstance(old, dict) or not isinstance(old.get("settings"), dict):
@@ -5103,8 +5459,15 @@ class DerivedResearch:
         lines = self.red_lines()
         if (not self.library.ideas and generate_if_empty) or extend:
             from .agent_client import role_scope
+            failures = []
+            def generation_event(event, notes):
+                failures.extend(row for row in notes if row.get('status') in
+                                {'idea_generation_failed', 'the library draft was refused'})
+                return self._note(event, notes)
             with role_scope(self.client, "ideator"):
-                rows = build_ideas(self.client, self._material(), on_event=self._note)
+                rows = build_ideas(self.client, self._material(), on_event=generation_event)
+            self.last_idea_generation = {'status': 'failed' if failures and not rows else 'completed',
+                                         'issues': failures[-2:], 'ideas_returned': len(rows)}
             before = len(self.library.ideas)
             for row in rows:
                 self.library.add(row)
@@ -5138,31 +5501,19 @@ class DerivedResearch:
         required = {"label", "granularity", "mechanism", "change", "risk", "crosses",
                     "why", "evidence", "touches"}
         if not isinstance(candidate, dict) or set(candidate) != required:
+            actual = set(candidate) if isinstance(candidate, dict) else set()
+            missing = sorted(required - actual)
+            unexpected = sorted(str(key) for key in actual - required)
             return {"status": "invalid", "why":
-                    f"idea fields must be exactly {sorted(required)}"}
-        label = candidate.get("label")
-        if not isinstance(label, str) or not label.strip() or len(label.strip()) > 160:
-            return {"status": "invalid", "why": "label must be 1–160 characters"}
-        granularity = candidate.get("granularity")
-        if granularity not in {"param", "code", "algo"}:
-            return {"status": "invalid", "why": "granularity must be param, code, or algo"}
-        risk = candidate.get("risk")
-        if risk not in {"low", "medium", "high"}:
-            return {"status": "invalid", "why": "risk must be low, medium, or high"}
-        for key in ("mechanism", "why"):
-            if not isinstance(candidate.get(key), str) or not candidate[key].strip():
-                return {"status": "invalid", "why": f"{key} must be non-empty text"}
-        if not isinstance(candidate.get("change"), dict):
-            return {"status": "invalid", "why": "change must be a JSON object"}
-        for key in ("evidence", "touches"):
-            value = candidate.get(key)
-            if (not isinstance(value, list) or
-                    any(not isinstance(item, str) or not item.strip() for item in value)):
-                return {"status": "invalid", "why": f"{key} must be a list of non-empty strings"}
-        if not candidate["evidence"]:
-            return {"status": "invalid", "why": "evidence must cite at least one observed fact"}
-        if candidate["touches"] and granularity != "code":
-            return {"status": "invalid", "why": "only code ideas may name touched files"}
+                    f"idea fields must be exactly {sorted(required)}; "
+                    f"missing={missing}; unexpected={unexpected}",
+                    "missing_fields": missing, "unexpected_fields": unexpected}
+        from .ideas import validate_main_proposal
+        try:
+            validate_main_proposal(candidate, repo=self.repo)
+        except ValueError as exc:
+            return {"status": "invalid", "why": str(exc)[:600]}
+        label, granularity, risk = (candidate[key] for key in ('label', 'granularity', 'risk'))
         idea = Idea(label=label.strip(), granularity=granularity,
                     mechanism=candidate["mechanism"].strip(), change=dict(candidate["change"]),
                     risk=risk, crosses=str(candidate.get("crosses") or "").strip(),
@@ -5176,17 +5527,7 @@ class DerivedResearch:
 
         if idea.granularity == "code":
             patches = patches_from_change(idea.change)
-            if not patches:
-                return {"status": "invalid", "why":
-                        "code changes need {file, find, replace} or a bounded patches list"}
-            actual_files = [patch.file for patch in patches]
-            if idea.touches and set(idea.touches) != set(actual_files):
-                return {"status": "invalid", "why":
-                        "touches must exactly match the file paths in change"}
-            idea.touches = actual_files
-            problems = check_many(patches, repo=self.repo)
-            if problems:
-                return {"status": "invalid", "why": "; ".join(problems)[:600]}
+            idea.touches = [patch.file for patch in patches]
         else:
             evidence_id = object_digest({"main_proposal": idea.evidence,
                                          "state_revision": self.controller_decision_id})
@@ -5626,7 +5967,8 @@ class DerivedResearch:
         self._record_shared_event(
             "research_action_started" if status == "running" else "research_action_finished",
             details={"action": action},
-            phase_state={"current_action": current_action, "last_action": last_action},
+            phase_state={"current_action": current_action, "last_action": last_action,
+                         "parent_action": current_action},
             event_patch={"current_action": current_action, "last_action": last_action},
             status="running" if status == "running" else status)
 
@@ -5668,9 +6010,56 @@ class DerivedResearch:
             "rounds": rounds, "settings": settings,
             "declaration": self.declaration,
             "metric": self.metric_spec.as_dict(),
-            "stages": self.sources,
+            "stages": self._research_session_stage_sources(),
             "execution_graph": self.execution_graph,
         }
+
+    def _research_session_stage_sources(self) -> dict[str, str]:
+        """Bind scoring inputs without locking future independent data producers.
+
+        Legacy scope is inferred ONLY by reproducing its exact component digest:
+        never drop a previously bound collector or alter train/evaluate to resume.
+        Graphs keep every node because their explicit edges may affect scoring.
+        Adding a capability does not verify its command or produced data; those
+        retain the existing derivation, native evidence and data lineage gates.
+        """
+        producers = {'collect', 'prepare_data'} if not self.execution_graph and 'evaluate' in self.sources else set()
+        default = {key: value for key, value in self.sources.items() if key not in producers}
+        path = self.run_root / 'controller_session.json'
+        if not path.exists() and not path.is_symlink():
+            return default
+        if (path.is_symlink() or self.run_root.is_symlink() or
+                path.stat().st_size > 8 * 1024**2):
+            raise ResearchStateError('unsafe research input-stage scope')
+        try:
+            session = read_json(path)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ResearchStateError('research input-stage scope cannot be read') from exc
+        if (not isinstance(session, dict) or session.get('run_id') != self.run_id or
+                Path(str(session.get('repository') or '')).resolve() != self.repo.resolve()):
+            raise ResearchStateError('research input-stage scope identity is invalid')
+        scope = session.get('input_stage_scope')
+        if scope is not None:
+            names = scope.get('frozen_stages') if isinstance(scope, dict) else None
+            if (not isinstance(scope, dict) or type(scope.get('schema_version')) is not int
+                    or scope.get('schema_version') != 2 or
+                    not isinstance(names, list) or any(not isinstance(name, str) for name in names)
+                    or len(set(names)) != len(names) or
+                    set(names) - set(self.sources) or
+                    set(self.sources) - set(names) - producers):
+                raise ResearchStateError('invalid or changed frozen stage scope; scoring inputs cannot be omitted')
+            return {key: self.sources[key] for key in names}
+        # Existing sessions hashed all then-known stages. Keep that exact scope
+        # while allowing only newly introduced canonical data-producing roles.
+        saved = session.get('input_component_sha256')
+        expected = saved.get('stages') if isinstance(saved, dict) else None
+        for omitted in (set(), {'collect'}, {'prepare_data'}, {'collect', 'prepare_data'}):
+            if not omitted <= producers:
+                continue
+            projected = {key: value for key, value in self.sources.items() if key not in omitted}
+            if object_digest(projected) == expected:
+                return projected
+        return dict(self.sources)  # Unproved legacy changes still fail exact identity checks.
 
     def _research_session_input_hashes(self, *, rounds: int,
                                        settings: dict[str, Any]) -> dict[str, str]:
@@ -5710,7 +6099,8 @@ class DerivedResearch:
             baseline_training_attempt_id: str = "",
             baseline_reference_checkpoint: Path | None = None,
             candidate_job: dict[str, Any] | None = None,
-            candidate_training_settings: dict[str, Any] | None = None) -> dict[str, Any]:
+            candidate_training_settings: dict[str, Any] | None = None,
+            candidate_frozen_policy: dict[str, Any] | None = None) -> dict[str, Any]:
         """Baseline, then one idea per round, each measured against the last.
 
         A round that cannot be proposed or cannot run ends the loop rather than being
@@ -5739,6 +6129,18 @@ class DerivedResearch:
                 not yield_after_action or max_rounds_per_action != 1):
             raise ValueError("main-controlled idea selection requires one bounded action")
         base_settings = self._base_settings(settings)
+        frozen_trial=None
+        if candidate_frozen_policy is not None:
+            from .frozen_policy_trial import load
+            if (not main_controller_owns_selection or not selected_idea_label or candidate_job
+                    or candidate_training_settings is not None or baseline_training_attempt_id
+                    or baseline_reference_checkpoint is not None
+                    or not (self.run_root/'controller_session.json').is_file()):
+                raise ResearchStateError('frozen policy trial requires one existing Main-selected code round')
+            selected=self.library.get(selected_idea_label)
+            if selected is None or selected.granularity!='code' or (selected.change or {}).get('collection'):
+                raise ResearchStateError('frozen policy trial is code-only and cannot collect or claim new training')
+            frozen_trial=load(self,candidate_frozen_policy)
         if candidate_training_settings is not None:
             from .candidate_settings import apply
             if (not main_controller_owns_selection or not selected_idea_label or candidate_job
@@ -5913,6 +6315,8 @@ class DerivedResearch:
                 session = {"schema_version": 1, "run_id": self.run_id,
                            "repository": str(self.repo), "input_identity": session_identity,
                            "input_component_sha256": session_input_hashes,
+                           "input_stage_scope": {"schema_version": 2,
+                               "frozen_stages": sorted(self._research_session_stage_sources())},
                            "status": "running", "action": "baseline", "rounds": rounds,
                            "base_settings": base_settings, "next_round": 1,
                            "current_measurement_label": "", "history": [], "kinds": [],
@@ -6249,6 +6653,16 @@ class DerivedResearch:
                 "evidence_sha256": object_digest(evidence), "updated_at": now()})
             kinds.append(idea.granularity)
             before_measured = self._was_measured(current)
+            # The last attempted measurement is a cursor, not the incumbent. In
+            # particular a linked result can be adopted without rewriting that
+            # cursor or the original baseline/history.
+            incumbent_before = self.snapshots.best()
+            comparison_reference = (
+                {"name": incumbent_before.name, "utility": incumbent_before.score,
+                 "scale": incumbent_before.scale}
+                if incumbent_before is not None and incumbent_before.scale == metric_scale
+                and type(incumbent_before.score) in (int, float)
+                else None)
             checkpoint_session(pending_action={
                 "round": index, "phase": "preparing_idea", "idea": idea.as_dict(),
                 "evidence_sha256": object_digest(evidence),
@@ -6297,6 +6711,12 @@ class DerivedResearch:
                 from .candidate_settings import apply
                 varied=apply(self,varied,candidate_job['training_settings'])
             varied, selected_data_versions = resolve_data_versions(self.output,self.repo,varied)
+            if frozen_trial:
+                # Code-only intervention: hold the exact training/data settings, not
+                # the original baseline defaults or an invented new training recipe.
+                if selected_data_versions or idea.granularity!='code':
+                    raise ResearchStateError('frozen policy candidate cannot introduce new data bindings')
+                varied=dict(frozen_trial['settings'])
             checkpoint_session(pending_action={
                 "round": index, "phase": "prepared", "idea": idea.as_dict(),
                 "evidence_sha256": object_digest(evidence),
@@ -6372,6 +6792,7 @@ class DerivedResearch:
                 "evidence_sha256": object_digest(evidence),
                 "changed": dict(changed), "proposal": dict(proposal),
                 "settings": dict(varied), "asked_for": sorted(asked_for),
+                **({'frozen_policy_request':dict(candidate_frozen_policy)} if frozen_trial else {}),
                 "collected": (dict(collected) if collected else None),
                 "updated_at": now()})
             if candidate_job and (candidate_job['round'] != index or candidate_job['settings'] != varied
@@ -6381,7 +6802,9 @@ class DerivedResearch:
                                   dataset=collected.get("data") if collected else None,
                                   **({'_data_bindings':selected_data_versions} if selected_data_versions else {}),
                                   **({'_reuse_training_attempt_id':candidate_job['training_attempt_id']}
-                                     if candidate_job else {}))
+                                     if candidate_job else {}),
+                                  **({'_frozen_policy_request':dict(candidate_frozen_policy)}
+                                     if frozen_trial else {}))
             round_label = f"round_{index}"
             finalization_id = self._candidate_finalization_id(label=round_label)
             if self.last_proposal_decision:
@@ -6406,7 +6829,8 @@ class DerivedResearch:
             measured = self._was_measured(result)
             helped, verdict = self._did_it_help(idea=idea, before_measured=before_measured,
                                                 measured=measured, result=result,
-                                                baseline=baseline_rate)
+                                                baseline=baseline_rate,
+                                                incumbent=(comparison_reference or {}).get("utility"))
             # The rubric first, because the state that was measured is the one worth scoring
             # and the state that was measured is the one about to be undone.
             def update_rubric_before_best() -> dict[str, Any]:
@@ -6429,6 +6853,7 @@ class DerivedResearch:
                 event = self._note(
                     "round", [{"round": index, "idea": idea.label,
                                "kind": idea.granularity, "verdict": verdict,
+                               "comparison_reference": comparison_reference,
                                "progress": round(progress, 4),
                                "frontier": (self.rubric.frontier().question
                                             if self.rubric.frontier() is not None else "")}])
@@ -6529,9 +6954,14 @@ class DerivedResearch:
                     current=result if not undone else current)
                 return {"answered_questions": answered}
 
-            self._run_candidate_finalization_step(
-                label=round_label, step="benchmark_questions",
-                action=answer_benchmark_questions)
+            if main_controller_owns_selection:
+                self._skip_candidate_finalization_step(
+                    label=round_label, step='benchmark_questions',
+                    because='optional research narration is off the scoring commit path; Main may request a specialist after commit')
+            else:
+                self._run_candidate_finalization_step(
+                    label=round_label, step="benchmark_questions",
+                    action=answer_benchmark_questions)
             self._run_candidate_finalization_step(
                 label=round_label, step="rubric_final",
                 action=lambda: (self._write_rubric(),
@@ -6548,6 +6978,7 @@ class DerivedResearch:
                             "risk": idea.risk,
                             "mechanism": idea.mechanism,
                             "verdict": verdict,
+                            "comparison_reference": comparison_reference,
                             "undone": undone,
                             "progress": round(progress, 4),
                             **({} if measured else
@@ -6688,18 +7119,27 @@ class DerivedResearch:
 
     @staticmethod
     def _did_it_help(*, idea: Any, before_measured: bool, measured: bool,
-                     result: dict[str, Any], baseline: float | None) -> tuple[bool, str]:
+                     result: dict[str, Any], baseline: float | None,
+                     incumbent: float | None = None) -> tuple[bool, str]:
         """Whether the round moved the thing the run is trying to move, and why.
 
-        Three states and they are not the same. A round that made the evaluation produce a
-        number where none came out has done the most a round can do here, whatever the number
-        is. A round that produced a number and beat the baseline is an improvement. A round
-        that produced a number no better than the baseline's has not failed -- it has measured
-        nothing new -- but it has not earned the right to keep its change either.
+        An existing same-metric incumbent is the comparison target, even when the
+        last attempt failed. Only when no scored incumbent exists can first valid
+        measurement represent environment progress. A measured regression is a
+        useful observation, not permission to keep the source change. Utility
+        ranking does not establish statistical or held-out improvement.
         """
         rate = DerivedResearch._metric_utility(result)
         if measured and (result.get("guardrails") or {}).get("status") in {"unknown", "violated"}:
             return False, "primary metric is measured, but secondary objectives are missing or violated"
+        if measured and type(rate) in (int, float) and type(incumbent) in (int, float):
+            # A known best metric takes precedence over environment-progress
+            # recovery and the original baseline. This also works for minimized
+            # metrics because both scores are normalized utility.
+            if rate > incumbent:
+                return True, f"{rate} against the incumbent utility of {incumbent}"
+            return False, (f"{rate} against the incumbent utility of {incumbent} -- measured, "
+                           "and no better than what was already retained")
         if measured and not before_measured:
             return True, (f"the evaluation produced a number where none came out before "
                           f"({rate}), which is the rung the run was on")

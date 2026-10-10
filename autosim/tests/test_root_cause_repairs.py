@@ -162,7 +162,9 @@ def test_readonly_fix_has_only_bounded_native_inspection(tmp_path):
 def test_stream_filter_retains_unknown_errors_and_results():
     assert not _critical_stream_line('{"type":"system","subtype":"thinking_tokens"}')
     for line in ['not json', '{"type":"result"}', '{"type":"system","subtype":"error"}',
-                 '{"type":"assistant"}', '{"type":"user"}', '{"type":"stream_event"}']:
+                 '{"type":"assistant"}', '{"type":"user"}', '{"type":"stream_event"}',
+                 '{"type":"system","subtype":"thinking_tokens","error":"bad"}',
+                 '{"type":"system","subtype":"thinking_tokens","unknown":1}']:
         assert _critical_stream_line(line)
 
 
@@ -190,6 +192,65 @@ def test_nonstream_capture_without_callback_does_not_fill_callback_queue(tmp_pat
         env=os.environ.copy(), timeout=5, decouple_callbacks=True)
     assert result.returncode == 0 and result.error is None
     assert len(json.loads(result.stdout)["rows"]) == 25000
+
+
+def test_telemetry_capture_flood_exceeds_raw_cap_but_retains_terminal(tmp_path):
+    received = []
+    code = ('import json\n'
+            'line=json.dumps({"type":"system","subtype":"thinking_tokens","estimated_tokens":1})\n'
+            'for i in range(4000): print(line)\n'
+            'print(json.dumps({"type":"result","result":"complete"}))\n')
+    result = run_process_stream([sys.executable,'-c',code], cwd=tmp_path,
+        env=os.environ.copy(), timeout=10, max_output_bytes=1024,
+        decouple_callbacks=True, on_stdout_line=received.append,
+        stdout_line_filter=_critical_stream_line,
+        capture_stdout_line_filter=_critical_stream_line)
+    assert result.returncode == 0 and result.error is None and not result.timed_out
+    assert len(received) == 1 and json.loads(received[0])['type'] == 'result'
+    assert json.loads(result.stdout)['result'] == 'complete'
+    stats = result.capture_diagnostics
+    assert stats['stdout_observed_bytes'] > 1024
+    assert stats['stdout_filtered_lines'] == 4000
+    assert stats['stdout_filtered_bytes'] + stats['retained_stdout_bytes'] == stats['stdout_observed_bytes']
+
+
+@pytest.mark.parametrize('line', ['not json', '{"type":"system","subtype":"error"}',
+                                  '{"type":"assistant"}', '{"type":"result"}'])
+def test_filtered_capture_cannot_hide_unknown_or_critical_overflow(tmp_path, line):
+    code = 'for i in range(400): print(' + repr(line) + ')'
+    result = run_process_stream([sys.executable,'-c',code], cwd=tmp_path,
+        env=os.environ.copy(), timeout=5, max_output_bytes=1024,
+        capture_stdout_line_filter=_critical_stream_line)
+    assert result.error is not None and 'output exceeded' in str(result.error)
+    assert result.capture_diagnostics['stdout_filtered_lines'] == 0
+
+
+def test_filtered_capture_preserves_unfinished_protocol_on_timeout(tmp_path):
+    prefix = '{"type":"result","result":"unfinished'
+    code = 'import sys,time;sys.stdout.write(' + repr(prefix) + ');sys.stdout.flush();time.sleep(5)'
+    result = run_process_stream([sys.executable,'-c',code], cwd=tmp_path,
+        env=os.environ.copy(), timeout=.2, capture_stdout_line_filter=_critical_stream_line)
+    assert result.timed_out and result.stdout == prefix
+    assert result.capture_diagnostics['stdout_filtered_lines'] == 0
+
+
+def test_filtered_telemetry_still_has_per_line_bound(tmp_path):
+    code = 'import json;print(json.dumps({"type":"system","subtype":"thinking_tokens","extra":"x"*2000}))'
+    result = run_process_stream([sys.executable,'-c',code], cwd=tmp_path,
+        env=os.environ.copy(), timeout=5, max_line_bytes=128,
+        capture_stdout_line_filter=_critical_stream_line)
+    assert result.error is not None and 'line exceeded' in str(result.error)
+    assert result.stdout  # Keep a bounded diagnostic prefix of the offending record.
+
+
+def test_filtered_capture_keeps_stderr_limit(tmp_path):
+    code = 'import sys;sys.stderr.write("x"*3000)'
+    result = run_process_stream([sys.executable,'-c',code], cwd=tmp_path,
+        env=os.environ.copy(), timeout=5, max_output_bytes=1024,
+        capture_stdout_line_filter=_critical_stream_line)
+    assert result.error is not None and 'output exceeded' in str(result.error)
+    assert len(result.stderr) == 1024
+    assert result.capture_diagnostics['stdout_filtered_lines'] == 0
 
 
 @pytest.mark.parametrize("identity", ["4c2d4a90e97d4f049a60918f4051dab8",

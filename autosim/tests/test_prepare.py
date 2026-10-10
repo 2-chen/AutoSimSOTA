@@ -39,13 +39,51 @@ def preparation(tmp_path, choices=()):
                        scouting=tmp_path / "scouting")
 
 
+def test_main_decision_does_not_inherit_closed_research_parent(tmp_path):
+    from autosim.research.research_state import ResearchStateStore
+    store=ResearchStateStore(tmp_path/'out',run_id='derived',repository=tmp_path)
+    parent={'step':'round_9','status':'running','controller_decision_id':'a'*16}
+    store.record('research','research_action_finished',status='completed',
+                 phase_state={'parent_action':parent,'current_action':None,
+                              'last_action':{**parent,'step':'research_complete','status':'completed'}})
+    store.record('preparation','action_started',status='running',
+                 phase_state={'current_action':{'step':'choose','status':'running'}},
+                 event_patch={'current_action':{'step':'choose','status':'running'}})
+    real=preparation(tmp_path)
+    assert real.recovery_after_interruption['action']['step']=='choose'
+    assert real.recovery_after_interruption['parent_action'] is None
+
+
+@pytest.mark.parametrize('closed_step',['round_9','research_complete'])
+@pytest.mark.parametrize('matching',[True,False])
+def test_saved_choose_recovery_requires_matching_closed_parent(tmp_path,closed_step,matching):
+    real=preparation(tmp_path)
+    parent={'step':'round_9','status':'running','controller_decision_id':'a'*16}
+    real.state_store.record('research','research_action_finished',status='completed',
+        phase_state={'parent_action':parent,'current_action':None,
+                     'last_action':{'step':closed_step,'status':'completed',
+                        'controller_decision_id':('a' if matching else 'b')*16}})
+    real.recovery_after_interruption={'action':{'step':'choose','status':'running'},
+                                    'parent_action':parent,'process_status':{'status':'not_recorded'}}
+    result=real._step_reconcile_interrupted_action()
+    if matching:
+        assert result['resume_scope']=='preparation'
+        assert real.recovery_after_interruption=={}
+    else:
+        assert result['outcome']=='blocked'
+        assert real.recovery_after_interruption
+    assert not (real.output/'research/derived/controller_session.json').exists()
+
+
 def test_preparation_steps_are_closed_and_named():
     """The set is closed and named, including the mandatory interruption recovery step."""
-    assert set(OPERATIONS) == {'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference",
+    assert set(OPERATIONS) == {'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference",
+                               'inspect_storage','configure_storage_controls','register_storage_artifact',
+                               'plan_storage_gc','commit_storage_gc','reconcile_storage_gc',
                                "extend_research_rounds", "read_the_checkout", "declare", "build_the_environment",
                                "derive_a_command", "reconcile_interrupted_action",
                                "discard_interrupted_candidate",
-                               "bind_metric", "recover_unscored_baseline", "run_the_loop",
+                               "bind_metric", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement", "run_the_loop",
                                "generate_research_ideas", "propose_research_idea",
                                "confirm_best", "stop", "research_task", "propose_harness_repair",
                                "update_research_plan", "retry_failed_action",
@@ -126,6 +164,11 @@ def test_completed_detached_train_is_passed_to_unscored_baseline_only(tmp_path, 
         def _verified_training_receipt(attempt, settings, *, audit_progress=False):
             return {"verified": True} if attempt == attempt_id and settings == {} else None
 
+        def _comparison_protocol_violation(self, settings, *, target, freeze=False):
+            assert settings=={} and target=='evaluate' and freeze
+            freezes.append(target)
+            return ''
+
         def run(self, **kwargs):
             seen.append(kwargs)
             return {"rounds": [], "run_status": "completed", "objective": {}}
@@ -135,6 +178,7 @@ def test_completed_detached_train_is_passed_to_unscored_baseline_only(tmp_path, 
             return {'ok': True, 'metric_value': 0.5, 'evaluate': {'attempt_id': 'c'*32}}
 
     seen = []
+    freezes = []
     monkeypatch.setattr(real, "_research_controller", lambda: (Research(), {}))
     if existing_unscored:
         root=Research.run_root
@@ -145,6 +189,7 @@ def test_completed_detached_train_is_passed_to_unscored_baseline_only(tmp_path, 
         (root/'research_report.json').write_text(json.dumps({
             'run_id': real.run_id, 'repo': str(real.repo), 'run_status': 'paused'}))
     result = real._step_run_the_loop(job_id=job_id)
+    assert freezes==([] if existing_unscored else ['evaluate'])
     if existing_unscored:
         assert result['outcome']=='yielded' and result['training_reused'] is True
         assert seen==[{'replacement_training_attempt_id': attempt_id}]
@@ -176,7 +221,7 @@ def test_public_operation_gate_accepts_only_offered_unscored_baseline_job(tmp_pa
         assert result['outcome']=='not attempted' and not seen
 
 
-def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_path):
+def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_path,monkeypatch):
     class Client(_Client):
         supports_agent_fix = True
 
@@ -194,6 +239,9 @@ def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_pa
     client = Client([])
     real = Preparation(repo=tmp_path, output=tmp_path / "run", client=client,
                        scouting=tmp_path / "run" / "scouting")
+    findings=[{'evidence_id':'c'*32,'native_attempt_id':'d'*32,
+               'origin':'operator_diagnostic','summary':'synthetic CPU counterexample, intentional cancellation'}]
+    monkeypatch.setattr(real,'_monitor_findings',lambda:findings)
     action = {"step": "run_the_loop", "outcome": "yielded",
               "candidate_failure": {"idea_label": "bad_candidate"},
               "evidence_id": "a" * 32,
@@ -201,6 +249,9 @@ def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_pa
     observation = real._fix_failed_action(action_id="b" * 16, action=action)
     assert observation["assessment"] == "no_safe_repair"
     assert client.seen[-1][2]["read_only"] is True
+    assert json.loads(client.seen[-1][1])['monitor_findings']==findings
+    assert 'failed_action.candidate_failure' in client.seen[-1][0]
+    assert 'receipt-bound handoff recovery instead of retraining' in client.seen[-1][0]
     real.steps.append({"step": "run_the_loop", "receipt_ref": action["receipt_ref"]})
     real.fix_observation = {**observation, "assessment": "repair_attempted"}
     assert real._repair_retry_available() is False
@@ -958,14 +1009,14 @@ def test_the_state_is_read_from_the_records(tmp_path):
     assert state["stages_the_checkout_has"] == {"train": "kept from an earlier run",
                                                 "collect": "no command"}
     assert state["available"] == [name for name in OPERATIONS
-                                          if name not in {'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds",
+                                          if name not in {'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds",
                                                           "research_task", "propose_harness_repair", "update_research_plan", "review_report_demo", "capture_environment_demo",
                                                       "retry_failed_action", "submit_research_task",
                                                       "cancel_research_task", "wait_for_jobs",
                                                       "configure_screening", "run_screening_trial", "inspect_screening",
                                                       "submit_native_job", "inspect_native_job",
                                                       "adjust_native_job", "cancel_native_job",
-                                                       "confirm_best", "recover_unscored_baseline",
+                                                       "confirm_best", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement",
                                                        "build_the_environment", "derive_a_command",
                                                        "bind_metric", "reconcile_interrupted_action",
                                                        "discard_interrupted_candidate",
@@ -1445,6 +1496,42 @@ def test_choose_stops_with_protocol_reason_after_malformed_reply_and_one_repair(
     assert choice["do"] == "stop"
     assert "controller decision was rejected twice" in choice["why"]
     assert "no action ran" in choice["why"]
+
+
+@pytest.mark.parametrize('bad', [{'arguments':{}}, {'do':''},
+    {'do':'stop'}, {'do':'stop','why':'  '}])
+def test_choose_never_defaults_incomplete_json_to_silent_stop(tmp_path, bad):
+    client = _Client([bad, {'do':'read_the_checkout','why':'inspect source'}])
+    real = Preparation(repo=tmp_path,output=tmp_path/'out',client=client,
+                       scouting=tmp_path/'scouting')
+    choice = real.choose()
+    assert choice['do'] == 'read_the_checkout'
+    assert len(client.seen) == 2 and 'no action ran' in client.seen[1]
+
+
+def test_choose_selects_explicit_decision_not_an_incidental_prose_object(tmp_path):
+    class Client:
+        model = 'fixture'
+        def chat_with_metadata(self, *args, **kwargs):
+            return ('The work controls were {}. Next action:\n' +
+                json.dumps({'do':'read_the_checkout','why':'inspect native source'})), {}
+    real = Preparation(repo=tmp_path,output=tmp_path/'out',client=Client(),
+                       scouting=tmp_path/'scouting')
+    assert real.choose()['do'] == 'read_the_checkout'
+
+
+def test_choose_rejects_multiple_conflicting_decisions(tmp_path):
+    class Client:
+        model = 'fixture'
+        def chat_with_metadata(self, *args, **kwargs):
+            return ('{"do":"stop","why":"halt"}\n'
+                    '{"do":"read_the_checkout","why":"inspect"}'), {}
+    real = Preparation(repo=tmp_path,output=tmp_path/'out',client=Client(),
+                       scouting=tmp_path/'scouting')
+    choice = real.choose()
+    assert choice['decision_by'] == 'tool'
+    assert choice['decision_failure']['kind'] == 'decision_rejected'
+    assert 'rejected twice' in choice['why']
 
 
 def test_preparation_run_continues_after_repaired_decision_protocol_error(
@@ -2207,6 +2294,31 @@ def test_main_controller_hands_off_between_baseline_and_candidate_without_duplic
         "idea_label": "increase training epochs"}
 
 
+def test_options_attach_related_trials_without_excluding_or_rewriting_alias(tmp_path):
+    from autosim.research.ideas import Idea, IdeaLibrary, CLEARED
+    real = preparation(tmp_path)
+    root = real.output / 'research' / real.run_id
+    root.mkdir(parents=True)
+    (root / 'controller_session.json').write_text(json.dumps({
+        'schema_version':1, 'run_id':real.run_id, 'repository':str(real.repo),
+        'status':'paused', 'rounds':3, 'next_round':2,
+        'history':[{'round':1, 'metric_value':0.22}]}), encoding='utf-8')
+    (real.repo / 'train.py').write_text('N = 1\n', encoding='utf-8')
+    library = IdeaLibrary(root / 'ideas.json')
+    change = {'file':'train.py', 'find':'N = 1', 'replace':'N = 2 # explanation'}
+    library.add(Idea(label='observed', granularity='code', change=change, status=CLEARED))
+    library.note('observed', worked=False, outcome='measured regression')
+    library.add(Idea(label='alias', granularity='code', status=CLEARED,
+        change={**change, 'replace':'N = 2 # different explanation'}))
+    saved = library.path.read_bytes()
+    result = real._research_options({'status':'paused'}, {})
+    alias = next(row for row in result['items'] if row['label'] == 'alias')
+    assert alias['times_tried'] == 0
+    assert alias['related_prior_trials'][0]['label'] == 'observed'
+    assert alias['related_prior_trials'][0]['outcome'] == 'measured regression'
+    assert library.path.read_bytes() == saved
+
+
 def test_paused_research_rejects_unreviewed_idea_label_without_mutating_session(tmp_path):
     real = preparation(tmp_path)
     root = real.output / "research" / real.run_id
@@ -2231,7 +2343,8 @@ def test_paused_research_rejects_unreviewed_idea_label_without_mutating_session(
     assert persisted["status"] == "paused"
 
 
-def test_fresh_idea_batch_is_suggestion_only_and_does_not_run_a_stage(tmp_path):
+@pytest.mark.parametrize('old_pool', [False, True])
+def test_fresh_idea_batch_is_suggestion_only_and_does_not_run_a_stage(tmp_path, old_pool):
     from autosim.research.ideas import CLEARED, Idea, IdeaLibrary
 
     real = preparation(tmp_path)
@@ -2250,8 +2363,14 @@ def test_fresh_idea_batch_is_suggestion_only_and_does_not_run_a_stage(tmp_path):
         "kinds": [], "current_measurement_label": "baseline",
     }), encoding="utf-8")
 
+    if old_pool:
+        IdeaLibrary(root/'ideas.json').add(Idea(label='old suggestion',granularity='param',
+            change={'train.learning_rate':0.01},risk='low',crosses='none',
+            why='old suggestion is not an obligation',status=CLEARED))
+    generated=[]
     class _IdeaGenerator:
         def prepare_idea_options(self, *, extend, generate_if_empty):
+            generated.append(True)
             assert extend is True
             assert generate_if_empty is False
             idea = Idea(label="new suggestion", granularity="param",
@@ -2270,9 +2389,34 @@ def test_fresh_idea_batch_is_suggestion_only_and_does_not_run_a_stage(tmp_path):
     result = real.do("generate_research_ideas")
 
     assert result["outcome"] == "ideas available"
-    assert real.state()["research_options"]["items"][0]["label"] == "new suggestion"
+    labels=[row['label'] for row in real.state()['research_options']['items']]
+    assert 'new suggestion' in labels
+    if old_pool:
+        assert 'old suggestion' in labels
+    assert real.do('generate_research_ideas')['outcome']=='not attempted'
+    assert generated==[True]
     assert not (root / "attempts").exists()
     assert json.loads(session_path.read_text(encoding="utf-8"))["status"] == "paused"
+
+
+def test_failed_idea_provider_is_not_reported_as_no_viable_ideas(tmp_path, monkeypatch):
+    real = preparation(tmp_path)
+    root = real.output/'research'/real.run_id
+    fault = {'status':'idea_generation_failed','runtime_status':'timed_out',
+             'evidence_id':'a'*32,'evidence_ref':'evidence/'+'a'*32+'.json'}
+    class Generator:
+        def prepare_idea_options(self, **options):
+            self.last_idea_generation={'status':'failed','issues':[fault],'ideas_returned':0}
+            return []
+    monkeypatch.setattr(real,'state',lambda:{'research_progress':{'status':'paused','next_round':17},
+                                            'research_options':{'items':[],'generation_attempted':False}})
+    monkeypatch.setattr(real,'_research_controller',lambda:(Generator(),{}))
+    result=real._step_generate_research_ideas()
+    assert result['outcome']=='idea generation failed'
+    assert result['generation_diagnostics']['issues'][0]['evidence_id']=='a'*32
+    receipt=json.loads((root/'idea_generation.json').read_text())
+    assert receipt['status']=='failed' and receipt['selectable_ideas']==0
+    assert not (root/'attempts').exists()
 
 
 def test_confirm_best_requires_explicit_request_and_never_trains(tmp_path):
@@ -3443,6 +3587,144 @@ def test_selected_train_producer_is_required_before_research_loop(tmp_path, monk
     real.stages["train"] = "def stage_argv_train(i): return []"
     assert not real._selected_train_command_missing()
     assert real._research_loop_ready()
+
+
+def test_score_derivation_requires_explicit_producer_even_without_checkpoint_flag(tmp_path, monkeypatch):
+    from autosim.research import prepare as module, checkpoint_handoff
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.execution = {'stages': {'evaluate': {'available': True, 'entrypoint':'eval.py',
+        'invocation':'python eval.py --agent <policy>'}}}
+    monkeypatch.setattr(real, '_score_target', lambda: 'evaluate')
+    monkeypatch.setattr(checkpoint_handoff, 'catalog', lambda *a, **k:{'status':'available'})
+    monkeypatch.setattr(module.execution_derive, 'checkpoint_for_verification',
+                        lambda *a, **k:{'path':'unrelated-template.pth'})
+    monkeypatch.setattr(module.execution_derive, 'make_runnable',
+                        lambda *a, **k:pytest.fail('must select actual producer before derivation'))
+    result = real._step_derive_a_command(stage='evaluate')
+    assert result['outcome'] == 'not attempted'
+    assert 'checkpoint_ref' in result['because']
+
+
+def test_caller_input_handoff_is_visible_to_main_without_false_impossibility(tmp_path, monkeypatch):
+    from autosim.research import prepare as module
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.execution = {'stages':{'train':{'available':True,'entrypoint':'train.py'}}}
+    record = {'status':'caller input correction required','failure_domain':'caller_input',
+        'repair_owner':'main_agent','error':'Caller input must be corrected by Main',
+        'caller_input_handoff':{'input':'dataset','reason':'native consumer requires a directory'}}
+    monkeypatch.setattr(module.execution_derive, 'checkpoint_for_verification',
+                        lambda *a,**k:{'path':''})
+    def derive(*args, **kwargs):
+        kwargs['on_event']('train',[record])
+        return None, {}, [record], args[2]
+    monkeypatch.setattr(module.execution_derive, 'make_runnable', derive)
+    result = real._step_derive_a_command(stage='train')
+    assert result['failure_domain'] == 'caller_input'
+    assert result['repair_owner'] == 'main_agent'
+    assert result['caller_input_handoff']['input'] == 'dataset'
+    assert result['because'] == record['error']
+    assert 'train' not in real.stages
+
+
+def test_environment_handoff_reopens_runtime_and_preserves_native_identity(tmp_path, monkeypatch):
+    from autosim.research import prepare as module
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.execution = {'stages': {'train': {'available': True, 'entrypoint': 'train.py'}}}
+    record = {'stage': 'train', 'status': 'environment repair required',
+        'failure_kind': 'runtime_environment_repair_required',
+        'error': 'source and sealed runtime failure require dependency diagnosis',
+        'native_evidence_ref': 'evidence/owned.json',
+        'environment_handoff': {'reason': 'native import cannot run in selected runtime'}}
+    monkeypatch.setattr(module.execution_derive, 'checkpoint_for_verification', lambda *a, **k: {'path': ''})
+    def derive(*args, **kwargs):
+        kwargs['on_event']('train', [record])
+        return None, {}, [record], args[2]
+    monkeypatch.setattr(module.execution_derive, 'make_runnable', derive)
+    result = real._step_derive_a_command(stage='train')
+    assert result['outcome'] == 'environment repair required'
+    assert result['repair_owner'] == 'environment_planner'
+    assert 'evidence/owned.json' in result['evidence_refs']
+    assert result['evidence_id']
+    assert 'train' not in real.stages
+    failure = module._last_stage_failure_after_build([
+        {'step': 'build_the_environment', 'outcome': 'done'},
+        {'step': 'derive_a_command', 'arguments': {'stage': 'train'}, **result}],
+        real.output, real.run_id)
+    assert failure['failure_kind'] == 'runtime_environment_repair_required'
+    assert failure['native_evidence_ref'] == 'evidence/owned.json'
+
+
+@pytest.mark.parametrize('owner', ['main_agent', 'resource', 'environment_planner', 'environment_executor'])
+def test_owned_handoff_does_not_purchase_duplicate_checkout_fix(tmp_path, owner):
+    class Client(_Client):
+        supports_agent_fix = True
+        def as_role(self, role):
+            pytest.fail('owned handoff must not enter a second checkout Fix')
+        def chat_with_metadata(self, *args, **kwargs):
+            pytest.fail('owned handoff must not buy another diagnostic turn')
+    real = preparation(tmp_path)
+    real.client = Client([])
+    assert real._fix_failed_action(action_id='a' * 16, action={
+        'step': 'derive_a_command', 'outcome': 'no runnable command',
+        'repair_owner': owner, 'because': 'return to the responsible planner'}) is None
+
+
+def test_main_explicitly_rebinds_handoff_draft_and_still_runs_verifier(tmp_path, monkeypatch):
+    from autosim.research import prepare as module
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    real.execution = {'stages':{'train':{'available':True,'entrypoint':'train.py'}}}
+    selected = {'path':'old-policy'}
+    monkeypatch.setattr(module.execution_derive, 'checkpoint_for_verification', lambda *a, **k:dict(selected))
+    seen = []
+    def derive(*args, **kwargs):
+        seen.append((args[2], dict(kwargs['inputs_for_verify'])))
+        row = {**args[2], 'environment': {'WRAPPER_PYTHON': '{verified_interpreter}', 'DISPLAY_MODE': 'chosen'}}
+        record = {'status':'caller input correction required', 'error':'loader needs another policy bundle',
+            'native_evidence_ref':'evidence/owned.json',
+            'caller_input_handoff':{'input':'checkpoint','reason':'loader expects a native model bundle'}}
+        kwargs['on_event']('train', [record])
+        return None, {}, [record], row
+    monkeypatch.setattr(module.execution_derive, 'make_runnable', derive)
+    first = real._step_derive_a_command(stage='train')
+    assert first['invocation_draft_ref']
+    selected['path'] = 'new-policy'
+    refused = real._step_derive_a_command(stage='train', draft_ref=first['invocation_draft_ref'])
+    assert refused['outcome'] == 'rejected' and len(seen) == 1
+    second = real._step_derive_a_command(stage='train', draft_ref=first['invocation_draft_ref'],
+                                        draft_rebind_inputs=['checkpoint'])
+    assert len(seen) == 2
+    assert seen[-1][0]['environment']['DISPLAY_MODE'] == 'chosen'
+    assert seen[-1][1]['checkpoint'] == 'new-policy'
+    assert second['outcome'] == 'no runnable command' and 'train' not in real.stages
+
+
+@pytest.mark.parametrize('changed_entrypoint', [False, True])
+def test_rederivation_retains_accepted_invocation_but_still_requires_native_verification(
+        tmp_path, monkeypatch, changed_entrypoint):
+    from autosim.research import prepare as module
+    real = preparation(tmp_path)
+    real.interpreter = Path(sys.executable)
+    original = {'available':True,'entrypoint':'train.py','artifact':'old-template/*'}
+    real.execution = {'stages':{'train':original}}
+    prior = {**original,'artifact':'actual/*.pth','staging':['mkdir -p "$AUTOSIM_STAGE_OUTPUT"']}
+    real.verified['train'] = prior
+    if changed_entrypoint:
+        real.execution['stages']['train'] = {**original,'entrypoint':'different.py'}
+    seen = []
+    def derive(*args, **kwargs):
+        seen.append(args[2])
+        return None, {}, [{'status':'rejected','error':'new native verification not passed'}], args[2]
+    monkeypatch.setattr(module.execution_derive,'make_runnable',derive)
+    monkeypatch.setattr(module.execution_derive,'checkpoint_for_verification',lambda *a,**k:{'path':''})
+    result = real._step_derive_a_command(stage='train')
+    assert result['outcome'] == 'no runnable command'
+    assert len(seen) == 1
+    assert seen[0]['artifact'] == ('old-template/*' if changed_entrypoint else 'actual/*.pth')
+    assert ('staging' in seen[0]) is (not changed_entrypoint)
 
 
 def test_failed_derivation_keeps_attempts_but_not_a_fake_command(tmp_path, monkeypatch):

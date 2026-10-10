@@ -26,6 +26,9 @@ build-backend = "setuptools.build_meta"
 include = ["autosim*"]
 exclude = ["tests*", "output*", "demo*", "task*"]
 
+[tool.setuptools.package-data]
+autosim = ["prompts/*.md", "skills/manifest.yaml", "skills/*/SKILL.md", "skills/*/references/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["output", ".git", ".venv"]

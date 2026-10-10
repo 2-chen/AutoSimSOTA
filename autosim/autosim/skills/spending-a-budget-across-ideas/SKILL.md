@@ -1,9 +1,6 @@
 ---
 name: spending-a-budget-across-ideas
 description: 当完整实验昂贵时按可验证的低保真信号分配预算、续训和淘汰；不得用跨模型不可比的 loss 草率排名。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 在多个假设之间分配预算
@@ -21,3 +18,11 @@ evidence: Reviewed 2026-09-29; literature links and limitations are stated in th
 可以调整局部时限、晋升比例与候选数，不把某个 rung 表写死为运行器规则。取消停滞任务前检查真实进度和阶段，长时作业使用现有提交/轮询/取消接口，总预算不可突破。
 
 有意义的停止依据是信息与收益不足、明确资源不可行或合法终态，不是“本轮 loss 没变”。最终赢家仍需完整产物身份与独立确认，低保真分数不进入正式最佳指标。
+
+## 先买有区分力的信息，再扩大工作量
+
+先判断是否有可复用产物上的合法候选（checkpoint、执行 chunk、支持的采样步数），而不是每轮都重新训练。按当前失败与不确定性选择少量候选，不把所有技巧做笛卡尔积；组合候选需承认不能单项归因。候选优先级可结合预期增益、信息价值、实际成本与风险，但没有校准经验时不编造数值概率。
+
+开发侧可预定小样本筛选再扩样本，不能缩小正式分母。高成功率时检查分辨率：50 回合的一个结果对应 2 个百分点；98% 到 100% 不足以仅凭一次比例认定可靠提升。反复选优后需独立确认；不反复使用固定样本检验直到显著，也不事后把已参与选优的数据命名为留出。
+
+计入一次性安装、转换、编译、蒸馏、加载和媒体成本，并估计剩余次数能否回本。优化吞吐时按相同工作量比较；训练更多步的收益另列。预留必要对照与赢家确认，金额/墙钟/GPU 额度均读取当前账本，不从历史默认值推测余量。关于关键路径与复用，按需读 [实验提效](../accelerating-policy-experiments/SKILL.md)。

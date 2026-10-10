@@ -136,9 +136,45 @@ def _merge_usage(held: dict[str, Any], update: dict[str, Any]) -> None:
             held[key] = max(int(held.get(key) or 0), value)
 
 
+def validate_generation_policy(policy: dict | None) -> dict:
+    """Explicit controls for fresh, bounded reviews; never infer them from a role."""
+    if policy is None:
+        return {}
+    if not isinstance(policy, dict) or set(policy) - {"max_output_tokens", "thinking"}:
+        raise ValueError("unsupported generation policy")
+    maximum, thinking = policy.get("max_output_tokens"), policy.get("thinking")
+    if maximum is not None and (isinstance(maximum, bool) or not isinstance(maximum, int)
+                                or not 1 <= maximum <= 65536):
+        raise ValueError("review max_output_tokens must be an integer in 1..65536")
+    if thinking is not None and thinking != "disabled":
+        raise ValueError("bounded review only supports an explicit disabled thinking override")
+    return {key: value for key, value in policy.items() if value is not None}
+
+
+def apply_generation_policy(request: dict, policy: dict) -> dict:
+    """Keep messages/tools/cache controls intact; limit the actual forwarded request."""
+    result = dict(request)
+    maximum = result.get("max_tokens")
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        raise ValueError("request max_tokens must be a positive integer")
+    if policy.get("max_output_tokens") is not None:
+        result["max_tokens"] = min(maximum, policy["max_output_tokens"])
+    if policy.get("thinking") == "disabled":
+        result["thinking"] = {"type": "disabled"}
+        # Effort controls apply to thinking; don't send contradictory CLI defaults.
+        if isinstance(result.get("output_config"), dict):
+            config = {k: v for k, v in result["output_config"].items() if k != "effort"}
+            if config:
+                result["output_config"] = config
+            else:
+                result.pop("output_config")
+    return result
+
+
 class DeepSeekTurnGateway:
     def __init__(self, *, upstream_base_url: str, upstream_key: str,
-                 model: str, limit_usd: float, extend_budget: Any = None):
+                 model: str, limit_usd: float, extend_budget: Any = None,
+                 generation_policy: dict | None = None):
         base = upstream_base_url.rstrip("/")
         if not base.startswith("https://") or not base.endswith("/anthropic"):
             raise ValueError("DeepSeek upstream must be an HTTPS Anthropic-compatible endpoint")
@@ -148,6 +184,7 @@ class DeepSeekTurnGateway:
         request_cost_ceiling_usd(model, 1, at=dt.datetime.now(dt.timezone.utc),
                                  input_bytes=1)
         self.upstream_base_url = base
+        self.generation_policy = validate_generation_policy(generation_policy)
         self._upstream_key = upstream_key
         self.local_token = secrets.token_urlsafe(32)
         self.gate = TurnCostGate(limit_usd=limit_usd, model=model,
@@ -166,6 +203,7 @@ class DeepSeekTurnGateway:
 
     def snapshot(self) -> dict[str, Any]:
         result = self.gate.snapshot()
+        result["generation_policy"] = dict(self.generation_policy)
         with self._incoming_lock:
             result["incoming"] = list(self._incoming)
             result["rejections"] = list(self._rejections)
@@ -224,6 +262,9 @@ class DeepSeekTurnGateway:
                     request = json.loads(raw)
                     if not isinstance(request, dict) or _has_nontext(request):
                         raise ValueError("only priced text requests are supported")
+                    if gateway.generation_policy:
+                        request = apply_generation_policy(request, gateway.generation_policy)
+                        raw = json.dumps(request, ensure_ascii=False).encode("utf-8")
                     model = request.get("model")
                     maximum = request.get("max_tokens")
                     at = dt.datetime.now(dt.timezone.utc)
@@ -344,8 +385,10 @@ class DeepSeekTurnGateway:
 @contextmanager
 def deepseek_turn_gateway(*, upstream_base_url: str, upstream_key: str,
                           model: str, limit_usd: float,
-                          extend_budget: Any = None) -> Iterator[DeepSeekTurnGateway]:
+                          extend_budget: Any = None,
+                          generation_policy: dict | None = None) -> Iterator[DeepSeekTurnGateway]:
     with DeepSeekTurnGateway(upstream_base_url=upstream_base_url,
                              upstream_key=upstream_key, model=model,
-                             limit_usd=limit_usd, extend_budget=extend_budget) as gateway:
+                             limit_usd=limit_usd, extend_budget=extend_budget,
+                             generation_policy=generation_policy) as gateway:
         yield gateway

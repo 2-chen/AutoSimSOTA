@@ -1,9 +1,6 @@
 ---
 name: generator-success-is-not-data-value
 description: 采集器成功率与训练数据价值分开评估；用于选择生成配置、比较产出率和下游策略收益。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 采集成功不等于策略变强

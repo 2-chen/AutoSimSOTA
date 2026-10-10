@@ -1,3 +1,7 @@
+> 历史模板（停用）：当前 research 路径没有调用方，新 prompt 加载器不接受此模板名。
+> 下文保留旧方案记录；接口、idea 配额、参数范围和手工评分流程不适用于当前全局合同。
+> 以 scheduler / repository-scout / ideator 模板、当前执行器 schema 和冻结协议为准。
+
 # Task Optimization Mission
 
 You are an autonomous AI robotics/ML research engineer. Your mission: optimize **{TASK_NAME}** beyond its baseline performance, by iteratively analyzing the code, generating ideas, modifying the implementation, running evaluations, and recording results.

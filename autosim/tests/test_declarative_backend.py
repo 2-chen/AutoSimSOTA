@@ -145,3 +145,15 @@ def test_an_artifact_that_exists_without_the_process_succeeding_is_not_a_pass(tm
     # Which is why both fields are reported rather than folded into one verdict: the
     # caller has to see that the file exists and the run failed.
     assert result["artifact"]["matched"] == 1
+def test_staging_context_is_attempt_owned_and_does_not_create_output(tmp_path):
+    from autosim.research.declarative_backend import staging_environment
+    original = {'PATH': '/bin', 'AUTOSIM_STAGE_OUTPUT': '/stale'}
+    output = tmp_path / '中文目录 with spaces' / 'absent'
+    inputs = {'output': str(output), 'repo': str(tmp_path), 'python': '/python'}
+    env = staging_environment(original, inputs)
+    assert env['AUTOSIM_STAGE_OUTPUT'] == str(output)
+    assert env['AUTOSIM_STAGE_PYTHON'] == '/python'
+    assert env['AUTOSIM_STAGE_REPO'] == str(tmp_path)
+    assert original['AUTOSIM_STAGE_OUTPUT'] == '/stale'
+    assert env['PATH'] == '/bin'
+    assert not output.exists()

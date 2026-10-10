@@ -1,0 +1,303 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[review]{cvpr}
+\usepackage{times}
+\usepackage{amsmath,amssymb,booktabs,graphicx}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta}
+\usepackage[pagebackref,breaklinks,colorlinks]{hyperref}
+\def\paperID{0000}
+\def\confName{CVPR}
+\def\confYear{2027}
+\title{Failure-Driven Acquisition and Selection for Autonomous Simulation Optimization}
+\author{Anonymous authors}
+\begin{document}
+\maketitle
+\begin{abstract}
+Improving an embodied policy often requires acquiring the right data, not merely
+changing its architecture or optimizer. We develop an autonomous research workflow
+that connects development-set policy failures to executable data acquisition and
+selection hypotheses in simulation repositories. A research agent inspects native
+expert and conversion interfaces, proposes a data intervention, and executes it
+under resource and evaluation constraints. An evidence layer connects immutable
+data versions to actual training consumption, loaded policy identity, and native
+rollout measurements. We separate equal-accepted-data comparisons from
+equal-total-compute comparisons, and reserve independent evaluation conditions
+before optimization. This manuscript specifies the implemented evidence mechanisms
+and the experiments needed to test failure-directed acquisition against random
+expansion and fixed-data continuation. \textbf{Development draft: real comparative
+experiments are pending; no performance improvement or SOTA claim is made.}
+\end{abstract}
+
+\section{Introduction}
+Robot imitation learning depends on the distribution of demonstrations available
+to the learner. A policy can achieve low training loss and still fail at states
+underrepresented in its demonstrations. Simulation offers an opportunity to
+generate additional supervision, but a runnable simulator alone is not an expert:
+a usable acquisition pipeline also needs task initialization, valid expert actions,
+success and termination semantics, serialization, and a compatible training loader.
+Acquiring more trajectories therefore involves both a learning decision and a
+repository integration problem.
+
+Scalable generation systems such as MimicGen provide powerful mechanisms for
+expanding demonstrations~\cite{mimicgen}. DataMIL demonstrates that selection
+should be evaluated through downstream policy performance rather than assumed
+useful from human notions of similarity~\cite{datamil}. RESample directly addresses
+missing recovery supervision through coverage-guided augmentation~\cite{resample}.
+These works make a weak novelty claim---``failure data are useful''---insufficient.
+Our intended question is narrower: can an autonomous repository-level workflow
+turn observed development failures into valid, resource-accounted interventions
+that outperform equally resourced alternatives without human experiment steering?
+
+The workflow builds on the research-agent decomposition of AutoSOTA~\cite{autosota}, rather than
+claiming a new agent architecture. Repository acquisition replaces paper-to-code
+discovery. A specialized Data role investigates expert availability, acquisition
+conditions, quality checks, conversion, provenance, and training consumption. The
+main Scheduler remains responsible for decisions and execution; independent
+supervision checks scientific validity. Human-readable run reports expose what
+was actually attempted, what remains blocked, and what the evidence supports.
+
+The intended contribution is an experimentally validated data intervention
+workflow, supported by: (1) executable, source-grounded acquisition and selection
+hypotheses; (2) an auditable chain from native collection to policy evaluation;
+and (3) controls distinguishing failure targeting, filtering, additional data,
+and additional compute. The first two currently have implementation and contract
+coverage. Whether the third yields a publishable empirical contribution remains
+an experimental question, not a consequence of passing software tests.
+
+\section{Related Work}
+\paragraph{Demonstration generation.}
+MimicGen scales robot-learning data through generation from human demonstrations
+across environments and tasks~\cite{mimicgen}. We do not introduce a replacement
+motion planner or general expert. We investigate whether a research agent can
+identify and connect a repository's existing generation mechanism, then choose
+useful conditions within its supported training domain. A repository without a
+valid automated expert is outside the autonomous acquisition track unless another
+legitimate supervision mechanism is explicitly available.
+
+\paragraph{Performance-aware selection.}
+DataMIL uses datamodel-based reasoning and a task-specific surrogate to select
+data for imitation learning~\cite{datamil}. Our present implementation does not
+include its datamodel algorithm. It is a relevant comparator when its requirements
+and cost fit the selected policy and task. We must establish whether failure-directed
+acquisition adds value beyond quality filtering and performance-aware selection
+of already available data.
+
+\paragraph{Recovery supervision.}
+RESample uses a conservative coverage function, exploratory sampling, and recovery
+actions to supplement missing corrective supervision~\cite{resample}. Thus,
+failure-guided recovery collection itself is not an unclaimed direction. Our
+workflow must specify which native acquisition decisions are automated, what
+evidence selects them, and whether automation generalizes to previously unseen
+tasks or repositories. Unsupported actions are not relabeled as expert supervision.
+
+\section{Method and Implemented Evidence Layer}
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[node distance=7mm and 7mm,
+ box/.style={draw,rounded corners=2pt,align=center,font=\small,
+             minimum height=10mm,text width=30mm,fill=blue!5},
+ arrow/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (fail) {Development\\failure evidence};
+\node[box,right=of fail] (plan) {Agent hypothesis\\target / selection};
+\node[box,right=of plan] (collect) {Native expert\\acquisition trial};
+\node[box,below=of collect] (data) {Immutable raw\\derived versions};
+\node[box,left=of data] (train) {Actual consumption\\train / policy load};
+\node[box,left=of train] (eval) {Native rollout\\verified outcome};
+\draw[arrow] (fail)--(plan);
+\draw[arrow] (plan)--(collect);
+\draw[arrow] (collect)--(data);
+\draw[arrow] (data)--(train);
+\draw[arrow] (train)--(eval);
+\draw[arrow] (eval)--(fail);
+\node[align=center,font=\small,below=5mm of train] {Independent review: provenance, fairness, cost\\
+Held-out confirmation stays outside the development loop};
+\end{tikzpicture}}
+\caption{Evidence-grounded development loop. Each edge needs native evidence;
+an agent plan is not a successful acquisition or a verified performance gain.}
+\label{fig:workflow}
+\end{figure}
+\subsection{Problem and capability boundary}
+An input consists of an isolated source checkout, explicitly connected resources,
+a native development evaluation protocol, and a total resource envelope. Let
+$D_0$ denote available training demonstrations and $\pi_0$ the reproducible
+baseline. Development rollouts provide evidence $E_t$. The agent proposes an
+intervention $h_t=(g_t,q_t,m_t)$, where $g_t$ describes supported acquisition
+conditions, $q_t$ specifies selection, and $m_t$ defines the training mixture.
+These are research decisions, not a hard-coded benchmark recipe. Their source
+connections must be established before execution.
+
+The intended iteration is
+\begin{equation}
+ D_t^{+}=q_t(\operatorname{Collect}_{\mathrm{native}}(g_t)),
+ \quad \pi_{t+1}=\operatorname{Train}(D_0,D_t^{+};m_t).
+\end{equation}
+The equation specifies an experiment, not a guarantee of a usable collector.
+A small native acquisition trial must establish expert validity, complete-episode
+output, serialization, and conversion before scaling. If these prerequisites
+cannot be met within resources, the run reports that boundary. It does not claim
+acquisition from a planned command or reinterpret failed learner actions as
+successful expert trajectories.
+
+\subsection{Agent decisions versus execution constraints}
+The Scheduler maintains a persistent research plan and consults Data, Resource,
+Init, Fix, and other roles as needed. Agents first see a short skill directory and
+explicitly choose relevant procedures with reasons. Recommendations do not silently
+replace agent choices. Data analyzes the connection between observed failure,
+native expert capabilities, target conditions, quantity, quality, and loader
+consumption. Resource reasons about local duration, storage, and cost; the Scheduler
+can submit long jobs, inspect progress, revise local limits, or cancel stalled
+jobs. The executor enforces only authorized total ceilings and experiment contracts.
+
+This separation matters for portability: changing repositories should change
+source-derived commands and proposals, not require a new hidden benchmark branch.
+However, an unconstrained shell or self-modifying evaluator would invalidate
+results. Skills and agents cannot override held-out separation, metric semantics,
+unknown usage reservations, or immutable experiment evidence.
+
+\subsection{Data identity and actual consumption}
+Raw outputs are immutable research resources; filtering and conversion create
+derived versions with parent identities and transformation provenance. A recorded
+acquisition observation must have a verified native collection ancestor. Merely
+processing an existing official dataset does not qualify as new acquisition.
+The version registry connects each experimental arm to its acquired and training
+versions, while the measurement records actual training consumption.
+
+The chain to be verified is
+\begin{center}
+\small Native producer $\rightarrow$ raw data $\rightarrow$ derived view\\
+$\rightarrow$ consumed training input $\rightarrow$ loaded policy\\
+$\rightarrow$ native rollout $\rightarrow$ measured outcome.
+\end{center}
+Registering an intention or observing a checkpoint file is insufficient. Recorded
+observations require verified policy consumption, rollout evidence, metric lineage,
+and data consumption. One measurement cannot represent both targeted and random
+arms, or multiple seeds. Evidence is checked again during export; changed data or
+inconsistent native receipts exclude a row instead of producing a stale table.
+
+\subsection{Campaigns and independent review}
+A campaign records a development measurement, a falsifiable hypothesis,
+acquisition and selection plans, required arms, accepted-episode budget, declared
+training seeds, recipe, and cost-accounting intent. Its registration is not an
+experiment result. A campaign observation joins a new scored measurement to its
+native-produced data lineage. Scientific fairness is reviewed separately from
+whether an individual score is genuine. Missing or insufficient review remains
+uncertain; a real metric does not establish matched training exposure or fair cost.
+
+\subsection{Evaluation separation and failure recovery}
+Independent evaluation conditions are reserved before optimization, using
+source-supported native inputs. A training RNG seed alone does not establish
+disjoint initial conditions. Once search or measurement begins, the reservation
+cannot be retroactively replaced. Held-out outcomes are not used to propose
+acquisition targets or filter training data.
+
+Execution failures are sealed with stable evidence identifiers. Fix receives the
+actual command, outcome, and evidence rather than a shortened display message.
+Valid replacements require a source/evidence connection and re-verification of
+the failed operation. Framework development interventions are recorded separately;
+trajectories that required such interventions cannot be described as uninterrupted,
+frozen-system autonomous trials.
+
+\section{Experimental Protocol}
+\subsection{Feasibility before scale}
+The first gate is a real native collection--conversion--training--evaluation cycle
+on a repository with an automated expert. The pilot uses source isolation and
+explicit read-only resource links, rather than copying every resource or assuming
+that copying code preserves its runtime. It must produce genuinely new usable
+episodes and show that the intended version reaches training. A runnable environment
+or an old baseline score does not pass this gate.
+
+After the pilot, freeze the harness, skill corpus, model configuration, resource
+bindings, and protocol. Select additional tasks and an unseen repository according
+to verified expert capabilities and available resources. Record exclusions before
+viewing held-out results. Development repairs are allowed during feasibility but
+must not silently enter formal trials.
+
+\subsection{Controls and two resource tracks}
+Table~\ref{tab:controls} defines the minimum controls. All arms share the native
+policy family, initialization policy, official-data access, permitted training
+domain, metric semantics, and common quality floor. The targeted arms may differ
+in acquisition conditions, not in privileged test access or expert quality.
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}p{.29\linewidth}p{.63\linewidth}@{}}
+\toprule
+Arm & Purpose \\
+\midrule
+Official recipe & Reproducible fixed-data reference.\\
+Continuation & No-new-data, equal-total-compute control.\\
+Random expansion & New data without failure targeting.\\
+Targeted expansion & Targeting with the common quality floor.\\
+Targeted + selection & Full intervention with task-directed selection.\\
+\bottomrule
+\end{tabular}
+\caption{Preregistered controls. These are planned experiments, not completed results.}
+\label{tab:controls}
+\end{table}
+
+In the \emph{equal-data} track, targeted and random arms receive the same number
+of accepted complete episodes. Report attempts, rejection rates, duplicates,
+conversion losses, actual training exposure, and acquisition cost. Equal accepted
+counts do not imply equal compute. In the \emph{equal-compute} track, charge failed
+acquisition, conversion, training, evaluation, and research overhead against
+matched envelopes; fixed-data continuation receives the corresponding opportunity.
+GPU device-lease time, wall time, and model cost remain distinct quantities.
+
+\subsection{Replication and statistics}
+Use at least three independently trained seeds for the small confirmed task set,
+with matched initialization procedures. Training-seed replication with a fixed
+acquired dataset is different from independent replications of the complete agent
+acquisition loop. Report the former as policy variation, and evaluate the latter
+separately where affordable. Pooling many evaluation episodes is not a substitute
+for independent training seeds or independent agent trials.
+
+Episode-level paired comparisons require recorded matching initial-state identities;
+shared episode indexes or RNG labels are insufficient. Otherwise use unpaired
+comparisons and state that limitation. Report effect sizes and uncertainty, not
+just the best run. A descriptive mean across declared seed IDs does not establish
+that those seeds were actually used; independent source and receipt audit is required.
+
+\subsection{Reporting and attribution}
+Each run maintains a Chinese human-readable report with status, actual scored
+comparisons, data progress, plots, and available native demos. Missing measurements
+are displayed as pending, not zero success. Paper exports are read-only, content-
+addressed snapshots. They distinguish whole-run costs from per-arm costs and
+development evidence from frozen formal evidence. Manual fixes, restarts,
+research choices, and unknown usage reservations are disclosed.
+
+\section{Results and Analysis: Pending Real Experiments}
+The current implementation provides campaign provenance, consumption checks,
+confirmation reservation, independent review interfaces, and development exports.
+Software contract tests verify these mechanisms but are not embodied performance
+results. The active pilot has not yet supplied the comparative measurements needed
+for a results table. We therefore omit numeric claims rather than reuse historical
+debugging scores or fill missing experiments with zero.
+
+The eventual analysis must answer: does targeting improve success at equal data
+quantity; does it retain an advantage at equal total cost; which failures are
+recoverable by the native expert; and do decisions transfer to held-out tasks or
+repositories without operator intervention? Ablations should remove failure
+targeting and task-directed selection separately, holding the remaining procedure
+constant. Additional policies or more repositories are useful only if the core
+comparison is already reproducible.
+
+\section{Limitations and Submission Gate}
+Automated acquisition is not supported by every simulation repository. Missing
+assets, incompatible hardware, absent expert supervision, or non-reproducible
+baselines may prevent experiments. Source citations do not prove successful
+runtime integration. Likewise, agent-generated plans do not prove that acquired
+data cover the identified failures or improve a learned policy.
+
+The current pilot is a development run with documented framework intervention,
+not formal evidence of complete autonomy. A submission needs real equal-data
+comparisons, cost controls, independent replication, held-out evaluation, and a
+clear incremental mechanism beyond existing data selection and recovery methods.
+If those gates fail, the scope or submission timeline should change. The paper
+must not substitute a broad framework narrative for missing experimental evidence.
+
+{\small
+\bibliographystyle{ieeenat_fullname}
+\bibliography{references}
+}
+\end{document}

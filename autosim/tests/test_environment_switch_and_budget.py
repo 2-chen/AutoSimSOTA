@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from autosim.research import environment_pool as pool, provision as pv
-from autosim.research.common import atomic_json, object_digest
+from autosim.research.common import atomic_json, object_digest, read_json
 from autosim.research.budget import RunBudget
 from autosim.research.task_budget import TaskGPUBudget
 from autosim.research.agent_budget import AgentCostLedger
@@ -204,6 +204,91 @@ def test_budget_amendment_refuses_live_model_reservation(tmp_path):
     result = reduce(output, factor=.5, reason='operator confirms stopped controller', preserve_stopped_holds=True)
     assert result['stopped_legacy_holds_preserved']
     assert json.loads(ledger.path.read_text())['entries'] == entries
+
+
+def test_operator_gpu_extension_preserves_history_and_old_authorization_chain(tmp_path):
+    output = tmp_path/'run'
+    ledger = budgets(output)
+    first = reduce(output, factor=.5, reason='old reduced budget')
+    before = json.loads((output/'task_gpu_budget.json').read_text())
+    entries = json.loads(ledger.path.read_text())['entries']
+    added = extend(output, model_usd=10, wall_seconds=3600, gpu_seconds=43200,
+                   reason='user resumes original study with renewed compute')
+    after = json.loads((output/'task_gpu_budget.json').read_text())
+    assert added['after']['gpu_seconds'] == 86400
+    assert after['charged_seconds'] == before['charged_seconds']
+    assert after['leases'] == before['leases']
+    assert after['task_id'] == before['task_id']
+    assert json.loads(ledger.path.read_text())['entries'] == entries
+    assert authorizes_transition(output, old_limit=60, new_limit=42, run_id='run')
+    assert authorizes_transition(output, old_limit=first['after']['model_usd'], new_limit=42, run_id='run')
+    assert extend(output, model_usd=10, wall_seconds=3600, gpu_seconds=43200,
+                  reason='user resumes original study with renewed compute') == added
+    added['gpu_add_seconds'] = 1
+    atomic_json(output/'budget_amendments'/f"{added['id']}.json", added)
+    assert not authorizes_transition(output, old_limit=60, new_limit=42, run_id='run')
+
+
+@pytest.mark.parametrize('seconds', [-1, float('nan'), float('inf'), 1])
+def test_gpu_extension_rejects_invalid_or_over_cap_without_mutating_records(tmp_path, seconds):
+    output = tmp_path/'run'
+    budgets(output)
+    files = [output/name for name in ('budget.json','task_gpu_budget.json',
+                                     'agent/cost_ledger.json','agent/runtime_spec.json')]
+    original = [path.read_bytes() for path in files]
+    with pytest.raises(ValueError):
+        extend(output, model_usd=0, wall_seconds=0, gpu_seconds=seconds,
+               reason='invalid compute renewal')
+    assert [path.read_bytes() for path in files] == original
+
+
+def test_explicit_operator_gpu_renewal_preserves_charges_and_survives_resume(tmp_path):
+    from autosim.research.budget_amendment import authorizes_gpu_cap
+    output = tmp_path/'run'
+    ledger = budgets(output)
+    budget = TaskGPUBudget(output)
+    budget.reserve('completed', 'GPU-test', 100)
+    budget.finish('completed', 50)
+    before = read_json(ledger.path)['entries']
+    renewal = extend(output, model_usd=10, wall_seconds=3600, gpu_seconds=86400,
+        operator_gpu_ceiling_seconds=172800, reason='user explicitly renews study budget')
+    assert renewal['preserved']['charged_gpu_seconds'] == 50
+    assert read_json(ledger.path)['entries'] == before
+    assert authorizes_gpu_cap(output, 172800)
+    budget.initialize(output/'checkout')
+    assert budget.snapshot()['available_gpu_seconds'] == 172750
+    # Later model/wall-only grants do not need a second GPU override.
+    extend(output, model_usd=1, wall_seconds=1, reason='later authorized wall extension')
+    assert authorizes_gpu_cap(output, 172800)
+    budget.initialize(output/'checkout')
+    path = output/'budget_amendments'/f"{renewal['id']}.json"
+    altered = read_json(path)
+    altered['operator_gpu_ceiling_seconds'] = 200000
+    atomic_json(path, altered)
+    assert not authorizes_gpu_cap(output, 172800)
+    with pytest.raises(ValueError, match='audited operator'):
+        budget.initialize(output/'checkout')
+
+
+@pytest.mark.parametrize('ceiling', [False, -1, float('nan'), 86401])
+def test_invalid_operator_ceiling_is_fail_closed(tmp_path, ceiling):
+    output = tmp_path/'run'
+    budgets(output)
+    before = (output/'task_gpu_budget.json').read_bytes()
+    with pytest.raises(ValueError):
+        extend(output, model_usd=0, wall_seconds=0, gpu_seconds=86400,
+            operator_gpu_ceiling_seconds=ceiling, reason='invalid')
+    assert (output/'task_gpu_budget.json').read_bytes() == before
+
+
+def test_edited_gpu_cap_without_operator_grant_cannot_resume(tmp_path):
+    output = tmp_path/'run'
+    budgets(output)
+    row = read_json(output/'task_gpu_budget.json')
+    row['cap_seconds'] = 172800
+    atomic_json(output/'task_gpu_budget.json', row)
+    with pytest.raises(ValueError, match='audited operator'):
+        TaskGPUBudget(output).initialize(output/'checkout')
 
 
 @pytest.mark.parametrize('legacy', [False, True])

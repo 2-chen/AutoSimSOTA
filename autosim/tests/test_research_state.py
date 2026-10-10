@@ -8,6 +8,20 @@ from autosim.research.research_state import (ResearchStateError, ResearchStateSt
                                              verify_event_rows)
 
 
+def test_research_parent_lifecycle_is_explicitly_closed():
+    from autosim.research.derived_research import DerivedResearch
+    real=DerivedResearch.__new__(DerivedResearch)
+    real.controller_decision_id='a'*16
+    real.active_research_action={}
+    rows=[]
+    real._record_shared_event=lambda *args,**kwargs:rows.append(kwargs)
+    real._set_research_action('round_9')
+    assert rows[-1]['phase_state']['parent_action']['step']=='round_9'
+    real._set_research_action('round_9',status='completed')
+    assert rows[-1]['phase_state']['parent_action'] is None
+    assert rows[-1]['phase_state']['current_action'] is None
+
+
 def test_one_run_state_merges_preparation_and_research_events(tmp_path):
     store = ResearchStateStore(tmp_path / "out", run_id="run-1", repository=tmp_path)
     prepared = store.record(

@@ -9,7 +9,7 @@ from autosim.research.derive_and_run import main, validate_paused_research_resum
 def _session(output: Path, *, status="paused", rounds=2, settings=None,
              repository=None):
     path = output / "research" / "derived" / "controller_session.json"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "schema_version": 1,
         "run_id": "derived",
@@ -26,6 +26,26 @@ def test_paused_session_accepts_exact_frozen_inputs(tmp_path):
 
     validate_paused_research_resume(
         tmp_path, rounds=2, settings={"task": "PushCube-v1"})
+
+
+@pytest.mark.parametrize('fault',['','changed_constraint','unowned','tampered_settings'])
+def test_launcher_preserves_verified_main_baseline_settings_without_requiring_agent_arguments(tmp_path,fault):
+    from tests.test_derived_research import research
+    real=research(tmp_path)
+    real.controller_decision_id='a'*16 if fault!='unowned' else ''
+    settings={'task':'Lift','steps':20000,'episodes':50,'seed':0}
+    baseline=real.baseline(settings=settings)
+    assert baseline['ok'] is True
+    _session(real.output,settings={**settings,**({'steps':1} if fault=='tampered_settings' else {})},
+             repository=tmp_path)
+    before=(real.run_root/'controller_session.json').read_bytes()
+    requested={'task':'different' if fault=='changed_constraint' else 'Lift'}
+    if fault:
+        with pytest.raises(ValueError,match='different frozen rounds/settings'):
+            validate_paused_research_resume(real.output,rounds=2,settings=requested,repository=tmp_path)
+    else:
+        assert validate_paused_research_resume(real.output,rounds=2,settings=requested,repository=tmp_path)==2
+    assert (real.run_root/'controller_session.json').read_bytes()==before
 
 
 @pytest.mark.parametrize("rounds,settings", [
@@ -83,6 +103,9 @@ def test_formal_research_entry_constructs_role_runtime_on_isolated_checkout(
     output = tmp_path / "run"
     captured = {}
 
+    output.mkdir()
+    (output / "STARTUP.md").write_text("# 旧运行启动受阻\n")
+
     class FakeRepositoryBudget:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -116,6 +139,8 @@ def test_formal_research_entry_constructs_role_runtime_on_isolated_checkout(
                      ["--resource", f"inputs={data}"])])
 
     assert result == 0
+    assert "启动检查通过" in (output / "STARTUP.md").read_text()
+    assert "受阻" not in (output / "STARTUP.md").read_text()
     assert isinstance(captured["client"], RoleAwareAgentClient)
     assert captured["repo"] == (output / "checkout").resolve()
     assert captured["scouting"] == (output / "scouting").resolve()

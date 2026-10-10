@@ -5,7 +5,7 @@ adding a method is adding a file -- no code change, no release. Drop one in
 `autosim/skills/`, or point `AUTOSIM_SKILLS_DIR` at your own directory and it is
 picked up too.
 
-Nothing here is enforced. A skill is evidence and guidance offered to the
+Methods are advisory; schema, scope and selection bounds are validated. A skill is evidence and guidance offered to the
 controller, which may contradict any of it and should say why when it does. That
 is the whole point: a rule narrows what the controller can try, whereas a method
 with its evidence attached widens what it can reason about.
@@ -185,14 +185,20 @@ def _load_manifest() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
             resolved = skill_path.resolve()
             resolved.relative_to(root.resolve())
             front = _read_frontmatter(resolved)
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, yaml.YAMLError) as exc:
             problems.append({"path": str(skill_path), "error": f"{type(exc).__name__}: {exc}"})
             continue
         expected_name = relative.parent.name if relative.name == "SKILL.md" else relative.stem
         if str(front["name"]) != expected_name:
             problems.append({"path": str(skill_path), "error": "frontmatter name does not match manifest path"})
             continue
-        scope_problem = _scope_problem(front.get("scope", "general"))
+        # Curated metadata lives in the manifest; legacy headers are compatible
+        # only when they do not contradict the indexed scope boundary.
+        scope = front.get("scope", raw.get("scope", "general"))
+        scope_problem = _scope_problem(scope)
+        if (not scope_problem and "scope" in front and "scope" in raw and
+                str(front["scope"]).strip() != str(raw["scope"]).strip()):
+            scope_problem = "conflicting scope in manifest and frontmatter"
         if scope_problem:
             problems.append({"path": str(skill_path), "error": scope_problem})
             continue
@@ -203,9 +209,9 @@ def _load_manifest() -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
         seen_ids.add(identity)
         rows[file_value] = {**raw, "name": str(front["name"]),
                             "description": str(front.get("description") or "").strip(),
-                            "scope": str(front.get("scope") or "general"),
-                            "confidence": str(front.get("confidence") or "unspecified"),
-                            "evidence": str(front.get("evidence") or "").strip(),
+                            "scope": str(scope or "general"),
+                            "confidence": str(front.get("confidence", raw.get("confidence")) or "unspecified"),
+                            "evidence": str(front.get("evidence", raw.get("evidence")) or "").strip(),
                             "source": str(resolved), "maturity": "curated"}
     return rows, problems
 
@@ -280,12 +286,19 @@ def _parse(path: Path, metadata: dict[str, Any] | None = None) -> dict[str, Any]
     row = dict(metadata or {})
     if row and str(row.get("name")) != str(meta["name"]):
         raise ValueError("skill body identity changed after indexing")
+    for field in ("scope", "id", "version", *_LIST_FIELDS):
+        if row and field in meta and str(meta[field]) != str(row.get(field)):
+            raise ValueError(f"skill {field} changed after indexing")
+    scope = meta.get("scope", row.get("scope", "general"))
+    problem = _scope_problem(scope)
+    if problem:
+        raise ValueError(problem)
     contract = {field: row.get(field, meta.get(field)) for field in
                 ("id", "version", *_LIST_FIELDS)}
     return {**row, **contract,
             "name": str(meta["name"]),
             "description": str(meta.get("description") or row.get("description") or "").strip(),
-            "scope": str(meta.get("scope") or row.get("scope") or "general"),
+            "scope": str(scope or "general"),
             "confidence": str(meta.get("confidence") or row.get("confidence") or "unspecified"),
             "evidence": str(meta.get("evidence") or row.get("evidence") or "").strip(),
             "method": body.strip(),

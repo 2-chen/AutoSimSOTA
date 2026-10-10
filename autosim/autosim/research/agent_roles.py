@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from .prompt_library import load_prompt
+
 
 @dataclass(frozen=True)
 class RoleProfile:
@@ -21,7 +23,7 @@ class RoleProfile:
 
     @property
     def can_inspect_native(self) -> bool:
-        return self.can_execute_diagnostics or self.name in {"scheduler", "fix", "init"}
+        return self.can_execute_diagnostics or self.name in {"scheduler", "fix", "init", "data"}
 
     @property
     def builtin_tools(self) -> tuple[str, ...]:
@@ -43,47 +45,64 @@ class RoleProfile:
                 (*evidence, "mcp__autosim_exec__inspect_native_environment")
                 if self.can_inspect_native else evidence)
 
+    def instruction_for(self, *, decision_only: bool = False) -> str:
+        if not decision_only:
+            return self.instruction
+        return (f"You are {self.title}. {self.responsibility} "
+                "This turn has no tools, filesystem access or execution capability. "
+                "Decide only from the supplied evidence; identify any missing check "
+                "without claiming it ran. Follow the current request's response schema.")
+
     @property
     def instruction(self) -> str:
-        limits = []
-        if not self.can_edit_checkout:
-            limits.append("you are read-only and must not propose that you applied a patch")
-        if not self.can_execute_diagnostics:
-            limits.append("you cannot execute commands; cite existing receipts or request a probe")
-            if self.can_inspect_native:
-                limits.append("exception: inspect_native_environment performs bounded read-only CPU inspection of the actual selected environment; it cannot edit, use GPU or access network")
-        constraint = "; ".join(limits) or (
-            "you may patch only the isolated checkout and run bounded CPU diagnostics; "
-            "scoring, GPU workloads and budget approval remain with the trusted executor")
-        return (f"You are {self.title}. {self.responsibility} Act only within your role. "
-                f"Permission boundary: {constraint}. Return a concise handoff with evidence, "
-                "uncertainty and the next decision needed; do not invent missing evidence. "
-                "Use /tmp/diagnostics for CPU diagnostic venvs and scratch files through "
-                "the execution tool; never create them inside the source checkout. "
-                "For noninteractive native setup, inspect repository config initialization, "
-                + ("Use inspect_native_environment for the actual selected interpreter and "
-                   "run-local configuration, not system Python or a new diagnostic venv. "
-                   if self.can_inspect_native else
-                   "Request a sealed native inspection from Scheduler/Init/Fix; this role has no native inspection tool. ") +
-                "If native context is not published, request environment preparation; "
-                "do not keep retrying native inspection. inspect_workspace_resources "
-                "lists the actual explicitly bound resource names/sizes; builtin Read/Glob "
-                "may only see empty mount placeholders. Empty placeholders do not mean "
-                "missing data. Use that metadata tool before reporting a resource gap. "
-                "For unknown public resources/methods, search_public_sources then "
-                "read_public_source; cite sealed sources. Search hits are not verified "
-                "papers/resources. Never submit secrets, private paths or raw data in queries. "
-                "If retrieval fails, report network capability as unavailable, not that "
-                "the resource does not exist. Binary downloads use a native acquisition plan. "
-                "prepare run-local config and use the same config context in every probe "
-                "and stage. An EOF/input prompt is not proof the repository cannot run. "
-                "After repair revalidate the failed native capability, not a weaker substitute. "
-                "An evidence-reviewed installation route may replace an obsolete command; "
-                "consumer probes and scientific protocol remain binding.")
+        # Caller schemas differ across decision, audit and narrative turns. Do not
+        # impose a second generic output format in the runtime's appended contract.
+        parts = [f"You are {self.title}. {self.responsibility}",
+                 "Use the current request's response schema; do not invent evidence."]
+        if self.name == "recorder":
+            return " ".join(parts + [
+                "You have no filesystem, network or execution tools. "
+                "Use only the supplied development snapshot; request declarative "
+                "charts/demos instead of trying to create them yourself."])
+        if self.can_edit_checkout:
+            parts.append("Edits are limited to the isolated checkout. Scoring, GPU "
+                         "workloads, live environment installs and budget approval "
+                         "remain with the trusted executor.")
+        else:
+            parts.append("You are read-only; do not claim to have applied a patch.")
+        if self.can_execute_diagnostics:
+            parts.append("Use bounded CPU diagnostics and /tmp/diagnostics for "
+                         "scratch/diagnostic venvs, not the checkout or live prefix.")
+        else:
+            parts.append("Do not execute commands; cite existing receipts or "
+                         "request a trusted probe.")
+        if self.can_inspect_native:
+            parts.append("inspect_native_environment is the bounded read-only CPU "
+                         "exception: use the actual selected interpreter and run-local "
+                         "config. If context is unpublished, request preparation "
+                         "instead of repeating inspection.")
+        if self.name in {"init", "fix"}:
+            parts.append("An EOF/config prompt is not proof of an impossible "
+                         "environment. Propose missing installs through Scheduler, "
+                         "not diagnostic prefix writes. Revalidate the failed native "
+                         "capability after repair; an evidence-reviewed install route "
+                         "may replace an obsolete command without weakening consumers "
+                         "or the scientific protocol.")
+        parts.append(load_prompt("runtime-tools"))
+        return "\n\n".join(parts)
 
 
 ROLE_PROFILES = {
+    "data": RoleProfile("data", "Data Agent", False, False, True,
+                         "Own the delegated data lifecycle: acquisition feasibility and targeted "
+                         "supply, quality/coverage, conversion, actual loader consumption, lineage "
+                         "and preservation. Revisit obsolete deferrals using current development "
+                         "evidence; return actionable probes and unresolved blockers to Scheduler. "
+                         "Never collect, train, delete data, alter evaluation or certify scores yourself."),
     "resource": RoleProfile("resource", "AgentResource", False, False, True,
+                             "Own local GPU/wall/model/storage allocation, extension and stall "
+                             "cancellation recommendations within hard caps; distinguish startup "
+                             "from full training. Scheduler executes; never mutate ledger or scores. "
                              "Identify repository assets/dependencies and data supply: native "
                              "collector, expert/planner or policy, prerequisites, conversion "
                              "and actual trainer loader. Report source evidence and gaps."),

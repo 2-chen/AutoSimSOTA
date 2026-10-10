@@ -1,9 +1,6 @@
 ---
 name: hold-one-variable
 description: 识别数据、采样器、归一化与训练配置共同变化的混杂；需要解释单项效果时设计消融，不禁止组合优化。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 把隐含改动算进实验

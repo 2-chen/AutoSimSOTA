@@ -243,7 +243,7 @@ def test_confirmation_keeps_paired_statistics_separate_from_an_l4_claim(tmp_path
     real.backend.answer["stages"]["evaluate"]["artifact"] = "results.csv"
     script = (
         "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True,exist_ok=True); "
-        "seed=int(sys.argv[2]); winner='round_1' in sys.argv[3]; "
+        "seed=int(sys.argv[2]); winner=pathlib.Path(sys.argv[3]).read_text()=='3'; "
         "rows=['task,episode_id,initial_state_sha256,success_rate']; "
         "rows += [f'lift,{n},{(str(seed)+str(n)).encode().hex().ljust(64,chr(48))},'"
         "+str(int(winner)) for n in range(20)]; "
@@ -253,10 +253,16 @@ def test_confirmation_keeps_paired_statistics_separate_from_an_l4_claim(tmp_path
               f"    return [i['python'], '-c', {script!r}, i['output'], "
               "str(i['seed']), i['checkpoint']]\n")
     real.backend.sources["evaluate"] = source
+    # Content-addressed artifacts have no round label in their paths. A native
+    # evaluator must distinguish actual policy bytes, not storage naming.
+    trainer=("import pathlib,sys; p=pathlib.Path(sys.argv[1])/'models'; "
+             "p.mkdir(parents=True,exist_ok=True); (p/'model.pth').write_text(sys.argv[2])")
+    real.backend.sources['train']=("def stage_argv_train(i):\n"
+        f"    return [i['python'], '-c', {trainer!r}, i['output'], str(i['settings'].get('train.n_epochs',1))]\n")
     real.backend = DeclarativeBackend(repo=real.repo, answer=real.backend.answer,
                                       sources=real.backend.sources, parameters={})
     baseline = real.measure(settings={"seed": 0}, label="baseline")
-    candidate = real.measure(settings={"seed": 0}, label="round_1")
+    candidate = real.measure(settings={"seed": 0,'train.n_epochs':3}, label="round_1")
     assert baseline["ok"] and candidate["ok"]
     real.snapshots.capture([], repo=real.repo, name="round-1")
     real.snapshots.advance("round-1", score=1.0, scale="success_rate")

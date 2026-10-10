@@ -1,9 +1,6 @@
 ---
 name: adapting-an-unfamiliar-benchmark
 description: 从当前仓库与实际资源推导可核验的能力图；用于新仓库接入，区分未知、缺条件和已验证。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 读陌生仓库，交付可检验的结论

@@ -1,9 +1,6 @@
 ---
 name: finding-how-a-benchmark-runs
 description: 查找当前版本原生采集、转换、训练与评测入口，并核对 wrapper、模型家族与实际调用；不从文件名猜命令。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 找到实际运行入口

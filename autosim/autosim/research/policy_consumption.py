@@ -65,7 +65,8 @@ def identity_contract() -> dict[str, Any]:
     }
 
 
-def audit_identity_schema(text: str, *, policy_kind: str | None = None) -> dict[str, Any]:
+def audit_identity_schema(text: str, *, policy_kind: str | None = None,
+                          required: bool = False) -> dict[str, Any]:
     """Pre-freeze interface feedback only; never certify loading or performance."""
     records = {MARKER: [], ROLLOUT_MARKER: [], METRIC_MARKER: []}
     issues = []
@@ -80,9 +81,12 @@ def audit_identity_schema(text: str, *, policy_kind: str | None = None) -> dict[
                 records[marker].append(row)
             except (ValueError, TypeError):
                 issues.append(marker.strip() + ' must contain a JSON object')
-    if not any(records.values()) and not issues:
+    if not any(records.values()) and not issues and not required:
         return {'status':'unavailable', 'issues':[],
                 'authority':'schema inspection only; not consumption or scoring evidence'}
+    if required:
+        issues.extend(marker.strip() + ' is missing; emit at the actual native execution site'
+                      for marker, values in records.items() if not values)
     loaded, rollouts, metrics = records[MARKER], records[ROLLOUT_MARKER], records[METRIC_MARKER]
     for row in loaded:
         fields = ['sha256'] if policy_kind == 'directory' else ['content_sha256'] if policy_kind == 'file' else ['sha256', 'content_sha256']

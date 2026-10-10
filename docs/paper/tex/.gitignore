@@ -1,0 +1,9 @@
+# Reproducible compiler intermediates; keep main.pdf as the draft preview.
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz

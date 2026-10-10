@@ -1,9 +1,6 @@
 ---
 name: where-successes-come-from
 description: 需要新训练轨迹时判断动作来自专家、规划器、人工或现有策略；成功判据、录制能力和自主采集能力分开验证。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 谁能产生训练轨迹

@@ -179,6 +179,23 @@ def test_global_context_is_refreshed_across_role_sessions(tmp_path, monkeypatch)
     assert "Shared research context" not in calls[-1]["prompt"]
     assert calls[-1]["read_only"] is True
     assert calls[-1]["auto_skills"] is False
+    monkeypatch.setattr(client,'_resume_role',lambda role:pytest.fail('bounded decision resumed unrelated memory'))
+    client.chat_with_metadata('audit','only supplied evidence',include_research_context=False,
+                             resume_session=False,decision_only=True,read_only=True,auto_skills=False)
+    assert calls[-1]['resume'] is False and calls[-1]['decision_only'] is True
+
+
+def test_generation_controls_are_explicit_only_for_bounded_reviews(tmp_path, monkeypatch):
+    calls=[]
+    monkeypatch.setattr('autosim.research.agent_runtime.run_coding_agent',
+        lambda **kwargs: (calls.append(kwargs) or {'status':'completed','final_text':'{}'}))
+    client=client_for(tmp_path)
+    client.chat_with_metadata('main','inspect',max_tokens=1800,thinking='disabled')
+    assert calls[-1]['generation_policy'] is None
+    with client.as_role('supervisor'):
+        client.chat_with_metadata('review','source',decision_only=True,
+                                 max_tokens=1800,thinking='disabled')
+    assert calls[-1]['generation_policy']=={'max_output_tokens':1800,'thinking':'disabled'}
 
 
 def test_agent_client_rejects_noncompleted_or_empty_turn(

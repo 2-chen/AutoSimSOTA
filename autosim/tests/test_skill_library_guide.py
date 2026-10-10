@@ -13,6 +13,9 @@ from autosim.research.skills import (GUIDE, discover, read_selected_skills,
 
 
 NEW_SIMULATION_METHODS = (
+    "curating-simulation-datasets",
+    "preserving-research-data",
+    "accelerating-policy-experiments",
     "choosing-simulation-improvements",
     "aligning-policy-inputs-and-actions",
     "tuning-action-chunks-and-feedback",
@@ -63,7 +66,9 @@ def test_catalog_does_not_read_method_bodies_or_literature(monkeypatch):
 
     def guarded_read(path, *args, **kwargs):
         assert path.name != "SKILL.md"
-        assert path.name not in ("literature-review.md", "library-audit.md")
+        assert path.name not in ("literature-review.md", "library-audit.md",
+                                 "score-efficiency-20261006.md",
+                                 "data-centric-research-20261006.md")
         return original_read(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", guarded_read)
@@ -88,6 +93,32 @@ def test_main_agent_catalog_is_body_free_and_read_is_explicit():
     assert read_selected_skills([unranked])["selection"][0]["id"] == unranked
 
 
+def test_efficiency_skill_is_advisory_and_explicit_read_does_not_expand_references(
+        monkeypatch):
+    identity = "autosimsota.accelerating-policy-experiments"
+    catalog = skills_catalog(benchmark="UnseenArmRepository", query="吞吐 缓存 计算瓶颈")
+    entry = next(row for row in catalog["entries"] if row["id"] == identity)
+    assert entry["scope"] == "general"
+    assert "method" not in entry
+    original_read = Path.read_text
+
+    def no_implicit_literature(path, *args, **kwargs):
+        assert path.name != "score-efficiency-20261006.md"
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", no_implicit_literature)
+    result = read_selected_skills([identity], benchmark="UnseenArmRepository")
+    selected = result["skills"][0]
+    assert "experiment.efficiency" in selected["capabilities"]
+    assert selected["version"] == "1.1.0"
+    assert selected["preconditions"] and selected["invalid_when"]
+    assert all("Advisory only" in item for item in selected["permissions"])
+    assert selected["verification"] and selected["outputs"]
+    assert selected["body_sha256"] == hashlib.sha256(
+        selected["method"].encode()).hexdigest()
+    assert [row["id"] for row in result["selection"]] == [identity]
+
+
 def test_explicit_skill_read_cannot_bypass_catalog_scope_or_count():
     with pytest.raises(ValueError, match="applicable catalog"):
         read_selected_skills(["autosimsota.robosynchallenge-measurements"],
@@ -96,6 +127,31 @@ def test_explicit_skill_read_cannot_bypass_catalog_scope_or_count():
         read_selected_skills(["autosimsota.using-the-method-library"] * 2)
     with pytest.raises(ValueError, match="applicable catalog"):
         read_selected_skills(["unknown.skill"])
+
+
+@pytest.mark.parametrize("name,capability", [
+    ("curating-simulation-datasets", "data.curation"),
+    ("preserving-research-data", "data.preservation"),
+])
+def test_data_methods_load_bounded_advice_not_a_platform_or_long_survey(
+        monkeypatch, name, capability):
+    original_read = Path.read_text
+
+    def no_implicit_survey(path, *args, **kwargs):
+        assert path.name != "data-centric-research-20261006.md"
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", no_implicit_survey)
+    identity = "autosimsota." + name
+    method = read_selected_skills([identity], benchmark="UnseenArmRepository")["skills"][0]
+    assert capability in method["capabilities"]
+    assert method["scope"] == "general"
+    assert method["version"] == "1.1.0"
+    assert method["preconditions"] and method["invalid_when"]
+    assert all("Advisory only" in item for item in method["permissions"])
+    assert len(method["method"]) < 6000
+    assert method["body_sha256"] == hashlib.sha256(
+        method["method"].encode()).hexdigest()
 
 
 def test_index_is_compact_and_unqueried_calls_only_load_the_guide():

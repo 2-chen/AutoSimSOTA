@@ -227,7 +227,8 @@ def _validate_agent_workspace(workspace: Path, *, max_entries: int = 100000) -> 
 
 
 def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
-                  cwd: Path, native: dict | None = None) -> tuple[list[str], Any]:
+                  cwd: Path, native: dict | None = None,
+                  diagnostic_policy: dict | None = None) -> tuple[list[str], Any]:
     bubblewrap = shutil.which("bwrap")
     if not bubblewrap:
         raise AgentRuntimeError("bubblewrap is unavailable; refusing host command execution")
@@ -261,6 +262,11 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
             command.extend(("--ro-bind", root, root))
         command.extend(("--ro-bind", str(prefix), str(prefix),
                         "--ro-bind", str(workspace), str(workspace)))
+        # Native probes use the real checkout path so installed packages and
+        # source-owned absolute paths resolve correctly. The earlier resource
+        # bindings cover only the inspection alias; mirror the exact validated,
+        # read-only bindings at this second checkout mount as well.
+        command.extend(mount_args(workspace))
         for key, value in native["paths"].items():
             path = Path(value)
             if path.exists():
@@ -272,6 +278,13 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
         raise AgentRuntimeError("diagnostic scratch path is unsafe")
     scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
     command.extend(("--bind", str(scratch), "/tmp/diagnostics"))
+    if diagnostic_policy is not None:
+        if native is None:
+            raise AgentRuntimeError('policy diagnostic grant requires the selected native context')
+        policy = Path(diagnostic_policy['path'])
+        # An ephemeral tmpfs alias, not a model-controlled path in persistent scratch.
+        alias = '/tmp/autosim_policy' if policy.is_dir() else '/tmp/autosim_policy/model'
+        command.extend(('--dir', '/tmp/autosim_policy', '--ro-bind', str(policy), alias))
     command.extend(("--dir", "/tmp/home", "--dir", "/tmp/cache",
                     "--unshare-pid", "--die-with-parent", "--proc", "/proc",
                     "--dev", "/dev", "--cap-drop", "ALL", "--clearenv",
@@ -288,6 +301,8 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
                     ("/" + cwd.relative_to(workspace).as_posix()
                     if cwd != workspace else "")))
     if native:
+        if diagnostic_policy is not None:
+            command.extend(('--setenv', 'AUTOSIM_DIAGNOSTIC_POLICY', alias))
         for key, value in native["paths"].items():
             command.extend(("--setenv", key, value))
         if native.get('runtime_library_dirs'):
@@ -349,6 +364,15 @@ def _turn_status(attempt: ProcessAttempt, final_result: dict[str, Any] | None,
     if attempt.error:
         return "failed", "process_executor", False
     return "failed", "missing_result_or_nonzero_exit", False
+
+
+def _live_turn_status(status: str, parent_action: Any) -> tuple[str, str]:
+    """A completed child model turn is not a completed parent experiment."""
+    if (status == 'completed' and isinstance(parent_action, dict)
+            and parent_action.get('status') == 'running'
+            and isinstance(parent_action.get('step'), str) and parent_action['step']):
+        return 'running', parent_action['step'][:120]
+    return status, 'coding agent turn'
 
 
 def execute_agent_command(*, arguments: dict[str, Any], workspace: Path,
@@ -442,8 +466,11 @@ def _critical_stream_line(line: str) -> bool:
         event = json.loads(line)
     except ValueError:
         return True
+    telemetry_fields = {'type', 'subtype', 'estimated_tokens', 'estimated_tokens_delta',
+                        'session_id', 'uuid', 'parent_tool_use_id'}
     return not (isinstance(event, dict) and event.get("type") == "system"
-                and event.get("subtype") == "thinking_tokens")
+                and event.get("subtype") == "thinking_tokens"
+                and set(event).issubset(telemetry_fields))
 
 
 def _project_claude_event(event: dict[str, Any],
@@ -676,6 +703,11 @@ class _McpExecutor:
         from .evidence_store import read_attempt_evidence
         if set(arguments) - {"evidence_id", "offset", "limit"}:
             raise ValueError("read_evidence accepts only evidence_id, offset and limit")
+        if str(arguments.get('evidence_id') or '').startswith('execution-review:'):
+            from .candidate_execution_review import read_review_evidence
+            return read_review_evidence(_worker_evidence_root(self.output),
+                arguments.get('evidence_id'),offset=arguments.get('offset',0),
+                limit=arguments.get('limit',8000))
         return read_attempt_evidence(
             _worker_evidence_root(self.output), arguments.get("evidence_id"),
             offset=arguments.get("offset", 0), limit=arguments.get("limit", 8000))
@@ -690,12 +722,9 @@ class _McpExecutor:
         return inspect(_worker_evidence_root(self.output), **arguments)
 
     def native_probe(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        from .native_context import load_context
-        from .common import atomic_text
-        from .evidence_store import capture_attempt_evidence
-        if set(arguments) - {"code", "purpose", "timeout_seconds"}:
-            raise ValueError("native diagnostic accepts code, purpose and timeout only")
-        code, purpose = arguments.get("code"), arguments.get("purpose")
+        if set(arguments) - {"code", "purpose", "timeout_seconds", 'policy_request', 'source_request'}:
+            raise ValueError("native diagnostic accepts code, purpose, timeout and optional policy_request only")
+        code, purpose = arguments.get("code", 'pass' if 'source_request' in arguments else None), arguments.get("purpose")
         if (not isinstance(code, str) or not 1 <= len(code) <= 16000 or
                 not isinstance(purpose, str) or not 1 <= len(purpose) <= 1000):
             raise ValueError("native diagnostic needs bounded code and purpose")
@@ -704,30 +733,61 @@ class _McpExecutor:
         timeout = float(arguments.get("timeout_seconds", 60))
         if not 0 < timeout <= 900:
             raise ValueError("invalid native diagnostic timeout")
-        # Read-only worker snapshots do not gain access to the parent's live environment.
-        native = load_context(self.output, self.workspace)
         self.calls += 1
         started = time.monotonic()
+        try:
+            if 'source_request' in arguments and 'code' not in arguments:
+                if 'policy_request' in arguments:
+                    raise ValueError('source-only capture cannot request policy access')
+                from .native_source_citations import capture
+                return capture(self.output,self.workspace,arguments['source_request'])
+            return self._native_probe_bound(arguments, code, purpose,
+                min(timeout, _MAX_TOOL_SECONDS-self.tool_seconds), started)
+        finally:
+            # Context/archive validation, execution and post-validation all cost time.
+            self.tool_seconds += time.monotonic() - started
+
+    def _native_probe_bound(self, arguments, code, purpose, timeout, started):
+        from .native_context import load_context
+        from .common import atomic_text
+        from .evidence_store import capture_attempt_evidence
+        # Read-only worker snapshots do not gain access to the parent's live environment.
+        native = load_context(self.output, self.workspace)
+        from .diagnostic_source_identity import source_identity
+        source_before = source_identity(self.workspace)
+        from .diagnostic_artifacts import policy_binding, binding_unchanged
+        binding = policy_binding(self.output, arguments['policy_request']) if 'policy_request' in arguments else None
+        remaining = timeout - (time.monotonic()-started)
+        if remaining <= 0:
+            raise AgentRuntimeError('diagnostic validation exhausted the original tool window')
         command, stream = _sandbox_argv([native["interpreter"], "-c", code],
-            output=self.output, workspace=self.workspace, cwd=self.workspace, native=native)
+            output=self.output, workspace=self.workspace, cwd=self.workspace, native=native,
+            **({'diagnostic_policy': binding} if binding is not None else {}))
         try:
             attempt = run_process(command, cwd=self.workspace, env={"PATH": "/usr/bin:/bin"},
-                                  timeout=min(timeout, _MAX_TOOL_SECONDS-self.tool_seconds),
+                                  timeout=max(.001, timeout-(time.monotonic()-started)),
                                   pass_fds=(stream.fileno(),))
         finally:
             stream.close()
-            self.tool_seconds += time.monotonic() - started
         result = _safe_tool_result(attempt, workspace=self.workspace)
         identity = uuid.uuid4().hex
         log = self.output / "native_diagnostics" / (identity + ".log")
         atomic_text(log, sanitize_model_text(f"Purpose: {purpose}\n{result['stdout']}\n{result['stderr']}"))
         ref = f"native_diagnostics/{identity}.json"
         receipt = {**result, "context_identity": native["identity"], "purpose": purpose,
+                   'repository_source_identity': source_before,
+                   'repository_source_stable': source_before is not None and source_before == source_identity(self.workspace),
                    "capability": "cpu_diagnostic_not_simulation_readiness", "gpu_access": False}
+        if binding is not None:
+            receipt['diagnostic_policy_binding'] = {k:v for k,v in binding.items() if k != 'path'}
+            receipt['diagnostic_policy_binding_stable'] = binding_unchanged(self.output, binding)
         receipt.update(capture_attempt_evidence(self.output, attempt_id=identity, log=log,
             receipt_ref=ref, status=result["status"], returncode=result["returncode"],
             termination_reason="cpu_native_diagnostic"))
         atomic_json(self.output / ref, receipt)
+        if 'source_request' in arguments:
+            from .native_source_citations import capture
+            receipt['source_citation'] = capture(self.output,self.workspace,arguments['source_request'])
         return receipt
 
     def public_source(self, name, arguments):
@@ -775,10 +835,11 @@ def _tool_schema() -> dict[str, Any]:
 
 def _evidence_tool_schema() -> dict[str, Any]:
     return {"name": _EVIDENCE_TOOL_NAME,
-            "description": ("Read a verified slice of run-owned native execution evidence "
-                            "by stable ID. Inspect the original error before proposing a fix."),
+            "description": ("Read a verified slice of run-owned evidence by stable ID. "
+                            "Native IDs are 32 hex. For a sealed candidate_execution_reviews/<64hex>.json "
+                            "reference use execution-review:<64hex>. Inspect the original error before a fix."),
             "inputSchema": {"type": "object", "properties": {
-                "evidence_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "evidence_id": {"type": "string", "pattern": "^([0-9a-f]{32}|execution-review:[0-9a-f]{64})$"},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 12000}},
                 "required": ["evidence_id"], "additionalProperties": False}}
@@ -788,12 +849,26 @@ def _native_tool_schema() -> dict[str, Any]:
     return {"name": _NATIVE_TOOL_NAME, "description":
             "Inspect the actual selected native interpreter and run configuration. "
             "CPU only, no network, checkout/environment/config read-only. "
+            "Optionally request a scored local policy via policy_request={label,measurement_sha256}; "
+            "executor verifies and mounts ONLY its archive read-only. In code use "
+            "os.environ['AUTOSIM_DIAGNOSTIC_POLICY']; no arbitrary host path grants. "
             "Returns sealed evidence; request GPU/simulation work from Scheduler.",
             "inputSchema": {"type": "object", "properties": {
                 "code": {"type": "string", "maxLength": 16000},
                 "purpose": {"type": "string", "maxLength": 1000},
-                "timeout_seconds": {"type": "number", "minimum": .1, "maximum": 900}},
-                "required": ["code", "purpose"], "additionalProperties": False}}
+                "timeout_seconds": {"type": "number", "minimum": .1, "maximum": 900},
+                'source_request': {'type':'object','required':['root_index','path'],
+                    'properties':{'root_index':{'type':'integer','minimum':0},
+                        'path':{'type':'string','minLength':1,'maxLength':512}},'additionalProperties':False,
+                    'description':'Capture exact installed public source under root 0=native interpreter prefix, '
+                        '1..N=published read-only dependency_roots. Returns native-source:ID for protocol/reference citations. '
+                        'No arbitrary host paths; code is optional for source-only reads.'},
+                'policy_request': {'type':'object', 'properties': {
+                    'label': {'type':'string','pattern':'^[A-Za-z0-9_-]{1,80}$'},
+                    'measurement_sha256': {'type':'string','pattern':'^[0-9a-f]{64}$'}},
+                    'required':['label','measurement_sha256'],'additionalProperties':False}},
+                "required": ["purpose"], "anyOf":[{'required':['code']},{'required':['source_request']}],
+                "additionalProperties": False}}
 
 
 def _resource_tool_schema() -> dict[str, Any]:
@@ -937,7 +1012,7 @@ def _role_cli_args(profile: Any, *, workspace: Path, output: Path,
             *(["--allowedTools", *authorized_tools] if authorized_tools else []),
             "--strict-mcp-config", "--mcp-config",
             json.dumps(config, separators=(",", ":")),
-            "--append-system-prompt", profile.instruction,
+            "--append-system-prompt", profile.instruction_for(decision_only=decision_only),
             "--setting-sources", "", "--model", model,
             *(["--max-budget-usd", str(max_budget_usd)]
               if max_budget_usd is not None else [])]
@@ -1205,7 +1280,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                            decision_attempt_id: str | None = None,
                            on_event: Callable[[dict[str, Any]], None] | None = None,
                            budget_output: Path | None = None,
-                           decision_only: bool = False, output_format: str = "stream-json"
+                           decision_only: bool = False, output_format: str = "stream-json",
+                           generation_policy: dict | None = None
                            ) -> dict[str, Any]:
     """Run one real, streamed Claude Code turn against the configured DeepSeek endpoint."""
     from ..llm_client import PROJECT_ROOT, load_credential_file
@@ -1222,6 +1298,11 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     if decision_only:
         resume = False
         auto_skills = False
+    if generation_policy:
+        if not decision_only:
+            raise ValueError("generation policy requires a fresh decision-only review")
+        from .deepseek_gateway import validate_generation_policy
+        generation_policy = validate_generation_policy(generation_policy)
     if decision_attempt_id is not None and not re.fullmatch(
             r"[0-9a-f]{32}", str(decision_attempt_id)):
         raise ValueError("decision attempt id must be a lowercase UUID hex value")
@@ -1248,6 +1329,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             "a reviewed pricing adapter before running")
     cost_basis = ("deepseek_official_estimate_v1" if official_pricing else
                   "cli_reported")
+    if generation_policy and not official_pricing:
+        raise AgentRuntimeError("bounded generation controls require the verified DeepSeek gateway")
     executable = cli or shutil.which("claude")
     if not executable:
         raise AgentRuntimeError("Claude Code CLI is unavailable")
@@ -1325,6 +1408,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                "model": model, "status": "running",
                "started_at": time.time(),
                "skill_selection": skill_manifest,
+               "generation_policy": generation_policy,
                "max_total_budget_usd": max_total_budget_usd,
                "budget_reservation_id": None,
                "budget_output": str(budget_root),
@@ -1577,6 +1661,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         gateway_context = (deepseek_turn_gateway(
             upstream_base_url=_anthropic_endpoint(base_url), upstream_key=key,
             model=model, limit_usd=turn_budget_usd,
+            generation_policy=generation_policy,
             extend_budget=(lambda required: ledger.extend(
                 reservation["reservation_id"], required)) if ledger is not None else None
             ) if official_pricing else nullcontext(None))
@@ -1594,7 +1679,8 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                                          max_output_bytes=16 * 1024 * 1024,
                                          max_line_bytes=2 * 1024 * 1024,
                                          on_start=on_process_start, decouple_callbacks=True,
-                                         stdout_line_filter=_critical_stream_line if output_format == "stream-json" else None)
+                                         stdout_line_filter=_critical_stream_line if output_format == "stream-json" else None,
+                                         capture_stdout_line_filter=_critical_stream_line if output_format == "stream-json" else None)
             if output_format == "json" and not attempt.timed_out and attempt.error is None:
                 # Parse the whole response, not individual pretty-printed lines.
                 try:
@@ -1709,6 +1795,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         process_record.update(status=process_status, finished_at=time.time(),
                               returncode=attempt.returncode, timed_out=attempt.timed_out,
                               process_identity=process_identity,
+                              capture_diagnostics=attempt.capture_diagnostics,
                               error=(type(attempt.error).__name__ if attempt.error else None))
         if startup_failure:
             process_record["startup_failure"] = startup_failure
@@ -1751,6 +1838,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                     if final_result else None,
                     "usage": final_result.get("usage") if final_result else None,
                     "returncode": attempt.returncode, "timed_out": attempt.timed_out,
+                    "capture_diagnostics":attempt.capture_diagnostics,
                     "protocol_error_count": len(protocol_errors)})
     stream_evidence = None
     if status != "completed" and attempt.launched:
@@ -1794,14 +1882,16 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                               "process_identity": None,
                               "last_agent_event": "turn_finished"},
                  decision_relevant=False)
-    run_record.refresh_live_status(output, fallback_status=status,
-                                   fallback_current="coding agent turn")
+    live_status, live_current = _live_turn_status(status, parent_action)
+    run_record.refresh_live_status(output, fallback_status=live_status,
+                                   fallback_current=live_current)
     refresh_agent_document(output)
     return {"status": status, "session_id": seen_session,
             "agent_session_key": session_key,
             "turn_id": process_attempt_id, "process_ref": process_ref,
             "decision_attempt_id": decision_attempt_id,
             "role": profile.name,
+            "generation_policy": generation_policy,
             "model": model, "total_cost_usd": total_cost,
             "cli_estimate_usd": cli_estimate, "pricing_ref": pricing_ref,
             "pricing_status": session["pricing_status"],
@@ -1832,7 +1922,8 @@ def run_coding_agent(*, workspace: Path, output: Path, prompt: str,
                      decision_attempt_id: str | None = None,
                      on_event: Callable[[dict[str, Any]], None] | None = None,
                      budget_output: Path | None = None,
-                     decision_only: bool = False, output_format: str = "stream-json") -> dict[str, Any]:
+                     decision_only: bool = False, output_format: str = "stream-json",
+                     generation_policy: dict | None = None) -> dict[str, Any]:
     """Serialize role turns so no concurrent process can corrupt this run's handoffs."""
     resolved_output = Path(output).expanduser().resolve(strict=True)
     from .budget import RunBudget
@@ -1855,13 +1946,13 @@ def run_coding_agent(*, workspace: Path, output: Path, prompt: str,
             max_budget_usd=max_budget_usd,resume=resume,max_total_budget_usd=max_total_budget_usd,
             cli=cli,role=role,read_only=read_only,auto_skills=auto_skills,
             decision_attempt_id=decision_attempt_id,on_event=on_event,budget_output=budget_output,
-            decision_only=decision_only,output_format=output_format)
+            decision_only=decision_only,output_format=output_format,generation_policy=generation_policy)
 
 
 def _admitted_coding_agent_turn(*, workspace, resolved_output, prompt, run_id, timeout,
         admission_started, max_budget_usd, resume, max_total_budget_usd, cli, role,
         read_only, auto_skills, decision_attempt_id, on_event, budget_output,
-        decision_only, output_format):
+        decision_only, output_format, generation_policy):
     """Called only with the run's exclusive agent-turn lock held."""
     from .scheduling import model_slot
     with model_slot(budget_output or resolved_output, timeout=timeout,
@@ -1876,7 +1967,8 @@ def _admitted_coding_agent_turn(*, workspace, resolved_output, prompt, run_id, t
             read_only=read_only, auto_skills=auto_skills,
             decision_attempt_id=decision_attempt_id,
             on_event=on_event, budget_output=budget_output,
-            decision_only=decision_only, output_format=output_format)
+            decision_only=decision_only, output_format=output_format,
+            generation_policy=generation_policy)
         from .scheduling import policy, note
         shared_output = Path(budget_output or resolved_output)
         if policy(shared_output):

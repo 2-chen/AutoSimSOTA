@@ -111,7 +111,7 @@ def test_resource_overlap_and_repository_exposure_refused(tmp_path):
             create(source, checkout, tracked_only=True, resources=specs)
 
 
-@pytest.mark.parametrize("mode", ["native", "inspection", "agent"])
+@pytest.mark.parametrize("mode", ["native", "inspection", "agent", "native_cpu"])
 def test_real_sandbox_reads_resource_but_cannot_modify_it(tmp_path, mode):
     if not shutil.which("bwrap"):
         pytest.skip("bubblewrap not installed")
@@ -137,6 +137,15 @@ def test_real_sandbox_reads_resource_but_cannot_modify_it(tmp_path, mode):
         command = isolated_argv(argv, output=checkout.parent, repo=checkout)
     elif mode == "inspection":
         command = inspection_argv(argv, repo=checkout, directory=checkout, environment={})
+    elif mode == 'native_cpu':
+        from autosim.research.agent_runtime import _sandbox_argv
+        script += ("\ntry: Path('train.py').write_text('corrupt')"
+                   "\nexcept OSError: pass"
+                   "\nelse: raise AssertionError('native probe source writable')")
+        argv[-1] = script
+        command, filter_stream = _sandbox_argv(argv, output=checkout.parent,
+            workspace=checkout, cwd=checkout,
+            native={'interpreter': '/usr/bin/python3', 'paths': {}})
     else:
         from autosim.research.agent_runtime import _sandbox_argv
         command, filter_stream = _sandbox_argv(argv, output=checkout.parent,

@@ -1,9 +1,6 @@
 ---
 name: benchmark-shapes
 description: 调查仿真仓库的任务、指标、观测、控制、数据与资源差异；所有维度都需要当前源码与运行证据，不预设通用默认值。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 仿真仓库有哪些不同

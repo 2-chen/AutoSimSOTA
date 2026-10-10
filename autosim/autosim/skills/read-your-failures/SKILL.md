@@ -1,9 +1,6 @@
 ---
 name: read-your-failures
 description: 失败后先读稳定证据并判断根因与可复验修复；区分瞬时错误、配置错误、资源上限和未知崩溃。
-scope: general
-confidence: methodological — requires current source and runtime verification
-evidence: Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults.
 ---
 
 # 让失败改变下一次决策

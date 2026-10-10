@@ -31,6 +31,11 @@ _MAX_STDOUT_BYTES_PER_POLL = 2 * 1024 * 1024
 _MAX_PARTIAL_LINE_BYTES = 64 * 1024
 _MAX_SERIES = 12
 _MAX_POINTS_PER_SERIES = 800
+_DIAGNOSTIC_LINE = re.compile(
+    r'(?:^|\s|\[)(?:WARNING|WARN|ERROR|CRITICAL)(?=\s|:|\])'
+    r'|(?:^|\s)[A-Za-z_]*(?:Warning|Error|Exception):'
+    r'|^\s*(?:Traceback \(most recent call last\)|File ["\'].*["\'], line\s+\d+'
+    r'|warnings\.warn\(|raise\s+)')
 
 
 @dataclass(frozen=True)
@@ -360,7 +365,11 @@ class LiveTelemetryWriter:
                 position += len(line.encode("utf-8", errors="replace"))
                 stripped = line.strip()
                 # Configuration dumps and command echoes are not observations of training.
-                if stripped and not stripped.startswith(("args.", "Namespace(", "command:")):
+                # Warning/error text (e.g. a package version in a deprecation notice)
+                # is diagnostic evidence, not a trainer scalar. Keep the raw log;
+                # suppress only this derived numeric projection, without a metric allowlist.
+                if (stripped and not _DIAGNOSTIC_LINE.search(stripped)
+                        and not stripped.startswith(("args.", "Namespace(", "command:"))):
                     values = named_numbers(stripped)
                     native_step = next((values[name] for name in _STEP_NAMES
                                         if name in values), None)

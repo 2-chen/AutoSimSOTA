@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .common import atomic_json, digest, now, read_json, object_digest
-from .main_agent import READ_ONLY_ROLES, TASK_SYSTEM, validate_report, validate_task
+from .main_agent import READ_ONLY_ROLES, task_system_for_role, validate_report, validate_task
 from .native_jobs import source_identity
 from .scheduling import locked, note, policy
 
@@ -152,15 +152,26 @@ def submit(output: Path, repo: Path, client, assignment: dict, facts: dict, time
                 current.update(status="running", started_at=now())
                 atomic_json(path, current)
             try:
-                content, metadata = child.chat_with_metadata(TASK_SYSTEM,
+                data_methods = {}
+                remaining = timeout
+                if task["role"] in {"data", "resource"}:
+                    from .data_agent import select_methods, remaining_window
+                    data_methods = select_methods(child, task, facts, timeout=timeout)
+                    remaining = remaining_window(start, timeout)
+                content, metadata = child.chat_with_metadata(task_system_for_role(task["role"]),
                     json.dumps({"assignment": task, "state": facts,
+                        **data_methods,
                         "snapshot_scope": "inventoried source only; read native errors by evidence ID"},
-                        ensure_ascii=False, default=str), timeout=timeout, read_only=True,
+                        ensure_ascii=False, default=str), timeout=remaining, read_only=True,
+                    **({"auto_skills": False} if task["role"] in {"data", "resource"} else {}),
                     include_research_context=False)
                 from .main_agent import receive_report
                 report = receive_report(content, client=child, output=root, workspace=checkout,
                     timeout=max(1, timeout - (time.monotonic()-start)), metadata=metadata)
                 changes = {"status": "completed", "report": report, "runtime": metadata}
+                if task["role"] in {"data", "resource"}:
+                    changes[f"{task['role']}_skill_selection"] = data_methods.get("method_library", {}).get("selection", [])
+                    changes["skill_selection_issues"] = data_methods.get("skill_selection_issues", [])
             except Exception as exc:
                 changes = {"status": "failed", "error": type(exc).__name__ + ": " + str(exc)[:300]}
             with locked(path.with_suffix(".lock")):

@@ -1,9 +1,6 @@
 ---
 name: budget-attempts-not-episodes
 description: 采集有失败、过滤或内部重试时，分别限制尝试数、接受数和实际时间，估计可承担的有效数据产出。
-scope: general
-confidence: methodological-or-borrowed — applicability must be verified in the current run
-evidence: Reviewed 2026-09-29; literature links and limitations are stated in the method body. No new benchmark experiment was run.
 ---
 
 # 预算不能只数成功 episode

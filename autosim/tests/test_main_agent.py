@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import pytest
 
 from autosim.research.prepare import Preparation
-from autosim.research.main_agent import memory_view, validate_plan, validate_task
+from autosim.research.main_agent import memory_view, validate_plan, validate_task, validate_report
 
 
 PLAN = {"objective": "Establish a reproducible baseline then improve it",
@@ -18,6 +18,25 @@ REPORT = {"summary": "Loader interface inspected; no benchmark was run",
           "uncertainties": ["The dataset has not been validated"],
           "evidence_refs": ["train.py"],
           "recommended_next_actions": ["Verify a native loader probe"]}
+
+
+def test_specialist_operation_proposals_survive_bounded_handoff_without_execution():
+    proposal = {'do':'inspect_native_job','arguments':{'job_id':'a'*32},
+        'why':'reuse exact completed work','evidence_refs':['evidence/'+('a'*32)+'.json'],
+        'expected_postcondition':'completed update audit or an explicit unresolved blocker'}
+    report = validate_report({**REPORT,'operation_proposals':[proposal]})
+    memory = memory_view({'handoffs':[{'role':'data','report':report}]})
+    assert memory['data_agent_handoff']['report']['operation_proposals']==[proposal]
+    assert report['authority']=='model_report_not_execution_verification'
+
+
+@pytest.mark.parametrize('proposal',[
+    {'do':'sh -c','arguments':{},'why':'x','evidence_refs':[],'expected_postcondition':'x'},
+    {'do':'inspect_native_job','arguments':[],'why':'x','evidence_refs':[],'expected_postcondition':'x'},
+    {'do':'inspect_native_job','arguments':{},'why':'x','evidence_refs':[]}])
+def test_malformed_specialist_proposal_is_not_a_command(proposal):
+    with pytest.raises(ValueError):
+        validate_report({**REPORT,'operation_proposals':[proposal]})
 
 
 class Client:
@@ -57,6 +76,30 @@ def make(tmp_path, client=None):
     repo.mkdir(parents=True, exist_ok=True)
     return Preparation(repo=repo, output=output, client=client or Client(),
                        scouting=output / "scouting")
+
+
+@pytest.mark.parametrize('configured,remaining,expected',[(900,None,870),(60,None,30),(900,120,90)])
+def test_main_window_respects_configuration_and_total_wall_with_catalog_time(tmp_path,monkeypatch,configured,remaining,expected):
+    from types import SimpleNamespace
+    clock=[100.0]
+    class WindowClient(Client):
+        timeout=configured
+        def chat_with_metadata(self,system,user,**kw):
+            payload=json.loads(user)
+            self.calls.append(kw)
+            if 'skill_catalog' in payload:
+                clock[0]+=30
+                return json.dumps({'skill_reads':[]}),{}
+            return json.dumps({'do':'stop','why':'fixture boundary','arguments':{},
+                               'state_revision':payload['state_revision']}),{}
+    client=WindowClient();real=make(tmp_path,client)
+    monkeypatch.setattr(real,'state',lambda:{'state_revision':1,'available':['stop']})
+    if remaining is not None: real.budget=SimpleNamespace(remaining=lambda:remaining)
+    monkeypatch.setattr('autosim.research.prepare.time.monotonic',lambda:clock[0])
+    result=real.choose()
+    assert result['do']=='stop'
+    assert client.calls[0]['timeout']==min(configured,240,remaining or float('inf'))
+    assert client.calls[-1]['timeout']==expected
 
 
 def test_plan_survives_restart_without_redefining_objective(tmp_path):
@@ -160,6 +203,20 @@ def test_main_agent_observes_native_schema_before_freeze(tmp_path):
     assert 'not consumption or scoring' in view['authority']
 
 
+def test_verified_policy_workflow_exposes_missing_identity_before_freeze(tmp_path, monkeypatch):
+    from autosim.research.common import atomic_json
+    from autosim.research import checkpoint_handoff
+    real = make(tmp_path)
+    atomic_json(real.output/'derivation_attempts/evaluate.json',{'attempts':[
+        {'status':'accepted','said':'native real rollout succeeded',
+         'native_evidence_ref':'evidence/owned.json'}]})
+    monkeypatch.setattr(checkpoint_handoff,'catalog',lambda *a,**k:{'status':'available'})
+    view = real._native_identity_schema_view('evaluate')
+    assert view['status'] == 'incompatible' and len(view['issues']) == 3
+    assert view['native_evidence_ref'] == 'evidence/owned.json'
+    assert 'not consumption or scoring' in view['authority']
+
+
 def test_editable_task_invalidates_commands_even_on_model_failure(tmp_path, monkeypatch):
     real = make(tmp_path)
     real.stages = {"train": "old source"}
@@ -205,6 +262,81 @@ def test_memory_projection_is_bounded_and_points_to_full_evidence():
     assert len(projected["handoffs"][-1]["report"]["findings"][0]) == 400
     assert len(memory["handoffs"]) == 12
     assert projected["history_ref"] == "run_events.json#main_agent"
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_data_agent_delegation_is_dedicated_readonly_and_persistent(tmp_path, monkeypatch, frozen):
+    class DataClient(Client):
+        def chat_with_metadata(self, system, user, **kwargs):
+            self.data_system, self.data_kwargs = system, kwargs
+            return super().chat_with_metadata(system, user, **kwargs)
+    client = DataClient()
+    real = make(tmp_path, client)
+    original = real.state
+    if frozen:
+        monkeypatch.setattr(real, "state", lambda: {**original(),
+                            "research_progress": {"status": "paused"}})
+    real.do("update_research_plan", plan=PLAN)
+    result = real.do("research_task", role="data", task="Trace expert to training batch",
+                     expected_result="Current blocker, owner and executable next probe")
+    assert result["outcome"] == "reported"
+    assert result["verification_level"] is None
+    assert "Dedicated Data Agent assignment" in client.data_system
+    assert client.data_kwargs["read_only"] is True
+    assert client.calls[-1][1]["assignment"]["mode"] == "inspect"
+    restored = make(tmp_path)
+    assert restored.main_agent["data_agent_handoff"]["role"] == "data"
+    assert restored.main_agent["data_agent_handoff"]["report"]["authority"] == \
+        "model_report_not_execution_verification"
+    assert restored.main_agent["plan"]["objective"] == PLAN["objective"]
+    assert not real.stages
+    assert client.role == "scheduler"
+
+
+def test_data_agent_cannot_request_edit_mode():
+    with pytest.raises(ValueError, match="Data Agent is read-only"):
+        validate_task({"role": "data", "task": "Change collector", "expected_result": "patch",
+                       "mode": "edit"})
+    assert validate_task({"role": "data", "task": "Inspect collector",
+                          "expected_result": "probe", "mode": "inspect"})["role"] == "data"
+
+
+def test_data_handoff_survives_unrelated_reports_with_bounded_advisory_view():
+    from autosim.research.main_agent import retain_handoff
+    data = {"task_id": "data-1", "role": "data", "stale": True,
+            "input_state_revision": 3, "report": {**REPORT, "findings": ["x" * 1500] * 20}}
+    initial = {"plan": PLAN, "handoffs": []}
+    memory = retain_handoff(initial, data)
+    for index in range(15):
+        memory = retain_handoff(memory, {"task_id": str(index), "role": "resource", "report": REPORT})
+    view = memory_view(memory)
+    assert len(memory["handoffs"]) == 12 and len(view["handoffs"]) == 3
+    assert all(row["role"] != "data" for row in view["handoffs"])
+    pinned = view["data_agent_handoff"]
+    assert pinned["task_id"] == "data-1" and pinned["stale"]
+    assert pinned["input_state_revision"] == 3
+    assert len(pinned["report"]["findings"]) == 3
+    assert len(pinned["report"]["findings"][0]) == 240
+    assert pinned["report"]["authority"] == "model_report_not_execution_verification"
+    assert initial == {"plan": PLAN, "handoffs": []}  # no in-place memory mutation
+    newer = {**data, "task_id": "data-2"}
+    assert memory_view(retain_handoff(memory, newer))["data_agent_handoff"]["task_id"] == "data-2"
+    assert memory_view({"handoffs": [data]})["data_agent_handoff"]["task_id"] == "data-1"
+
+
+def test_async_data_report_is_pinned_by_scheduler_not_by_worker(tmp_path, monkeypatch):
+    from autosim.research import agent_tasks
+    real = make(tmp_path)
+    row = {"id": "data-async", "role": "data", "task": "Read loader",
+           "expected_result": "Next probe", "report": REPORT, "stale": True,
+           "input_state_revision": 1, "worker_ref": "agent_workers/data-async"}
+    monkeypatch.setattr(agent_tasks, "collect", lambda *args: [row])
+    acknowledged = []
+    monkeypatch.setattr(agent_tasks, "acknowledge", lambda output, task_id: acknowledged.append(task_id))
+    assert real._collect_agent_tasks()
+    assert make(tmp_path).main_agent["data_agent_handoff"]["stale"] is True
+    assert acknowledged == ["data-async"]
+    assert not real._collect_agent_tasks()  # repeated collection does not merge twice
 
 
 def test_handoff_does_not_promote_model_runtime_references(tmp_path, monkeypatch):
@@ -278,3 +410,105 @@ def test_scheduler_decision_profile_cannot_edit_or_execute():
     assert "mcp__autosim_exec__read_evidence" in " ".join(args)
     assert args[args.index("--tools") + 1] == "Read,Glob,Grep"
     assert role_profile("scheduler").can_edit_checkout
+
+
+def test_skill_choice_refreshes_at_development_milestone_not_heartbeat(tmp_path, monkeypatch):
+    from autosim.research.skills import skills_catalog
+
+    environment = "autosimsota.building-an-environment-that-runs"
+    collection = "autosimsota.connecting-native-data-collection"
+
+    class SkillClient(Client):
+        def chat_with_metadata(self, system, user, **kwargs):
+            payload = json.loads(user)
+            self.calls.append((self.role, payload, self.context))
+            chosen = environment if len(self.calls) == 1 else collection
+            return json.dumps({"skill_reads": [{"id": chosen,
+                "why": "Inspect the unresolved producer/consumer evidence"}]}), {}
+
+    client = SkillClient()
+    real = make(tmp_path, client)
+    # Keep directory/ranking and available actions fixed: changed experiments alone
+    # must invalidate a previously chosen environment method, not keyword ranking.
+    catalog = skills_catalog()
+    monkeypatch.setattr("autosim.research.prepare.skills_catalog", lambda **kwargs: catalog)
+    facts = {"available": ["research_task", "run_the_loop"],
+             "stages_the_checkout_has": {"train": "has a command"},
+             "surveyed_stages": {"collect": {"available": True,
+                                             "entrypoint": "produce.py"}}}
+
+    def select():
+        methods, _, problems = real._select_controller_methods(
+            facts, decision_attempt_id="fixture", traces=[])
+        assert not problems
+        return methods
+
+    assert select()["skills"][0]["id"] == environment
+    assert select()["skills"][0]["id"] == environment
+    assert len(client.calls) == 1
+    facts["research_progress"] = {"measured_rounds": 1,
+        "last_observation": {"label": "baseline", "status": "measured"},
+        "confirmation": {"hidden_score": "DO_NOT_EXPORT"}}
+    facts["latest_development_measurements"] = [{"label": "baseline",
+        "measurement_ref": "measurements/baseline.json", "metric_value": 0,
+        "data_consumption_status": "not_required"}]
+    assert select()["skills"][0]["id"] == collection
+    assert len(client.calls) == 2
+    milestones = client.calls[-1][1]["decision_context"]["research_milestones"]
+    assert milestones["scored_development"][0]["data_consumption_status"] == "not_required"
+    assert "confirmation" not in milestones
+    assert "DO_NOT_EXPORT" not in json.dumps(milestones)
+    facts["state_revision"] = 300
+    facts["current_action"] = {"heartbeat": "later"}
+    facts["native_jobs"] = [{"progress": {"steps": 44}}]
+    assert select()["skills"][0]["id"] == collection
+    assert len(client.calls) == 2
+    facts["research_progress"]["last_observation"] = {
+        "label": "round_1", "status": "nothing was measured"}
+    select()
+    assert len(client.calls) == 3
+    facts["stages_the_checkout_has"]["collect"] = "has a command"
+    select()
+    assert len(client.calls) == 4
+    facts["native_stage_verifications"] = [{"id": "collect-1", "stage": "collect",
+        "status": "failed", "evidence_verified": True,
+        "evidence_ref": "evidence/collect-1.json", "excerpt": "DO_NOT_EXPORT"}]
+    select()
+    assert len(client.calls) == 5
+    facts["native_stage_verifications"][0]["live_telemetry"] = {"observed_at": "later"}
+    select()
+    assert len(client.calls) == 5
+    facts["latest_development_measurements"][0]["data_consumption_status"] = "verified"
+    select()
+    assert len(client.calls) == 6
+    facts['data_versions']=[dict(id='pilot',kind='collected',record_sha256='a'*64,
+                                sample_rows='DO_NOT_EXPORT')]
+    select()
+    assert len(client.calls)==7
+    assert client.calls[-1][1]['decision_context']['research_milestones']['data_assets']==[
+        dict(id='pilot',kind='collected',record_sha256='a'*64)]
+    facts['native_jobs'][0]['progress']['steps']=99
+    select()
+    assert len(client.calls)==7
+    assert "DO_NOT_EXPORT" not in json.dumps(
+        client.calls[-1][1]["decision_context"]["research_milestones"])
+
+
+def test_milestones_are_bounded_and_do_not_decide_data_route():
+    measurements = [{"label": str(index), "measurement_ref": f"{index}.json",
+                     "metric_value": 0, "private_trace": "DO_NOT_EXPORT"}
+                    for index in range(20)]
+    facts = {"latest_development_measurements": measurements,
+             "research_progress": {"confirmation": {"score": 1}},
+             "native_stage_verifications": [{"id": "live", "stage": "collect",
+                 "status": "running_unverified", "evidence_verified": False}],
+             "stages_the_checkout_has": {"collect": "no command"}}
+    milestone = Preparation._controller_research_milestones(facts)
+    assert len(milestone["scored_development"]) == 6
+    assert milestone["scored_development"][0]["label"] == "14"
+    assert milestone["command_stages"]["collect"] == "no command"
+    assert milestone["surveyed_collection"]["available"] is None
+    assert not milestone["sealed_data_stage_verifications"]
+    assert "route" not in milestone and "do" not in milestone
+    assert "private_trace" not in json.dumps(milestone)
+    assert "confirmation" not in json.dumps(milestone)

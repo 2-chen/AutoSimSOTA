@@ -9,53 +9,33 @@ from __future__ import annotations
 import json
 from typing import Any
 
-READ_ONLY_ROLES = frozenset({"resource", "objective", "monitor", "ideator", "supervisor"})
+from .prompt_library import load_prompt
+
+READ_ONLY_ROLES = frozenset({"resource", "data", "objective", "monitor", "ideator", "supervisor"})
 TASK_ROLES = READ_ONLY_ROLES | {"scheduler", "init", "fix"}
 
-TASK_SYSTEM = """Work on the main Scheduler's explicit research assignment.
-Use your actual tools to inspect source, configuration and available evidence; do not guess
-an interface from filenames. Follow producer-to-consumer connections when relevant (data
-root -> loader, checkpoint -> policy loader, server -> client). The shared research context
-is a snapshot, not permission and not guaranteed current after a tool action. Consult the
-referenced evidence and distinguish observed facts, hypotheses, and missing prerequisites.
+TASK_SYSTEM = load_prompt("specialist")
 
-You may take multiple tool steps within this turn's budget. Editable roles may repair only
-the isolated checkout before research begins and run bounded CPU diagnostics. Do not launch
-training, collection, simulation evaluation, services or GPU work here: request a trusted
-executor operation from the Scheduler. Never edit evaluation rules or authoritative records.
-The live run environment/prefix and package cache are NOT writable through your diagnostic
-tools. For environment installs/configuration, return an executable repair proposal to
-Scheduler's build_the_environment(repair_proposal=...), linked to the sealed failure ID.
-Do not repeatedly attempt prefix writes here. A diagnostic report is not an installation.
-Read-only roles must not edit or execute. Never claim that a repair is verified merely because
-you edited a file. Do not change the shared plan or select the next experiment yourself.
-Native stage failures carry a stable evidence_id. Use read_evidence with that ID to inspect
-the original log; an inaccessible relative path is not proof that the log is absent.
-For policy/rollout/metric witnesses, state.native_identity_contract gives the executor's
-exact field names and file/directory digest recipe. Follow that contract, not an invented
-serialization; syntax or a CPU witness fixture does not prove native consumption.
 
-For a data-supply assignment, Resource owns discovery and Init/Fix owns connection repair.
-Use inspect_workspace_resources to enumerate actual explicit resource bindings; empty
-checkout mount placeholders and gitignored Glob results are NOT missing-asset evidence.
-Trace the collector's action provider and prerequisites, the native output/conversion, and
-the trainer's actual resolved data root and sample reader. Distinguish unknown capability,
-missing resources, a successful collection probe and verified training consumption. Propose
-a bounded trusted-executor probe with source citations; a read-only report cannot certify
-that collection or a loader probe ran. State whether new training data is protocol-allowed
-and why it deserves an early experiment or should be deferred.
-Distinguish native expert/planner, trajectory adaptation, success-filtered training policy
-rollout and teleoperation. If only the recorder is missing, report the minimal source-backed
-training-side bridge Init could implement, not "autonomous collection impossible". Label
-possible versus implemented routes explicitly. Do not research optional families once a
-safe next action is identified; return a compact handoff immediately.
+def task_system_for_role(role: str) -> str:
+    """Share the specialist contract, adding the dedicated data responsibility."""
+    if role not in TASK_ROLES:
+        raise ValueError("research_task role is not supported")
+    return TASK_SYSTEM + "\n\n" + load_prompt(role) if role in {"data", "resource"} else TASK_SYSTEM
 
-Return one JSON object with summary (string), findings (list of strings),
-uncertainties (list of strings), evidence_refs (list of relative references), and
-recommended_next_actions (list of strings). This is a model report, not an accepted score.
-Each list must contain at most 20 entries; the entire JSON object must be at most 16000
-UTF-8 bytes. Group related citations by source instead of listing every line separately.
-"""
+
+def retain_handoff(memory: dict[str, Any], handoff: dict[str, Any]) -> dict[str, Any]:
+    """Keep data ownership visible even after unrelated reports roll out of the window.
+
+    The retained report remains advisory and may be stale; it grants no job, data deletion
+    or scoring authority. Native receipts must be inspected again before execution.
+    """
+    result = {**memory, "handoffs": [*(memory.get("handoffs") or []), handoff][-12:]}
+    if handoff.get("role") == "data":
+        result["data_agent_handoff"] = handoff
+    if handoff.get("role") == "resource":
+        result["resource_agent_handoff"] = handoff
+    return result
 
 
 def _text(value: Any, name: str, limit: int = 4000) -> str:
@@ -72,18 +52,40 @@ def _items(value: Any, name: str) -> list[str]:
 
 def validate_plan(value: Any) -> dict[str, Any]:
     required = {"objective", "hypotheses", "open_questions", "next_actions", "evidence_refs"}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"data_strategy"}:
-        raise ValueError("plan requires objective, hypotheses, open_questions, next_actions, "
-                         "and evidence_refs; optional data_strategy")
-    if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 16000:
-        raise ValueError("working plan exceeds 16000 bytes; keep source evidence in files")
+    if not isinstance(value, dict):
+        raise ValueError('plan must be an object')
+    missing = required - set(value)
+    extra = set(value) - required - {"data_strategy", "budget_strategy"}
+    if missing or extra:
+        raise ValueError(f'plan: missing fields={sorted(missing)}; unexpected fields={sorted(extra)}; '
+                         'authority is server-owned metadata; submit main_agent.writable_plan instead')
+    size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    if size > 16000:
+        raise ValueError(f"working plan exceeds 16000 bytes: actual={size}; keep source evidence in files")
     result = {"objective": _text(value["objective"], "objective"),
             **{key: _items(value[key], key) for key in (
                 "hypotheses", "open_questions", "next_actions", "evidence_refs")},
             "authority": "model_working_plan_not_verified_facts"}
     if "data_strategy" in value:
         result["data_strategy"] = validate_data_strategy(value["data_strategy"])
+    if "budget_strategy" in value:
+        result["budget_strategy"] = validate_budget_strategy(value["budget_strategy"])
     return result
+
+
+def validate_budget_strategy(value: Any) -> dict[str, Any]:
+    """Resource-authored guidance, never permission to change hard ceilings."""
+    keys = {"why", "allocations", "evidence_refs", "revisit_condition", "next_action"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("budget_strategy requires why, allocations, evidence_refs, revisit_condition and next_action")
+    if len(json.dumps(value, ensure_ascii=False).encode()) > 6000:
+        raise ValueError("budget_strategy exceeds 6000 bytes")
+    return {"why": _text(value["why"], "why", 1500),
+            "revisit_condition": _text(value["revisit_condition"], "revisit_condition", 1000),
+            "next_action": _text(value["next_action"], "next_action", 1000),
+            "allocations": _items(value["allocations"], "allocations"),
+            "evidence_refs": _items(value["evidence_refs"], "evidence_refs"),
+            "authority": "resource_allocation_advice_not_hard_budget_authorization"}
 
 
 def validate_data_strategy(value: Any) -> dict[str, Any]:
@@ -123,6 +125,8 @@ def validate_task(arguments: dict[str, Any], *, allow_source_paths: bool = False
         if arguments["mode"] not in {"inspect", "edit"}:
             raise ValueError("research_task mode must be inspect or edit")
         result["mode"] = arguments["mode"]
+        if role in {"data", "resource"} and arguments["mode"] != "inspect":
+            raise ValueError(f"{'Data' if role == 'data' else 'Resource'} Agent is read-only; request Init/Fix repairs through Scheduler")
     if "timeout_seconds" in arguments:
         import math
         value = arguments["timeout_seconds"]
@@ -147,10 +151,29 @@ def validate_report(value: Any) -> dict[str, Any]:
         raise ValueError("research task must return an object")
     if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 16000:
         raise ValueError("research report exceeds 16000 bytes; cite evidence instead")
-    return {"summary": _text(value.get("summary"), "summary"),
+    result = {"summary": _text(value.get("summary"), "summary"),
             **{key: _items(value.get(key), key) for key in (
                 "findings", "uncertainties", "evidence_refs", "recommended_next_actions")},
             "authority": "model_report_not_execution_verification"}
+    if 'operation_proposals' in value:
+        import re
+        proposals = value['operation_proposals']
+        if not isinstance(proposals, list) or len(proposals)>3:
+            raise ValueError('operation_proposals must contain at most three proposals')
+        checked = []
+        for proposal in proposals:
+            if not isinstance(proposal, dict) or set(proposal) != {'do','arguments','why','evidence_refs','expected_postcondition'}:
+                raise ValueError('operation proposal requires do, arguments, why, evidence_refs, expected_postcondition')
+            if not isinstance(proposal['do'], str) or not re.fullmatch(r'[a-z][a-z0-9_]{1,79}', proposal['do']):
+                raise ValueError('operation proposal has an invalid operation name')
+            if not isinstance(proposal['arguments'], dict) or len(json.dumps(proposal['arguments'], ensure_ascii=False).encode())>6000:
+                raise ValueError('operation proposal arguments must be a bounded object')
+            checked.append({'do':proposal['do'], 'arguments':proposal['arguments'],
+                'why':_text(proposal['why'],'why',1000),
+                'expected_postcondition':_text(proposal['expected_postcondition'],'expected_postcondition',1000),
+                'evidence_refs':_items(proposal['evidence_refs'],'evidence_refs')})
+        result['operation_proposals'] = checked
+    return result
 
 
 def receive_report(content: str, *, client, output, workspace, timeout: float,
@@ -194,27 +217,61 @@ def receive_report(content: str, *, client, output, workspace, timeout: float,
         return report
 
 
+def _proposal_view(proposals: list, *, compact: bool) -> list:
+    from .common import object_digest
+    rows = []
+    for proposal in proposals[:1 if compact else 3]:
+        if len(json.dumps(proposal,ensure_ascii=False).encode())<=1800:
+            rows.append(proposal)
+        else:
+            rows.append({k:proposal.get(k) for k in ('do','why','expected_postcondition')})
+            rows[-1].update(arguments_omitted=True,
+                arguments_sha256=object_digest(proposal.get('arguments')),
+                full_handoff_ref='run_state.json#phases.main_agent.memory',
+                guidance='read exact retained handoff before deciding; do not reconstruct omitted arguments')
+    return rows
+
+
+def _handoff_view(row: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+    report = row.get("report") or {}
+    return {
+        "task_id": row.get("task_id"), "role": row.get("role"),
+        "at": row.get("at"), "stale": bool(row.get("stale")),
+        "input_state_revision": row.get("input_state_revision"),
+        "task": str(row.get("task") or "")[:400 if compact else 600],
+        "expected_result": str(row.get("expected_result") or "")[:400 if compact else 600],
+        "runtime_evidence_refs": row.get("runtime_evidence_refs") or [],
+        "report": {"summary": str(report.get("summary") or "")[:600 if compact else 800],
+                   "authority": "model_report_not_execution_verification",
+                   **{key: [str(item)[:240 if compact else 400]
+                            for item in (report.get(key) or [])[:3 if compact else 5]]
+                      for key in ("findings", "uncertainties", "evidence_refs",
+                                  "recommended_next_actions")},
+                   **({'operation_proposals': _proposal_view(report['operation_proposals'],compact=compact)}
+                      if report.get('operation_proposals') else {})},
+    }
+
+
 def memory_view(memory: dict[str, Any]) -> dict[str, Any]:
     """A bounded prompt projection; the event journal retains the complete history."""
     handoffs = memory.get("handoffs") or []
-    recent = []
-    for row in handoffs[-3:]:
-        report = row.get("report") or {}
-        recent.append({
-            "task_id": row.get("task_id"), "role": row.get("role"),
-            "stale": bool(row.get("stale")),
-            "input_state_revision": row.get("input_state_revision"),
-            "task": str(row.get("task") or "")[:600],
-            "expected_result": str(row.get("expected_result") or "")[:600],
-            "runtime_evidence_refs": row.get("runtime_evidence_refs") or [],
-            "report": {"summary": str(report.get("summary") or "")[:800],
-                       "authority": "model_report_not_execution_verification",
-                       **{key: [str(item)[:400] for item in (report.get(key) or [])[:5]]
-                          for key in ("findings", "uncertainties", "evidence_refs",
-                                      "recommended_next_actions")}},
-        })
-    return {**{key: value for key, value in memory.items() if key != "handoffs"},
+    recent = [_handoff_view(row) for row in handoffs[-3:]]
+    data_handoff = memory.get("data_agent_handoff") or next(
+        (row for row in reversed(handoffs) if row.get("role") == "data"), None)
+    data_view = _handoff_view(data_handoff, compact=True) if data_handoff else None
+    resource_handoff = memory.get("resource_agent_handoff") or next(
+        (row for row in reversed(handoffs) if row.get("role") == "resource"), None)
+    resource_view = _handoff_view(resource_handoff, compact=True) if resource_handoff else None
+    writable = {k:v for k,v in (memory.get('plan') or {}).items() if k != 'authority'}
+    for key in ('data_strategy', 'budget_strategy'):
+        if isinstance(writable.get(key), dict):
+            writable[key] = {k:v for k,v in writable[key].items() if k != 'authority'}
+    return {**{key: value for key, value in memory.items()
+               if key not in {"handoffs", "data_agent_handoff", "resource_agent_handoff"}},
             "handoffs": recent, "retained_handoff_count": len(handoffs),
+            "writable_plan": writable,
+            **({"data_agent_handoff": data_view} if data_view else {}),
+            **({"resource_agent_handoff": resource_view} if resource_view else {}),
             "full_memory_ref": "run_state.json#phases.main_agent.memory",
             "history_ref": "run_events.json#main_agent",
             "projection": "bounded_excerpt_not_complete_history"}
