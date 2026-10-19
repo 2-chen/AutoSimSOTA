@@ -21,9 +21,41 @@ def _sources_available(root, label):
     return True
 
 
-def eligible(root):
+def eligible(root, *, _development_packets: list[dict] | None = None, _blocked=None):
     root = Path(root)
     offered = []
+    def offer(row):
+        from .completed_evaluation_recovery import registered_training_blocker
+        parent=read_json(root/'measurements'/f'{row["label"]}.json')
+        blocker=registered_training_blocker(root.parent.parent,root.name,parent)
+        if blocker:
+            if _blocked is not None:
+                _blocked.append(blocker)
+            return
+        offered.append(row)
+    from .completed_score_recovery import offered as completed_scores
+    for packet in completed_scores(root):
+        try:
+            _sources_available(root,packet['label'])
+            offer(packet)
+        except (OSError,ValueError,TypeError,KeyError,AttributeError):
+            continue
+    from .measurement_recovery import offered as consumer_recoveries
+    packets = (consumer_recoveries(root.parent.parent, root.name)
+               if _development_packets is None else _development_packets)
+    for packet in packets:
+        if any(row['label']==packet['label'] for row in offered):
+            continue
+        if packet['label'] == 'baseline':
+            continue
+        try:
+            _sources_available(root, packet['label'])
+            offer({**packet, 'kind':'failed_development_consumer',
+                'corrected_label':packet['label']+'_handoff_correction',
+                'why':'completed formal training has a sealed consumer failure; '
+                      'Fix/Main chooses its exact native load boundary and revalidates without retraining'})
+        except (OSError,ValueError,TypeError,KeyError,AttributeError):
+            continue
     for path in sorted((root/'measurements').glob('*.json')):
         if path.is_symlink():
             continue
@@ -59,7 +91,7 @@ def eligible(root):
                 if completed.is_symlink() or (completed.exists() and read_json(completed).get('ok')):
                     continue
                 _sources_available(root, label)
-                offered.append({'label':label, 'training_attempt_id':attempt,
+                offer({'label':label, 'training_attempt_id':attempt,
                     'kind':'completed_unscored_training', 'corrected_label':corrected_label,
                     'why':'native training completed; explicitly re-audit progress and resolve '
                           'the existing policy before any retraining. Eligibility is advisory; '
@@ -99,7 +131,7 @@ def eligible(root):
             if completed.exists() and read_json(completed).get('ok'):
                 continue
             _sources_available(root, label)
-            offered.append({'label':label, 'training_attempt_id':attempt,
+            offer({'label':label, 'training_attempt_id':attempt,
                 'selected_completed_work':counter['value'], 'other_counter_max':max(later),
                 'why':'selected positive-progress proof omitted larger counters; independently re-audit native terminal/best semantics',
                 'corrected_label':corrected_label})
@@ -156,6 +188,42 @@ def _candidate_source_plan(research, label):
     return patches
 
 
+def historical_progress_sources(output, run_root, repo, label, argv):
+    """Read the exact restorable candidate trace without modifying the checkout.
+
+    The archived patch, verified pre/post images and unchanged inherited files
+    establish the source view. The caller must ALSO compare every traced hash to
+    the training-time independent audit; a patch snapshot alone is insufficient.
+    """
+    from types import SimpleNamespace
+    from .snapshot import Snapshots
+    from .training_progress_audit import sources
+    match = re.fullmatch(r'round_([1-9][0-9]*)', label)
+    if match is None:
+        raise ValueError('historical producer has no candidate source transaction')
+    snapshots = Snapshots(run_root/'snapshots')
+    research = SimpleNamespace(run_root=run_root, repo=repo, snapshots=snapshots)
+    patches = _candidate_source_plan(research, label)
+    if not patches:
+        raise ValueError('historical candidate source transaction is unavailable')
+    after = snapshots.get('round-'+match.group(1))
+    if snapshots.root.is_symlink() or snapshots.blobs.is_symlink():
+        raise ValueError('historical candidate snapshot location is unsafe')
+    overrides = {}
+    for name, key in after.files.items():
+        blob = snapshots.blobs/key
+        if (not re.fullmatch(r'[a-f0-9]{64}', key) or blob.is_symlink()
+                or not blob.is_file() or digest(blob) != key):
+            raise ValueError('historical candidate postimage blob is missing or changed: '+name)
+        overrides[(repo/name).resolve()] = blob
+    code = sources(repo, output, argv, source_overrides=overrides)
+    return code, {'kind':'archived_candidate_snapshot',
+        'snapshot_ref':snapshots.path.relative_to(output).as_posix(),
+        'snapshot_name':after.name, 'files':after.files,
+        'code_change_ref':(run_root/'code_changes'/f'round-{match.group(1)}.json').relative_to(output).as_posix(),
+        'restore_required':True}
+
+
 @contextmanager
 def candidate_sources(research, label):
     from .codepatch import apply_many, revert
@@ -174,7 +242,7 @@ def candidate_sources(research, label):
         research._held = prior
 
 
-def correct(research, *, label):
+def correct(research, *, label, checkpoint_ref=''):
     if getattr(research, 'execution_graph', None):
         return {'ok':False, 'why':'graph handoff correction requires an explicit verified '
                 'reuse edge; no graph stages started'}
@@ -188,6 +256,13 @@ def correct(research, *, label):
     folder = research.run_root/'attempts'/attempt
     selected = folder/'artifact_selection.json'
     reference = selected.relative_to(research.output).as_posix()
+    checkpoint_choice = None
+    if row.get('kind') == 'failed_development_consumer':
+        if not checkpoint_ref:
+            return {'ok':False,'why':'the failed consumer requires an Agent-selected checkpoint_ref '
+                    'inside its exact formal producer; diagnosis is not another smoke evaluation'}
+        from .measurement_recovery import select_for_recovery
+        _, checkpoint_choice = select_for_recovery(research.output, research.run_root.name, label, checkpoint_ref)
     state_path = folder/'handoff_correction.json'
     if state_path.is_symlink():
         return {'ok':False,'why':'unsafe correction state path'}
@@ -197,21 +272,40 @@ def correct(research, *, label):
             return {'ok':False, 'why':'previous correction outcome is unknown; reconcile '
                     'its selection/evaluation receipts before starting another operation'}
     state = {'at':now(), 'original_measurement_ref':original_path.relative_to(research.output).as_posix(),
-             'original_measurement_sha256':original_hash, 'original_selection_sha256':digest(selected),
+             'original_measurement_sha256':original_hash,
+             'original_selection_sha256':digest(selected) if selected.is_file() else None,
              'training_receipt_sha256':digest(folder/'receipt.json'),
              'training_attempt_id':attempt, 'training_reused':True,
              'corrected_label':row['corrected_label'], 'status':'revalidating'}
+    if checkpoint_choice:
+        state['checkpoint_handoff_ref'] = checkpoint_choice['evidence_ref']
     atomic_json(state_path, state)
+    recovery_phase = 'restore_original_selection'
     try:
         with candidate_sources(research,label):
+            from .data_versions import restore_selection
+            data_bindings = restore_selection(research.output, research.repo,
+                                             research.run_id, original)
+            recovery_phase = 'native_measurement_revalidation'
             result = research.measure(settings=original['settings'], label=row['corrected_label'],
                 _reuse_training_attempt_id=attempt,
-                **({'_audit_training_progress':True} if row.get('kind')=='completed_unscored_training'
+                **({'_data_bindings':data_bindings} if data_bindings else {}),
+                **({'_checkpoint_handoff':checkpoint_choice} if checkpoint_choice else
+                   {'_audit_training_progress':True} if row.get('kind')=='completed_unscored_training'
                    else {'_selection_correction_ref':reference}))
     except (OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
+        from .operation_failure import seal
+        failure=seal(research.output,operation='completed_training_handoff_recovery',exc=exc,
+            native_operation_status=('not_started' if recovery_phase=='restore_original_selection' else 'unknown'),
+            context={'training_attempt_id':attempt,'recovery_phase':recovery_phase,
+                'measurement_label':label,'original_measurement_sha256':original_hash,
+                'completed_producer_preserved':True,'checkpoint_handoff_ref':state.get('checkpoint_handoff_ref')})
         atomic_json(state_path,{**state,'status':'source_or_receipt_refused',
-                              'error':f'{type(exc).__name__}: {exc}'[:1200]})
+                              'error':f'{type(exc).__name__}: {exc}'[:1200],'failure':failure})
         return {'ok':False,'why':f'completed training recovery refused: {exc}',
+                'recovery_failure':{**failure,'failure_category':'completed_training_recovery_refused',
+                    'failure_scope':'development_consumer','repair_owner':'fix',
+                    'training_attempt_id':attempt,'measurement_label':label},
                 'handoff_correction':{**state,'status':'unscored'}}
     if digest(original_path) != original_hash:
         raise ValueError('original measurement changed during corrective evaluation')

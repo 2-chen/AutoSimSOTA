@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-10-19",
+  "study": "robosyn_matched_data_20261019_v1",
+  "claim_scope": "native_success_gated_acquisition_only_not_training_effect",
+  "campaign_id": "clickbell_matched_selection_v2_20261019",
+  "campaign_registration_action": "af19de2e0408bf4f",
+  "submitted_by_main_action": "11228dc26b19000f",
+  "native_job_id": "ab4783977c9741f285242ce23e227eca",
+  "native_attempt_id": "914cb8a064664afca4cb8ba82e19f5a2",
+  "native_status": "completed",
+  "native_returncode": 0,
+  "native_wall_seconds": 432.9,
+  "native_reported_attempts": 40,
+  "native_reported_successful_episodes": 40,
+  "metadata_total_episodes": 40,
+  "metadata_total_frames": 2960,
+  "metadata_codebase_version": "v2.1",
+  "metadata_fps": 25,
+  "metadata_ref": "research/derived/collect/native_outputs/914cb8a064664afca4cb8ba82e19f5a2/cobotmagic_Sim_click_the_bell_000/meta/info.json",
+  "collection_control_scope": {
+    "episodes_dynamic": true,
+    "seed_dynamic": false,
+    "profile_dynamic": false,
+    "targeted_acquisition_demonstrated": false
+  },
+  "prospective_comparison": {
+    "shared_pool": true,
+    "control": "manifest-order prefix; do not describe it as independently randomized selection",
+    "targeted_selection": "frozen extreme-first-observation.state rule; feature availability and variation remain to verify",
+    "shared_initialization_actual_consumption_verified": false,
+    "training_consumption_verified": false,
+    "measured_data_effect": null
+  },
+  "pending": [
+    "full video and parquet integrity audit",
+    "duplicate and feature-variation audit",
+    "subset materialization and data-version registration",
+    "matched initialization and actual batch consumption",
+    "same-protocol policy evaluation"
+  ],
+  "operator_scope": "Read-only terminal receipt, metadata and native count inspection; no operator acquisition, subset selection, training or scoring."
+}

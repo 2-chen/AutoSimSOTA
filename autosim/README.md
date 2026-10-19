@@ -4,6 +4,13 @@
 
 > 本文包含早期实现及历史使用说明。当前独立项目入口与已知限制以[根目录README](../README.md)为准；整体许可证尚待维护者确认。
 
+面向“必须完成数据对照”的新前瞻开发轨道，研究CLI使用
+`--research-brief /path/to/intent.md --require-data-comparison`。
+该要求随研究意图冻结，续跑时继承；确认前必须有v2随机/Agent定向数据campaign，
+实际arm或独立审核的资源/能力边界也必须完成。空registry或v1计划不能通过。
+它不授权修改评测、采集非法数据或增加预算；旧已确认轨道不能追加这个要求重开开发。
+单个正式矩阵arm依其冻结协议执行，不把整个比较的要求误加给固定数据控制单元。
+
 结合 **AutoSOTA** 的闭环优化范式、**isaac-sim-mcp** 的仿真控制和 **RoboTwin** 的任务定义，实现具身智能领域的自动化研究——通过仿真中的迭代优化，自动发现更好的机器人控制策略。
 
 ## 目录
@@ -302,7 +309,7 @@ python -m autosim.llm_optimizer \
 ```bash
 export AUTOSIM_LLM_BASE_URL=http://10.1.21.21:3000/v1
 export AUTOSIM_LLM_API_KEY=sk-...
-export AUTOSIM_LLM_MODEL=deepseek-v4-flash
+export AUTOSIM_LLM_MODEL=deepseek-flash
 ```
 
 ### ACT 模型接入验证
@@ -590,7 +597,7 @@ class MyAdapter(TaskAdapter):
 
 ```yaml
 # LLM 模型配置
-llm_model: deepseek-v4-flash
+llm_model: deepseek-flash
 llm_api_key: ""
 llm_base_url: http://10.1.21.21:3000/v1
 
@@ -606,7 +613,7 @@ target_improvement_pct: 30.0  # 目标提升百分比
 # OpenAI-compatible API（LLM 优化模式）
 export AUTOSIM_LLM_BASE_URL=http://10.1.21.21:3000/v1
 export AUTOSIM_LLM_API_KEY=sk-...
-export AUTOSIM_LLM_MODEL=deepseek-v4-flash
+export AUTOSIM_LLM_MODEL=deepseek-flash
 
 # 仿真连接
 export ISAAC_SIM_HOST=localhost

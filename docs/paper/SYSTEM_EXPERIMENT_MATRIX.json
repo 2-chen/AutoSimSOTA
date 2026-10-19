@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "study_id": "autosimsota_native_system_draft_20261015",
+  "phase": "draft",
+  "tasks": [
+    {"id": "robosyn_bell", "repository": "RoboSynChallenge", "native_task": "click_bell", "workflow": "expert_demonstrations", "role": "development", "admission": null},
+    {"id": "second_native_task", "repository": "To be selected by resource and native-workflow admission, not by observed gain", "native_task": null, "workflow": "fixed_data", "role": "development", "admission": null}
+  ],
+  "systems": [
+    {"id": "original", "kind": "original_recipe", "model_configuration": null, "capability_manifest": null},
+    {"id": "generic", "kind": "generic_research", "model_configuration": null, "capability_manifest": null},
+    {"id": "full", "kind": "autosimsota", "model_configuration": null, "capability_manifest": null}
+  ],
+  "research_replicas": [0, 1, 2],
+  "protocol": {
+    "resource_package": null,
+    "allowed_interventions": null,
+    "shared_resources_and_tools": null,
+    "baseline_calibration": null,
+    "native_development_evaluation": null,
+    "final_confirmation": null,
+    "initialization": null,
+    "stopping_and_failure_rules": null,
+    "memory_isolation": null,
+    "interventions_and_repairs": "Record every operator action and framework/native/external failure. Engineering development runs cannot be retrospectively relabelled zero-intervention frozen trials. Formal harness changes preserve the interrupted trial and require a new version.",
+    "full_cost_accounting": "Match the complete research resource package; disclose model USD including unknown holds, GPU device time, CPU/wall time, storage, failures and shared initialization. No per-cell automatic 24-hour reset. Published weights are calibration, not independent research repetitions.",
+    "comparison_scope": "Native repository integration and metric optimization; not a mandatory data-acquisition contest. Generic research has the same lawful tools/resources including an expert when available. Compare autoresearch-robotics separately on a common native template, or label a repository-adaptation extension explicitly. Do not classify a previously debugged repository as unseen."
+  },
+  "bindings": {}
+}

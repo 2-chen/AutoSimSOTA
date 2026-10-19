@@ -91,6 +91,15 @@ class ArtifactSelectionClient:
         return json.dumps(answer), {"provider": "test", "model": self.model}
 
 
+def test_collection_input_does_not_inherit_eval_episode_priority(tmp_path):
+    real = research(tmp_path)
+    settings = {'episodes': 7, 'eval.n_eval': 100, 'seed': 19}
+    assert real._inputs('collect', settings=settings)['episodes'] == 7
+    assert real._inputs('evaluate', settings=settings)['episodes'] == 100
+    assert real._inputs('collect', settings={'eval.n_eval': 100})['episodes'] == 0
+    assert settings == {'episodes': 7, 'eval.n_eval': 100, 'seed': 19}
+
+
 def ambiguous_policy_research(tmp_path, *, selector_mode="select"):
     real = research(tmp_path)
     (tmp_path / "ppo.py").write_text(
@@ -191,6 +200,168 @@ def test_bounded_research_yields_after_baseline_and_resumes_without_retraining_i
         repo=resumed.repo, round_index=1)
     assert rejected["status"] == "unverified"
     assert "summary evidence hash" in rejected["because"]
+
+
+def _registered_reference_fixture(real, *, label='reference_record'):
+    from autosim.research.common import atomic_json, digest
+    path = real.run_root / 'measurements' / (label + '.json')
+    protocol = real.run_root / 'reference_protocols' / 'released_policy.json'
+    atomic_json(protocol, {'target': 'evaluate', 'settings': {'episodes': 100}})
+    atomic_json(path, {'label': label, 'ok': False, 'baseline_origin': 'released_reference',
+                      'reference_protocol_ref': 'reference_protocols/released_policy.json',
+                      'train': {'attempt_id': None, 'returncode': None, 'artifact': None}})
+    row = {'id': 'released_policy', 'reference': {'kind': 'released_checkpoint'},
+           'review': {k: True for k in ('sources_supported', 'protocol_matches',
+                                       'tolerance_supported', 'release_identity_supported')},
+           'evaluations': [{'measurement_ref': path.relative_to(real.output).as_posix(),
+                            'measurement_sha256': object_digest(json.loads(path.read_text())), 'valid': False}]}
+    registry = real.output / 'baseline_references' / 'released_policy.json'
+    atomic_json(registry, row)
+    return path, protocol, registry
+
+
+def test_registered_reference_history_does_not_block_first_local_baseline(tmp_path):
+    from autosim.research.baseline_reference import registered_reference_measurement
+    from autosim.research.common import digest
+    real = research(tmp_path)
+    path, protocol, registry = _registered_reference_fixture(real)
+    original = {p: digest(p) for p in (path, protocol, registry)}
+    assert registered_reference_measurement(real.output, real.run_root, path)
+    result = real.run(rounds=1, yield_after_action=True)
+    assert (real.run_root / 'measurements' / 'baseline.json').is_file()
+    assert (real.run_root / 'controller_session.json').is_file()
+    assert len(list((real.run_root / 'attempts').glob('*/receipt.json'))) == 2
+    assert result['run_status'] == 'paused'
+    assert all(digest(p) == sha256 for p, sha256 in original.items())
+
+
+def _unstarted_reference_fixture(real):
+    from autosim.research.operation_failure import seal
+    from autosim.research.common import atomic_json
+    path, protocol, registry = _registered_reference_fixture(real)
+    evidence = seal(real.output, operation='measurement_protocol_guard',
+                    exc=ValueError('invalid reserved protocol key'),
+                    context={'run_id': real.run_id, 'label': path.stem},
+                    native_operation_status='not_started')
+    record = {'label': path.stem, 'ok': False, 'where': 'comparison_protocol',
+              'ran': False, 'metric_value': None, **evidence,
+              'reference_protocol_ref': 'reference_protocols/released_policy.json'}
+    atomic_json(path, record)
+    row = json.loads(registry.read_text())
+    row['evaluations'][0]['measurement_sha256'] = object_digest(record)
+    atomic_json(registry, row)
+    return path, protocol, registry
+
+
+def test_sealed_registered_prelaunch_reference_does_not_block_local_baseline(tmp_path):
+    from autosim.research.baseline_reference import registered_reference_measurement
+    from autosim.research.common import digest
+    real = research(tmp_path)
+    records = _unstarted_reference_fixture(real)
+    original = {p: digest(p) for p in records}
+    assert registered_reference_measurement(real.output, real.run_root, records[0])
+    result = real.run(rounds=1, yield_after_action=True)
+    assert result['run_status'] == 'paused'
+    assert (real.run_root / 'measurements' / 'baseline.json').is_file()
+    assert all(digest(p) == sha for p, sha in original.items())
+
+
+@pytest.mark.parametrize('fault', ['missing_receipt', 'log_changed', 'receipt_label',
+    'receipt_status', 'receipt_operation', 'receipt_symlink', 'log_symlink',
+    'claimed_metric', 'training', 'evaluation', 'ran', 'unregistered', 'local_origin'])
+def test_prelaunch_reference_exception_requires_registered_sealed_nonexecution(tmp_path, fault):
+    from autosim.research.baseline_reference import registered_reference_measurement
+    from autosim.research.common import atomic_json
+    real = research(tmp_path)
+    path, _, registry = _unstarted_reference_fixture(real)
+    measured = json.loads(path.read_text())
+    receipt = real.output / measured['receipt_ref']
+    log = real.output / measured['log_ref']
+    row = json.loads(registry.read_text())
+    if fault == 'missing_receipt':
+        receipt.unlink()
+    elif fault == 'log_changed':
+        log.write_text('{}')
+    elif fault.startswith('receipt_') and fault != 'receipt_symlink':
+        data = json.loads(receipt.read_text())
+        if fault == 'receipt_label':
+            data['context']['label'] = 'baseline'
+        elif fault == 'receipt_status':
+            data['native_operation_status'] = 'not_inferred'
+        else:
+            data['operation'] = 'other_operation'
+        atomic_json(receipt, data)
+    elif fault.endswith('_symlink'):
+        target = receipt if fault == 'receipt_symlink' else log
+        original = target.with_suffix('.original')
+        target.rename(original)
+        target.symlink_to(original)
+    elif fault == 'claimed_metric':
+        measured['metric_value'] = 0.9
+    elif fault in {'training', 'evaluation'}:
+        measured['train' if fault == 'training' else 'evaluate'] = {'attempt_id': 'a' * 32}
+    elif fault == 'ran':
+        measured['ran'] = True
+    elif fault == 'local_origin':
+        measured['baseline_origin'] = 'local_training'
+    elif fault == 'unregistered':
+        row['evaluations'] = []
+    atomic_json(path, measured)
+    if row['evaluations']:
+        row['evaluations'][0]['measurement_sha256'] = object_digest(measured)
+    atomic_json(registry, row)
+    assert not registered_reference_measurement(real.output, real.run_root, path)
+    from autosim.research.research_state import ResearchStateError
+    with pytest.raises(ResearchStateError, match='without a resumable'):
+        real.run(rounds=1, yield_after_action=True)
+    assert not list((real.run_root / 'attempts').glob('*/receipt.json'))
+
+
+@pytest.mark.parametrize('fault', [
+    'unregistered', 'changed_bytes', 'local_origin', 'training_attempt', 'reused_training',
+    'baseline_name', 'wrong_protocol', 'wrong_reference_kind', 'rejected_review',
+    'symlink_measurement', 'symlink_registry', 'symlink_protocol', 'bad_history',
+])
+def test_reference_scope_cannot_disguise_or_bypass_local_measurement_protection(tmp_path, fault):
+    from autosim.research.baseline_reference import registered_reference_measurement
+    from autosim.research.common import atomic_json, digest
+    from autosim.research.research_state import ResearchStateError
+    real = research(tmp_path)
+    path, protocol, registry = _registered_reference_fixture(
+        real, label='baseline' if fault == 'baseline_name' else 'reference_record')
+    measured, row = json.loads(path.read_text()), json.loads(registry.read_text())
+    if fault == 'unregistered':
+        row['evaluations'] = []
+    elif fault == 'changed_bytes':
+        measured['ok'] = True  # No matching new registry hash.
+    elif fault == 'local_origin':
+        measured['baseline_origin'] = 'local_training'
+    elif fault == 'training_attempt':
+        measured['train']['attempt_id'] = 'a' * 32
+    elif fault == 'reused_training':
+        measured['train']['reused'] = True
+    elif fault == 'wrong_protocol':
+        measured['reference_protocol_ref'] = 'comparison_protocol.json'
+    elif fault == 'wrong_reference_kind':
+        row['reference']['kind'] = 'local_policy'
+    elif fault == 'rejected_review':
+        row['review']['sources_supported'] = False
+    elif fault == 'bad_history':
+        row['evaluations'] = 'invalid'
+    atomic_json(path, measured)
+    if isinstance(row['evaluations'], list) and row['evaluations'] and fault != 'changed_bytes':
+        row['evaluations'][0]['measurement_sha256'] = object_digest(json.loads(path.read_text()))
+    atomic_json(registry, row)
+    if fault.startswith('symlink_'):
+        linked = {'symlink_measurement': path, 'symlink_registry': registry,
+                  'symlink_protocol': protocol}[fault]
+        original = linked.with_suffix('.original')
+        linked.rename(original)
+        linked.symlink_to(original)
+    assert not registered_reference_measurement(real.output, real.run_root, path)
+    with pytest.raises(ResearchStateError, match='without a resumable'):
+        real.run(rounds=1, yield_after_action=True)
+    assert not list((real.run_root / 'attempts').glob('*/receipt.json'))
 
 
 def test_paused_research_reports_changed_input_component_without_starting_an_attempt(
@@ -452,6 +623,25 @@ def test_gpu_deadline_clamps_native_process_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "isolated_argv", lambda argv, **kw: argv)
     real._run_stage("train", settings={}, timeout=1000, _gpu_deadline=time.monotonic() + 5)
     assert len(seen) == 1 and 0 < seen[0] <= 5
+
+
+@pytest.mark.parametrize('timed_out', [False, True])
+def test_evidence_failure_keeps_native_termination_cause(tmp_path,monkeypatch,timed_out):
+    from autosim.research import derived_research as module
+    from autosim.research.process_executor import ProcessAttempt
+    real=research(tmp_path)
+    monkeypatch.setattr(module,'isolated_argv',lambda argv,**kwargs:argv)
+    monkeypatch.setattr(module,'run_process',lambda *args,**kwargs:
+        ProcessAttempt(True,None if timed_out else 0,timed_out=timed_out))
+    def refuse(*args,**kwargs):
+        raise ValueError('bounded evidence sealing refusal')
+    monkeypatch.setattr(module,'capture_attempt_evidence',refuse)
+    result=real._run_stage('train',settings={},timeout=1)
+    assert result['status']=='failed'
+    assert result['termination_reason']=='evidence_capture_failed'
+    assert result['native_execution_status']==('timed_out' if timed_out else 'completed')
+    assert result['native_termination_reason']==('timeout' if timed_out else 'normal_exit')
+    assert result['native_returncode']==(None if timed_out else 0)
 
 
 def test_benchmark_stage_refuses_weak_containment_even_with_operator_opt_in(
@@ -843,11 +1033,12 @@ def test_explicit_staging_prepares_each_native_output_not_checkout(tmp_path, mon
     assert not (repo/'model.pth').exists()
 
 
-@pytest.mark.parametrize('fault', ['', 'duplicate', 'changed_specimen', 'changed_producer', 'outside_producer', 'different_name', 'stale', 'symlink', 'changed_metric', 'exact_ambiguous'])
-def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_producer(tmp_path, fault):
+@pytest.mark.parametrize('reference', [False, True])
+@pytest.mark.parametrize('fault', ['', 'duplicate', 'changed_specimen', 'changed_producer', 'outside_producer', 'different_name', 'stale', 'symlink', 'changed_metric', 'exact_ambiguous', 'media', 'parent_symlink'])
+def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_producer(tmp_path, fault, reference):
     from autosim.research.common import atomic_json, digest
     real = research(tmp_path)
-    producer = 'results/**/*.json'
+    producer = 'results/**' if fault == 'media' else 'results/**/*.json'
     original_pattern = 'results/old-timestamp/score.json'
     spec = MetricSpec.from_declaration({'research_goal': {'primary_metric': {
         'name': 'return', 'direction': 'maximize', 'source': 'json',
@@ -866,7 +1057,10 @@ def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_produ
                                      'root': 'output', 'pattern': original_pattern}}
     atomic_json(real.output/'metric_binding.json', binding)
     protocol = {'metric': spec.as_dict(), 'evaluator_stage': {'artifact': producer}}
-    atomic_json(real.run_root/'comparison_protocol.json', protocol)
+    if reference:
+        real._reference_protocol_id = 'released'
+    protocol_path = real._active_protocol_path()
+    atomic_json(protocol_path, protocol)
     output = real.run_root/'evaluate'/'native_outputs'/'attempt'
     new = output/'results'/'new-timestamp'/'score.json'
     new.parent.mkdir(parents=True)
@@ -889,14 +1083,21 @@ def test_bound_metric_relocation_requires_original_bytes_and_frozen_unique_produ
         new.unlink(); new.symlink_to(specimen)
     elif fault == 'changed_metric':
         protocol['metric']['json_key'] = 'other'
-        atomic_json(real.run_root/'comparison_protocol.json', protocol)
+        atomic_json(protocol_path, protocol)
+    elif fault == 'media':
+        (new.parent/'rollout.mp4').write_bytes(b'video')
+        (new.parent/'config.json').write_text('{"reward": 200}')
+    elif fault == 'parent_symlink':
+        moved = output/'other-directory'
+        new.parent.rename(moved)
+        new.parent.symlink_to(moved, target_is_directory=True)
     elif fault == 'exact_ambiguous':
         # Exact existing products do not fall through to producer-based relocation.
         exact = output/original_pattern
         exact.parent.mkdir(parents=True); exact.write_text('{"reward": 4}')
     result = real._resolve_bound_metric_artifact(spec, roots={'output': output},
         started_at=started, allowed_roots=[real.run_root])
-    if not fault:
+    if not fault or fault == 'media':
         assert result['status'] == 'matched'
         assert result['path'] == str(new.resolve())
         assert result['pattern'] == original_pattern
@@ -1081,6 +1282,89 @@ def test_policy_work_association_is_native_counter_container_not_filename(tmp_pa
         assert facts['not_a_score_or_best_checkpoint_claim']
         assert isinstance(facts['receipt_invocation_argv'], list)
         assert counter_ref not in runtime['text']
+
+
+@pytest.mark.parametrize('fault', ['', 'counter_changed', 'source_changed',
+                                  'other_counter', 'unreviewed_payload', 'two_payload_branches',
+                                  'root_counter'])
+def test_broad_checkpoint_bundle_uses_audited_metadata_not_file_count(tmp_path, monkeypatch, fault):
+    from autosim.research import training_progress_audit as pa
+    from autosim.research.common import atomic_json, digest
+    real = research(tmp_path)
+    real.require_training_progress = True
+    real._comparison_protocol_violation({}, target='evaluate', freeze=True)
+    real.backend.stages['train']['artifact'] = 'bundles/**'
+    counter_target = "p/'root_work.json'" if fault == 'root_counter' else "s/'work.json'"
+    code = ("import pathlib,json,sys; p=pathlib.Path(sys.argv[1]); "
+            "b=p/'bundles'/'opaque'; s=b/'state'; m=b/'payload'; "
+            "s.mkdir(parents=True); m.mkdir(); "
+            f"({counter_target}).write_text(json.dumps({{'updates':23}})); "
+            "(s/'optimizer.bin').write_bytes(b'optimizer'); "
+            "(s/'rng.bin').write_bytes(b'rng'); "
+            "(m/'schema.json').write_text(json.dumps({'width':17})); "
+            "(m/'recipe.json').write_text(json.dumps({'requested':23})); "
+            "(m/'weights.bin').write_bytes(b'policy'); "
+            "(p/'bundles'/'alias').symlink_to('opaque',target_is_directory=True)")
+    real.backend.sources['train'] = ('def stage_argv_train(i):\n'
+        + f"    return [i['python'], '-c', {code!r}, i['output']]\n")
+    real.backend = DeclarativeBackend(repo=tmp_path, answer=real.backend.answer,
+        sources=real.backend.sources, parameters={})
+    record = real.run_stage('train', settings={})
+    counter_ref = 'root_work.json' if fault == 'root_counter' else 'bundles/opaque/state/work.json'
+    reviewed = [counter_ref, 'bundles/opaque/payload/schema.json',
+                'bundles/opaque/payload/recipe.json']
+    output = Path(record['output_directory'])
+    producer = tmp_path/'producer.py'
+    producer.write_text('optimizer.step()\nupdates += 1\nsave_checkpoint(model, updates)\n')
+    row = {'id':'source-0', 'path':producer, 'sha256':digest(producer),
+           'content':producer.read_text(), 'excerpt':producer.read_text()}
+    monkeypatch.setattr(pa, 'sources', lambda *args:[row])
+    class Client:
+        supports_native_progress_audit = True
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'verdict':'verified', 'counter':{'path':counter_ref,
+                'field':['updates'], 'value':23}, 'counter_selection':{
+                'kind':'terminal_completed', 'reviewed_documents':reviewed,
+                'why':'Native save persists completed updates and one policy payload bundle.'},
+                'source_evidence':[{'source_id':'source-0', 'quote':producer.read_text()}]}), {}
+    real.client = Client()
+    receipt = real._verified_training_receipt(record['attempt_id'], {}, audit_progress=True)
+    assert receipt is not None
+    if fault == 'counter_changed':
+        (output/counter_ref).write_text('{"updates":24}')
+    if fault == 'source_changed':
+        producer.write_text('different producer')
+    if fault == 'other_counter':
+        (output/'bundles/opaque/payload/second.json').write_text('{"updates":23}')
+    if fault in {'unreviewed_payload', 'two_payload_branches'}:
+        audit_path = real.output/receipt['training_progress']['audit_ref']
+        audit = json.loads(audit_path.read_text())
+        if fault == 'unreviewed_payload':
+            audit['answer']['counter_selection']['reviewed_documents'] = [counter_ref]
+        else:
+            extra = output/'bundles/opaque/second/schema.json'
+            extra.parent.mkdir()
+            extra.write_text('{"width":17}')
+            audit['answer']['counter_selection']['reviewed_documents'].append(
+                'bundles/opaque/second/schema.json')
+        atomic_json(audit_path, audit)
+    paths, error = real._selection_candidates(receipt)
+    assert not error
+    aliases = {f'candidate_{i+1}':p for i,p in enumerate(paths)}
+    bindings, sources, proof = real._policy_work_evidence(receipt, aliases)
+    if fault:
+        assert not bindings and not proof
+        return
+    names = {aliases[k] for k in bindings}
+    assert 'bundles/opaque/payload' in names
+    assert 'bundles/alias/payload' in names
+    assert 'bundles/opaque/payload/weights.bin' in names
+    assert all('/payload' in name for name in names)
+    assert all(b['completed_work'] == 23 for b in bindings.values())
+    assert all(b['native_save_load_selection_still_required'] for b in bindings.values())
+    assert all(b['association_basis'] == 'independently_reviewed_metadata_sibling_payload'
+               for b in bindings.values())
+    assert proof and any(s['path'] == 'runtime_completed_work' for s in sources)
 
 
 @pytest.mark.parametrize('fault', ['', 'changed_inputs', 'later_score', 'settings'])
@@ -2550,6 +2834,69 @@ def test_evaluation_refuses_a_changed_frozen_protocol(tmp_path):
     receipt = json.loads((real.run_root / "attempts" / result["attempt_id"] /
                           "receipt.json").read_text(encoding="utf-8"))
     assert receipt["termination_reason"] == "protocol_changed"
+    assert receipt['ran'] is False and receipt['command_started'] is False
+    assert receipt['evidence_id'] == result['evidence_id']
+    from autosim.research.evidence_store import read_attempt_evidence
+    evidence=read_attempt_evidence(real.output,result['evidence_id'])
+    assert 'not_started' in evidence['text']
+
+
+def test_prestart_protocol_refusal_is_not_missing_policy_load_proof(tmp_path,monkeypatch):
+    evaluator=tmp_path/'evaluate.py';evaluator.write_text('score = 0\n')
+    real=research(tmp_path)
+    weight=real.output/'release.bin';weight.write_bytes(b'weights')
+    assert not real._protocol_violation()
+    original=(real.run_root/'protocol_frozen.json').read_bytes()
+    evaluator.write_text('score = 1\n')
+    real.require_policy_consumption=True
+    monkeypatch.setattr('autosim.research.derived_research.verify_policy_consumption',
+        lambda *a:pytest.fail('no native loader ran; do not inspect a nonexistent log'))
+    # Isolate the lower-level execution guard. The public entry point now also
+    # rejects this earlier, with its own sealed evidence (tested below).
+    monkeypatch.setattr(real,'_comparison_protocol_violation',lambda *a,**k:'')
+    result=real.measure(settings={},label='reference_blocked',_reference_checkpoint=weight)
+    assert not result['ok'] and 'frozen protocol changed' in result['why']
+    assert result['policy_consumption']['status']=='not_observed'
+    assert result['evaluate']['ran'] is False
+    assert result['evaluate']['status']=='blocked'
+    assert result['evaluate']['termination_reason']=='protocol_changed'
+    assert result['evaluate']['evidence_id']
+    assert (real.run_root/'protocol_frozen.json').read_bytes()==original
+
+
+def test_prestart_comparison_refusal_seals_original_cause(tmp_path):
+    evaluator=tmp_path/'evaluate.py';evaluator.write_text('score = 0\n')
+    real=research(tmp_path)
+    assert not real._protocol_violation()
+    original=(real.run_root/'protocol_frozen.json').read_bytes()
+    evaluator.write_text('score = 1\n')
+    result=real.measure(settings={},label='blocked_before_execution')
+    assert not result['ok'] and result['ran'] is False
+    assert result['native_operation_status']=='not_started'
+    assert 'frozen protocol changed' in result['why']
+    from autosim.research.evidence_store import read_attempt_evidence
+    evidence=read_attempt_evidence(real.output,result['evidence_id'])
+    assert 'frozen protocol changed' in evidence['text']
+    assert (real.run_root/'protocol_frozen.json').read_bytes()==original
+
+
+def test_readonly_research_construction_does_not_freeze_preparation(tmp_path):
+    evaluator=tmp_path/'evaluate.py';evaluator.write_text('score = 0\n')
+    reader=research(tmp_path)
+    assert not (reader.run_root/'protocol_frozen.json').exists()
+    # A later controller after a pre-search adapter edit gets current source;
+    # the old reader object must still reject an edit after its own binding.
+    evaluator.write_text('score = 1\n')
+    fresh=research(tmp_path)
+    assert not (fresh.run_root/'protocol_frozen.json').exists()
+    assert not fresh._comparison_protocol_violation({},target='evaluate',freeze=True)
+    assert (fresh.run_root/'protocol_frozen.json').is_file()
+    assert reader._protocol_violation()
+    original=(fresh.run_root/'protocol_frozen.json').read_bytes()
+    evaluator.write_text('score = 2\n')
+    resumed=research(tmp_path)
+    assert 'frozen protocol changed' in resumed._protocol_violation()
+    assert (resumed.run_root/'protocol_frozen.json').read_bytes()==original
 
 
 def test_evaluation_refuses_new_protected_file_after_protocol_freeze(tmp_path):

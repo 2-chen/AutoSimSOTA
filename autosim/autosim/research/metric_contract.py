@@ -344,10 +344,14 @@ class MetricSpec:
 
 
 def resolve_metric_artifact(spec: MetricSpec, *, roots: dict[str, Path],
-                            started_at: float, allowed_roots: list[Path]) -> dict[str, Any]:
+                            started_at: float, allowed_roots: list[Path],
+                            required_basename: str = '') -> dict[str, Any]:
     """Resolve one fresh, declared result file and bind its bytes to this score attempt."""
     if not spec.artifact_pattern:
         return {"status": "not_declared", "matched": 0}
+    if required_basename and (Path(required_basename).name != required_basename or
+            any(char in required_basename for char in '\\/*?[\x00')):
+        return {"status": "unsafe_filename", "matched": 0}
     base = roots.get(spec.artifact_root)
     if base is None:
         return {"status": "missing_root", "matched": 0}
@@ -360,7 +364,13 @@ def resolve_metric_artifact(spec: MetricSpec, *, roots: dict[str, Path],
     fresh: list[Path] = []
     for path in matches:
         try:
+            if required_basename and path.name != required_basename:
+                continue
             if path.is_symlink():
+                continue
+            if not path.is_relative_to(base) or any(
+                    parent.is_symlink() for parent in path.parents
+                    if parent.is_relative_to(base)):
                 continue
             resolved = path.resolve(strict=True)
             stat = resolved.stat()

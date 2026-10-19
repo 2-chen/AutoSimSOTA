@@ -11,3 +11,13 @@ Do not write a fake module into site-packages to satisfy an import probe. If the
 A probe should call the code the way the repository calls it. A task module that begins `from ._base_task import ...` is part of a package and cannot be run as a file; the repository imports it by name, and so should the probe.
 
 Return one JSON object: {"commands": ["<the commands to run next, in order>"], "reasoning": "<what the failure told you>", "probes": ["<the replacement probes, only when the existing ones are wrong>"], "unbuildable": "<if this cannot be fixed by installing something, say why; otherwise omit>"}.
+
+Before further installs compare prepared_overlays with actual_environment_observation.
+If a checked run-owned overlay retains the missing local dependency/source closure,
+you may return ONLY {"proposed_action":{"step":"build_the_environment",
+"arguments":{"base_environment_id":"<current matching ID>","base_environment_mode":"overlay",
+"reuse_environment_ref":"<prepared ref>","environment_selection_reason":"<evidence-grounded reason>"}},
+"reasoning":"<why reuse is preferable>"}. Alternatively propose corrected explicit
+source_binding_ids from the current catalog. Do not mix this advice with commands,
+probes or unbuildable. It is returned unexecuted to Main, not an environment pass;
+Main chooses it and the executor revalidates ownership/identity and all consumers.

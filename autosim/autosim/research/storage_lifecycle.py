@@ -118,13 +118,16 @@ def inventory(output, refs):
     return rows
 
 
-def native_owner(output, evidence_id):
+def _native_owner(output, evidence_id, *, inspection_only=False):
     from .evidence_store import read_attempt_evidence
     native = read_attempt_evidence(Path(output),evidence_id,limit=3000)
     if native.get('status') not in {'completed','failed'}:
         raise ValueError('native evidence has unresolved outcome')
     receipt = read_json(safe(output,native['receipt_ref']))
-    if receipt.get('stage',receipt.get('node_id')) not in {'train','evaluate','record_demo'}:
+    stages={'train','evaluate','record_demo'}
+    if inspection_only:
+        stages|={'collect','prepare_data'}
+    if receipt.get('stage',receipt.get('node_id')) not in stages:
         raise ValueError('data producers are not eligible for automatic payload GC')
     if receipt.get('evidence_id',receipt.get('attempt_id',receipt.get('id')))!=evidence_id:
         raise ValueError('native receipt identity disagrees with sealed evidence')
@@ -137,6 +140,16 @@ def native_owner(output, evidence_id):
     native['receipt_facts']={key:receipt.get(key) for key in ('stage','node_id','argv',
         'status','returncode','termination_reason','training_progress','settings_digest','storage_pressure')}
     return raw.resolve(), native
+
+
+def native_owner(output, evidence_id):
+    """GC ownership admission: datasets never become automatic payload candidates."""
+    return _native_owner(output,evidence_id)
+
+
+def inspection_owner(output, evidence_id):
+    """Read-only inventory ownership; grants no retention/deletion permission."""
+    return _native_owner(output,evidence_id,inspection_only=True)
 
 
 def protected(output):

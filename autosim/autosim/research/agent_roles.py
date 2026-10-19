@@ -23,7 +23,11 @@ class RoleProfile:
 
     @property
     def can_inspect_native(self) -> bool:
-        return self.can_execute_diagnostics or self.name in {"scheduler", "fix", "init", "data"}
+        return self.can_execute_diagnostics or self.name in {"scheduler", "fix", "init", "data", "objective"}
+
+    @property
+    def native_source_only(self) -> bool:
+        return self.name == 'objective'
 
     @property
     def builtin_tools(self) -> tuple[str, ...]:
@@ -77,7 +81,13 @@ class RoleProfile:
             parts.append("Do not execute commands; cite existing receipts or "
                          "request a trusted probe.")
         if self.can_inspect_native:
-            parts.append("inspect_native_environment is the bounded read-only CPU "
+            parts.append("inspect_native_environment is SOURCE-ONLY for this role: "
+                         "read the published dependency catalog or capture exact public source. "
+                         "No code, policy/data grants, GPU, installs or configuration writes. "
+                         "Use the supplied confirmation_reservation for the original intent; "
+                         "stale citations are not permission to replace its conditions."
+                         if self.native_source_only else
+                         "inspect_native_environment is the bounded read-only CPU "
                          "exception: use the actual selected interpreter and run-local "
                          "config. If context is unpublished, request preparation "
                          "instead of repeating inspection.")

@@ -33,6 +33,7 @@ import hashlib
 import csv
 import math
 import re
+from copy import deepcopy
 import shutil
 import subprocess
 import sys
@@ -143,8 +144,8 @@ def _structured_result_schema(path: Path) -> dict[str, Any]:
 #: model may take them in any order it can justify, and may take one twice.
 OPERATIONS: dict[str, str] = {
     'configure_confirmation_protocol': 'before the first research session/measurement, reserve source-backed independent evaluation conditions. Provide confirmation={native_key:heldout_value},source_refs:[{ref,quote}],reason and optional protocol_keys:[custom native evaluation keys]. Objective/Supervisor independently checks input routing, real disjoint initial conditions (not merely a training RNG seed), unchanged policy/metric. Does not change native development settings or relax frozen/heldout constraints; no full repository resurvey needed.',
-    'register_data_campaign': 'prespecify a development-failure-driven data experiment. campaign={id,development_label,hypothesis,acquisition,selection,comparison:{arms:[targeted,random,optional unfiltered],usable_episodes,training_recipe,seeds,compute_accounting}}. Explanations <=2000 chars. Requires scored development identity, never held-out. Agent selects native collection/filtering; registration does not execute or approve the hypothesis.',
-    'record_data_campaign_arm': 'link campaign_id,arm,seed,measurement_label,acquired_version_id,training_version_id to an actually consumed and scored new-data intervention. Immutable observation, not independent fairness approval or best-score promotion. Data registration/producer/profile/native loader contracts still apply.',
+    'register_data_campaign': 'prespecify a development-failure-driven data experiment. For current comparisons use campaign={schema_version:2,id,development_label,hypothesis,acquisition,selection,comparison:{arms:[random_quality,agent_targeted],usable_episodes,training_recipe,seeds,compute_accounting,budget_axis,budget_limit,quality_floor,frozen_factors,rule:null}}. Optional arms: fixed_official,fixed_continuation,rule_targeted,targeted_quality,fdas; rule_targeted requires a source-backed rule specification. budget_axis=accepted_episodes|attempts|acquisition_seconds|total_compute; declare finite matching budget_limit. Explanations <=2000 chars. Legacy schema_version:1 uses only targeted/random/optional unfiltered and the five legacy comparison fields; omitting schema_version selects legacy v1, never v2. Requires scored development identity, never held-out. Agent selects native collection/filtering; registration does not execute or approve the hypothesis. verified sample_read is NOT training_batch evidence or a completed data-comparison arm.',
+    'record_data_campaign_arm': 'link campaign_id,arm,seed,measurement_label,acquired_version_id,training_version_id to an actually consumed and scored new-data intervention. Current v2 campaigns require training_batch consumption: data_consumption=verified with only sample_read/basic_read_only is insufficient. Inspect data_consumption_scope and the sealed measurement; a completed policy score alone does not establish a data-comparison arm. Alternatively, boundary={status:unsupported|budget_limited,reason,evidence_refs:[sealed_ID],source_refs:[{ref,quote}]} requests independent review of an unresolved boundary: OMIT all measurement/data-version arguments in that mode. Source input uses ref/quote, not Supervisor-only source_id. Boundary is not a score or successful experiment. Data registration/producer/profile/native loader contracts still apply.',
     'inspect_storage': 'inspect filesystem headroom, category sizes, native producers and retention transactions; no deletion. Optional evidence_id, offset, limit (1..64) reads a complete producer file inventory by pages, not just discovery samples.',
     'configure_storage_controls': 'source-backed independently reviewed native TRAIN saving/logging flags; never learning or evaluator settings. Provide controls [{flag,value}], reason, source_evidence [{path,quote}], optional checkpoint_bytes/projected_bytes.',
     'register_storage_artifact': 'Storage retention/GC classification ONLY, not checkpoint producer authorization or scoring identity. Register exact run-relative binary payload refs with sealed evidence_id, role intermediate|terminal|resume|verification, reason and source_evidence. Exclude source, metadata/configs and evidence. Independent Supervisor classifies; final/resume groups are permanently protected.',
@@ -169,6 +170,13 @@ OPERATIONS: dict[str, str] = {
         "checkout/authorized resource paths), release_url, revision, expected_metric, tolerance, "
         "episodes. Supervisor independently reviews exact sources and protocol/tolerance. "
         "Unavailable requires evidence, never silently substituting probe-trained weights.",
+    "recover_reference_score": "re-read the active failed reference's completed native evaluation "
+        "using reference_id and reason. No GPU work, native receipt rewrite, metric/protocol "
+        "change or baseline adoption. Original evidence is retained; independent checks required. "
+        "If the frozen locator alone misses a model-dependent output directory, optionally propose "
+        "artifact_revision={pattern,reason,source_refs:[{ref,quote}]}. This needs separate source "
+        "review for one unique fresh result of the SAME attempt and exact policy/episode/metric "
+        "re-verification; never patch a frozen protocol or choose a result by its value.",
     "evaluate_baseline_reference": "evaluate the active reviewed reference using reference_id "
         "and optional retry_reason for a known failed/mismatched attempt. No training, no "
         "baseline replacement and no best-score promotion. Frozen native evaluator, policy "
@@ -182,16 +190,23 @@ OPERATIONS: dict[str, str] = {
     "extend_research_rounds": "allocate additional development rounds within existing total "
         "budgets: additional_rounds (integer 1..1000), expected_rounds (current planned_rounds), "
         "reason (<=1000 characters). Preserve original baseline, settings, history and best; "
-        "never reopen after held-out exposure or while jobs/pending actions own the workspace.",
+        "idle finalizing before confirmation is eligible too; never reopen after held-out "
+        "exposure or while jobs/pending actions own the workspace.",
     "propose_harness_repair": "investigate a suspected framework-owned failure using "
-        "evidence_id and diagnosis. Fix reads an isolated framework snapshot and proposes "
+        "evidence_id, diagnosis, and optional source_paths selected from source_catalog. "
+        "Fix reads those isolated framework files on demand and proposes "
         "bounded exact edits. No live modification, budget reset, validator edits or automatic "
         "Python activation. Repository faults return to native recovery. Candidate-only, "
         "not successful recovery; independent original-operation replay is still required.",
+    "revise_presearch_protocol": "request independent review of a prospective setup/instrumentation "
+        "protocol version using reason. Available only before any actual formal evaluation, "
+        "local session or held-out exposure. Authentic old bytes and exact new diff required. "
+        "Preserve old protocols, failures and costs; never promote scores or relax metrics. "
+        "Retry the original operation only after the new version is committed and reverified.",
     "configure_screening": "declare a fidelity study: study={id,budget_axis,rungs,eta,min_peers,evidence,reason}; final rung matches formal training budget, evaluation stays frozen.",
     "run_screening_trial": "execute one audited param idea at an explicit study_id/rung with idea_label, window_seconds, reason; separate receipts and scores, never formal best.",
     "inspect_screening": "read study_id and advisory same-rung promotion recommendations; Scheduler decides promotion and must revalidate full-protocol candidates.",
-    "submit_research_task": "submit a read-only specialist assignment asynchronously: role, task, expected_result, optional source_paths controlling actual copied files/directories; independent session, shared total model budget. Results are merged only by Scheduler.",
+    "submit_research_task": "submit a read-only specialist assignment asynchronously: role, task, expected_result, optional source_paths controlling copied BENCHMARK checkout files/directories only (not framework catalog paths); framework source is read separately through inspect_native_environment.framework_source_request. Independent session, shared total model budget. Results are merged only by Scheduler.",
     "cancel_research_task": "discard an active read-only task result using task_id and reason; in-flight provider charges remain accounted.",
     "wait_for_jobs": "wait for native/agent completion events without model polling; provide no arguments. Use when dependencies are running and no useful independent work remains.",
     "review_report_demo": "resolve a Recorder request with request_id, decision (capture or "
@@ -220,12 +235,20 @@ OPERATIONS: dict[str, str] = {
                            "its responsible executor/planner and judge its new receipt; do not "
                            "turn a patch or CPU probe into a verified recovery.",
     "submit_native_job": "submit a verified native stage as a detached, budgeted job; optional "
+                         "for evaluate: checkpoint_ref selects ONE verified producer bundle; "
+                         "evaluation_settings={episodes: positive integer, seed: nonnegative integer} "
+                         "requests development inputs, never held-out exposure; an existing frozen "
+                         "comparison still requires its original episodes and evaluation seed, "
+                         "even for a diagnostic job. This interface cannot bypass that protocol. "
                          "training_settings={steps: positive integer, ...} explicitly chooses "
                          "declared learning axes for a train job without rewriting baseline. "
                          "Required fields: stage, window_seconds, reason (nonempty, <=1000 characters). Optional "
                          "resources={cpu: integer 1..256, memory_mib: integer 1..16777216, "
                          "gpu: JSON boolean true/false (not a count), priority: integer -10..10}. "
-                         "Omit resources to use validated defaults. "
+                         "Omitted resources mean 2 logical CPUs and 4096 MiB, enforced with "
+                         "CPU affinity/thread caps, not the verification run's resources. "
+                         "Choose an explicit source/throughput-backed profile or ask Resource; "
+                         "do not extrapolate a full-host probe's duration to a two-CPU job. "
                          "provide a positive local window and evidence-based reason. A "
                          "Use idea_label to bind a cleared param/algo candidate to its exact "
                          "allocated round and settings; optional training_settings explicitly "
@@ -259,6 +282,9 @@ OPERATIONS: dict[str, str] = {
                              "Init selects needed source_binding_ids from the candidate catalog and "
                              "tests native consumers before installing missing dependencies. "
                              "Optional source_binding_ids with an explicit overlay selection lets "
+                             "Main correct caller bindings. Optional reuse_environment_ref chooses "
+                             "a metadata-verified run-owned overlay from environment.prepared_overlays "
+                             "with its matching base ID and overlay mode, retaining installed delta. "
                              "Scheduler revise the binding definition; prose alone is not a revision. "
                              "source-backed base switch EVEN when an interpreter exists. New prefix "
                              "is isolated, old evidence retained; disallowed once stages are verified. "
@@ -283,7 +309,23 @@ OPERATIONS: dict[str, str] = {
                         "After Main corrects a checkpoint caller-input handoff, "
                         "draft_rebind_inputs=['checkpoint'] permits an offered rebindable draft "
                         "with otherwise identical source/task/interpreter context; preserve wrapper "
-                        "runtime fixes and run NEW native verification, never certify from the draft.",
+                        "runtime fixes and run NEW native verification, never certify from the draft. "
+                        "Optional blueprint_ref explicitly selects an offered historical invocation "
+                        "after a source edit. It preserves runtime connections as an unverified "
+                        "starting point with matching task/interpreter/resources; new native "
+                        "verification is mandatory. Do not combine blueprint_ref with draft_ref "
+                        "or reuse_verified; still choose the CURRENT checkpoint explicitly. "
+                        "Optional artifact_revision={pattern,reason,source_refs} "
+                        "explicitly proposes a source-backed relative output path/glob, including a dataset "
+                        "directory when required. Independent scope review and NEW native verification are "
+                        "mandatory. It never widens old producer receipts; no automatic marker-parent inference. "
+                        "For train/evaluate this corrects ONLY an output locator before any baseline, "
+                        "research session or comparison protocol: evaluator/metric, learning and inputs "
+                        "must stay unchanged. It is not permitted after formal research starts. "
+                        "A successful collect derivation verifies the interface, not a formal data producer. "
+                        "Then choose submit_native_job(stage=collect, collection_settings=...) for "
+                        "formal acquisition; an empty artifact in a derivation_native envelope is not "
+                        "evidence the installed interface is broken or needs repeated derivation.",
     "reconcile_interrupted_action": "inspect the prior attempt receipt and process identity; "
                                     "stop only its verified process group, preserve unknown "
                                     "outcome, and report evidence before another attempt.",
@@ -295,12 +337,35 @@ OPERATIONS: dict[str, str] = {
                    "and repository source; do not guess a score from a label.",
     "recover_unscored_baseline": "revalidate an unscored baseline's exact completed train "
                                  "receipt and native policy selection, then evaluate that "
-                                 "already-produced policy without retraining.",
-    "correct_policy_handoff": "choose an offered handoff_corrections label; independently "
+                                 "already-produced policy without retraining. For a failed native "
+                                 "consumer, checkpoint_ref must select its exact formal producer "
+                                 "from verified_train_artifacts, never command-verification weights. "
+                                 "If native evaluation already completed and only result location failed, "
+                                 "DO NOT replay: propose artifact_revision={pattern,reason,source_refs:[{ref,quote}]} "
+                                 "without checkpoint_ref. Independent same-attempt locator review, fixed metric, "
+                                 "producer/load/rollout/receipt checks and a resumable commit recover the score "
+                                 "with zero native work. A pending CPU commit resumes without another revision.",
+    "diagnose_development_failure": "delegate an offered development_recoveries label to Fix. "
+                                    "It reads the sealed native error and save/load source, and "
+                                    "returns an executable repair proposal for Main; no training, "
+                                    "scoring, protocol edits or implicit replay occurs.",
+    "correct_policy_handoff": "label MUST be the ORIGINAL failed measurement label in "
+                              "development_recoveries/handoff_corrections, NOT corrected_label "
+                              "or a new output name. The executor generates the linked output name. Independently "
                               "re-audit its completed training and evaluate the corrected "
                               "policy without retraining, including completed_unscored_training. "
                               "Prefer recovering that finished work before another train. Preserve the original score, "
-                              "baseline and incumbent; this adds a linked measurement.",
+                              "baseline and incumbent; this adds a linked measurement. "
+                              "If completed_evaluation_links offers a finished evaluate job, pass its "
+                              "exact job_id with label to reverify and link existing native work, "
+                              "including valid negative results, without running evaluation again. "
+                              "These modes are exclusive: checkpoint_ref selects the completed TRAIN "
+                              "producer for a new evaluation; job_id selects an offered completed EVALUATE "
+                              "job for linking. A training attempt/evidence ID is NOT that job_id. "
+                              "For kind=completed_evaluation_missing_locator, supply ONLY label and "
+                              "artifact_revision={pattern,reason,source_refs}: independent source-reviewed "
+                              "CPU score recovery of the existing completed evaluation, no native replay "
+                              "or best adoption. Preserve the original failure and frozen metric.",
     "adopt_linked_measurement": "explicitly adopt an offered measurement_adoptions label "
                                "using its exact expected_best and measurement_sha256. "
                                "Revalidates archived native evidence and protocol; advances "
@@ -313,21 +378,50 @@ OPERATIONS: dict[str, str] = {
                     "Existing baseline and evaluation settings "
                     "are immutable. With a paused audited idea_label, training_settings chooses "
                     "only this candidate's local learning work; it never rewrites baseline settings. "
-                    "Do not combine an adopting job_id with new training_settings.",
+                    "training_settings.seed selects only the source-supported train seed, "
+                    "not the frozen evaluation seed (including seed zero). "
+                    "Do not combine an adopting job_id with new training_settings. "
+                    "For a reviewed uncertain (not inapplicable/unavailable) candidate, Main may "
+                    "explicitly choose execution_uncertainty={reason,postcondition,stage_window_seconds} "
+                    "with explicit training_settings to test the missing connection. This bounds "
+                    "each native stage, never changes total budgets or scientific scoring checks.",
     "generate_research_ideas": "ask for and audit a fresh batch of candidate research ideas; "
                               "this does not run a benchmark stage.",
+    "apply_workflow_candidate": "Apply one exact cleared code idea to a declared non-scoring "
+        "collect/prepare_data/convert/preprocess workflow after independent preservation review. "
+        "Arguments idea_label, target_stage, reason. No native job, score or round is produced. "
+        "Commands become unverified: derive source-bound commands again before separate jobs. "
+        "Restore this temporary patch before policy learning/scoring; native data retains its production lineage. "
+        "This is the research-time path for collector/data-preparation code; ordinary editable "
+        "research_task stays forbidden. It does not change old data or certify future quality.",
+    "restore_workflow_candidate": "Exact guarded rollback of a workflow source transaction; "
+        "arguments patch_id, reason. Refuses active jobs, held-out exposure or divergent files; "
+        "requires fresh command verification, never restores a score or refunds compute.",
     "propose_research_idea": "submit one evidence-backed idea from the main controller for "
                              "deterministic audit; this does not run a benchmark stage. "
                              "arguments={idea:{label,granularity,mechanism,change,risk,crosses,why,evidence,touches}}. "
                              "granularity=param|code|algo; risk=low|medium|high (put risk explanations in why). "
+                             "crosses is exactly the string none or one current red-line ID such as R1; "
+                             "put its explanation in why, never in crosses, and do not invent category IDs. "
                              "For code, change={file,find,replace} or {patches:[{file,find,replace},...]}; "
                              "at most eight patches, exactly one combined patch per file. "
                              "If an import and a configuration in the same file must change, quote one "
                              "unique contiguous source block covering both (find maximum 4000 characters). "
                              "find/replace are exact literal source blocks, not line numbers or from/to/block aliases. "
-                             "evidence and touches are lists of strings; all nine idea fields are required.",
+                             "evidence and touches are lists of strings; all nine idea fields are required for a new payload. "
+                             "For an exact prior-payload replication, use the separate four-field alternative "
+                             "idea={label:<new unused label>,reuse_idea_label,expected_idea_sha256,reason} from "
+                             "research_options.reproposable_prior_ideas. This proposes and reaudits only; "
+                             "it does not run, revive the old trial or copy its settings/score.",
     "confirm_best": "evaluate the already-frozen best policy on the explicitly requested "
                     "held-out protocol; this action must not train or change the policy.",
+    "review_confirmation_failure": "request an independent Supervisor review of a failed confirmation "
+        "using a sealed successful CPU repair diagnostic. Positive source/execution evidence must "
+        "establish setup-only failure before rollout/metrics. Approval permits the same frozen "
+        "confirmation only, never further development. arguments={diagnostic_evidence_id,reason}",
+    "diagnose_confirmation_failure": "seal score-free traceback/source locations from the failed "
+        "confirmation and delegate CPU-only diagnosis to Fix. Does not authorize editing frozen "
+        "candidate/evaluator or repeating held-out rollout.",
     "stop": "nothing further can be done, and say why.",
 }
 
@@ -340,6 +434,15 @@ _MONITORED_FAILURES = frozenset({
 MONITOR_SYSTEM = load_prompt("monitor")
 
 FIX_SYSTEM = load_prompt("fix")
+
+# Recommendations only: Main still chooses, checks applicability and executes.
+# Keep the offered contracts and the report validator on this ONE list.
+_FIX_PROPOSAL_OPERATIONS = (
+    'recover_unscored_baseline', 'correct_policy_handoff', 'propose_harness_repair',
+    'build_the_environment', 'derive_a_command', 'reconcile_interrupted_action',
+    'discard_interrupted_candidate',
+    'research_task', 'propose_research_idea', 'apply_workflow_candidate', 'restore_workflow_candidate',
+)
 
 _FIX_ASSISTANCE_STEPS = frozenset({
     "read_the_checkout", "declare", "build_the_environment", "derive_a_command",
@@ -701,6 +804,25 @@ def _last_research_observation(rows: list[Any], run_id: str, *,
                                        if isinstance(receipt.get("returncode"), int) else None,
                                        "parameters": _safe_receipt_parameters(
                                            receipt.get("argv"))})
+                        from .development_evidence import training_selection_transport
+                        actual['registered_data_transport'] = training_selection_transport(receipt)
+                        progress = receipt.get('training_progress')
+                        if isinstance(progress, dict):
+                            completed = {'status': str(progress.get('status') or 'unknown')[:40],
+                                'authority': 'recorded native receipt; not a new progress audit or adequacy claim'}
+                            ref = progress.get('audit_ref')
+                            if isinstance(ref, str) and re.fullmatch(
+                                    r'training_progress_audits/[a-f0-9]{64}\.json', ref):
+                                completed['audit_ref'] = ref
+                            proof = progress.get('evidence')
+                            counter = proof.get('native_counter') if isinstance(proof, dict) else None
+                            if isinstance(counter, dict):
+                                value, field = counter.get('value'), counter.get('field')
+                                if (type(value) is int and value > 0 and isinstance(field, list)
+                                        and 1 <= len(field) <= 16 and all(isinstance(k, str)
+                                            and re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', k) for k in field)):
+                                    completed['native_counter'] = {'field': field, 'value': value}
+                            actual['completed_work_review'] = completed
                 observation["actual_training"] = actual
         except (OSError, RuntimeError, TypeError, ValueError):
             # State remains useful when optional evidence cannot be read; its reference stays
@@ -776,6 +898,9 @@ class Preparation:
                           **dict(exc.evidence)})
         self.decisions: Decisions | None = None
         self._resume_from_records()
+        from .native_context import publish_interpreter_hint
+        self.native_hint_publication = publish_interpreter_hint(self.output, self.repo,
+            self.interpreter_hint if self.interpreter is None else None)
         try:
             self.decisions = Decisions(self.output)
         except (OSError, ValueError, TypeError) as exc:
@@ -854,6 +979,11 @@ class Preparation:
                              research_phase.get("parent_action")
                              if isinstance(research_phase, dict) and
                              research_phase.get("status") == "running" else None)
+            if (isinstance(action, dict) and action.get('step') in {'coding_agent_turn','choose'}
+                    and 'parent_action' in action and action['parent_action'] is None):
+                # Explicitly unparented Monitor/Main turns do not own a stale
+                # research-phase round. Missing legacy linkage stays fail-closed.
+                parent_action = None
             if (shared_state.get("status") == "running" and isinstance(action, dict) and
                     action.get("status") == "running" and
                     not self.recovery_after_interruption):
@@ -962,6 +1092,12 @@ class Preparation:
                         self._set_metric_guardrails(record["guardrail_metrics"])
             except (OSError, ValueError, TypeError, KeyError):
                 pass
+        if self.interpreter:
+            from .invocation_blueprints import import_archives
+            try:
+                import_archives(self.output, self.repo, interpreter=str(self.interpreter))
+            except (OSError, ValueError, TypeError, KeyError):
+                pass  # Optional migration never restores an approval or resets state.
 
     def _set_primary_metric(self, metric: dict[str, Any]) -> None:
         declared = {**self.declaration}
@@ -983,12 +1119,12 @@ class Preparation:
     def _step_configure_confirmation_protocol(self, *, confirmation: dict[str, Any],
             source_refs: list[dict[str, Any]], reason: str,
             protocol_keys: list[str] | None = None) -> dict[str, Any]:
-        from .confirmation_reservation import validate, search_started, record
-        from .baseline_reference import source_evidence
+        from .confirmation_reservation import validate, search_started, record, with_reviewed_intent
+        from .baseline_reference import source_evidence, SourceCitationError
         from .agent_client import role_scope
         from .execution_derive import _object
         from .native_jobs import active_jobs
-        from .source_citations import project, resolve, INSTRUCTION
+        from .source_citations import project, resolve, INSTRUCTION, ReviewCitationError
         if search_started(self.output, self.run_id):
             return self._business_refusal(operation='configure_confirmation_protocol',
                 because='search already started; cannot retrofit a held-out split',
@@ -1000,16 +1136,23 @@ class Preparation:
                 category='resource_busy',owner='resource',
                 next_action='wait_for_jobs; reservation only after jobs are terminal and before search')
         review = {}
+        review_started = False
         proposal = dict(confirmation=confirmation,source_refs=source_refs,reason=reason,
                         protocol_keys=protocol_keys or [])
         try:
             extra = protocol_keys or []
-            validate(confirmation, reason, extra)
+            validate(confirmation, reason, extra, require_protocol_keys=True)
+            previous_confirmation = json.loads(json.dumps(
+                (self.declaration.get('research_goal') or {}).get('confirmation') or {}))
+            candidate_declaration = with_reviewed_intent(self.declaration,confirmation,extra,
+                replaces_confirmation=previous_confirmation)
             citations = source_evidence(self.repo, source_refs, output=self.output)
-            proposal = dict(confirmation=confirmation,source_refs=citations,reason=reason,protocol_keys=extra)
+            proposal = dict(confirmation=confirmation,source_refs=citations,reason=reason,protocol_keys=extra,
+                            replaces_confirmation=previous_confirmation)
             packet, shown = project({'proposal':proposal,'development_settings':self.base_settings,
                 'native_evaluator':self.stages.get('evaluate'),'declaration':self.declaration},
                 citations,local_roots=(self.repo,self.output))
+            review_started = True
             with role_scope(self.client, 'supervisor'):
                 answer, _ = self.client.chat_with_metadata(
                     'Independently review a PRE-SEARCH held-out evaluation reservation. Read only. '
@@ -1028,9 +1171,31 @@ class Preparation:
             review = _object(answer)
             review['citations'] = resolve(citations,shown,review.get('citations'))
             row = record(self.output,self.repo,self.run_id,proposal,review)
-            self._restore_confirmation_reservation()
-            if self.confirmation_reservation_error:
-                raise ValueError(self.confirmation_reservation_error)
+            # All fallible compatibility/source/review checks precede the atomic
+            # pointer commit. Do not reapply it to the stale previous overlay and
+            # report failure after a successful scientific-intent replacement.
+            self.declaration = candidate_declaration
+            self.confirmation_reservation_error = ''
+        except ReviewCitationError as exc:
+            failed = [k for k in ('native_evaluation_input_supported', 'disjoint_conditions_supported',
+                'preserves_policy_and_metric', 'source_connection_supported') if review.get(k) is not True]
+            return self._business_refusal(operation='configure_confirmation_protocol',
+                because=str(exc), owner='objective' if failed else 'supervisor',
+                category='confirmation_protocol_required' if failed else 'review_citation_invalid',
+                context={'proposal': proposal, 'review': review, 'failed_checks': failed,
+                         'review_citation_error': str(exc), 'scientific_review_started': review_started},
+                next_action='Re-review the same proposal with citations=[{source_id: supplied_ID}]. '
+                    'If scientific checks failed, Objective supplies the missing native sources first. '
+                    'Do not infer approval, reinstall the environment, or weaken the evaluation protocol.')
+        except SourceCitationError as exc:
+            return self._business_refusal(operation='configure_confirmation_protocol',
+                because=str(exc), owner='scheduler', category='source_citation_invalid',
+                context={'proposal': proposal, 'review': review, 'failed_checks': [],
+                         'source_validation': exc.details, 'scientific_review_started': review_started},
+                next_action='Main corrects the identified citation input or captures '
+                    'checkout_source_request={ref:actual_relative_file[:line[-line]]}; '
+                    'copy its exact checkout-source ID/quote and retry this proposal. '
+                    'Do not reinstall the environment or alter evaluator/metric/confirmation values.')
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
             failed = [k for k in ('native_evaluation_input_supported','disjoint_conditions_supported',
                 'preserves_policy_and_metric','source_connection_supported') if review and review.get(k) is not True]
@@ -1054,13 +1219,27 @@ class Preparation:
         if self.main_agent.get("metric_revalidation_required"):
             return False
         try:
+            # A declaration's metric label is not a substitute for the binding of
+            # the current executable. Derivation can replace its builder without
+            # editing the checkout, including across a controller resume.
+            binding_path = self.output / 'metric_binding.json'
+            if binding_path.exists() or binding_path.is_symlink():
+                if binding_path.is_symlink() or not binding_path.is_file() or binding_path.stat().st_size > 1048576:
+                    return False
+                binding = read_json(binding_path)
+                target = self._score_target()
+                source = self.stages.get(target, '')
+                if (not isinstance(binding, dict) or binding.get('score_target', 'evaluate') != target
+                        or not source or binding.get('stage_source_sha256') !=
+                        hashlib.sha256(source.encode()).hexdigest()):
+                    return False
             if not isinstance(((self.declaration.get("research_goal") or {}).get(
                     "primary_metric") or (self.declaration.get("task_contract") or {}).get(
                     "primary_metric")), dict):
                 return False
             MetricSpec.from_declaration(self.declaration)
             return True
-        except (TypeError, ValueError):
+        except (OSError, TypeError, ValueError):
             return False
 
     # -- the state, read from the records ------------------------------------------------
@@ -1172,6 +1351,11 @@ class Preparation:
         """Share the exact deterministic readiness condition used by the research action."""
         return not self._research_admission_missing()
 
+    def _working_plan_required(self) -> bool:
+        """The existing controller planning gate, independent of native readiness."""
+        return (bool(getattr(self.client, 'supports_main_agent', False))
+                and not self.keep_only and not self.main_agent.get('plan'))
+
     def _research_admission_missing(self, *, identity_schema: dict | None = None,
                                     native_only: bool = False) -> list[str]:
         missing = []
@@ -1206,8 +1390,8 @@ class Preparation:
 
     def _business_refusal(self, *, operation: str, because: str, category: str,
                           owner: str, context: dict | None = None, retryable: bool = True,
-                          next_action: str = '') -> dict[str, Any]:
-        """Seal pre-execution refusals without fabricating a process failure or score.
+                          next_action: str = '', native_operation_status: str = 'not_started') -> dict[str, Any]:
+        """Seal admission/commit refusals without fabricating a process failure or score.
 
         Main receives a typed owner handoff; only Fix-owned failures enter checkout
         repair. State reads and heartbeat refreshes cannot purchase a diagnosis.
@@ -1217,7 +1401,7 @@ class Preparation:
         details = {**(context or {}), 'controller_runtime_id':controller_identity(),
             'failure_category':category, 'repair_owner':owner, 'next_action':next_action}
         sealed = seal(self.output, operation=operation, exc=ValueError(because),
-                      context=details, native_operation_status='not_started')
+                      context=details, native_operation_status=native_operation_status)
         return {**sealed, 'outcome':'not attempted','because':because[:700],
             'failure_domain':'admission','failure_category':category,'repair_owner':owner,
             'retryable':retryable, 'retry_when':next_action,
@@ -1330,7 +1514,8 @@ class Preparation:
             if kinds_wanted is not None and idea.granularity not in kinds_wanted:
                 continue
             compatible, why = execution_compatibility(
-                idea, stage_parameters=training_parameters, repo=self.repo)
+                idea, stage_parameters=training_parameters, repo=self.repo,
+                train_source=self.stages.get('train', ''))
             if compatible and idea.granularity in {"param", "algo"}:
                 if declared_space is None:
                     compatible, why = False, "the declaration has no usable optimization space"
@@ -1348,7 +1533,8 @@ class Preparation:
                                 'pool':native_observations(self.output, self.repo,
                                     requested_ids=requested, return_pool=True)}
                         held = cached(self.output, packet_for(self.output,self.repo,self.stages,idea,
-                            native_observation_snapshot=native_observation_snapshot))
+                            native_observation_snapshot=native_observation_snapshot,
+                            research_root=root))
                         if held:
                             execution_reviews[idea.label]={
                                 'status':held.get('status','reviewed'),
@@ -1365,7 +1551,7 @@ class Preparation:
                             request = {k:offer[k] for k in ('label','measurement_sha256')}
                             frozen = cached(self.output, packet_for(self.output,self.repo,self.stages,idea,
                                 reuse_policy=request, policy_metadata=offer.get('policy_metadata_sources'),
-                                native_observation_snapshot=native_observation_snapshot))
+                                native_observation_snapshot=native_observation_snapshot,research_root=root))
                             if not frozen:
                                 continue
                             review_state = execution_reviews.setdefault(idea.label,
@@ -1388,7 +1574,7 @@ class Preparation:
                                            if frozen_offers and idea.granularity=='code' else None)
                             frozen_review=(cached(self.output,packet_for(self.output,self.repo,self.stages,idea,
                                 reuse_policy=reuse_request, policy_metadata=frozen_offers[0].get('policy_metadata_sources'),
-                                native_observation_snapshot=native_observation_snapshot)) if reuse_request else None)
+                                native_observation_snapshot=native_observation_snapshot,research_root=root)) if reuse_request else None)
                             if frozen_review:
                                 execution_reviews[idea.label]['frozen_policy_review']={
                                     'status':frozen_review.get('status','reviewed'),
@@ -1414,6 +1600,7 @@ class Preparation:
             else:
                 excluded.append({"label": idea.label, "because": why})
         from .training_work import consumes_steps
+        from .idea_reproposal import reproposal_offers
         return {"status": "available" if options else "empty", "items": [
                     {"label": idea.label, "granularity": idea.granularity,
                      "mechanism": idea.mechanism, "change": idea.change,
@@ -1423,8 +1610,12 @@ class Preparation:
                      **({'execution_review':execution_reviews[idea.label]}
                         if idea.label in execution_reviews else {})}
                     for idea in options],
+                "reproposable_prior_ideas": reproposal_offers(library),
                 "candidate_training_budget": {
                     'explicit_steps_input': consumes_steps(self.stages.get('train','')),
+                    'settings_projection':'Only explicitly named idea axes override the measured '
+                        'session base. Validation defaults never replace omitted seed, batch, '
+                        'chunk, data or evaluation settings; synchronous and detached paths agree.',
                     'guidance':'For Main-selected candidates run_the_loop(training_settings=...) '
                         'selects validated local work, preserving baseline. A declared grouped '
                         'setting is not automatically an alias for the native caller steps slot. '
@@ -1473,11 +1664,24 @@ class Preparation:
         from .policy_consumption import identity_contract
         from .checkpoint_handoff import catalog as producer_catalog
         from .invocation_drafts import catalog as draft_catalog
+        from .invocation_blueprints import catalog as blueprint_catalog
         from .storage_runtime import view as storage_view
+        from .workflow_patch import view as workflow_patch_view
+        # This is an advisory, read-only state projection, not execution admission.
+        # Audit producers once for its recovery/choice surfaces; actual operations
+        # still build a fresh catalog immediately before reusing a checkpoint.
+        train_artifacts = producer_catalog(self.output)
         model_budget = current_model_budget(self.output, self.run_id)
         self.monitor_observation = budget_observation(self.monitor_observation, model_budget)
         self.fix_observation = budget_observation(self.fix_observation, model_budget)
-        runtime_context = controller_context(self.output, self.steps)
+        runtime_context = controller_context(self.output, self.steps,
+                                             train_source=self.stages.get('train'))
+        from .native_context import inspection_availability
+        native_inspection = inspection_availability(self.output)
+        tool_capabilities = self.output / 'agent/tool_capabilities.json'
+        if (tool_capabilities.is_file() and not tool_capabilities.is_symlink()
+                and tool_capabilities.stat().st_size <= 32000):
+            runtime_context['last_cli_tool_discovery'] = read_json(tool_capabilities)
         found, refused = self._declaration_candidates()
         held = json.loads((self.output / "environment.json").read_text(encoding="utf-8")) \
             if (self.output / "environment.json").is_file() else {}
@@ -1597,12 +1801,18 @@ class Preparation:
         workflow_selection["train_score_same_entrypoint"] = bool(
             train_row.get("entrypoint") and
             train_row.get("entrypoint") == target_row.get("entrypoint"))
-        native_identity_schema = self._native_identity_schema_view(score_target)
+        native_identity_schema = self._native_identity_schema_view(score_target,
+            _train_artifacts=train_artifacts)
         native_missing = self._research_admission_missing(identity_schema=native_identity_schema,native_only=True)
         missing = list(native_missing)
         admission_problem = self._confirmation_admission_problem()
+        planning_required = self._working_plan_required()
+        planning_problem = ('a persisted Main working plan; use update_research_plan '
+                            'with main_agent.writable_plan fields before scored workloads')
         if admission_problem:
             missing.append(admission_problem)
+        if planning_required:
+            missing.append(planning_problem)
         score_reason = ("missing: " + ", ".join(missing) if missing else
                         f"the research loop can start: score target {score_target} has a "
                         "verified command and declaration, with the primary metric bound; "
@@ -1664,6 +1874,9 @@ class Preparation:
                             (report or {}).get("confirmation")),
                         "report_ref": f"research/{self.run_id}/research_report.json",
                     }
+                    if (status == 'paused' and isinstance(session.get('source_preflight_failure'), dict)
+                            and session['source_preflight_failure'].get('round') == session.get('next_round')):
+                        research_progress['source_preflight_failure'] = session['source_preflight_failure']
                     interruption = session.get("interruption")
                     reconciliation = session.get("reconciliation")
                     if status == "interrupted" and isinstance(interruption, dict):
@@ -1724,25 +1937,60 @@ class Preparation:
         elif report_error and research_progress is None:
             research_progress = {"status": "unreadable",
                                  "evidence": str(research_report_path)}
+        # A bounded recent-measurement list can omit an older adopted incumbent.
+        # Give Main its recorded development score explicitly instead of asking
+        # resumed conversation memory to reconstruct it. Confirmation stays opaque.
+        incumbent = (report or {}).get('best')
+        if (isinstance(research_progress,dict) and research_progress.get('status') in
+                {'paused','running','finalizing','completed','interrupted'}
+                and isinstance(incumbent,dict) and
+                type(incumbent.get('score')) in (int,float) and math.isfinite(incumbent['score'])):
+            research_progress['recorded_incumbent'] = {
+                'candidate':incumbent.get('name') or incumbent.get('label'),
+                'metric_value':incumbent['score'],
+                'report_ref':f'research/{self.run_id}/research_report.json',
+                'authority':'recorded development incumbent; not a new measurement or held-out result'}
         evaluation_verdict = self._load_supervisor_verdict()
         if research_progress is not None:
+            if research_progress.get('status') not in {'unreadable', 'identity_mismatch'}:
+                from .confirmation_recovery import lifecycle
+                latest_confirmation = lifecycle(research_root)
+                if latest_confirmation is not None:
+                    research_progress['confirmation'] = self._confirmation_controller_view(latest_confirmation)
             from .candidate_source_guard import historical_mismatches
             research_progress['candidate_source_integrity_warnings'] = historical_mismatches(research_root)
             recovery = self._unscored_baseline_recovery_status()
             research_progress["unscored_baseline_recovery"] = recovery
+            from .measurement_recovery import offered as development_recoveries
+            research_progress['development_recoveries'] = development_recoveries(
+                self.output, self.run_id, _producers=train_artifacts.get('producers') or [])
             from .handoff_correction import eligible
-            research_progress['handoff_corrections'] = eligible(self.output/'research'/self.run_id)
+            handoff_blockers=[]
+            research_progress['handoff_corrections'] = eligible(self.output/'research'/self.run_id,
+                _development_packets=research_progress['development_recoveries'],_blocked=handoff_blockers)
+            research_progress['handoff_correction_blockers']=handoff_blockers
+            from .completed_evaluation_recovery import offered as completed_evaluations
+            evaluation_blockers=[]
+            research_progress['completed_evaluation_links']=completed_evaluations(
+                self.output,self.repo,self.run_id,producers=train_artifacts.get('producers') or [],
+                _blocked=evaluation_blockers)
+            research_progress['completed_evaluation_blockers']=evaluation_blockers
             from .measurement_adoption import offered
             research_progress['measurement_adoptions'] = offered(research_root)
             observation = research_progress.get("last_observation") or {}
             failure = observation.get("failure") or {}
-            if (failure.get("stage") == "policy_artifact" or
-                    recovery.get("available") is True):
+            if recovery.get("available") is True:
                 score_reason = ("the evaluator command and primary metric binding are already "
                                 "verified, but the recorded baseline is unscored because its "
                                 "policy artifact was not safely selected; inspect the train "
                                 "receipt and use recover_unscored_baseline if the persisted "
                                 "recovery contract says it is available")
+            elif failure.get("stage") == "policy_artifact":
+                score_reason = ("the latest development measurement has an unresolved policy "
+                                "artifact handoff; this does not invalidate an already measured "
+                                "baseline or other results. Inspect its exact failed label, "
+                                "producer and current recovery contract; do not infer that "
+                                "baseline reconstruction is required")
         metric_binding = self._metric_binding_retry_status()
         metric_binding["structured_upgrade_available"] = \
             self._structured_metric_upgrade_available()
@@ -1785,11 +2033,19 @@ class Preparation:
                 "existing_unverified_interpreter": (str(held.get("interpreter") or "")
                     if held.get("interpreter") and Path(str(held["interpreter"])).is_file()
                     and not self.interpreter else ""),
-                "native_inspection_available": (self.output / "native_context.json").is_file(),
+                "native_inspection_available": native_inspection['available'],
+                "native_inspection": native_inspection,
                 "base_python_hint": ({
                     "path": str(self.interpreter_hint),
                     "exists": self.interpreter_hint.is_file(),
+                    "diagnostic_publication": self.native_hint_publication,
                 } if self.interpreter_hint else None),
+                "prepared_overlays": provision.prepared_environment_catalog(self.output, self.repo),
+                "reuse_guidance": "Before another installation or base switch, compare prepared_overlays "
+                    "and their local_distributions/source bindings with the selected prefix. A different "
+                    "traceback is local progress, not proof the shortest whole-chain route is being used. "
+                    "Main may choose a valid reuse_environment_ref; Fix can propose that choice read-only. "
+                    "Metadata readiness does not replace the original native consumer probes.",
                 "probes": len(held.get("probes") or []),
                 "verification_status": verification_status,
                 "verdict_reason": str(held_verdict.get("reason") or "")[:240],
@@ -1826,17 +2082,20 @@ class Preparation:
                     "a historical failure from a different prefix. Capability probes still required.",
                 "repair_rejection": held.get("repair_rejection") or {},
                 "recovery_status": held.get("recovery_status") or "",
+                "selection_proposal": held.get('selection_proposal') or {},
                 "recovery_revision": held.get("recovery_revision") or "",
                 "installation_recovery_inventory": self._installation_recovery_inventory(),
             },
             "harness_repair": self._harness_repair_status(),
+            "presearch_protocol_revision": self._presearch_protocol_revision_view(),
             "native_stage_verifications": recent_attempts(self.output),
             "native_identity_contract": identity_contract(),
             "native_job_baseline_recovery": self._completed_baseline_jobs(),
             "native_identity_schema": native_identity_schema,
-            "verified_train_artifacts": producer_catalog(self.output),
+            "verified_train_artifacts": train_artifacts,
             "storage": storage_view(self.output),
             "unverified_invocation_drafts": draft_catalog(self.output),
+            "historical_invocation_blueprints": blueprint_catalog(self.output),
             "device": {"chosen": self.decision.device, "why": self.decision.why},
             "task_gpu_budget": self._task_gpu_budget_view(),
             "scheduling": scheduling_view(self.output),
@@ -1845,7 +2104,8 @@ class Preparation:
             "steps_taken": _latest_per_step(self.steps),
             "recent_actions": [{key: row.get(key) for key in (
                 "step", "outcome", "because", "evidence_id", "receipt_ref", "failure_domain",
-                "failure_category", "retryable", "retry_when", "repair_owner", "native_operation_status")}
+                "failure_category", "retryable", "retry_when", "repair_owner", "native_operation_status",
+                "independent_review")}
                 for row in self.steps[-8:]],
             "last_decision": self.last_decision or None,
             "current_action": self.current_action or None,
@@ -1882,31 +2142,58 @@ class Preparation:
             "to_measure": {
                 "ready": not missing,
                 "native_ready": not native_missing,
-                "admission_blockers": [admission_problem] if admission_problem else [],
-                "repair_owner": 'objective' if admission_problem else None,
-                "next_action": 'configure_confirmation_protocol' if admission_problem else None,
+                "admission_blockers": ([planning_problem] if planning_required else []) +
+                                      ([admission_problem] if admission_problem else []),
+                "planning_required": planning_required,
+                "repair_owner": ('scheduler' if planning_required else
+                                 'objective' if admission_problem else None),
+                "next_action": ('update_research_plan' if planning_required else
+                                'configure_confirmation_protocol' if admission_problem else None),
                 "because": score_reason,
-                "what_it_would_do": "use available native stages; training is optional when "
-                                     "a verified policy already exists",
+                "what_it_would_do": "execute the explicitly requested formal research action; "
+                                     "native readiness does not select or reuse a verification policy. "
+                                     "A new baseline with an update-controlled trainer requires "
+                                     "explicit training_settings; an eligible completed formal "
+                                     "train job requires its exact job_id. Evaluation-only execution "
+                                     "requires a separately supported baseline route, not merely "
+                                     "an existing checkpoint or evaluation_settings.",
+                "verification_policy_automatically_reused": False,
             },
             "research_progress": research_progress,
             "evaluation_verdict": evaluation_verdict,
             "research_options": research_options,
-            "latest_development_measurements": self._development_evidence(),
+            "workflow_source_patches": {
+                'transactions': workflow_patch_view(self.output,self.run_id),
+                'apply_operation':'apply_workflow_candidate',
+                'restore_operation':'restore_workflow_candidate',
+                'authority':'source-only audited non-scoring workflow investments; not a native job, '
+                    'quality certificate or score. Editable research_task remains prohibited during research.',
+                'guidance':'For collector/converter/preparation code, propose an exact code idea, '
+                    'choose apply_workflow_candidate with its declared non-scoring target_stage, '
+                    'inspect review and transaction, then derive/verify commands before separately '
+                    'submitting native work. Restore the temporary workflow patch before policy trials. '
+                    'Do not run train/evaluate merely to exercise an inert collector patch.'},
+            "latest_development_measurements": self._development_evidence(
+                _handoffs=(research_progress or {}).get('handoff_corrections')),
             "data_campaigns": self._data_campaign_view(),
             "research_brief": self._research_brief_view(),
             "monitor_findings": self._monitor_findings(),
             "confirmation_requested": bool(self.base_settings.get("_confirm")),
+            "confirmation_reservation": self._confirmation_reservation_view(),
             "confirmation_reservation_error": getattr(self,'confirmation_reservation_error',''),
         }
+
+    def _confirmation_reservation_view(self) -> dict[str, Any]:
+        from .confirmation_reservation import view
+        return view(self.output, self.repo, self.run_id)
 
     def _monitor_findings(self) -> list[dict[str, Any]]:
         from .monitor_findings import view
         return view(self.output, self.run_id)
 
-    def _development_evidence(self) -> list[dict[str, Any]]:
+    def _development_evidence(self, *, _handoffs=None) -> list[dict[str, Any]]:
         from .development_evidence import summaries
-        return summaries(self.output/'research'/self.run_id)
+        return summaries(self.output/'research'/self.run_id, _handoffs=_handoffs)
 
     def _data_campaign_view(self) -> list[dict[str, Any]]:
         from .data_campaign import view
@@ -1925,7 +2212,7 @@ class Preparation:
     def _step_register_data_campaign(self, *, campaign: dict[str, Any]) -> dict[str, Any]:
         from .data_campaign import register
         try:
-            row = register(self.output, self.run_id, campaign)
+            row = register(self.output, self.run_id, campaign, repo=self.repo)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             return {'outcome': 'not attempted', 'because': f'data campaign refused: {exc}'[:700]}
         return {'outcome': 'registered', 'campaign_id': row['id'],
@@ -1933,16 +2220,151 @@ class Preparation:
                 'evidence_refs': [f'data_campaigns/{row["id"]}/plan.json']}
 
     def _step_record_data_campaign_arm(self, *, campaign_id: str, arm: str, seed: int,
-                                      measurement_label: str, acquired_version_id: str,
-                                      training_version_id: str) -> dict[str, Any]:
-        from .data_campaign import record_arm
+                                      measurement_label: str = '', acquired_version_id: str = '',
+                                      training_version_id: str = '', boundary: dict | None = None) -> dict[str, Any]:
+        from .data_campaign import record_arm, record_boundary
+        from .baseline_reference import SourceCitationError, source_evidence
+        from .source_citations import ReviewCitationError, project, resolve, INSTRUCTION
+        context = {'campaign_id':campaign_id, 'arm':arm, 'seed':seed,
+                   'measurement_label':measurement_label, 'acquired_version_id':acquired_version_id,
+                   'training_version_id':training_version_id, 'boundary':boundary}
+        review = {}
+        review_started = False
+        review_call_active = False
         try:
-            row = record_arm(self.output, self.repo, self.run_id, campaign_id=campaign_id,
-                arm=arm, seed=seed, measurement_label=measurement_label,
-                acquired_version_id=acquired_version_id, training_version_id=training_version_id)
+            if boundary is not None:
+                if measurement_label or acquired_version_id or training_version_id:
+                    return self._business_refusal(operation='record_data_campaign_arm',
+                        because='boundary and measured-arm inputs are mutually exclusive',
+                        category='data_arm_argument_conflict', owner='main_agent', context=context,
+                        next_action='For a boundary omit measurement_label, acquired_version_id and '
+                            'training_version_id entirely; for a measured arm omit boundary. '
+                            'A boundary never counts as successful training or a score.')
+                if not isinstance(boundary, dict):
+                    raise ValueError('boundary must be an object')
+                from .agent_client import role_scope
+                from .execution_derive import _object
+                from .evidence_store import read_attempt_evidence
+                citations = source_evidence(self.repo, boundary.get('source_refs'), output=self.output)
+                evidence=[]
+                for index,identity in enumerate(boundary.get('evidence_refs', [])):
+                    if not isinstance(identity,str) or not re.fullmatch(r'[0-9a-f]{32}',identity):
+                        raise ValueError(f'boundary evidence_refs[{index}] must be a sealed 32-hex evidence ID')
+                    try:
+                        evidence.append(read_attempt_evidence(self.output,identity,limit=3000))
+                    except (OSError,ValueError,TypeError,KeyError) as exc:
+                        raise ValueError(f'boundary evidence_refs[{index}]={identity}: {exc}; '
+                            'inspect this exact sealed evidence ID; do not substitute a job, '
+                            'measurement, telemetry or decision ID') from exc
+                from .runtime_freshness import current_model_budget, controller_context
+                packet, shown = project({'boundary':boundary,'native_evidence':evidence,
+                    'controller_runtime':controller_context(self.output, self.steps,
+                        train_source=self.stages.get('train', '')),
+                    'available_operations':self._available_operations(), 'budget':{
+                        'model':current_model_budget(self.output,self.run_id),
+                        'gpu':self._task_gpu_budget_view(),
+                        'wall_remaining_seconds':self.budget.remaining() if self.budget else None}}, citations,
+                    local_roots=(self.repo,self.output))
+                review_started = True
+                review_call_active = True
+                with role_scope(self.client,'supervisor'):
+                    answer,_=self.client.chat_with_metadata('Independently review why a prespecified DEVELOPMENT data arm '
+                        'cannot safely proceed. Require positive native/source evidence. Missing investigation, '
+                        'a failed command with a repair path, or reset-only expert alone is not proof that all '
+                        'legal acquisition/selection routes are impossible. Respect remaining total budgets, '
+                        'and compare historical refusals with the supplied CURRENT executor contracts and '
+                        'loaded train builder. A builder that has not adopted an available input channel '
+                        'is a repairable connection, not proof the executor cannot transport that input. '
+                        'not an arbitrary local window. '
+                        'Local rounds are allocations, not hard totals: consider an advertised '
+                        'extend_research_rounds even when some rounds remain. A full matrix not '
+                        'fitting does not establish no safe next operation for this requested arm; '
+                        'assess legal partial experiments without changing the prespecified protocol. '
+                        'Return JSON boundary_evidence_supported, no_safe_next_data_operation, '
+                        'why and citations.'+INSTRUCTION,
+                        json.dumps(packet,ensure_ascii=False),max_tokens=1600,read_only=True,
+                        include_research_context=False)
+                review_call_active = False
+                review=_object(answer)
+                failed_checks = [key for key in ('boundary_evidence_supported',
+                    'no_safe_next_data_operation') if review.get(key) is not True]
+                if failed_checks:
+                    # Scientific denial dominates citation delivery errors. Do not
+                    # send Main to an alleged Supervisor-only formatting dead end
+                    # when the actual review says legal repair paths remain.
+                    result = self._business_refusal(operation='record_data_campaign_arm',
+                        because='data boundary not established: '+str(review.get('why') or
+                            'independent review did not support all required checks'),
+                        category='data_boundary_not_supported', owner='data',
+                        context={**context,'review':review,'failed_checks':failed_checks,
+                                 'scientific_review_started':True},
+                        next_action='Read the sealed independent denial and missing prerequisites. '
+                            'Main may delegate the unresolved provenance/consumer connection to Data '
+                            'or Fix, then use the trusted executor to revalidate that connection. '
+                            'repair_owner is responsibility guidance, not an operator-only gate. '
+                            'Do not retry the same unsupported boundary, fabricate approval, or '
+                            'treat source access/format errors as proof no legal experiment remains.')
+                    result['independent_review']={
+                        'boundary_evidence_supported':review.get('boundary_evidence_supported'),
+                        'no_safe_next_data_operation':review.get('no_safe_next_data_operation'),
+                        'failed_checks':failed_checks,
+                        'why':str(review.get('why') or '')[:1800],
+                        'authority':'unapproved_boundary_not_a_completed_experiment'}
+                    return result
+                try:
+                    checked = resolve(citations,shown,review.get('citations'))
+                except ReviewCitationError:
+                    # At most one bounded format repair. Preserve the independent
+                    # scientific decision; no new approval/changed checks may be
+                    # smuggled in through a citation-only response.
+                    initial_review = dict(review)
+                    review_call_active = True
+                    with role_scope(self.client,'supervisor'):
+                        fixed,_=self.client.chat_with_metadata(
+                            'Repair citation FORMAT only for your prior independent review. '
+                            'Return JSON {"citations":[{"source_id":"review-source-N"}]}. '
+                            'Select only IDs actually displayed; do not change scientific checks, '
+                            'invent evidence, quote substrings, or claim execution. '+INSTRUCTION,
+                            json.dumps({'prior_review':initial_review,'review_sources':shown},ensure_ascii=False),
+                            max_tokens=600,read_only=True,include_research_context=False)
+                    review_call_active = False
+                    repaired=_object(fixed)
+                    checked=resolve(citations,shown,repaired.get('citations'))
+                    review['citation_format_repair']={'initial_review':initial_review,
+                        'reply':repaired, 'authority':'citation_mapping_only_not_a_new_scientific_verdict'}
+                review['citations']=checked
+                row=record_boundary(self.output,self.run_id,campaign_id=campaign_id,arm=arm,seed=seed,
+                    boundary={**boundary,'source_refs':citations},review=review)
+            else:
+                row = record_arm(self.output, self.repo, self.run_id, campaign_id=campaign_id,
+                    arm=arm, seed=seed, measurement_label=measurement_label,
+                    acquired_version_id=acquired_version_id, training_version_id=training_version_id)
+        except SourceCitationError as exc:
+            return self._business_refusal(operation='record_data_campaign_arm', because=str(exc),
+                category='source_citation_invalid', owner='main_agent',
+                context={**context,'source_validation':exc.details},
+                next_action='Correct this exact source citation or capture a checkout-source ID '
+                    'and exact quote. Source citations require {ref,quote}; Supervisor citations '
+                    'separately select supplied source_id objects. No native operation ran.')
+        except ReviewCitationError as exc:
+            return self._business_refusal(operation='record_data_campaign_arm', because=str(exc),
+                category='review_citation_invalid', owner='supervisor',
+                context={**context,'review':review,'scientific_review_started':review_started},
+                next_action='Supervisor must select citations=[{source_id: supplied_ID}]. '
+                    'Inspect the sealed review; unsupported scientific checks require more '
+                    'native evidence, not an install or a change to protected evaluation.')
         except (OSError, ValueError, TypeError, KeyError) as exc:
-            return {'outcome': 'not attempted', 'because': f'data arm refused: {exc}'[:700]}
-        return {'outcome': 'recorded', 'because': 'data consumed and development score observed; fairness still needs audit',
+            if review_call_active:
+                raise  # Provider/prompt failures are not data infeasibility.
+            return self._business_refusal(operation='record_data_campaign_arm',
+                because=f'data arm refused: {exc}', category='data_arm_evidence_invalid',
+                owner='data' if review_started else 'main_agent',
+                context={**context,'review':review,'scientific_review_started':review_started},
+                next_action='Inspect the sealed missing prerequisite and repair that exact '
+                    'data/measurement connection. A repairable refusal is not evidence that '
+                    'the repository cannot acquire data; keep the campaign incomplete.')
+        return {'outcome': 'recorded', 'because': ('data boundary reviewed; experiment remains incomplete' if boundary is not None else
+                'data consumed and development score observed; fairness still needs audit'),
                 'evidence_refs': [f'data_campaigns/{campaign_id}/{arm}-{seed}.json'],
                 'metric_value': row['metric_value']}
 
@@ -1952,8 +2374,16 @@ class Preparation:
         if not isinstance(value, dict):
             return {"status": "not_recorded", "recorded": False}
         status = str(value.get("status") or "unknown")[:40]
-        return {"status": status,
-                "recorded": status in {"taken", "attempted_and_failed"}}
+        projected = {"status": status,
+                     "recorded": status in {"taken", "attempted_and_failed", "admission_refused", "engineering_recovery_approved"}}
+        if status in {"admission_refused", "engineering_recovery_approved"}:
+            failure = value.get("engineering_failure") or {}
+            projected.update(retryable=value.get("retryable") is True,
+                failure_evidence_id=failure.get("evidence_id"),
+                where=failure.get("where"), because=failure.get("because"),
+                repair_owner=failure.get("repair_owner"),
+                native_operation_status="reviewed_setup_only" if status == "engineering_recovery_approved" else "not_started")
+        return projected
 
     def _load_supervisor_verdict(self) -> dict[str, Any] | None:
         """Read the hash-checked, run-bound independent review projection, if present."""
@@ -2162,11 +2592,15 @@ class Preparation:
         if research_options is None:
             research_options = self._research_options(progress, self.execution)
         available = list(OPERATIONS)
+        diagnosis = self._baseline_diagnosis_view()
         diagnosis_required = (getattr(self.client,'supports_main_agent',False)
                               and not self.keep_only
-                              and self._baseline_diagnosis_view()['status'] == 'required')
+                              and diagnosis['status'] == 'required'
+                              and diagnosis.get('diagnosis_recordable', True))
         if not diagnosis_required:
             available.remove('record_baseline_diagnosis')
+        if self._presearch_protocol_revision_view().get('status')!='review_available':
+            available.remove('revise_presearch_protocol')
         from .confirmation_reservation import search_started
         if (not getattr(self.client,'supports_main_agent',False) or self.keep_only
                 or search_started(self.output,self.run_id)):
@@ -2178,14 +2612,18 @@ class Preparation:
             available.remove('record_data_campaign_arm')
         reference = self._baseline_reference_view()
         exposed = any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json'))
+        if (not getattr(self.client, 'supports_main_agent', False) or self.keep_only or exposed
+                or reference.get('status') != 'evaluation_failed' or 'evaluate' not in self.stages):
+            available.remove('recover_reference_score')
         if not getattr(self.client, 'supports_main_agent', False) or self.keep_only or exposed:
             available.remove('configure_baseline_reference')
             available.remove('evaluate_baseline_reference')
         elif reference.get('status') not in {'ready', 'evaluating', 'evaluation_failed', 'performance_mismatch'} or 'evaluate' not in self.stages:
             available.remove('evaluate_baseline_reference')
         # Reference status qualifies claims, not permission to improve a valid local baseline.
+        from .round_extension import IDLE_ALLOCATION_STATUSES
         if (not getattr(self.client, 'supports_main_agent', False) or self.keep_only
-                or not progress or progress.get('status') not in {'paused', 'completed'}
+                or not progress or progress.get('status') not in IDLE_ALLOCATION_STATUSES
                 or (progress.get('confirmation') or {}).get('recorded')
                 or self.budget is None or self.budget.remaining() <= 0
                 or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json'))):
@@ -2273,7 +2711,8 @@ class Preparation:
             for name in ("build_the_environment", "derive_a_command"):
                 if name in available:
                     available.remove(name)
-        if not (progress or {}).get('handoff_corrections') and 'correct_policy_handoff' in available:
+        if (not (progress or {}).get('handoff_corrections') and
+                not (progress or {}).get('completed_evaluation_links') and 'correct_policy_handoff' in available):
             available.remove('correct_policy_handoff')
         if not (progress or {}).get('measurement_adoptions') and 'adopt_linked_measurement' in available:
             available.remove('adopt_linked_measurement')
@@ -2286,6 +2725,9 @@ class Preparation:
             # already-paid baseline attempt.
             if "run_the_loop" in available:
                 available.remove("run_the_loop")
+        if (not (progress or {}).get('development_recoveries') or self.keep_only or
+                not getattr(self.client,'supports_agent_fix',False)):
+            available.remove('diagnose_development_failure')
         if not self._research_loop_ready() and "run_the_loop" in available:
             available.remove("run_the_loop")
         if not self.recovery_after_interruption and not self._prelaunch_recovery_view(progress):
@@ -2330,11 +2772,14 @@ class Preparation:
         confirmation_state = (progress or {}).get("confirmation") or {}
         if (not self.base_settings.get("_confirm") or not progress or
                 progress.get("status") != "completed" or
-                confirmation_state.get("status") != "available_not_taken"):
+                confirmation_state.get("status") not in {"available_not_taken", "admission_refused", "engineering_recovery_approved"}):
             if "confirm_best" in available:
                 available.remove("confirm_best")
-        if (getattr(self.client, "supports_main_agent", False) and not self.keep_only and
-                not self.main_agent.get("plan")):
+        if confirmation_state.get('status') != 'attempted_and_failed':
+            for name in ('review_confirmation_failure', 'diagnose_confirmation_failure'):
+                if name in available:
+                    available.remove(name)
+        if self._working_plan_required():
             # Do not hide environment preparation behind a planning-only gate: that
             # deadlocks onboarding into repeated source inventories. A short persisted
             # roadmap still precedes scored workloads and demonstrations.
@@ -2353,6 +2798,17 @@ class Preparation:
             # readable; repair and published-reference evaluation stay available.
             available = [name for name in available if name != 'run_the_loop']
         return available
+
+    @staticmethod
+    def _historical_completed_resolution(resolution, boundary) -> bool:
+        """A completed earlier discard is history, not a global closed flag."""
+        return (isinstance(resolution, dict) and isinstance(boundary, dict)
+            and resolution.get('status') == 'completed'
+            and type(resolution.get('round')) is int and type(boundary.get('round')) is int
+            and 0 < resolution['round'] < boundary['round']
+            and isinstance(resolution.get('idea_label'), str) and bool(resolution['idea_label'])
+            and isinstance(resolution.get('resolution_id'), str)
+            and re.fullmatch(r'[0-9a-f]{32}', resolution['resolution_id']) is not None)
 
     @staticmethod
     def _interrupted_candidate_discard_available(
@@ -2386,7 +2842,8 @@ class Preparation:
                 isinstance(boundary.get("idea"), dict) and
                 bool(boundary["idea"].get("label")) and
                 (not isinstance(resolution, dict) or
-                 resolution.get("status") != "completed"))
+                 resolution.get("status") != "completed" or
+                 Preparation._historical_completed_resolution(resolution, boundary)))
 
     def _metric_binding_retry_status(self) -> dict[str, Any]:
         """Require fresh score-command evidence before repeating a failed metric bind."""
@@ -2420,12 +2877,29 @@ class Preparation:
                 "reason": "a failed bind can only be retried after a new verified score-stage run",
                 "verified_output_excerpt": output[-600:]}
 
+    def _verified_metric_pattern(self, target: str, item: dict, evidence: dict) -> str:
+        """Reuse only a verified producer pattern resolving to this exact fresh candidate."""
+        fallback = str(item.get('relative_path') or '')
+        pattern = str((self.verified.get(target) or {}).get('artifact') or '')
+        if not pattern or pattern == fallback:
+            return fallback
+        spec = MetricSpec(name='artifact identity', direction='maximize', unit='',
+                          source='json', artifact_root=str(item.get('root') or ''),
+                          artifact_pattern=pattern)
+        match = resolve_metric_artifact(spec,
+            roots={key:Path(str(evidence.get(key if key!='output' else 'output_directory') or ''))
+                   for key in ('working_directory','output','policy_parent')},
+            started_at=float(evidence.get('attempt_started') or 0),
+            allowed_roots=[self.repo,self.output])
+        if (match.get('status')=='matched' and match.get('path')==str(Path(str(item.get('path') or '')).resolve())
+                and match.get('sha256')==item.get('sha256')):
+            return pattern
+        return fallback
+
     def _structured_metric_upgrade_available(self) -> bool:
         """Offer a one-time evidence-backed upgrade from a log aggregate to episode data."""
         try:
             spec = MetricSpec.from_declaration(self.declaration)
-            if spec.source != "log":
-                return False
             target = self._score_target()
             attempts = read_json(self.output / "derivation_attempts" / f"{target}.json")
             accepted = next((row for row in reversed(attempts.get("attempts") or [])
@@ -2434,6 +2908,14 @@ class Preparation:
             candidates = evidence.get("structured_candidates") or []
             if not candidates:
                 return False
+            if spec.source != 'log':
+                from .confirmation_reservation import search_started
+                if search_started(self.output,self.run_id):
+                    return False
+                return any(item.get('root')==spec.artifact_root and
+                           (pattern:=self._verified_metric_pattern(target,item,evidence))!=
+                           str(item.get('relative_path') or '') and pattern!=spec.artifact_pattern
+                           for item in candidates)
             binding_path = self.output / "metric_binding.json"
             binding = read_json(binding_path) if binding_path.is_file() else {}
             reviewed = str(binding.get("reviewed_structured_candidates_sha256") or "")
@@ -2444,6 +2926,10 @@ class Preparation:
     def _unscored_baseline_recovery_status(self) -> dict[str, Any]:
         """Expose only receipt-bound recoveries that cannot repeat completed training."""
         root = self.output / "research" / self.run_id
+        from .baseline_score_recovery import available as cpu_score_recovery
+        cpu = cpu_score_recovery(root)
+        if cpu.get('available'):
+            return cpu
         measurement_path = root / "measurements" / "baseline.json"
         retry_after_archive_failure = False
         try:
@@ -2453,6 +2939,19 @@ class Preparation:
                     measurement.get("ok") is True):
                 return {"available": False,
                         "why": "no failed baseline measurement is recorded"}
+            from .measurement_recovery import offered
+            packet = next((row for row in offered(self.output, self.run_id) if row['label'] == 'baseline'), None)
+            if packet is not None:
+                session = read_json(root/'controller_session.json')
+                history = session.get('history') or []
+                if (session.get('status') in {'paused','completed'} and history and
+                        history[0].get('label') == 'baseline' and not any(
+                            row.get('measured') is True or type(row.get('metric_value')) in (int,float)
+                            for row in history[1:])):
+                    return {**packet, 'available':True, 'attempt_id':packet['training_attempt_id'],
+                        'kind':'repair_development_consumer_handoff',
+                        'why':'completed formal training survives a failed native consumer; '
+                              'choose its exact native load boundary and revalidate without retraining'}
             if measurement.get("where") == "policy_archive":
                 failed_recovery = measurement.get("recovery") or {}
                 attempt_hint = str(failed_recovery.get("training_attempt_id") or "")
@@ -3236,22 +3735,21 @@ class Preparation:
         # exact parent action to this reconciled attempt; never infer that the research action
         # itself completed.
         parent = recovery.get("parent_action") or action.get("parent_action")
-        if (action.get("step") == "choose" and not action.get("parent_action")
-                and isinstance(parent, dict)):
-            # Older projections retained a completed round's parent across a later
-            # Main decision. Reconcile only that decision when the journal proves
-            # the inherited parent has closed; never rewrite the research session.
-            shared = self.state_store.load() or {}
-            phase = (shared.get("phases") or {}).get("research") or {}
-            closed = phase.get("last_action") or {}
-            if (phase.get("status") != "running" and not phase.get("current_action")
-                    and (closed.get("step") == parent.get("step") or
-                         closed.get("step") == "research_complete")
-                    and closed.get("status") != "running"
-                    and isinstance(parent.get("controller_decision_id"), str)
-                    and bool(parent.get("controller_decision_id"))
-                    and closed.get("controller_decision_id") == parent.get("controller_decision_id")):
-                parent = None
+        if (action.get('step') in {'coding_agent_turn','choose'} and 'parent_action' in action
+                and action['parent_action'] is None):
+            # Correct old saved recoveries with an inferred parent too. Only the
+            # owned model-process receipt is reconciled; candidate state and all
+            # unknown side effects/charges remain untouched.
+            parent = None
+        if (action.get('step') == 'choose' and not action.get('parent_action')
+                and identity is None and not any(action.get(key) for key in
+                    ('attempt_id','receipt_ref','process_ref'))):
+            # `choose` is exclusively the outer Preparation decision, never a
+            # native stage (which has its own attempt/receipt). Old stores omitted
+            # explicit None and inherited any stale running research parent. That
+            # omission grants NO ownership of another phase, even if it is still
+            # running: close only this pure decision and leave session bytes alone.
+            parent = None
         if not isinstance(parent, dict):
             parent = action if is_research_action_name(action.get("step")) else {}
         controller_action = str(parent.get("step") or "")
@@ -3596,6 +4094,8 @@ class Preparation:
         from .source_citations import project, resolve, INSTRUCTION
         if active_jobs(self.output) or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
             return {'outcome':'not attempted','because':'active job or held-out boundary prevents new data registration'}
+        review = {}
+        requires_manifest_review = False
         try:
             if (not isinstance(version,dict) or not {'id','dataset_ref','source_refs','reason'} <= set(version)
                     or set(version)-{'id','dataset_ref','source_refs','reason','asset'}):
@@ -3608,36 +4108,71 @@ class Preparation:
                 raise ValueError('version needs a safe id, dataset_ref and concise nonempty reason')
             from .baseline_reference import resolve_checkpoint
             resolve_checkpoint(self.output,self.repo,version['dataset_ref'])
-            citations=source_evidence(self.repo,version['source_refs'])
+            citations=source_evidence(self.repo,version['source_refs'],output=self.output)
             described=describe(self.output,self.repo,{**version,'source_refs':citations})
+            requires_manifest_review = bool(described.get('asset', {}).get('profile_witness', {}).get('inspector'))
             packet, shown = project({'version':{**version,'source_refs':citations},
-                'native_data_card':described,'declaration':self.declaration},
+                'native_data_card':described,'declaration':self.declaration,
+                'frozen_study_intent':self._research_brief_view(),
+                'review_phase':'source_and_asset_registration_not_runtime_consumption'},
                 citations,local_roots=(self.repo,self.output))
             with role_scope(self.client,'supervisor'):
                 answer,_=self.client.chat_with_metadata(
                     'Independently review DEVELOPMENT TRAINING data, not evaluation data. '
-                    'Require exact source evidence that new data are allowed by the protocol, '
-                    'the stated dataset root actually reaches the trainer sample reader, and '
-                    'the AUTOSIM_TRAIN_DATA_CONSUMPTION event is emitted only after actual sample '
-                    'reads with identity recomputed from the loaded dataset, not echoed constants. '
+                    'This is SOURCE AND ASSET REGISTRATION, before candidate installation or training. '
+                    'Require exact source evidence for the native training-domain/format and the '
+                    'reachable dataset-root-to-sample-reader route. Evaluate allowed_training_data '
+                    'against both the frozen study intent and protocol: an absent repository sentence '
+                    'explicitly permitting new demonstrations is not itself a prohibition. Explicit '
+                    'benchmark restrictions, held-out contamination and unrelated domains still forbid use. '
+                    'Do NOT require a prior training run, an installed consumption emitter, a nonempty '
+                    'AUTOSIM_TRAIN_SELECTION_JSON channel or runtime samples_read to register identity. '
+                    'That channel is populated only AFTER an approved version is selected. '
+                    'loader_connection_supported means the cited source supports a reachable native '
+                    'reader for these bytes, not that training consumption has already happened; '
+                    'a constructor-only guess without the actual reader route is insufficient. '
+                    'Candidate execution review separately checks the installed consumer. Formal data '
+                    'scoring still requires AUTOSIM_TRAIN_DATA_CONSUMPTION after actual batch reads, '
+                    'with identity recomputed from loaded bytes rather than echoed constants. '
                     'For optional asset metadata require source support for the producer/profile, '
                     'count units and scope, episode/parent grouping, training-only split and '
                     'reversible recipe. Exposure counters must be measured at actual training batch '
                     'consumption, not dataset discovery, requested counts or configured mixture weights. '
                     'Registration does not certify quality, successful collection or performance. '
+                    'A missing direct task-success call in a launcher does not prove no filter: '
+                    'trace supplied native reset/save callbacks and inherited dependencies before '
+                    'making that claim. A possible gate is not a per-episode runtime certificate. '
+                    'If profile_witness.inspector is present, independently inspect its sealed code, '
+                    'native reader route, actual episode/condition/file counting and scope/decoder checks; '
+                    'fabricated constants, model-declared provenance and unmeasured coverage are not observations. '
+                    'Additionally return manifest_observations_supported true only when these source checks pass. '
                     'Return JSON booleans allowed_training_data,loader_connection_supported,sources_supported, '
                     'why and citations.'+INSTRUCTION,
                     json.dumps(packet,ensure_ascii=False),
                     max_tokens=1800,read_only=True,include_research_context=False)
             review=_object(answer)
             review['citations'] = resolve(citations,shown,review.get('citations'))
-            if source_evidence(self.repo,citations)!=citations:
+            if source_evidence(self.repo,citations,output=self.output)!=citations:
                 raise ValueError('data/loader sources changed during review')
             row=register(self.output,self.repo,{**version,'source_refs':citations},review,described=described)
         except (OSError,ValueError,TypeError,RuntimeError) as exc:
-            return {'outcome':'not attempted','because':f'data version refused: {exc}'[:700]}
+            checks = ('allowed_training_data','loader_connection_supported','sources_supported')
+            if requires_manifest_review:
+                checks += ('manifest_observations_supported',)
+            failed=[key for key in checks
+                    if review and review.get(key) is not True]
+            return self._business_refusal(operation='register_data_version',
+                because=f'data version refused: {exc}',category='data_registration_review',owner='data',
+                context={'version_id':version.get('id') if isinstance(version,dict) else None,
+                         'review':review,'failed_checks':failed},
+                next_action='Read the sealed Supervisor review and failed_checks; obtain missing exact '
+                            'source/provenance/loader evidence or delegate a necessary adapter correction '
+                            'through Main. Re-submit only after a relevant change; never force approval.')
         return {'outcome':'registered','because':'reviewed version is not yet consumed or scored',
                 'data_version_id':row['id'],'handle':'data-version:'+row['id'],
+                'registration_review':row.get('review') or {},
+                'registration_scope':'source-level training permission and reader compatibility only; '
+                    'not actual batch consumption, task-success, label-quality or performance certification',
                 'evidence_refs':['data_versions/'+row['id']+'.json']}
 
     def _step_configure_baseline_reference(self, *, reference: dict[str, Any]) -> dict[str, Any]:
@@ -3720,6 +4255,43 @@ class Preparation:
                 'reference_id': row['id'], 'reference_status': row['status'],
                 'evidence_refs': [f'baseline_references/{row["id"]}.json']}
 
+    def _step_recover_reference_score(self, *, reference_id: str, reason: str,
+                                     artifact_revision: dict[str,Any] | None = None) -> dict[str, Any]:
+        from . import baseline_reference as refs
+        from .native_jobs import active_jobs
+        from .reference_score_recovery import recover
+        if active_jobs(self.output) or any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
+            return {'outcome': 'not attempted', 'because': 'active job or held-out boundary forbids reference recovery'}
+        if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 1000:
+            raise ValueError('bounded recovery reason required')
+        held = refs.view(self.output)
+        if held.get('id') != reference_id or held.get('status') != 'evaluation_failed':
+            return {'outcome': 'not attempted', 'because': 'only the active failed reference can be recovered'}
+        research, _ = self._research_controller()
+        registry = read_json(self.output/'baseline_references'/(reference_id+'.json'))
+        original_ref = (registry.get('evaluation') or {}).get('measurement_ref') or ''
+        try:
+            spec = registry['reference']
+            if refs.source_evidence(self.repo, spec['source_refs'], output=self.output) != spec['source_refs']:
+                raise ValueError('reference source evidence changed')
+            measurement, measurement_ref = recover(research, reference_id=reference_id,
+                original_ref=original_ref,**({'locator_revision':artifact_revision,'client':self.client}
+                                           if artifact_revision is not None else {}))
+            refs.begin(self.output, reference_id, measurement_ref=measurement_ref, retry_reason=reason)
+            result = refs.complete(self.output, reference_id, measurement, measurement_ref)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            return self._business_refusal(operation='recover_reference_score',
+                because=f'completed reference score recovery refused: {exc}',
+                category='reference_score_recovery_failed', owner='fix',
+                context={'reference_id':reference_id, 'original_measurement_ref':original_ref,
+                         'locator_review_ref':getattr(exc,'review_ref',None),
+                         'locator_review':getattr(exc,'review',None)},
+                next_action='inspect exact refusal; do not rerun native work or change the frozen protocol')
+        return {'outcome':'recovered', 'because':'completed native evidence independently re-read; original receipt/measurement retained, no GPU replay or baseline adoption',
+            'reference_status':result['status'], 'metric_value':result.get('measured_metric'),
+            'native_replayed':False, 'verification_level':'development_reference',
+            'evidence_refs':[original_ref,measurement_ref,result['record_ref']]}
+
     def _step_evaluate_baseline_reference(self, *, reference_id: str,
                                          retry_reason: str = '') -> dict[str, Any]:
         from . import baseline_reference as refs
@@ -3792,12 +4364,41 @@ class Preparation:
                     'evidence_id':evidence['evidence_id'],'evidence_refs':evidence_refs,
                     'native_operation_status':evidence['native_operation_status'],
                     'retryable':True,'retry_when':'repair and inspect pending/native ownership before retry or reconciliation'}
-        return {'outcome': 'measured' if measurement.get('ok') else 'reference failed',
-                'because': 'reference evaluated separately; original baseline/history/best unchanged',
+        failed = not measurement.get('ok')
+        evaluation = measurement.get('evaluate') or {}
+        evidence_id = evaluation.get('evidence_id') or measurement.get('evidence_id')
+        evidence_ref = evaluation.get('evidence_ref') or measurement.get('evidence_ref')
+        postprocess_failure = (failed and evaluation.get('ran') is True
+                               and evaluation.get('returncode') == 0
+                               and evaluation.get('status') == 'completed')
+        additional_refs = []
+        if postprocess_failure:
+            from .operation_failure import seal
+            postcondition = seal(self.output, operation='evaluate_baseline_reference',
+                exc=ValueError('completed evaluation failed scoring postconditions: '+str(
+                    (measurement.get('metric_reading') or {}).get('why_not') or measurement.get('why'))),
+                context={'reference_id':reference_id, 'measurement_ref':measurement_ref,
+                    'native_attempt_id':evidence_id, 'native_evidence_ref':evidence_ref,
+                    'metric_artifact_evidence':measurement.get('metric_artifact_evidence'),
+                    'next_action':'recover_reference_score after repairing the result connection; no GPU replay'},
+                native_operation_status='completed')
+            additional_refs = [postcondition['evidence_ref'],postcondition['receipt_ref']]
+            evidence_id = postcondition['evidence_id']
+        failure = ({'failure_category':'reference_operation_failed', 'repair_owner':'fix',
+                    'native_operation_status':'completed' if postprocess_failure else measurement.get('native_operation_status') or
+                        ('not_started' if evaluation.get('ran') is False else 'not_inferred'),
+                    'retryable':True,
+                    'retry_when':'inspect sealed failure and repair the connection without rewriting frozen protocol; retry only after ownership is clear'}
+                   if failed and evidence_id else {})
+        return {'outcome': 'measured' if not failed else 'reference failed',
+                'because': ('reference evaluation failed: '+str(measurement.get('why') or
+                    evaluation.get('why') or 'see sealed measurement'))[:700] if failed else
+                    'reference evaluated separately; original baseline/history/best unchanged',
                 'reference_status': result['status'], 'metric_value': result.get('measured_metric'),
                 'verification_level': 'development_reference',
-                'evidence_id': (measurement.get('evaluate')or{}).get('evidence_id'),
-                'evidence_refs': [measurement_ref,result['record_ref']]}
+                'evidence_id': evidence_id,
+                'evidence_refs': [measurement_ref,result['record_ref'], *([evidence_ref] if evidence_ref else []), *additional_refs],
+                **failure}
 
     def _step_extend_research_rounds(self, *, additional_rounds: int,
                                     expected_rounds: int, reason: str) -> dict[str, Any]:
@@ -3821,6 +4422,88 @@ class Preparation:
                 'planned_rounds': result['new_rounds'], 'extension_id': result['id'],
                 'evidence_refs': [f'research/{self.run_id}/round_extensions/{result["id"]}.json']}
 
+    def _invalidate_workflow_commands(self, transaction):
+        """Invalidate before source writes; retain invocation memory, not approval."""
+        from .common import immutable_json
+        path = self.output/'derived_stages.json'
+        kept = read_json(path) if path.is_file() else {}
+        immutable_json(self.output/'superseded_stages'/('workflow-'+transaction['id']+'-'+
+            uuid.uuid4().hex+'.json'), {'reason':'audited workflow source transition',
+            'patch_id':transaction['id'], 'kept':kept, 'verified':self.verified})
+        from .invocation_blueprints import remember
+        for stage, entry in kept.items():
+            try:
+                remember(self.output, self.repo, stage, entry,
+                    interpreter=str(self.interpreter), task=self._declared_task())
+            except (OSError, ValueError, TypeError, KeyError):
+                pass  # Historical native receipts remain; never retain approval on failure.
+        atomic_json(path, {stage:{**entry, 'row':{},
+            'workflow_patch_verification_required':transaction['id']}
+            for stage,entry in kept.items() if isinstance(entry,dict)})
+        self.verified.clear()
+
+    def _step_apply_workflow_candidate(self, *, idea_label: str, target_stage: str,
+                                      reason: str) -> dict[str, Any]:
+        from . import workflow_patch
+        from .candidate_execution_review import decision_context
+        from .execution_derive import _object
+        from .agent_client import role_scope
+        if not getattr(self.client,'supports_main_agent',False):
+            return {'outcome':'rejected','because':'workflow source investments require Main'}
+        research, _ = self._research_controller()
+        def independent(packet):
+            with role_scope(self.client,'supervisor'):
+                answer,_ = self.client.chat_with_metadata(
+                    'Independently audit a SOURCE-ONLY non-scoring workflow patch. '
+                    'No collection, training or evaluation will run in this operation. '
+                    'Require a genuine target-stage connection, all changed code hunks, and '
+                    'preservation of evaluation logic/metrics, STUDENT policy learning logic, frozen protocol, '
+                    'old data/labels and archived records. Shared files are not automatic permission. '
+                    'Collector/generator changes (including its own non-student learning) are possible '
+                    'investments only when explicitly declared and allowed by the frozen protocol; '
+                    'their later execution/costs need separate jobs, never student-score promotion. '
+                    'Unknown effects mean uncertain, not applicable. Source evidence is bounded, '
+                    'not complete import-graph proof. Return JSON verdict=applicable|inapplicable|uncertain, '
+                    'reason (1..1500 chars), source_evidence=[{source_id,quote}] with exact '
+                    '4..800-char substrings from the offered sources. Applicable MUST cite '
+                    'candidate_change, workflow_<target_stage>, a candidate_source_* preimage '
+                    'and EVERY changed candidate_effective_source_* postimage, plus required native source. '
+                    'Also return booleans target_stage_only, evaluation_preserved, training_preserved, '
+                    'existing_data_preserved, protocol_preserved. All five must be true to apply. '
+                    'This is not quality approval, metric adoption, or permission to execute jobs.',
+                    json.dumps(packet,ensure_ascii=False), max_tokens=2600,
+                    read_only=True, include_research_context=False)
+            return _object(answer)
+        try:
+            row = workflow_patch.apply(research,idea_label=idea_label,target_stage=target_stage,
+                reason=reason,reviewer=independent,decision_context=decision_context(self.current_action),
+                before_apply=self._invalidate_workflow_commands)
+        except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+            return self._business_refusal(operation='apply_workflow_candidate',because=str(exc)[:900],
+                category='workflow_source_transaction',owner='fix',
+                next_action='Inspect workflow patch evidence; restore unfinished exact transactions '
+                    'or revise the source-backed candidate. Do not edit old data, score or frozen protocol.')
+        return {'outcome':row['status'],'because':'workflow source '+row['status']+
+            '; no native job or score; derive commands for collection/preparation, then restore before policy work',
+            'workflow_patch_id':row['id'],'evidence_id':row['evidence_id'],
+            'evidence_refs':[row['request_ref'],row['review_ref'],
+                'workflow_patches/'+row['id']+'/state.json']}
+
+    def _step_restore_workflow_candidate(self, *, patch_id: str, reason: str) -> dict[str, Any]:
+        from . import workflow_patch
+        if not getattr(self.client,'supports_main_agent',False):
+            return {'outcome':'rejected','because':'workflow source rollback requires Main'}
+        research,_ = self._research_controller()
+        try:
+            row = workflow_patch.restore(research,patch_id=patch_id,reason=reason,
+                before_restore=self._invalidate_workflow_commands)
+        except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+            return self._business_refusal(operation='restore_workflow_candidate',because=str(exc)[:900],
+                category='workflow_source_transaction',owner='fix',
+                next_action='Inspect exact transaction and source divergence; never overwrite unrelated work.')
+        return {'outcome':row['status'],'because':'exact workflow source rollback; no metrics or budgets changed',
+            'workflow_patch_id':patch_id,'evidence_refs':['workflow_patches/'+patch_id+'/state.json']}
+
     def _do_operation(self, step: str, **arguments: Any) -> dict[str, Any]:
         """Take one step. Never raises: a step that fails is a step that failed.
 
@@ -3830,10 +4513,60 @@ class Preparation:
         """
         if step not in OPERATIONS:
             return {"outcome": "no such step", "because": f"{step!r} is not one of the steps"}
+        from . import workflow_patch
+        try:
+            workflow_rows = workflow_patch.view(self.output,self.run_id,limit=None)
+            pending_workflows = [r for r in workflow_rows if r['status'] not in
+                                 {'applied','rolled_back','refused'}]
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            return {'outcome':'blocked','because':'workflow source record needs reconciliation: '+str(exc)[:500]}
+        if pending_workflows and step not in {'restore_workflow_candidate','research_task',
+                'update_research_plan','stop','inspect_native_job','wait_for_jobs'}:
+            return {'outcome':'blocked','because':'unfinished source-only workflow transaction; '
+                    'restore its exact ID before native or source mutation',
+                    'pending_workflow_patches':pending_workflows}
+        if pending_workflows and step == 'research_task' and arguments.get('mode') != 'inspect':
+            from .main_agent import READ_ONLY_ROLES
+            if arguments.get('role') not in READ_ONLY_ROLES:
+                return {'outcome':'blocked','because':'unfinished workflow permits read-only diagnosis only'}
+        active_workflows = [r for r in workflow_rows if r['status']=='applied']
+        if active_workflows and (step in {'run_the_loop','confirm_best','correct_policy_handoff',
+                'recover_unscored_baseline','adopt_linked_measurement','evaluate_baseline_reference',
+                'recover_reference_score','run_screening_trial','declare','build_the_environment'} or
+                (step in {'submit_native_job','derive_a_command'} and arguments.get('stage') not in workflow_patch.STAGES)):
+            return {'outcome':'not attempted','because':'active non-scoring workflow patch must be '
+                'restored after collection/preparation and before policy learning or scoring; '
+                'the native producer preserves patched source provenance',
+                'active_workflow_patches':active_workflows,'failure_category':'workflow_restore_before_policy_trial'}
+        native_stages = ({str(arguments.get('stage'))} if step == 'submit_native_job' else
+                         {'evaluate','score'} if step in {'correct_policy_handoff','recover_unscored_baseline',
+                             'evaluate_baseline_reference','recover_reference_score'} else
+                         {'train','evaluate','score'} if step in {'run_the_loop','confirm_best','run_screening_trial'} else set())
+        if step == 'correct_policy_handoff' and arguments.get('artifact_revision') is not None:
+            native_stages=set()  # Same completed evaluation, independently re-read on CPU.
+        current_workflow = workflow_patch.generation(self.output,self.run_id)
+        if native_stages and current_workflow and step in {'run_the_loop','confirm_best','run_screening_trial',
+                'correct_policy_handoff','recover_unscored_baseline','evaluate_baseline_reference'}:
+            graph = (self.execution or {}).get('execution_graph')
+            if graph:
+                try:
+                    from .execution_graph import ExecutionGraph
+                    native_stages.update(ExecutionGraph(graph).order_for(str(graph['score_target'])))
+                except (ValueError,TypeError,KeyError):
+                    return {'outcome':'blocked','because':'workflow graph verification scope is unresolved'}
+        stale_workflow = [name for name in native_stages if name in self.stages and current_workflow
+            and self.verified.get(name,{}).get('workflow_source_generation') != current_workflow]
+        if stale_workflow:
+            return {'outcome':'not attempted','because':'workflow source changed; derive and natively verify '
+                'these commands again under the unchanged frozen protocol', 'stages':sorted(stale_workflow),
+                'failure_category':'workflow_stage_reverification'}
+        if step == 'derive_a_command' and current_workflow and arguments.get('reuse_verified'):
+            return {'outcome':'not attempted','because':'workflow transitions require fresh native verification; '
+                    'a historical blueprint may initialize an unverified derivation, not reuse approval'}
         from .native_jobs import active_jobs
         if active_jobs(self.output) and step in {"build_the_environment", "derive_a_command", "declare", "bind_metric",
                 'configure_storage_controls','register_storage_artifact','plan_storage_gc','commit_storage_gc','reconcile_storage_gc',
-                "retry_failed_action", "run_the_loop", "confirm_best", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement", "configure_screening", "run_screening_trial"}:
+                "retry_failed_action", "run_the_loop", "confirm_best", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement", "configure_screening", "run_screening_trial", "revise_presearch_protocol"}:
             return {"outcome": "blocked", "because": "unresolved native jobs own source/environment; wait or cancel first"}
         if self.state_persistence_error:
             return {"outcome": "blocked", "because":
@@ -3861,9 +4594,17 @@ class Preparation:
                     validate_task(arguments)
                     if (self.state().get("research_progress") and
                             arguments["role"] not in READ_ONLY_ROLES and arguments.get("mode") != "inspect"):
-                        return {"outcome": "rejected", "because":
-                                "existing research requires a read-only task role; code "
-                                "changes must use the audited candidate path"}
+                        refusal = self._business_refusal(operation='research_task',
+                            because='existing research requires a read-only task role; code '
+                                'changes must use the audited candidate path',
+                            category='candidate_source_edit_required', owner='main_agent',
+                            context={'role':arguments['role'],'mode':arguments.get('mode')},
+                            next_action='Use mode=inspect for a source-backed Fix/Init patch proposal. '
+                                'After reconciling any pending candidate, submit/review an audited '
+                                'code idea and run it through the offered research operations. '
+                                'This refusal is not a repository capability boundary or a grant '
+                                'to modify the framework, evaluator or old experiment records.')
+                        return {**refusal, 'outcome':'rejected'}
                 else:
                     if set(arguments) != {"plan"}:
                         raise ValueError("update_research_plan requires exactly plan")
@@ -4005,8 +4746,11 @@ class Preparation:
                 "reconcile_interrupted_action": "monitor",
                 "discard_interrupted_candidate": "monitor",
                 "recover_unscored_baseline": "fix",
+                "diagnose_development_failure": "fix",
                 "correct_policy_handoff": "fix",
                 "adopt_linked_measurement": "scheduler",
+                "apply_workflow_candidate": "scheduler",
+                "restore_workflow_candidate": "fix",
                 'configure_storage_controls':'fix',
                 'register_storage_artifact':'fix',
                 'plan_storage_gc':'fix',
@@ -4082,7 +4826,14 @@ class Preparation:
             if planning_failure:
                 result.update(failure_domain="framework_plan",
                               repair_owner=planning_failure.get('repair_owner','environment_planner'),
-                              failure_category="environment_plan_invalid")
+                              failure_category=planning_failure.get('failure_category','environment_plan_invalid'))
+                if planning_failure.get('native_operation_status') in {'not_started','not_inferred'}:
+                    result['native_operation_status']=planning_failure['native_operation_status']
+                if planning_failure.get('retry_original_arguments') is False:
+                    result.update(retry_original_arguments=False,
+                        next_operation=planning_failure.get('next_operation'),
+                        recovery_guidance=planning_failure.get('guidance'),
+                        selection_fault=planning_failure.get('details'))
                 if planning_failure.get("evidence_ref"):
                     result.update(evidence_id=planning_failure["evidence_id"],
                                   evidence_refs=[planning_failure["evidence_ref"]])
@@ -4112,6 +4863,12 @@ class Preparation:
         after cost-budget exhaustion or state-store failure; Monitor must not be used to
         bypass either hard boundary.
         """
+        if failure.get('failure_category') in {'provider_payment_required','provider_access_blocked'}:
+            failure['recovery'] = {'status':'external_action_required',
+                'reason':'configured model endpoint refused payment/account access; do not retry roles, install environments, increase local budgets or clear unknown usage',
+                'next_action':'resolve upstream account quota/billing/access, then resume the same run with all history retained'}
+            atomic_json(self.output/'runtime_blocker.json',failure)
+            return False
         if (self.state_persistence_error or
                 not callable(getattr(self.client, "as_role", None))):
             return False
@@ -4146,7 +4903,7 @@ class Preparation:
             transient = failure.get("failure_category") in {
                 "TimeoutError", "ConnectionError", "BrokenPipeError", "ConnectionResetError",
                 "ConnectionAbortedError", "provider_or_tool_error", "wall_timeout", "admission_wait"}
-            transient = transient or failure.get("failure_category") == "provider_transport"
+            transient = transient or failure.get("failure_category") in {"provider_transport", "missing_final_response"}
             attempts = int(gate.get("attempts", 0)) + 1 if gate.get("fingerprint") == fingerprint else 1
             same_recovery = (recovery_version is None or
                              gate.get('recovery_version') == recovery_version)
@@ -4158,7 +4915,7 @@ class Preparation:
             atomic_json(guard_path, {"fingerprint": fingerprint, "at": now(), "attempts": attempts,
                                     "evidence_id": failure.get("evidence_id"),
                                     "recovery_version": recovery_version})
-            if failure.get("failure_category") == "provider_transport":
+            if failure.get("failure_category") in {"provider_transport", "missing_final_response"}:
                 # No benchmark action ran. Retry the decision at most three times;
                 # do not invoke Monitor/Fix through the same unavailable transport.
                 failure["recovery"] = {"status": "retry_pending", "attempt": attempts,
@@ -4220,17 +4977,32 @@ class Preparation:
             return None
         facts = self._decision_facts()
         self._publish_main_context(facts)
+        from .failure_observation import current_failure as current_failure_observation
         payload = {
             "run_id": self.run_id,
             "action_id": action_id,
             "failed_action": action,
+            "current_failure": current_failure_observation(self.output, action),
             "recent_actions": (facts.get("recent_actions") or [])[-6:],
             "environment": facts.get("environment"),
             "surveyed_stages": facts.get("surveyed_stages"),
             "to_measure": facts.get("to_measure"),
             "research_progress": facts.get("research_progress"),
+            "latest_development_measurements": facts.get('latest_development_measurements') or [],
+            "current_source_continuity": facts.get('current_source_continuity') or [],
             "available_next_actions": facts.get("available"),
             "previous_monitor_observation": self.monitor_observation or None,
+            "budget_observations": {
+                "observed_at": now(),
+                "wall_remaining_seconds": max(0,self.budget.remaining()) if self.budget else None,
+                "model": {key:value for key,value in (facts.get('current_model_budget') or {}).items()
+                    if key in {'run_id','limit_usd','spent_usd','remaining_usd','status'}},
+                "gpu": {key:value for key,value in (facts.get('task_gpu_budget') or {}).items()
+                    if key in {'cap_gpu_seconds','settled_gpu_seconds','available_gpu_seconds',
+                               'active_leases','status'}},
+                "authority": "current executor observations, not budget extension permission; "
+                    "job wall windows must fit remaining whole-run wall AND GPU where applicable",
+            },
         }
         payload_text = json.dumps(_controller_model_value(
             payload, local_roots=(self.repo, self.output)),
@@ -4244,8 +5016,9 @@ class Preparation:
                        if self.budget else 180)
             with role_scope(self.client, "monitor"):
                 content, metadata = self.client.chat_with_metadata(
-                    MONITOR_SYSTEM, payload_text, max_tokens=900, timeout=timeout,
-                    thinking="disabled")
+                    MONITOR_SYSTEM, payload_text, max_tokens=1800, timeout=timeout,
+                    thinking="disabled", decision_only=True, read_only=True,
+                    include_research_context=False, resume_session=False, auto_skills=False)
             from .execution_derive import _object
             answer = _object(content)
             progress = str(answer.get("progress") or "")
@@ -4353,7 +5126,7 @@ class Preparation:
 
     def _fix_failed_action(self, *, action_id: str,
                            action: dict[str, Any]) -> dict[str, Any] | None:
-        """Delegate one recoverable onboarding failure to AgentFix.
+        """Delegate one sealed onboarding or development failure to AgentFix.
 
         Fix is deliberately an intervention, not proof of recovery: it may edit only the
         isolated checkout and run bounded diagnostics. The next Scheduler decision must
@@ -4374,6 +5147,8 @@ class Preparation:
         step = str(action.get("step") or "")
         outcome = str(action.get("outcome") or "")
         candidate_failure = step == "run_the_loop" and bool(action.get("candidate_failure"))
+        consumer_failure = bool((action.get('failure_packet') or {}).get('required_checkpoint_producer') or
+                                (action.get('candidate_failure') or {}).get('required_checkpoint_producer'))
         sealed_handoff = _sealed_fix_handoff(action)
         if sealed_handoff:
             from .evidence_store import read_attempt_evidence
@@ -4402,8 +5177,27 @@ class Preparation:
             "to_measure": facts.get("to_measure"),
             "monitor_observation": self.monitor_observation or None,
             "monitor_findings": facts.get("monitor_findings") or [],
+            "latest_development_measurements": facts.get('latest_development_measurements') or [],
+            "sealed_training_reader_failures": facts.get('sealed_training_reader_failures') or [],
             "fix_observation": self.fix_observation or None,
-            "boundary": (("Candidate measurement has already been committed and its source "
+            "current_source_continuity": facts.get('current_source_continuity') or [],
+            "development_recoveries": (facts.get('research_progress') or {}).get('development_recoveries') or [],
+            "verified_train_artifacts": facts.get('verified_train_artifacts') or {},
+            "harness_repair": {'source_catalog':(facts.get('harness_repair') or {}).get('source_catalog') or []},
+            "repair_operations": {name: facts.get('operation_contracts', {}).get(name)
+                                  for name in _FIX_PROPOSAL_OPERATIONS},
+            "boundary": (("Read the sealed failed development consumer, completed producer and ALL "
+                          "reported reader/postcondition failures. Preserve the paid producer; do not "
+                          "edit or replay directly. A bundle-only correction cannot repair invalid "
+                          "data events or an unmet study contract. Diagnose independent edges together "
+                          "and recommend the next useful offered action, not necessarily checkpoint "
+                          "recovery first. You may recommend a read-only Data task or a new audited "
+                          "proposal for Main to consider. For a handoff-only fault, choose a source-backed "
+                          "checkpoint_ref inside this exact producer without retraining. Main alone "
+                          "selects, revalidates original settings/source/protocol and executes; no "
+                          "probe substitution, scientific-setting change or retrospective log repair.")
+                         if consumer_failure else
+                         ("Candidate measurement has already been committed and its source "
                           "may have been rolled back. Diagnose only; do not edit the checkout "
                           "or replay the candidate. Return an evidence-backed repair idea "
                           "for the Scheduler to audit as a NEW experiment round.")
@@ -4441,6 +5235,33 @@ class Preparation:
         agent_status = ""
         run_budget: dict[str, Any] = {}
         metadata: dict[str, Any] = {}
+        content = None
+        proposal_status = 'not_provided'
+        protocol_failure = None
+
+        def seal_report_error(exc):
+            from .operation_failure import seal
+            reason = sanitize_model_text(f'{type(exc).__name__}: {exc}',
+                                         local_roots=(self.repo, self.output))[:1200]
+            details = {'error': reason, 'authority': 'Fix report protocol only; '
+                       'no repair execution, native outcome or permission inferred'}
+            if isinstance(content, str):
+                try:
+                    receipt = seal(self.output, operation='fix_report_protocol', exc=exc,
+                        context={'failed_action_id': action_id,
+                                 'failed_evidence_id': action.get('evidence_id'),
+                                 'provider_turn': {key: metadata.get(key) for key in
+                                     ('turn_id', 'process_ref') if isinstance(metadata, dict)},
+                                 'response': content[:65536],
+                                 'response_sha256': hashlib.sha256(content.encode()).hexdigest(),
+                                 'response_truncated': len(content) > 65536},
+                        native_operation_status='not_inferred')
+                    details.update({key: receipt[key] for key in
+                                    ('evidence_id', 'evidence_ref', 'receipt_ref')})
+                except (OSError, ValueError, TypeError) as capture_error:
+                    details['evidence_capture_error'] = sanitize_model_text(
+                        str(capture_error), local_roots=(self.repo, self.output))[:300]
+            return details
         try:
             from .agent_client import role_scope
             local_limit = float(getattr(self.client, "timeout", 300))
@@ -4456,6 +5277,9 @@ class Preparation:
                     read_only=read_only_diagnosis,
                     thinking="disabled")
             trace = metadata if isinstance(metadata, dict) else {}
+            # Runtime metadata cannot smuggle a recommendation past validation.
+            metadata = dict(trace)
+            metadata.pop('proposed_action', None)
             turn_id = str(trace.get("turn_id") or "")
             process_ref = str(trace.get("process_ref") or "")
             if (trace.get("role") == "fix" and
@@ -4465,7 +5289,7 @@ class Preparation:
             from .execution_derive import _object
             answer = _object(content)
             assessment = str(answer.get("assessment") or "")
-            if assessment not in {"repair_attempted", "no_safe_repair", "blocked", "uncertain"}:
+            if assessment not in {"repair_attempted", "repair_proposed", "no_safe_repair", "blocked", "uncertain"}:
                 raise ValueError("AgentFix response has an unknown assessment")
             if read_only_diagnosis and assessment == "repair_attempted":
                 assessment = "uncertain"
@@ -4490,6 +5314,46 @@ class Preparation:
                     if (reference and not ref_path.is_absolute() and
                             ".." not in ref_path.parts and "\\" not in reference):
                         refs.append(reference)
+            proposal = answer.get('proposed_action')
+            if proposal is not None:
+                from .operation_contracts import schema, validate
+                try:
+                    if (not isinstance(proposal,dict) or proposal.get('step') not in
+                            _FIX_PROPOSAL_OPERATIONS or
+                            not isinstance(proposal.get('arguments'),dict)):
+                        raise ValueError('Fix proposed_action must name an offered audited repair operation')
+                    handler = getattr(self, '_step_'+proposal['step'])
+                    validate(schema(handler), proposal['arguments'])
+                    if proposal['step'] == 'research_task':
+                        from .main_agent import validate_task
+                        validate_task(proposal['arguments'])
+                    elif proposal['step'] == 'propose_research_idea':
+                        from .ideas import validate_main_proposal, IdeaLibrary
+                        candidate = proposal['arguments']['idea']
+                        if isinstance(candidate, dict) and 'reuse_idea_label' in candidate:
+                            from .idea_reproposal import expand_reproposal
+                            candidate, _ = expand_reproposal(candidate,
+                                IdeaLibrary(self.output/'research'/self.run_id/'ideas.json'))
+                        validate_main_proposal(candidate, repo=self.repo)
+                    elif proposal['step'] == 'apply_workflow_candidate':
+                        from .workflow_patch import STAGES
+                        from .ideas import IdeaLibrary, CLEARED
+                        args = proposal['arguments']
+                        item = IdeaLibrary(self.output/'research'/self.run_id/'ideas.json').get(args['idea_label'])
+                        if args['target_stage'] not in STAGES or item is None or item.status != CLEARED or item.granularity != 'code':
+                            raise ValueError('workflow advice needs a current cleared code idea and non-scoring target')
+                    elif proposal['step'] == 'restore_workflow_candidate':
+                        from .workflow_patch import view
+                        if proposal['arguments']['patch_id'] not in {r['id'] for r in view(self.output,self.run_id,limit=None)}:
+                            raise ValueError('workflow rollback advice must name a real current transaction')
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    # A bad OPTIONAL next-action field cannot erase a valid,
+                    # already-delivered diagnosis. It grants no replay authority.
+                    proposal_status = 'rejected'
+                    protocol_failure = seal_report_error(exc)
+                else:
+                    proposal_status = 'schema_valid_not_executed'
+                    metadata['proposed_action'] = proposal
         except Exception as exc:  # noqa: BLE001 - the original Scheduler still owns recovery.
             agent_status = str(getattr(exc, "status", "") or "")[:80]
             failure_category = str(getattr(exc, "failure_category", "") or
@@ -4500,6 +5364,8 @@ class Preparation:
             summary = ("AgentFix could not run because the model budget is exhausted."
                        if budget_failure else
                        "AgentFix could not complete; the failure remains unresolved.")
+            if not budget_failure:
+                protocol_failure = seal_report_error(exc)
             run_budget = getattr(exc, "run_budget", None)
             if isinstance(run_budget, dict):
                 run_budget = {
@@ -4514,6 +5380,7 @@ class Preparation:
             "fix_attempt_id": fix_attempt_id,
             "failed_action_id": action_id,
             "failure_receipt_ref": parent_receipt or None,
+            "failed_evidence_id": action.get('evidence_id') or None,
             "status": status,
             "assessment": assessment,
             "summary": summary,
@@ -4526,6 +5393,10 @@ class Preparation:
             "run_budget": run_budget,
             "elapsed_wall_seconds": max(0.0, time.monotonic() - started),
             "recorded_at": now(),
+            'proposed_action_status': proposal_status,
+            **({'protocol_failure': protocol_failure} if protocol_failure else {}),
+            **({'proposed_action':metadata['proposed_action']}
+               if isinstance(metadata,dict) and 'proposed_action' in metadata else {}),
         }
         self.fix_observation = observation
         self.current_action = prior_action
@@ -4535,7 +5406,8 @@ class Preparation:
                 details={key: observation.get(key) for key in (
                     "fix_attempt_id", "failed_action_id", "failure_receipt_ref",
                     "assessment", "summary", "changes", "evidence_refs",
-                    "runtime_evidence_refs", "failure_category", "agent_status")},
+                    "runtime_evidence_refs", "failure_category", "agent_status",
+                    'proposed_action_status', 'protocol_failure')},
                 phase_state={"latest_observation": observation})
             self.state_revision = int(stored.get("state_revision") or self.state_revision)
             self.decision_revision = int(stored.get("decision_revision") or
@@ -4560,7 +5432,7 @@ class Preparation:
             publish({key: value for key, value in facts.items()
                      if key not in {"current_action", "last_decision"}})
 
-    def _native_identity_schema_view(self, stage: str) -> dict[str, Any]:
+    def _native_identity_schema_view(self, stage: str, *, _train_artifacts=None) -> dict[str, Any]:
         from .policy_consumption import audit_identity_schema
         unavailable = {'status':'unavailable', 'issues':[],
                        'authority':'schema inspection only; not consumption or scoring evidence'}
@@ -4584,7 +5456,8 @@ class Preparation:
                         kind = 'directory' if policy.is_dir() else 'file' if policy.is_file() else None
                     break
             from .checkpoint_handoff import catalog as producer_catalog
-            required = producer_catalog(self.output).get('status') == 'available'
+            inventory = producer_catalog(self.output) if _train_artifacts is None else _train_artifacts
+            required = inventory.get('status') == 'available'
             return {**audit_identity_schema(text, policy_kind=kind, required=required),
                     'stage':stage, 'native_evidence_ref':accepted.get('native_evidence_ref'),
                     'source':'accepted derivation output projection; formal receipt verification still required'}
@@ -4724,7 +5597,7 @@ class Preparation:
 
     def _step_submit_research_task(self, *, role: str, task: str, expected_result: str,
                                    source_paths: list[str] | None = None):
-        from .agent_tasks import submit
+        from .agent_tasks import submit, ReaderSourceScopeError
         try:
             row = submit(self.output, self.repo, self.client,
                 {"role": role, "task": task, "expected_result": expected_result,
@@ -4733,6 +5606,16 @@ class Preparation:
                     if self.budget else float(getattr(self.client, "timeout", 240)))
             return {"outcome": "submitted", "because": "read-only investigation runs independently",
                     "task_id": row["id"], "evidence_refs": [f"agent_tasks/{row['id']}/task.json"]}
+        except ReaderSourceScopeError as exc:
+            return self._business_refusal(operation='submit_research_task',
+                because=str(exc), category='reader_source_scope', owner='main_agent',
+                context={'role':role,'task':task,'expected_result':expected_result,
+                    'source_paths':source_paths,
+                    'snapshot_status':'preflight_refused_no_worker_submitted'},
+                next_action='Main corrects source_paths to actual BENCHMARK checkout files. '
+                    'Public framework catalog files use inspect_native_environment with '
+                    'framework_source_request separately, not this snapshot list. No model '
+                    'worker or native operation started; no environment rebuild is needed.')
         except (OSError, ValueError) as exc:
             return {"outcome": "rejected", "because": str(exc)[:400]}
 
@@ -4745,19 +5628,61 @@ class Preparation:
             return {"outcome": "rejected", "because": str(exc)[:400]}
 
     def _step_wait_for_jobs(self):
-        from .scheduling import policy
-        def signature():
+        from .scheduling import policy, native_review_events
+        def resource_review(jobs):
+            for event in native_review_events(jobs, epoch=time.time()):
+                identity = object_digest({key: event.get(key) for key in
+                    ('job_id', 'attempt_id', 'deadline_epoch', 'phase')})
+                path = self.output / 'native_job_reviews' / f'{identity}.json'
+                if (path.parent.is_symlink() or path.is_symlink() or
+                        not path.resolve().is_relative_to(self.output.resolve())):
+                    raise ValueError('unsafe native job review record')
+                if path.exists():
+                    continue
+                observation_refs = []
+                if event.get('progress', {}).get('attempt_id') and any(
+                        job.get('job_id') == event['job_id'] and
+                        job.get('stage') in {'train', 'collect', 'prepare_data'} for job in jobs):
+                    try:
+                        from .native_progress import capture
+                        observed = capture(self.output, event['job_id'])
+                        event['progress_observation'] = {key: observed[key] for key in
+                            ('observation_id', 'evidence_ref', 'observed_finished_at',
+                             'source_byte_range', 'requested_resources', 'native_cpu_affinity', 'authority')}
+                        observation_refs.append(observed['evidence_ref'])
+                    except (OSError, ValueError, TypeError) as exc:
+                        # Optional observation failure must not cancel a healthy native
+                        # producer or suppress the original resource advisory.
+                        event['progress_observation'] = {'status': 'unavailable',
+                            'error_type': type(exc).__name__,
+                            'authority': 'no live snapshot; inspect owned job or terminal evidence'}
+                atomic_json(path, {**event, 'review_id': identity, 'observed_at': now()})
+                return {'outcome': 'event', 'because': 'local job window needs AgentResource review',
+                        'resource_review': event, 'review_id': identity,
+                        'evidence_refs': [path.relative_to(self.output).as_posix(), *observation_refs]}
+            return None
+        jobs = self._native_job_view()
+        review = resource_review(jobs)
+        if review:
+            return review
+        def signature(jobs, tasks):
             return object_digest([[{key: row.get(key) for key in
                 ("job_id", "status", "attempt_id", "deadline_epoch")}
-                for row in self._native_job_view()], self._agent_task_view()])
-        before = signature()
-        end = time.monotonic() + min(policy(self.output).get("wait_seconds", 30),
+                for row in jobs], tasks])
+        before = signature(jobs, self._agent_task_view())
+        settings = policy(self.output)
+        interval = max(.1, float(settings.get('resource_poll_seconds', 2)))
+        end = time.monotonic() + min(settings.get("wait_seconds", 30),
                                     self.budget.remaining() if self.budget else 30)
         while time.monotonic() < end:
-            time.sleep(min(1, max(0, end-time.monotonic())))
+            time.sleep(min(interval, max(0, end-time.monotonic())))
             self._collect_agent_tasks()
-            if signature() != before:
+            jobs = self._native_job_view()
+            if signature(jobs, self._agent_task_view()) != before:
                 return {"outcome": "event", "because": "a background task changed state"}
+            review = resource_review(jobs)
+            if review:
+                return review
         return {"outcome": "waiting", "because": "dependencies remain active; no model poll was made"}
 
     def _screening_controller(self):
@@ -4794,7 +5719,8 @@ class Preparation:
 
     def _repair_retry_available(self) -> bool:
         target = self._pending_repair()
-        return bool(target and (target["original"].get("replayed_step") or
+        return bool(target and target['original'].get('retry_original_arguments') is not False and
+                    (target["original"].get("replayed_step") or
                                 target["original"].get("step")) in _FIX_ASSISTANCE_STEPS)
 
     def _pending_repair(self) -> dict[str, Any]:
@@ -4831,7 +5757,10 @@ class Preparation:
     def _step_submit_native_job(self, *, stage: str, window_seconds: float,
                                 reason: str, resources: dict | None = None,
                                 training_settings: dict[str, Any] | None = None,
-                                idea_label: str = '') -> dict[str, Any]:
+                                idea_label: str = '', checkpoint_ref: str = '',
+                                evaluation_settings: dict[str, Any] | None = None,
+                                collection_settings: dict[str, Any] | None = None,
+                                repeat_job_id: str = '') -> dict[str, Any]:
         from .native_jobs import submit
         from .repository_budget import RepositoryBudget
         if stage not in self.stages:
@@ -4839,6 +5768,98 @@ class Preparation:
                     "only a verified native stage may be submitted"}
         settings = {key: value for key, value in self.base_settings.items()
                     if not key.startswith('_')}
+        collection_control_contract = None
+        if stage == 'collect' or collection_settings is not None:
+            from .source_citations import ReviewCitationError
+            from .baseline_reference import SourceCitationError
+            try:
+                if any((self.output/'research'/self.run_id/'confirmation_attempts').glob('*.json')):
+                    raise ValueError('data acquisition cannot reopen development after finalization; '
+                                     'preserve this study and arrange a prospective budget-inheriting data track')
+                from .training_work import consumes_input, missing_formal_collection_work
+                if (stage != 'collect' or training_settings is not None or
+                        evaluation_settings is not None or checkpoint_ref or idea_label):
+                    raise ValueError('collection_settings is collect-only and cannot mix with training, evaluation or candidate settings')
+                source = self.stages.get('collect') or ''
+                if collection_settings is not None:
+                    from .data_acquisition import collection_inputs, review_collection_controls
+                    settings.update(collection_inputs(collection_settings, source))
+                    if 'controls' in collection_settings:
+                        collection_control_contract = review_collection_controls(output=self.output,
+                            repo=self.repo, client=self.client, source=source,
+                            declaration=self.declaration, settings=collection_settings)
+                # A frozen evaluation count must not become an acquisition request.
+                explicit = collection_settings or {}
+                problem = missing_formal_collection_work(source, explicit)
+                if problem:
+                    raise ValueError(problem)
+            except SourceCitationError as exc:
+                return self._business_refusal(operation='submit_native_job', because=str(exc),
+                    category='source_citation_invalid', owner='main_agent',
+                    context={'collection_settings': collection_settings,
+                             'source_validation': exc.details,
+                             'scientific_review_status': 'not_inferred_from_source_transport_failure'},
+                    next_action='Repair only the identified source citation item using '
+                                'inspect_native_environment(checkout_source_request={ref: actual_relative_file[:line[-line]]}); '
+                                'cite its sealed checkout-source ID and displayed exact quote. '
+                                'Builtin Read display placeholders are not original source bytes. '
+                                'No native collection ran; source changes require fresh review. '
+                                'Do not reinstall or claim an acquisition capability boundary.')
+            except ReviewCitationError as exc:
+                return self._business_refusal(operation='submit_native_job', because=str(exc),
+                    category='review_citation_invalid', owner='supervisor',
+                    context={'collection_settings': collection_settings,
+                             'scientific_review_started': True,
+                             'citation_format_repair_limit': 1},
+                    next_action='The independent collection reviewer could not deliver valid supplied source IDs '
+                                'after one bounded citation-only repair. Inspect the sealed Supervisor reply; '
+                                'this is not a native collection failure or evidence of an acquisition boundary. '
+                                'Preserve the scientific verdict and source checks; do not reinstall the environment, '
+                                'change evaluation or repeatedly reword the same collection request.')
+            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                return self._business_refusal(operation='submit_native_job', because=str(exc),
+                    category='native_collection_context', owner='main_agent',
+                    context={'collection_settings': collection_settings},
+                    next_action='choose explicit collection_settings from the campaign and native yield; '
+                                'for native controls supply control_source_refs and a verified builder '
+                                'that reads collection_controls, or use selection-only; preserve evaluation settings and the existing baseline')
+        checkpoint_selection = None
+        if checkpoint_ref or evaluation_settings is not None:
+            if stage != 'evaluate' or idea_label or training_settings is not None:
+                return self._business_refusal(operation='submit_native_job',
+                    because='checkpoint_ref/evaluation_settings are evaluate-only; cannot mix with training/candidate settings',
+                    category='native_evaluation_context',owner='main_agent')
+        if stage == 'evaluate':
+            problem = self._confirmation_admission_problem()
+            if problem:
+                return self._business_refusal(operation='submit_native_job',because=problem,
+                    category='confirmation_protocol_required',owner='objective',
+                    next_action='reserve independent conditions before detached evaluation; '
+                                'if the history boundary is closed, preserve evidence and request a predeclared study')
+            try:
+                from .checkpoint_handoff import catalog, select
+                offered = catalog(self.output)
+                if offered.get('status') == 'available' and not checkpoint_ref:
+                    raise ValueError('Choose checkpoint_ref from verified_train_artifacts; '
+                        'detached evaluation cannot infer the Agent-selected policy from an earlier derivation')
+                if checkpoint_ref:
+                    checkpoint_selection = select(self.output, checkpoint_ref, offered)
+                if evaluation_settings is not None:
+                    if (not isinstance(evaluation_settings,dict) or not evaluation_settings or
+                            any(k not in {'episodes','seed'} or isinstance(v,bool) or
+                                not isinstance(v,int) or v < (1 if k=='episodes' else 0)
+                                for k,v in evaluation_settings.items())):
+                        raise ValueError('evaluation_settings accepts positive integer episodes and nonnegative integer seed only')
+                    settings.update(evaluation_settings)
+                research, _ = self._research_controller()
+                violation = research._comparison_protocol_violation(settings, target='evaluate', freeze=False)
+                if violation:
+                    raise ValueError(violation)
+            except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+                return self._business_refusal(operation='submit_native_job',because=str(exc),
+                    category='native_evaluation_context',owner='main_agent',
+                    context={'checkpoint_ref':checkpoint_ref,'evaluation_settings':evaluation_settings},
+                    next_action='select a verified producer and explicit native development settings; preserve frozen and held-out constraints')
         candidate_binding = None
         if idea_label:
             try:
@@ -4846,27 +5867,55 @@ class Preparation:
                 if stage != 'train':
                     raise ValueError('candidate job must use the train stage')
                 research, _ = self._research_controller()
-                admission = self._review_candidate_execution(research, idea_label)
+                from .candidate_settings import scoped_training_inputs
+                admission = self._review_candidate_execution(research, idea_label,
+                    selected_training_settings={**settings,
+                        **scoped_training_inputs(research, training_settings or {})})
                 if admission is not None:
                     return admission
                 candidate_binding = allocation(research, idea_label,training_settings)
                 settings = candidate_binding['settings']
             except (OSError, ValueError, RuntimeError) as exc:
-                return {'outcome':'rejected', 'because':f'candidate job refused: {exc}'[:700]}
+                return self._business_refusal(operation='submit_native_job',
+                    because=f'candidate job refused: {exc}',
+                    category='candidate_job_admission', owner='main_agent',
+                    context={'idea_label':idea_label, 'stage':stage,
+                             'training_settings':training_settings},
+                    next_action='Read the exact sealed admission error, correct the identified '
+                        'input or delegate framework diagnosis to Fix. Do not change frozen '
+                        'evaluation settings, retrain the baseline, or replay an unchanged refusal.')
         if training_settings is not None and not candidate_binding:
             if stage != 'train' or not isinstance(training_settings, dict) or not training_settings:
                 return {'outcome': 'not attempted', 'because': 'training_settings requires a train job and nonempty mapping'}
             research, _ = self._research_controller()
             axes = {axis.name: axis for axis in research.space.training}
-            from .training_work import consumes_steps, missing_formal_work
+            from .training_work import consumes_steps, consumes_input, missing_formal_work
+            from .candidate_settings import canonical_dataset_input, scoped_training_inputs
             source = research.sources.get('train', '')
             for key, value in training_settings.items():
                 valid = (axes[key].accepts(value) if key in axes else
+                         canonical_dataset_input(research, key, value) or
                          key == 'steps' and consumes_steps(source) and
-                         isinstance(value, int) and not isinstance(value, bool) and value > 0)
+                         isinstance(value, int) and not isinstance(value, bool) and value > 0 or
+                         key == 'seed' and consumes_input(source,'seed') and type(value) is int and value >= 0)
                 if not valid:
-                    return {'outcome': 'not attempted', 'because': f'invalid or undeclared learning setting: {key}'}
-            settings.update(training_settings)
+                    constraint = (axes[key].explain() if key in axes else
+                                  'not a declared training axis or supported optimizer-step input')
+                    constraints = research.space.describe()['training']
+                    refused = self._business_refusal(operation='submit_native_job',
+                        because=f'invalid or undeclared learning setting: {key}; accepts {constraint}',
+                        category='native_learning_settings', owner='main_agent',
+                        context={'training_settings': training_settings, 'invalid_setting': key,
+                                 'training_setting_constraints': constraints},
+                        next_action='inspect declared_space.training in the Main decision facts; '
+                                    'choose an accepted value or use an offered source-backed '
+                                    'declaration revision, not another unchanged submission')
+                    return {**refused, 'invalid_setting': key,
+                            'training_setting_constraints': constraints}
+            try:
+                settings.update(scoped_training_inputs(research,training_settings))
+            except ValueError as exc:
+                return {'outcome':'not attempted','because':str(exc)}
             problem = missing_formal_work(source, research._inputs('train', settings=settings))
             if problem:
                 return {'outcome': 'not attempted', 'because': problem}
@@ -4887,29 +5936,70 @@ class Preparation:
             job = submit(self.output, repo=self.repo, stage=stage,
                          settings=settings, requested_seconds=window_seconds,
                          reason=reason, run_id=self.run_id, resources=resources,
+                         **({'collection_control_contract':collection_control_contract}
+                            if collection_control_contract else {}),
+                         **({'checkpoint_selection':checkpoint_selection} if checkpoint_selection else {}),
+                         **({'repeat_job_id':repeat_job_id} if repeat_job_id else {}),
                          **({'candidate_binding':candidate_binding} if candidate_binding else {}))
         except (OSError, ValueError, TypeError) as exc:
             return {"outcome": "rejected", "because":
                     f"native job refused: {type(exc).__name__}: {exc}"[:600]}
-        return {"outcome": "submitted", "because": "verified native stage is running "
-                "under the existing hard budget", **job,
+        return {"outcome": "already done" if job.get('reused_completed_diagnostic') else "submitted",
+                "because": "exact completed diagnostic reused; inspect its existing receipt and "
+                "repair the formal consumer instead of repeating probe work" if job.get('reused_completed_diagnostic') else
+                "verified native stage is running under the existing hard budget", **job,
                 "evidence_refs": [job["job_ref"]]}
 
-    def _step_inspect_native_job(self, *, job_id: str) -> dict[str, Any]:
+    def _step_inspect_native_job(self, *, job_id: str,
+                                 log_query: str | None = None) -> dict[str, Any]:
         from .native_jobs import status
+        if (re.fullmatch(r'[0-9a-f]{32}',job_id) and
+                not (self.output/'native_jobs'/job_id).exists() and
+                not (self.output/'native_jobs'/job_id).is_symlink()):
+            from .evidence_store import read_attempt_evidence
+            try:
+                evidence = read_attempt_evidence(self.output,job_id,limit=300)
+            except (OSError,ValueError,TypeError):
+                pass
+            else:
+                return {'outcome':'observed','because':'this ID is sealed attempt evidence, not a detached job',
+                    'id_kind':'attempt_evidence','evidence_id':job_id,
+                    'evidence_ref':f'evidence/{job_id}.json',
+                    'next_action':'Use read_evidence with this evidence_id to inspect the original '
+                        'native log. Job controls require an actual submitted job_id; '
+                        'do not resubmit training just to inspect a completed attempt.',
+                    'authority':'identity clarification only; not job adoption or a new measurement'}
         try:
             job = status(self.output, job_id)
         except (OSError, ValueError, TypeError) as exc:
             return {"outcome": "rejected", "because":
                     f"job status unavailable: {type(exc).__name__}: {exc}"[:500]}
         review = {}
+        observation_refs = []
+        if log_query is not None:
+            try:
+                from .native_progress import capture
+                observed = capture(self.output, job_id, query=log_query)
+                review['progress_observation'] = observed
+                observation_refs.append(observed['evidence_ref'])
+            except (OSError, ValueError, TypeError) as exc:
+                review['progress_observation'] = {'status': 'unavailable',
+                    'error_type': type(exc).__name__,
+                    'authority': 'no live snapshot; terminal evidence remains unchanged',
+                    'next_action': 'inspect the owned producer status; completed stages use original sealed evidence'}
         result = (job.get('result') or {}).get('stage_result') or {}
         if job.get('status') == 'completed' and result.get('stage') == 'train':
             request = read_json(self.output/'native_jobs'/job_id/'request.json')
             from .native_jobs import source_matches, bind_completed_source
             from .training_progress_audit import revalidate_detached
-            if (request.get('repo') == str(self.repo) and request.get('run_id') == self.run_id
-                    and source_matches(self.output, self.repo, request)):
+            matches=(request.get('repo') == str(self.repo) and request.get('run_id') == self.run_id
+                     and source_matches(self.output, self.repo, request))
+            review['adoption_admission']={'status':'source_matches' if matches else 'blocked_source_identity',
+                'source_matches':bool(matches),'authority':'source prerequisite only, not full adoption approval',
+                'why':'remaining work/consumer/protocol checks still required' if matches else
+                    'original training source identity missing or changed; retain weights, '
+                    'do not repeat unchanged inspection or silently adopt; source correction requires fresh verification'}
+            if matches:
                 try:
                     review['source_handoff'] = bind_completed_source(self.output,self.repo,request)
                 except (OSError,ValueError,TypeError,KeyError):
@@ -4933,7 +6023,7 @@ class Preparation:
                     'scope': 'completed training only; not a score'}})
         return {"outcome": "observed", "because": f"native job {job['status']}",
                 **review,
-                **job, "evidence_refs": [job["job_ref"]]}
+                **job, "evidence_refs": [job["job_ref"], *observation_refs]}
 
     def _step_adjust_native_job(self, *, job_id: str, window_seconds: float,
                                 reason: str) -> dict[str, Any]:
@@ -4966,6 +6056,10 @@ class Preparation:
                     "no unused repair handoff matches a failed action"}
         target = self._pending_repair()
         original = target["original"]
+        if original.get('retry_original_arguments') is False:
+            return {'outcome':'not attempted', 'because':original.get('recovery_guidance') or
+                'Correct invalid caller selection through build_the_environment; unchanged replay is forbidden.',
+                'repair_owner':'main_agent', 'next_operation':'build_the_environment'}
         original_step = str(original.get("replayed_step") or original["step"])
         arguments = original.get("replayed_arguments") or original.get("arguments") or {}
         if not isinstance(arguments, dict):
@@ -5009,10 +6103,30 @@ class Preparation:
                     "Use capture_environment_demo with source-backed recording code; "
                     "no scored measurement is required and no score will be inferred."}
         from .native_jobs import active_jobs
+        if request.get('kind') == 'dataset_preview':
+            from .data_campaign import _development_open
+            from .data_preview import capture
+            if active_jobs(self.output):
+                return {'outcome':'blocked', 'because':'wait for active native writers before data preview'}
+            try:
+                _development_open(self.output, self.run_id)
+                remaining = self.budget.remaining() if self.budget else 60
+                if remaining <= 0:
+                    return {'outcome':'blocked','because':'run wall budget is exhausted'}
+                recorder.resolve_request(self.output, request_id, status='capturing', reason=reason)
+                result = capture(self.output, self.repo, version_id=request['data_version_id'],
+                    card_sha256=request['data_version_sha256'], timeout_seconds=min(60, remaining))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                result = {'kind':'dataset_preview','status':'unavailable','why':str(exc)[:500]}
+                if request_id in {r['id'] for r in recorder.pending_requests(self.output)}:
+                    return {'outcome':'rejected','because':result['why']}
+            recorder.complete_capture(self.output, request_id, result)
+            return {'outcome':result['status'], 'because':result.get('why') or reason,
+                    'evidence_refs':[f'data_versions/{request["data_version_id"]}.json', 'report/demo_requests.json']}
         progress = self.state().get("research_progress") or {}
-        if (active_jobs(self.output) or progress.get("status") != "paused" or
+        if (active_jobs(self.output) or progress.get("status") not in {"paused", "completed"} or
                 (progress.get("confirmation") or {}).get("status") in {"taken", "attempted_and_failed"}):
-            return {"outcome": "blocked", "because": "capture requires an idle paused development session"}
+            return {"outcome": "blocked", "because": "capture requires an idle paused or completed development session without held-out exposure"}
         if self.budget and self.budget.remaining() <= 0:
             return {"outcome": "blocked", "because": "run wall budget is exhausted"}
         relative = str(request.get("measurement_ref") or "")
@@ -5033,13 +6147,7 @@ class Preparation:
                                            settings=measurement.get("settings") or {})
         except Exception as exc:
             result = {"status": "unknown", "why": type(exc).__name__}
-        with run_record._report_lock(self.output / "report" / "demo_requests.json"):
-            store = recorder.read(self.output, "report/demo_requests.json")
-            for row in store.get("requests", []):
-                if row.get("id") == request_id:
-                    row.update(status=result.get("status") or "unknown", result=result,
-                               resolved_at=now())
-            atomic_json(self.output / "report" / "demo_requests.json", store)
+        recorder.complete_capture(self.output, request_id, result)
         return {"outcome": result.get("status") or "unknown", "because": result.get("why") or reason,
                 "attempt_ids": [result["attempt_id"]] if result.get("attempt_id") else []}
 
@@ -5102,9 +6210,55 @@ class Preparation:
                 "evidence_refs": ["run_state.json#phases.main_agent.memory.plan"]}
 
     def _step_propose_harness_repair(self, *, evidence_id: str,
-                                   diagnosis: str) -> dict[str, Any]:
+                                   diagnosis: str, source_paths: list[str] | None = None) -> dict[str, Any]:
         from .harness_repair import propose
-        return propose(self.output, self.client, evidence_id=evidence_id, diagnosis=diagnosis)
+        return propose(self.output, self.client, evidence_id=evidence_id, diagnosis=diagnosis,
+                       **({'source_paths':source_paths} if source_paths is not None else {}))
+
+    def _presearch_protocol_revision_view(self) -> dict[str, Any]:
+        from .protocol_revision import view
+        from . import redlines
+        if not (self.output/'research'/self.run_id/'protocol_frozen.json').exists():
+            return {'status':'not_available','why':'no historical protected-source freeze to revise'}
+        root = self.output/'research'/self.run_id
+        if (root/'controller_session.json').exists() or (root/'comparison_protocol.json').exists():
+            # The revision boundary rejects initialized studies before any source
+            # review. Do not repeatedly hydrate an engine just to rediscover it.
+            return {'status':'not_available','why':'local research session/protocol already initialized'}
+        try:
+            research,_=self._research_controller()
+            hashes=redlines.protected_hashes(self.repo,research.red_lines(),exclude_roots=(research.run_root,))
+            return view(self.output,self.repo,self.run_id,hashes)
+        except (OSError,ValueError,TypeError,RuntimeError) as exc:
+            return {'status':'not_available','why':str(exc)[:500]}
+
+    def _step_revise_presearch_protocol(self, *, reason: str) -> dict[str, Any]:
+        from . import protocol_revision as revisions, redlines
+        from .agent_client import role_scope
+        from .execution_derive import _object
+        try:
+            research,_=self._research_controller()
+            hashes=redlines.protected_hashes(self.repo,research.red_lines(),exclude_roots=(research.run_root,))
+            planned=revisions.plan(self.output,self.repo,self.run_id,hashes)
+            with role_scope(self.client,'supervisor'):
+                content,_=self.client.chat_with_metadata(
+                    'Independently review a PROSPECTIVE DEVELOPMENT setup/instrumentation protocol revision. '
+                    'No formal rollout has started according to executor-verified prestart receipts. '
+                    'Review the authentic old/new protected-source diff: reject changed task distributions, '
+                    'success conditions, metric definitions, reserved conditions, artificial policy results, '
+                    'or weakened identity evidence. Old failures and costs remain; this is not score promotion. '
+                    'Return JSON with the exact plan_id, why, and booleans '+','.join(revisions.CHECKS)+'.',
+                    json.dumps(_controller_model_value(planned,local_roots=(self.repo,self.output)),ensure_ascii=False),
+                    max_tokens=1800,timeout=180,read_only=True,include_research_context=False)
+            row=revisions.activate(self.output,self.repo,self.run_id,planned,_object(content),reason)
+        except (OSError,ValueError,TypeError,RuntimeError,KeyError) as exc:
+            return {'outcome':'revision refused','because':str(exc)[:700],
+                'repair_owner':'main_agent','failure_category':'presearch_revision_review',
+                'native_operation_status':'not_started'}
+        return {'outcome':'revised','because':'reviewed prospective protocol committed; old failures, protocols, scores and budgets untouched',
+            'protocol_revision_id':row['id'],'formal_paper_eligible':False,
+            'evidence_refs':[f'research/{self.run_id}/protocol_revisions/{row["id"]}/revision.json'],
+            'next_action':'reverify the original native operation under this version; do not infer a score'}
 
     def _harness_repair_status(self) -> dict[str, Any]:
         from .harness_repair import status
@@ -5124,7 +6278,19 @@ class Preparation:
                     "an unresolved native job owns this checkout; editable research must wait"}
 
         task_id = uuid.uuid4().hex
+        no_edit_context = None
+        suspended = None
         if editable:
+            # Only an exact unchanged context may restore old approvals. Real source
+            # edits still need dependency/native revalidation; do not trust a tool's
+            # self-reported changed files or guess Python's dynamic imports.
+            try:
+                from .native_jobs import checkout_identity
+                no_edit_context = checkout_identity(self.output, self.repo)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+            suspended = {'stages': dict(self.stages), 'parameters': dict(self.parameters),
+                         'verified': dict(self.verified), 'memory': dict(self.main_agent)}
             self._save_main_memory({**self.main_agent, "checkout_needs_resurvey": True,
                                    "metric_revalidation_required": True,
                                    "last_editable_task_id": task_id},
@@ -5141,6 +6307,14 @@ class Preparation:
                                          "kept": kept, "stages": self.stages,
                                          "parameters": self.parameters,
                                          "verified": self.verified})
+                    from .invocation_blueprints import remember
+                    for stage, entry in kept.items():
+                        try:
+                            remember(self.output, self.repo, stage, entry,
+                                interpreter=str(self.interpreter), task=self._declared_task())
+                        except (OSError, ValueError, TypeError, KeyError) as exc:
+                            self._note('invocation_blueprint_unpublished',
+                                       [{'stage': stage, 'why': type(exc).__name__}])
                     atomic_json(kept_path, {})
                 except (OSError, ValueError, TypeError) as exc:
                     raise ResearchStatePersistenceError(
@@ -5160,23 +6334,49 @@ class Preparation:
             configured = min(configured, timeout_seconds)
         timeout = max(1, min(configured, self.budget.remaining())) if self.budget else configured
         task_started = time.monotonic()
+        task_epoch = time.time()
         task_deadline = task_started + timeout
         data_methods = {}
-        with role_scope(self.client, role):
-            if role in {"data", "resource"}:
-                from .data_agent import select_methods, remaining_window
-                data_methods = select_methods(self.client, payload["assignment"], facts, timeout=timeout)
-                payload.update(_controller_model_value(data_methods, local_roots=(self.repo, self.output)))
-                timeout = remaining_window(task_started, timeout)
-            content, metadata = self.client.chat_with_metadata(
-                task_system_for_role(role), json.dumps(payload, ensure_ascii=False, default=str),
-                max_tokens=4000, timeout=timeout, include_research_context=False,
-                **({"auto_skills": False} if role in {"data", "resource"} else {}),
-                **({"read_only": True} if mode == "inspect" or role in READ_ONLY_ROLES else {}))
-            from .main_agent import receive_report
-            report = receive_report(content, client=self.client, output=self.output,
-                workspace=self.repo, timeout=max(1, task_deadline-time.monotonic()),
-                metadata=metadata)
+        try:
+            with role_scope(self.client, role):
+                if role in {"data", "resource"}:
+                    from .data_agent import select_methods, remaining_window
+                    data_methods = select_methods(self.client, payload["assignment"], facts, timeout=timeout)
+                    payload.update(_controller_model_value(data_methods, local_roots=(self.repo, self.output)))
+                    timeout = remaining_window(task_started, timeout)
+                content, metadata = self.client.chat_with_metadata(
+                    task_system_for_role(role), json.dumps(payload, ensure_ascii=False, default=str),
+                    max_tokens=4000, timeout=timeout, include_research_context=False,
+                    **({"auto_skills": False} if role in {"data", "resource"} else {}),
+                    **({"read_only": True} if mode == "inspect" or role in READ_ONLY_ROLES else {}))
+                from .main_agent import receive_report
+                report = receive_report(content, client=self.client, output=self.output,
+                    workspace=self.repo, timeout=max(1, task_deadline-time.monotonic()),
+                    metadata=metadata)
+        finally:
+            if editable and no_edit_context and suspended:
+                try:
+                    from .native_jobs import checkout_identity, active_jobs
+                    from .agent_runtime import _safe_session
+                    agent_session = _safe_session(self.output)
+                    # A timed-out worker could continue writing. Unknown/running is
+                    # deliberately not treated as no-op, even if bytes match now.
+                    identity = agent_session.get('process_identity')
+                    terminal = (agent_session.get('status') == 'completed'
+                        and agent_session.get('role') == role
+                        and agent_session.get('workspace_identity') == str(self.repo)
+                        and float(agent_session.get('started_at') or 0) >= task_epoch
+                        and isinstance(identity, dict)
+                        and inspect_process_identity(identity).get('status') == 'not_running')
+                    if (terminal and not active_jobs(self.output)
+                            and checkout_identity(self.output, self.repo) == no_edit_context):
+                        atomic_json(self.output / 'derived_stages.json', kept)
+                        self.stages = suspended['stages']
+                        self.parameters = suspended['parameters']
+                        self.verified = suspended['verified']
+                        self._save_main_memory(suspended['memory'], event='unchanged_edit_context_restored')
+                except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+                    pass  # Keep invalidation when exact restoration cannot be established.
         runtime_refs: list[str] = []
         metadata = metadata if isinstance(metadata, dict) else {}
         turn_id = str(metadata.get("turn_id") or "")
@@ -5190,13 +6390,27 @@ class Preparation:
         if role in {"data", "resource"}:
             handoff[f"{role}_skill_selection"] = data_methods.get("method_library", {}).get("selection", [])
             handoff["skill_selection_issues"] = data_methods.get("skill_selection_issues", [])
+        data_refs = []
+        if role == "data" and (report.get("failure_cases") or report.get("acquisition_proposals")):
+            from .common import atomic_text
+            from .evidence_store import capture_attempt_evidence
+            log = self.output / "data_reports" / f"{task_id}.log"
+            ref = f"data_reports/{task_id}.json"
+            atomic_text(log, json.dumps(report, ensure_ascii=False, allow_nan=False))
+            evidence = capture_attempt_evidence(self.output, attempt_id=task_id, log=log,
+                receipt_ref=ref, status="advisory_report", returncode=None,
+                termination_reason="reported_not_executed")
+            atomic_json(self.output / ref, {"schema_version": 1, "task_id": task_id,
+                "report": report, **evidence, "authority": "Data hypothesis; not native evidence"})
+            handoff.update(report_ref=ref, report_evidence_id=evidence["evidence_id"])
+            data_refs = [ref, evidence["evidence_ref"]]
         self._save_main_memory(retain_handoff(self.main_agent, handoff),
                                event="research_task_reported")
         # The hash-chained state log keeps older reports even when the prompt window rolls.
         return {"outcome": "reported", "because": report["summary"],
                 "delegated_role": role, "verification_level": None,
                 "evidence_refs": ["run_state.json#phases.main_agent.memory.handoffs",
-                                  *runtime_refs]}
+                                  *runtime_refs, *data_refs]}
 
     def _step_read_the_checkout(self) -> dict[str, Any]:
         """Survey the repository and record which stages exist and how they are entered."""
@@ -5264,7 +6478,8 @@ class Preparation:
                                    base_environment_id: str | None = None,
                                    base_environment_mode: str = 'clone',
                                    environment_selection_reason: str = '',
-                                   source_binding_ids: list[str] | None = None) -> dict[str, Any]:
+                                   source_binding_ids: list[str] | None = None,
+                                   reuse_environment_ref: str | None = None) -> dict[str, Any]:
         """Build or re-verify an environment, keeping only the commands that worked.
 
         A valid, unrebutted passing record is reused. A later failed native-stage derivation
@@ -5406,12 +6621,20 @@ class Preparation:
                             'environment_selection_reason':environment_selection_reason}
                            if base_environment_id is not None else {}),
                         **({'source_binding_ids':source_binding_ids} if source_binding_ids is not None else {}),
+                        **({'reuse_environment_ref':reuse_environment_ref} if reuse_environment_ref is not None else {}),
                         **({"step_timeout": min(operation_timeout_seconds, self.budget.remaining())}
                            if operation_timeout_seconds is not None else {}))
         self.interpreter = provision.env_python(self.output)
         if (build_result or {}).get("status") == "yielded":
             latest = build_result.get("latest_attempt") or {}
             if build_result.get("new_native_operation") is False:
+                if build_result.get('recovery_status') == 'selection_proposed':
+                    proposal = build_result['selection_proposal']
+                    return {'outcome':'selection proposed',
+                        'because':'Fix已提出环境复用／绑定选择建议，交Main选择；尚未切换环境或复验通过。',
+                        'repair_owner':'main_agent', 'proposed_action':proposal['proposed_action'],
+                        'parent_evidence_id':proposal.get('parent_evidence_id'),
+                        'native_operation_launched':False}
                 rejection = build_result.get("repair_rejection") or {}
                 return {"outcome": "repair proposal rejected", "because":
                     str(rejection.get("reason") or "No accepted repair; no new native operation launched"),
@@ -5434,7 +6657,11 @@ class Preparation:
             return {"outcome": "checkpoint failure" if failed else "checkpoint", "because":
                     "一次原生准备操作已封存，控制权返回 Scheduler；环境尚未核验。",
                     "failure_domain": ("native_probe" if latest.get("kind") == "probe" else "native_install") if failed else None,
-                    "repair_owner": "environment_executor" if failed else None,
+                    "repair_owner": ("resource" if provision.resource_retryable(latest)
+                                     else "environment_executor") if failed else None,
+                    "failure_category": latest.get("failure_category") if failed else None,
+                    "retryable": latest.get("retryable") if failed else None,
+                    "retry_when": latest.get("retry_when") if failed else None,
                     "evidence_id": latest.get("evidence_id") if failed else None,
                     "native_operation": ({"attempt_id": latest.get("attempt_id"),
                         "template": latest.get("probe") or latest.get("template"), "returncode": latest.get("returncode"),
@@ -5739,7 +6966,9 @@ class Preparation:
                                agent_timeout_seconds: int | float | None = None,
                                checkpoint_ref: str = '', draft_ref: str = '',
                                reference_id: str = '', reuse_verified: bool = False,
-                               draft_rebind_inputs: list[str] | None = None) -> dict[str, Any]:
+                               draft_rebind_inputs: list[str] | None = None,
+                               blueprint_ref: str = '',
+                               artifact_revision: dict[str, Any] | None = None) -> dict[str, Any]:
         """Find a command that runs one stage, revising the invocation until it does.
 
         The invocation is what gets revised, not the argv: a failure the invocation caused
@@ -5748,6 +6977,31 @@ class Preparation:
         """
         if type(reuse_verified) is not bool:
             return {'outcome':'rejected','because':'reuse_verified must be a boolean'}
+        if artifact_revision is not None:
+            try:
+                from .artifact_revision import validate as validate_artifact_revision
+                validate_artifact_revision(stage, artifact_revision)
+                if stage in {'train', 'evaluate'}:
+                    from .artifact_revision import assert_prebaseline
+                    assert_prebaseline(self.output, self.run_id)
+                if reuse_verified or draft_ref or blueprint_ref:
+                    raise ValueError('artifact_revision requires fresh derivation; cannot combine with cached/draft/blueprint selection')
+            except (ValueError, TypeError) as exc:
+                return self._business_refusal(operation='derive_a_command', because=str(exc),
+                    category='artifact_revision_invalid', owner='main_agent',
+                    context={'stage':stage}, next_action='Choose a source-backed native output '
+                        'declaration and request new verification; never reinterpret old receipts')
+        if blueprint_ref and (reuse_verified or draft_ref or draft_rebind_inputs is not None):
+            return {'outcome': 'rejected', 'because':
+                    'blueprint_ref cannot be combined with draft_ref/rebind or reuse_verified'}
+        if stage == 'evaluate' and not reuse_verified:
+            problem = self._confirmation_admission_problem()
+            if problem:
+                return self._business_refusal(operation='derive_a_command', because=problem,
+                    category='confirmation_protocol_required', owner='objective',
+                    context={'stage': stage},
+                    next_action='configure_confirmation_protocol from native sources before '
+                    'the first evaluator probe; do not close the pre-search reservation boundary')
         if draft_rebind_inputs is not None and (
                 not draft_ref or not isinstance(draft_rebind_inputs, list) or
                 any(key != 'checkpoint' for key in draft_rebind_inputs) or
@@ -5864,7 +7118,7 @@ class Preparation:
                   "steps": execution_derive.TRAINING_VERIFICATION_STEPS, "episodes": 1,
                   "device": self.decision.device, "device_index": self.decision.device_index}
         self._attempts = []
-        from .invocation_drafts import load as load_draft, save as save_draft
+        from .invocation_drafts import load as load_draft, save as save_draft, DraftContextChanged
         draft_base = {'stage': wanted, 'row': rows[wanted],
             'repo': str(self.repo.resolve()), 'interpreter': str(self.interpreter),
             'checkpoint': checkpoint, 'task': inputs['task']}
@@ -5872,25 +7126,63 @@ class Preparation:
         if entry.is_file() and entry.resolve().is_relative_to(self.repo.resolve()):
             from .common import digest
             draft_base['entrypoint_sha256'] = digest(entry)
-        selected_row = rows[wanted]
+        selected_row = deepcopy(rows[wanted])
+        selected_blueprint = None
         # Reverify the accepted invocation, not the original README example.
         # Native source may have changed, so this still goes through make_runnable
         # and a new real receipt. Explicit drafts override this starting point.
         prior_row = self.verified.get(wanted)
         if (isinstance(prior_row, dict) and
                 prior_row.get('entrypoint') == rows[wanted].get('entrypoint')):
-            selected_row = dict(prior_row)
+            selected_row = deepcopy(prior_row)
+        if blueprint_ref:
+            from .invocation_blueprints import load as load_blueprint
+            try:
+                selected_blueprint = load_blueprint(self.output, blueprint_ref,
+                    repo=self.repo, stage=wanted, interpreter=str(self.interpreter),
+                    task=inputs['task'], current_row=rows[wanted])
+                selected_row = dict(selected_blueprint['entry']['row'])
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                return {'outcome': 'rejected', 'because': f'Cannot select invocation blueprint: {exc}',
+                        'native_operation_status': 'not_started'}
         if draft_ref:
             try:
                 selected_row = load_draft(self.output, draft_ref, stage=wanted,
                     base=draft_base, rebind_inputs=draft_rebind_inputs)['row']
+            except DraftContextChanged as exc:
+                next_action=('Explicitly select the current verified checkpoint and request '
+                             'draft_rebind_inputs=["checkpoint"]; native re-verification remains mandatory'
+                             if exc.checkpoint_only else
+                             'Do not retry this stale draft: derive a fresh invocation from the current '
+                             'source/row/task/interpreter without draft_ref; retain the old draft as history')
+                result=self._business_refusal(operation='derive_a_command',because=str(exc),
+                    category='invocation_draft_context_changed',owner='main',
+                    context={'draft_ref':draft_ref,'changed_fields':exc.changed_fields},
+                    next_action=next_action)
+                return {**result,'changed_fields':exc.changed_fields,'outcome':'rejected'}
             except (OSError, ValueError, TypeError) as exc:
                 return {'outcome': 'rejected', 'because': f'Cannot select invocation draft: {exc}'}
+        artifact_revision_ref = ''
+        if artifact_revision is not None:
+            try:
+                from .artifact_revision import review as review_artifact_revision
+                selected_row, artifact_revision_ref = review_artifact_revision(
+                    self.output, self.repo, self.client, wanted, selected_row, artifact_revision,
+                    run_id=self.run_id)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+                return self._business_refusal(operation='derive_a_command', because=str(exc),
+                    category='artifact_revision_review', owner='main_agent',
+                    context={'stage':wanted, 'review_ref':getattr(exc,'review_ref',None),
+                             'review':getattr(exc,'review',None)},
+                    next_action='Read the artifact-scope refusal; provide '
+                        'exact collector/output source evidence for a bounded new declaration. '
+                        'No native verification or old producer change was performed')
         from .native_execution import resource_window
         source, settled, log, row = execution_derive.make_runnable(
             self.client, wanted, selected_row, repo=self.repo,
             repository_files=answer.get("read") or [], inputs_for_verify=inputs,
             base_environment=self.decision.environment,
+            invocation_blueprint=selected_blueprint,
             attempts=execution_derive.ARGV_DERIVATION_ATTEMPTS,
             rounds=execution_derive.ARGV_DERIVATION_ROUNDS,
             require_step_control=wanted == "train",
@@ -5912,6 +7204,26 @@ class Preparation:
                 evidence_ref=evidence_ref),
             on_event=lambda stage, entries: self._note(stage, entries))
         derivation_evidence = self._record_attempts(wanted, inputs)
+        if source is not None and artifact_revision_ref and wanted in {'train', 'evaluate'}:
+            try:
+                from .artifact_revision import assert_prebaseline
+                assert_prebaseline(self.output, self.run_id)
+            except ValueError as exc:
+                return self._business_refusal(operation='derive_a_command', because=str(exc),
+                    category='artifact_revision_context_changed', owner='main_agent',
+                    context={'stage':wanted,'review_ref':artifact_revision_ref},
+                    next_action='Do not install or reinterpret a locator after formal research starts')
+        if source is not None and artifact_revision_ref and (
+                row.get('artifact') != artifact_revision['pattern'] or
+                row.get('artifact_revision_ref') != artifact_revision_ref):
+            return self._business_refusal(operation='derive_a_command',
+                because='native derivation changed the independently reviewed artifact scope; not installed',
+                category='artifact_revision_context_changed', owner='main_agent',
+                context={'stage':wanted, 'review_ref':artifact_revision_ref,
+                         'evidence_id':derivation_evidence.get('evidence_id')},
+                next_action='Inspect the sealed diagnostic. Explicitly propose and review '
+                    'the actual source-backed output scope before a new verification; '
+                    'no verified adapter or old receipt was changed')
         if source is None:
             handoff_draft_ref = ''
             handoff = next((entry for entry in reversed(log)
@@ -5972,11 +7284,41 @@ class Preparation:
                     "evidence_refs": [derivation_evidence["evidence_ref"]]
                     if derivation_evidence else self._existing_evidence_refs(
                         f"derivation_attempts/{wanted}.json")}
-        self.stages[wanted] = source
-        self.parameters[wanted] = {name: {"value": value}
-                                   for name, value in (settled or {}).items()}
         verified = {**row, "parameters": [
             {"name": name, "value": value} for name, value in (settled or {}).items()]}
+        candidate_entry={'source':source,
+            'parameters':{name:{'value':value} for name,value in (settled or {}).items()},
+            'row':verified}
+        from .frozen_invocation import differences, retain_diagnostic
+        try:
+            changed=differences(self.output,self.run_id,wanted,candidate_entry)
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            return self._business_refusal(operation='derive_a_command',
+                because=f'frozen evaluator invocation cannot be checked: {exc}',
+                category='frozen_evaluator_invocation_unverifiable',owner='fix',
+                native_operation_status='diagnostic_completed_not_installed',
+                context={'stage':wanted}, next_action='Inspect the frozen invocation evidence. '
+                    'No formal adapter was replaced; preserve the diagnostic and do not '
+                    'overwrite protocols or repeat the completed training.')
+        if changed:
+            ref=retain_diagnostic(self.output,self.run_id,wanted,candidate_entry,log)
+            return self._business_refusal(operation='derive_a_command',
+                because='diagnostic verified but not installed: frozen evaluator invocation differs in '+', '.join(changed),
+                category='frozen_evaluator_invocation',owner='main_agent',
+                native_operation_status='diagnostic_completed_not_installed',
+                context={'stage':wanted,'changed_fields':changed,'diagnostic_ref':ref,
+                         'candidate_entry':candidate_entry},
+                next_action='The original formal evaluator remains installed. Use its existing '
+                    'verified invocation with a producer-owned caller input. For policy handoff '
+                    'recovery select the ORIGINAL failed measurement label from development_recoveries, '
+                    'not corrected_label; the executor creates the linked result name. '
+                    'Do not re-freeze the protocol, retrain, or treat this diagnostic as a score.')
+        self.stages[wanted] = source
+        self.parameters[wanted] = candidate_entry['parameters']
+        from .workflow_patch import generation as workflow_generation
+        workflow_revision = workflow_generation(self.output,self.run_id)
+        if workflow_revision:
+            verified = {**verified, 'workflow_source_generation':workflow_revision}
         self.verified[wanted] = verified
         kept_path = self.output / "derived_stages.json"
         kept = json.loads(kept_path.read_text(encoding="utf-8")) if kept_path.is_file() else {}
@@ -5987,6 +7329,13 @@ class Preparation:
         interface_ref = ''
         try:
             interface_ref = publish_interface(self.output, self.repo, wanted)['ref']
+            from .invocation_blueprints import remember
+            try:
+                remember(self.output, self.repo, wanted, kept[wanted],
+                         interpreter=str(self.interpreter), task=inputs['task'])
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self._note('invocation_blueprint_unpublished',
+                           [{'stage': wanted, 'why': type(exc).__name__}])
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self._note('execution_interface_unpublished', [{'stage':wanted, 'why':type(exc).__name__}])
         remaining = [name for name in rows if name not in self.stages]
@@ -5994,16 +7343,26 @@ class Preparation:
         return {"outcome": "done", "because": f"{wanted} startup verified; formal training still required"
                     if startup_only else f"{wanted} runs",
                 'verification_scope': row.get('verification_scope', 'completed_stage'),
+                **({'selected_invocation_blueprint_ref': selected_blueprint['ref']}
+                   if selected_blueprint else {}),
                 **({'next': 'Ask Resource Agent to budget a submit_native_job train operation. '
                             'Use actual native resume support where available; startup weights '
                             'are not formal baseline/candidate results. Do not repeat derivation '
                             'to demand full training completion.',
                     'startup_review': row.get('startup_review', {})} if startup_only else {}),
+                **({'formal_producer_status':'interface_verified_not_formal_acquisition',
+                    'next_operation':'submit_native_job',
+                    'next':'Choose explicit collection_settings and resources for formal collect. '
+                        'Its sealed production receipt must bind the installed output declaration. '
+                        'The derivation probe is not a formal producer; do not repeat derivation '
+                        'merely because its evidence envelope has no formal artifact/context.'}
+                   if wanted == 'collect' else {}),
                 "still_without_a_command": remaining,
                 "evidence_refs": self._existing_evidence_refs(
                     f"derivation_attempts/{wanted}.json", "derived_stages.json",
                     *([interface_ref] if interface_ref else []),
-                    *([choice['evidence_ref']] if choice else []))}
+                    *([choice['evidence_ref']] if choice else []),
+                    *([artifact_revision_ref] if artifact_revision_ref else []))}
 
     def _step_bind_metric(self) -> dict[str, Any]:
         """Bind a native log or fresh structured result to a source-backed metric."""
@@ -6061,7 +7420,8 @@ class Preparation:
             existing = MetricSpec.from_declaration(self.declaration)
             reading = resolve_proposal(existing).get("reading") or {"value": None}
             if (reading.get("value") is not None and
-                    not (existing.source == "log" and structured_candidates)):
+                    not (existing.source == "log" and structured_candidates) and
+                    not self._structured_metric_upgrade_available()):
                 return {"outcome": "already done", "because": "declared metric occurs in "
                         "the current verified native output/artifact"}
         entrypoint = str((self.verified.get(target) or {}).get("entrypoint") or "")
@@ -6105,7 +7465,7 @@ class Preparation:
             localized = {key: value for key, value in proposal.items()
                          if key not in {"artifact_candidate", "artifact_pattern"}}
             localized["artifact_root"] = item["root"]
-            localized["artifact_pattern"] = item["relative_path"]
+            localized["artifact_pattern"] = self._verified_metric_pattern(target,item,artifact_evidence)
             return localized, None
 
         prompt = (
@@ -6376,8 +7736,23 @@ class Preparation:
     def _step_run_the_loop(self, *, idea_label: str = "", job_id: str = "",
                            training_settings: dict[str, Any] | None = None,
                            evaluation_settings: dict[str, Any] | None = None,
-                           reuse_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+                           reuse_policy: dict[str, Any] | None = None,
+                           execution_uncertainty: dict[str, Any] | None = None) -> dict[str, Any]:
         """Run one bounded research action, then return control to Preparation."""
+        from .candidate_validation_trial import validate_request, authorize, stage_window
+        from .candidate_execution_review import decision_evidence_refs, decision_context
+        if execution_uncertainty is not None:
+            try:
+                if not getattr(self.client, 'supports_main_agent', False):
+                    raise ValueError('bounded validation requires the Main controller')
+                execution_uncertainty = validate_request(execution_uncertainty,
+                    decision_id=self.current_action.get('decision_id'), idea_label=idea_label,
+                    training_settings=training_settings, job_id=job_id,
+                    reuse_policy=reuse_policy, evaluation_settings=evaluation_settings)
+            except (ValueError, TypeError) as exc:
+                return {'outcome':'not attempted', 'because':str(exc),
+                        'failure_category':'candidate_validation_request',
+                        'native_operation_status':'not_started'}
         report_path = self.output / "research" / self.run_id / "research_report.json"
         session_path = report_path.with_name("controller_session.json")
         prior: dict[str, Any] | None = None
@@ -6448,6 +7823,12 @@ class Preparation:
                 return {"outcome": "blocked", "because":
                         "the research report records an interruption without a verified "
                         "resumable controller session"}
+        if execution_uncertainty is not None and (
+                not session or session.get('status') != 'paused'):
+            return {'outcome':'not attempted', 'because':
+                    'bounded validation requires an existing paused candidate round, not baseline or finalization',
+                    'failure_category':'candidate_validation_workflow',
+                    'native_operation_status':'not_started'}
         target = self._score_target()
         if self._confirmation_admission_problem():
             return self._business_refusal(operation='run_the_loop',
@@ -6474,6 +7855,12 @@ class Preparation:
                                "metric and any producer required by the selected workflow; "
                                "an incidental checkpoint from failed training is not enough"}
         research, answer = self._research_controller()
+        if execution_uncertainty is not None and not (
+                research.available('train') and research.available('evaluate')):
+            return {'outcome':'not attempted', 'because':
+                    'bounded uncertain validation requires the verified train/evaluate workflow',
+                    'failure_category':'candidate_validation_workflow',
+                    'native_operation_status':'not_started'}
         if (session is not None and not self.keep_only
                 and getattr(self.client, 'supports_main_agent', False)):
             from .baseline_diagnosis import view as diagnosis_view
@@ -6573,17 +7960,30 @@ class Preparation:
             try:
                 apply(research,session['base_settings'],training_settings)
             except (ValueError,KeyError,TypeError) as exc:
-                return {'outcome':'not attempted','because':str(exc)}
+                return self._business_refusal(operation='run_the_loop', because=str(exc),
+                    category='candidate_training_input', owner='main_agent',
+                    context={'idea_label':idea_label,'training_settings':training_settings,
+                             'candidate_source_written':False},
+                    next_action='Inspect declared_space and executor_input_contracts; correct caller '
+                        'settings or inspect research/candidate_settings.py. The canonical dataset '
+                        'slot accepts an explicit registered data-version handle only when the '
+                        'verified trainer builder reads it; native flags are not implicit aliases.')
             candidate_training_settings=dict(training_settings)
         if training_settings is not None and candidate_training_settings is None:
             if session is not None or prior is not None:
                 return {'outcome': 'not attempted', 'because':
                         'training_settings cannot rewrite an existing baseline; choose an audited candidate'}
             axes = {axis.name: axis for axis in research.space.training}
-            from .training_work import consumes_steps
+            from .training_work import consumes_steps, consumes_input
+            from .candidate_settings import canonical_dataset_input, scoped_training_inputs
             def learning_value_valid(key: str, value: Any) -> bool:
                 if key in axes:
                     return axes[key].accepts(value)
+                if canonical_dataset_input(research, key, value):
+                    return True
+                if key == 'seed':
+                    return (type(value) is int and value >= 0 and
+                            consumes_input(getattr(research,'sources',{}).get('train',''),'seed'))
                 # The verified command may map optimizer updates to native epochs.
                 # This explicit execution input is not an invented research axis.
                 return (key == 'steps' and consumes_steps(getattr(research, 'sources', {}).get('train', ''))
@@ -6593,11 +7993,15 @@ class Preparation:
                         for key, value in training_settings.items())):
                 return {'outcome': 'not attempted', 'because':
                         'training_settings must contain valid declared training-axis values'}
+            try:
+                scoped = scoped_training_inputs(research,training_settings)
+            except ValueError as exc:
+                return {'outcome':'not attempted','because':str(exc)}
             if any(key in execution_settings and execution_settings[key] != value
-                   for key, value in training_settings.items()):
+                   for key, value in scoped.items()):
                 return {'outcome': 'not attempted', 'because':
                         'training_settings conflicts with explicit run settings'}
-            execution_settings.update(training_settings)
+            execution_settings.update(scoped)
         elif session is not None:
             held_settings = session.get('base_settings')
             if not isinstance(held_settings, dict) or any(
@@ -6620,7 +8024,15 @@ class Preparation:
             problem = missing_formal_work(research.sources['train'],
                 research._inputs('train', settings=execution_settings))
             if problem:
-                return {'outcome': 'not attempted', 'because': problem}
+                return self._business_refusal(operation='run_the_loop', because=problem,
+                    category='formal_training_input_required', owner='main_agent',
+                    context={'training_settings': training_settings,
+                             'evaluation_settings': evaluation_settings,
+                             'verification_policy_automatically_reused': False},
+                    next_action='choose explicit valid training_settings from declared_space '
+                                'and source-backed learning units, or inspect an eligible '
+                                'completed formal train job and pass its exact job_id; '
+                                'evaluation_settings alone never selects a verification policy')
         baseline_training_attempt_id = ""
         if session is not None and session.get('status')=='paused' and idea_label and not job_id and reuse_policy is None:
             from .candidate_settings import proposed,apply
@@ -6732,8 +8144,22 @@ class Preparation:
             return ids, refs
 
         def candidate_failure_from(report: dict[str, Any]) -> dict[str, Any]:
+            preflight = report.get('source_preflight_failure')
+            if isinstance(preflight, dict) and preflight.get('evidence_id'):
+                return {**preflight, 'failure_scope': 'candidate_source_preflight',
+                        'repair_owner': 'main_agent', 'native_operation_status': 'not_started',
+                        'why': 'refresh the exact source evidence; candidate was not applied or launched'}
             if not idea_label:
-                return {}
+                baseline_path=research.run_root/'measurements/baseline.json'
+                if baseline_path.is_file() and not baseline_path.is_symlink():
+                    data_failure=self._data_consumer_failure(research,read_json(baseline_path),
+                        operation='baseline_training_data_validation')
+                    if data_failure:
+                        return data_failure
+                from .measurement_recovery import offered
+                packet = next((row for row in offered(self.output,self.run_id) if row['label']=='baseline'), None)
+                return ({**packet, 'failure_scope':'development_consumer',
+                         'why':'completed formal training needs a receipt-bound native handoff repair'} if packet else {})
             last = (report.get("rounds") or [])[-1:]
             row = last[0] if last and isinstance(last[0], dict) else {}
             if (row.get("idea") != idea_label or row.get("status") == "measured" or
@@ -6749,6 +8175,10 @@ class Preparation:
                            not measure_path.is_symlink() else {})
             if not isinstance(measurement, dict):
                 measurement = {}
+            data_failure=self._data_consumer_failure(research,measurement,
+                operation='candidate_training_data_validation')
+            if data_failure:
+                return {**data_failure,'idea_label':idea_label}
             stage = measurement.get("evaluate") or {}
             if not isinstance(stage, dict):
                 stage = {}
@@ -6831,19 +8261,63 @@ class Preparation:
                     "attempt_ids": attempt_ids,
                     "evidence_refs": evidence_refs,
                     **({"candidate_failure": candidate_failure,
-                       "evidence_id": candidate_failure.get("evidence_id")}
+                       "evidence_id": candidate_failure.get("evidence_id"),
+                       **{k:candidate_failure[k] for k in ('failure_category','failure_domain',
+                           'repair_owner','retryable','retry_when','native_operation_status')
+                          if k in candidate_failure}}
                       if candidate_failure else {}),
                     **({"selected_idea_label": idea_label} if idea_label else {}),
                     "independently_confirmed": False}
+        from .candidate_settings import scoped_training_inputs
+        selected_training_inputs = {**execution_settings,
+            **scoped_training_inputs(research,candidate_training_settings or {})}
         admission = self._review_candidate_execution(research, idea_label,
             **({'reuse_policy':reuse_policy} if reuse_policy is not None else {}),
+            **({'selected_training_settings':selected_training_inputs}
+               if reuse_policy is None and candidate_job is None else {}),
             **({'execution_plan':{'mode':'completed_training_job_evaluation','stages':['evaluate'],
                                  'will_train':False,'job_id':candidate_job['job_id'],
                                  'training_attempt_id':candidate_job['training_attempt_id']}}
                if candidate_job else {}))
-        if admission is not None:
+        validation = None
+        if execution_uncertainty is not None:
+            try:
+                validation = authorize(research, output=self.output, repo=self.repo,
+                    stages=self.stages, idea_label=idea_label,
+                    settings=selected_training_inputs,
+                    training_settings=training_settings,
+                    decision_id=self.current_action['decision_id'],
+                    request=execution_uncertainty, admission=admission,
+                    additional_evidence_refs=decision_evidence_refs(self.current_action),
+                    **({'research_decision_context': decision_context(self.current_action)}
+                       if decision_context(self.current_action) is not None else {}))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                if admission is not None and (
+                        admission.get('failure_category')!='candidate_execution_relevance' or
+                        (admission.get('candidate_execution_review') or {}).get('verdict')!='uncertain'):
+                    # A real negative/unavailable review remains its own boundary.
+                    return {**admission, 'bounded_validation_refusal':str(exc),
+                        'because':f'bounded validation refused: {exc}; original execution review retained'[:700]}
+                # Do not hide a broken authorization reconstruction behind the
+                # unrelated uncertain verdict. Seal a separate pre-native failure
+                # so Main/Fix can inspect the actual contract error without
+                # changing the independent review or replaying native work.
+                refusal=self._business_refusal(operation='run_the_loop_validation_authorization',
+                    because=f'bounded validation authorization refused: {exc}',
+                    category='candidate_validation_authority',owner='fix',context={
+                        'idea_label':idea_label,
+                        'decision_id':self.current_action.get('decision_id'),
+                        'training_inputs_sha256':object_digest(selected_training_inputs),
+                        'execution_review_evidence_id':(admission or {}).get('evidence_id'),
+                        'execution_review_verdict':((admission or {}).get('candidate_execution_review') or {}).get('verdict')},
+                    next_action='Inspect the sealed authorization failure and exact current review material. '
+                        'Repair or reconcile the contract before a new Main action; do not replay native work '
+                        'or change an independent verdict.')
+                return {**(admission or {}),**refusal,'bounded_validation_refusal':str(exc)}
+        elif admission is not None:
             return admission
-        report = research.run(rounds=allocated_rounds,
+        with stage_window(research, execution_uncertainty):
+            report = research.run(rounds=allocated_rounds,
                               settings=execution_settings,
                               confirm=False, yield_after_action=True,
                               max_rounds_per_action=1,
@@ -6861,6 +8335,9 @@ class Preparation:
                                   (int, float))]
         candidate_failure = candidate_failure_from(report)
         attempt_ids, evidence_refs = new_attempt_evidence()
+        if validation is not None:
+            evidence_refs.extend([validation['authorization_ref'], validation['evidence_ref'],
+                                  validation['review_ref']])
         level = verified_native_level() if measured else "unknown"
         status = report.get("run_status", "completed")
         return {"outcome": ("yielded" if status == "paused" else
@@ -6875,22 +8352,35 @@ class Preparation:
                 "next_round": report.get("next_round"),
                 "attempt_ids": attempt_ids,
                 "evidence_refs": evidence_refs,
+                **({'bounded_validation':validation, 'evidence_ids':[validation['evidence_id']]}
+                   if validation is not None else {}),
                 **({"candidate_failure": candidate_failure,
-                   "evidence_id": candidate_failure.get("evidence_id")}
+                   "evidence_id": candidate_failure.get("evidence_id"),
+                   **{k:candidate_failure[k] for k in ('failure_category','failure_domain',
+                       'repair_owner','retryable','retry_when','native_operation_status')
+                      if k in candidate_failure}}
                   if candidate_failure else {}),
                 **({"selected_idea_label": idea_label} if idea_label else {}),
                 "objective": (report.get("objective") or {}).get("score")}
 
-    def _review_candidate_execution(self, research, idea_label: str, *, reuse_policy=None, execution_plan=None) -> dict | None:
+    def _review_candidate_execution(self, research, idea_label: str, *, reuse_policy=None,
+                                    execution_plan=None, selected_training_settings=None) -> dict | None:
         if not idea_label or not getattr(self.client,'supports_candidate_execution_review',False):
             return None
-        from .candidate_execution_review import review
+        from .candidate_execution_review import review, decision_evidence_refs, decision_context
         from .frozen_policy_trial import metadata_sources
         try:
             idea=research.library.get(idea_label)
             if idea is None:
                 raise ValueError('selected idea is absent from audited library')
             result=review(self.output,self.repo,self.stages,idea,self.client,
+                research_root=getattr(research,'run_root',None),
+                **({'additional_evidence_refs':decision_evidence_refs(self.current_action)}
+                   if decision_evidence_refs(self.current_action) else {}),
+                **({'selected_training_settings':selected_training_settings}
+                   if selected_training_settings is not None else {}),
+                **({'research_decision_context':decision_context(self.current_action)}
+                   if decision_context(self.current_action) is not None else {}),
                 **({'policy_metadata':metadata_sources(research.run_root, reuse_policy)}
                    if reuse_policy is not None else {}),
                 **({'reuse_policy':reuse_policy} if reuse_policy is not None else {}),
@@ -6898,12 +8388,17 @@ class Preparation:
             answer=result['answer']
             if answer['verdict']=='applicable':
                 return None
+            evidence_id=result.get('evidence_id','execution-review:'+result['material_sha256'])
+            record_ref=f"candidate_execution_reviews/{result['material_sha256']}.json"
             return {'outcome':'not attempted', 'because':answer['reason'],
                     'failure_category':'candidate_execution_relevance',
                     'native_operation_status':'not_started',
                     'candidate_execution_review':answer,
-                    'evidence_ids':[result.get('evidence_id','execution-review:'+result['material_sha256'])],
-                    'evidence_refs':[f"candidate_execution_reviews/{result['material_sha256']}.json"]}
+                    'evidence_id':evidence_id, 'evidence_ids':[evidence_id],
+                    'evidence_refs':[record_ref],
+                    'independent_review':{'role':'supervisor', 'kind':'candidate_execution_relevance',
+                        'verdict':answer['verdict'],'evidence_id':evidence_id,'record_ref':record_ref,
+                        'authority':'independent source plausibility judgment, not Main rationale or native execution'}}
         except (OSError,ValueError,TypeError,KeyError,AttributeError,RuntimeError) as exc:
             return {'outcome':'not attempted','because':f'execution review unavailable: {exc}'[:900],
                     'failure_category':'candidate_execution_review_unavailable',
@@ -7020,12 +8515,19 @@ class Preparation:
         reconciliation = session.get("reconciliation")
         boundary = (interruption.get("boundary") if isinstance(interruption, dict) else None)
         resolution = session.get("interruption_resolution")
+        historical_resolution = (resolution if self._historical_completed_resolution(resolution, boundary)
+                                 else None)
+        if historical_resolution:
+            resolution = None
         progress = {"status": session.get("status"), "interruption": interruption,
                     "reconciliation": reconciliation,
                     "interruption_boundary": boundary,
                     "interruption_resolution": resolution}
         if not self._interrupted_candidate_discard_available(progress):
-            if isinstance(resolution, dict) and resolution.get("status") == "completed":
+            if (isinstance(resolution, dict) and resolution.get("status") == "completed"
+                    and isinstance(boundary, dict) and resolution.get('round') == boundary.get('round')
+                    and resolution.get('idea_label') == (boundary.get('idea') or {}).get('label')
+                    and resolution.get('resolution_id') == boundary.get('resolution_id')):
                 return {"outcome": "already resolved", "because":
                         "this candidate was already explicitly discarded",
                         "resolution_id": resolution.get("resolution_id")}
@@ -7078,9 +8580,20 @@ class Preparation:
                         "because": "discard must be owned by a persisted main-controller decision"}
             resolution_id = object_digest({"round": round_index, "idea_label": idea_label,
                                            "decision_id": decision_id})[:32]
+            archived_resolution_ref = ''
+            if historical_resolution:
+                archive = research_root/'interruption_resolutions'/(
+                    historical_resolution['resolution_id']+'.json')
+                if archive.parent.is_symlink() or archive.is_symlink():
+                    return {'outcome':'blocked','because':'unsafe prior-resolution archive'}
+                from .common import immutable_json
+                immutable_json(archive, historical_resolution)
+                archived_resolution_ref = archive.relative_to(self.output).as_posix()
             resolution = {"status": "discarding", "round": round_index,
                           "idea_label": idea_label, "resolution_id": resolution_id,
                           "decision_id": decision_id,
+                          **({'previous_resolution_ref':archived_resolution_ref}
+                             if archived_resolution_ref else {}),
                           "reason": redact(reason.strip())[:1000], "started_at": now()}
             session.update(interruption_resolution=resolution, updated_at=now())
             atomic_json(session_path, session)
@@ -7199,6 +8712,18 @@ class Preparation:
                        interruption=interruption, interruption_resolution=resolution,
                        stopped_because="", updated_at=now())
         atomic_json(session_path, session)
+        shared = self.state_store.load() or {}
+        research_phase = (shared.get('phases') or {}).get('research') or {}
+        previous_parent = research_phase.get('parent_action') or {}
+        if not isinstance(previous_parent,dict):
+            previous_parent = {}
+        finished = {**(previous_parent if previous_parent.get('step')==f'round_{round_index}' else {}),
+                    'step':f'round_{round_index}', 'status':'discarded',
+                    'resolution_id':resolution_id, 'discard_decision_id':self.current_action.get('decision_id'),
+                    'updated_at':now()}
+        self.state_store.record('research','candidate_discarded',status=next_status,
+            details={'round':round_index,'resolution_id':resolution_id,'native_replayed':False},
+            phase_state={'current_action':None,'parent_action':None,'last_action':finished})
         document_warning = ""
         try:
             run_record.generate(
@@ -7219,15 +8744,69 @@ class Preparation:
                                   f"research/{self.run_id}/controller_session.json",
                                   f"research/{self.run_id}/ideas.json"]}
 
-    def _step_recover_unscored_baseline(self) -> dict[str, Any]:
+    def _step_diagnose_development_failure(self, *, label: str) -> dict[str, Any]:
+        from .measurement_recovery import offered
+        packet = next((row for row in offered(self.output,self.run_id) if row['label'] == label), None)
+        if packet is None:
+            return {'outcome':'not attempted','because':'no sealed failed development consumer is offered'}
+        prior = self.fix_observation or {}
+        if (prior.get('failure_receipt_ref') == packet['measurement_ref'] and
+                (prior.get('failed_evidence_id') or prior.get('failed_action_id')) == packet['evidence_id'] and
+                prior.get('status') == 'assessed' and prior.get('proposed_action')):
+            return {'outcome':'already assessed', 'because':'use the retained Fix proposal; '
+                    'unchanged evidence does not need another paid diagnosis', 'fix_proposal':prior['proposed_action']}
+        result = self._fix_failed_action(action_id=packet['evidence_id'], action={
+            'step':'diagnose_development_failure', 'outcome':'failed',
+            'failure_category':packet['failure_category'], 'repair_owner':'fix',
+            'evidence_id':packet['evidence_id'], 'receipt_ref':packet['measurement_ref'],
+            'failure_packet':packet})
+        return {'outcome':'assessed' if (result or {}).get('status') == 'assessed' else 'not diagnosed',
+                'because':(result or {}).get('summary') or 'Fix is unavailable; failure remains unresolved',
+                'fix_attempt_id':(result or {}).get('fix_attempt_id'),
+                'fix_proposal':(result or {}).get('proposed_action'),
+                'delegated_role':'fix', 'evidence_id':packet['evidence_id']}
+
+    def _step_recover_unscored_baseline(self, *, checkpoint_ref: str = '',
+                                      artifact_revision: dict[str,Any] | None = None) -> dict[str, Any]:
         """Continue a policy-artifact failure from its completed train receipt, not a new train."""
         eligibility = self._unscored_baseline_recovery_status()
+        if artifact_revision is not None or eligibility.get('kind') in {
+                'completed_baseline_result_locator','resume_cpu_baseline_score_commit'}:
+            if checkpoint_ref:
+                return {'outcome':'not attempted','because':'completed-result CPU recovery and checkpoint replay are exclusive'}
+            from .baseline_score_recovery import record
+            try:
+                research,_=self._research_controller()
+                result=record(research,revision=artifact_revision,client=self.client)
+            except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+                return self._business_refusal(operation='recover_unscored_baseline',
+                    because=f'completed baseline score recovery refused: {exc}',
+                    category='baseline_score_recovery_failed',owner='fix',
+                    context={'artifact_revision':artifact_revision,
+                        'locator_review_ref':getattr(exc,'review_ref',None),
+                        'locator_review':getattr(exc,'review',None)},
+                    next_action='inspect the sealed result writer/attempt evidence; propose exact locator citations, no replay')
+            return {'outcome':'done','because':'independently recovered the same completed baseline result without native replay',
+                'metric_value':result['metric_value'],'training_reused':True,'native_replayed':False,
+                'training_attempt_id':result['train']['attempt_id'],
+                'evaluation_attempt_id':result['evaluate']['attempt_id'],
+                'evidence_refs':[f'research/{self.run_id}/measurements/baseline.json',
+                    f'research/{self.run_id}/baseline_score_recovery.json',
+                    f'research/{self.run_id}/'+result['scoring_recovery']['attachment_ref']]}
         if not eligibility.get("available"):
             return {"outcome": "not attempted",
                     "because": str(eligibility.get("why") or
                                    "no recoverable unscored baseline is recorded")}
         research, _ = self._research_controller()
-        result = research.recover_unscored_baseline()
+        if eligibility.get('checkpoint_ref_required') and not checkpoint_ref:
+            return {'outcome':'not attempted','because':'choose checkpoint_ref inside the exact '
+                    'completed formal producer shown in development_recoveries; ask Fix to '
+                    'inspect native save/load source, not another smoke-model evaluation'}
+        choice = None
+        if checkpoint_ref:
+            from .measurement_recovery import select_for_recovery
+            _, choice = select_for_recovery(self.output,self.run_id,'baseline',checkpoint_ref)
+        result = research.recover_unscored_baseline(**({'checkpoint_handoff':choice} if choice else {}))
         if result.get("ok"):
             return {"outcome": "done",
                     "because": "evaluated the receipt-bound baseline policy without "
@@ -7238,23 +8817,186 @@ class Preparation:
                     "training_attempt_id": (result.get("recovery") or {}).get(
                         "training_attempt_id"),
                     "evaluation_attempt_id": (result.get("evaluate") or {}).get("attempt_id")}
+        from .measurement_recovery import offered
+        packet = next((row for row in offered(self.output,self.run_id) if row['label']=='baseline'), None)
         return {"outcome": "not recovered",
                 "because": str(result.get("why") or "policy evidence did not revalidate"),
                 "training_reused": bool((result.get("recovery") or {}).get(
                     "training_reused")),
-                "evidence": result.get("recovery_state") or result.get("artifact_selection")}
+                "evidence": result.get("recovery_state") or result.get("artifact_selection"),
+                **({k:packet[k] for k in ('failure_category','repair_owner','evidence_id')} if packet else {}),
+                **self._native_evaluation_failure(research,result),
+                **self._data_consumer_failure(research,result,operation='recovered_baseline_data_validation')}
 
-    def _step_correct_policy_handoff(self, *, label: str) -> dict[str, Any]:
+    def _native_evaluation_failure(self, research, measurement):
+        """Forward the failed consumer's sealed identity, not its successful producer.
+
+        A missing policy-load event may be a consequence of a native crash. Keep
+        that postcondition, but give Fix the actual failed process and log. This
+        is read-only diagnosis authority, never an automatic retry or a score.
+        """
+        if (not isinstance(measurement,dict) or measurement.get('ok') is not False
+                or measurement.get('where')!='evaluate'):
+            return {}
+        evaluation=measurement.get('evaluate')
+        if not isinstance(evaluation,dict):
+            return {}
+        attempt=evaluation.get('attempt_id')
+        if not isinstance(attempt,str) or not re.fullmatch(r'[0-9a-f]{32}',attempt):
+            return {}
+        from .evidence_store import read_attempt_evidence
+        from .experiment_transaction import safe
+        reference=f'research/{research.run_id}/attempts/{attempt}/receipt.json'
+        try:
+            proof=read_attempt_evidence(self.output,attempt,limit=1)
+            receipt=read_json(safe(self.output,reference))
+            code=receipt.get('returncode')
+            if (proof.get('receipt_ref')==reference and proof.get('status')=='completed'
+                    and type(code) is int and code==0 and proof.get('returncode')==0
+                    and receipt.get('attempt_id')==attempt and receipt.get('run_id')==research.run_id
+                    and receipt.get('stage')=='evaluate' and receipt.get('node_id')=='evaluate'
+                    and receipt.get('status')=='completed' and receipt.get('termination_reason')=='normal_exit'
+                    and evaluation.get('status')=='completed' and evaluation.get('returncode')==0
+                    and (measurement.get('metric_artifact_evidence') or {}).get('status')=='missing'
+                    and measurement.get('metric_value') is None and not measurement.get('result_artifact')):
+                from .operation_failure import seal
+                failure=seal(self.output,operation='completed_native_scoring',
+                    exc=ValueError(str((measurement.get('metric_reading') or {}).get('why_not') or
+                        measurement.get('why') or 'completed native evaluation result not located')),
+                    context={'native_attempt_id':attempt,'native_receipt_ref':reference,
+                        'measurement_label':measurement.get('label'),
+                        'metric_artifact_evidence':measurement.get('metric_artifact_evidence')},
+                    native_operation_status='completed')
+                train=(measurement.get('train') or {}).get('attempt_id')
+                refs=[f'evidence/{attempt}.json',reference,failure['evidence_ref'],failure['receipt_ref']]
+                if isinstance(train,str) and re.fullmatch(r'[0-9a-f]{32}',train):
+                    refs.append(f'research/{research.run_id}/attempts/{train}/receipt.json')
+                return {**failure,'evaluation_attempt_id':attempt,'training_attempt_id':train,
+                    'failure_category':'completed_native_scoring_failed','repair_owner':'fix',
+                    'native_operation_status':'completed','retryable':False,
+                    'because':'native evaluation completed; result-location postcondition needs repair',
+                    'retry_when':'Fix inspects the sealed completed attempt and native writer. Main '
+                        'may propose a reviewed CPU locator recovery; do not replay completed '
+                        'episodes, retrain, alter metric/protocol, or report missing score as zero.',
+                    'evidence_refs':list(dict.fromkeys(refs))}
+            if (proof.get('receipt_ref')!=reference or proof.get('status')!='failed'
+                    or proof.get('returncode')!=code or receipt.get('attempt_id')!=attempt
+                    or receipt.get('run_id')!=research.run_id or receipt.get('stage')!='evaluate'
+                    or receipt.get('status')!='failed' or type(code) is not int or code==0
+                    or receipt.get('termination_reason')!='nonzero_exit'
+                    or evaluation.get('status')!=receipt['status']
+                    or evaluation.get('returncode')!=code):
+                return {}
+        except (OSError,ValueError,TypeError,KeyError):
+            return {}  # Unverified/unknown ownership must not authorize Fix.
+        reason=str(measurement.get('why') or 'evaluation postcondition failed')
+        train=measurement.get('train') or {}
+        return {'evidence_id':attempt,'evaluation_attempt_id':attempt,
+            'training_attempt_id':train.get('attempt_id') if isinstance(train,dict) else None,
+            'failure_category':'native_evaluation_failed','failure_domain':'native_execution',
+            'repair_owner':'fix','native_operation_status':'failed','retryable':False,
+            'because':f'native evaluation exited {code}; {reason}',
+            'retry_when':'Fix must inspect the sealed failed consumer and preserve the completed '
+                'producer. Main chooses a receipt-bound recovery after diagnosis; do not '
+                'automatically replay, retrain, erase the failure or report it as zero success.',
+            'evidence_refs':list(dict.fromkeys([*(measurement.get('evidence_refs') or []),
+                f'evidence/{attempt}.json',reference]))}
+
+    def _data_consumer_failure(self, research, measurement, *, operation):
+        """Keep a completed producer separate from a failed data-proof operation.
+
+        No source edits, native reruns, reconstructed reader IDs or score changes.
+        The next Data/Fix investigation receives the actual failed postcondition,
+        not the successful training receipt or the already-resolved bundle error.
+        """
+        usage=measurement.get('data_consumption') if isinstance(measurement,dict) else None
+        if (not isinstance(usage,dict) or usage.get('status')!='unverified'
+                or measurement.get('ok') is not False
+                or measurement.get('where') not in {'training_data','policy_artifact'}):
+            return {}
+        from .operation_failure import seal
+        from .experiment_transaction import safe
+        label=measurement.get('label')
+        reference=None;fingerprint=None
+        if isinstance(label,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,80}',label):
+            path=safe(research.output,f'research/{research.run_id}/measurements/{label}.json')
+            if path.is_file():
+                reference=path.relative_to(research.output).as_posix();fingerprint=digest(path)
+        train=measurement.get('train') or {}
+        if not isinstance(train,dict):
+            train={}
+        reason=str(usage.get('why') or measurement.get('why') or 'training data consumption not verified')
+        evidence=seal(self.output,operation=operation,exc=ValueError(reason),
+            native_operation_status='not_started',context={
+                'measurement_ref':reference,'measurement_sha256':fingerprint,
+                'measurement_label':label,
+                'training_attempt_id':train.get('attempt_id'),
+                'completed_producer_preserved':train.get('status')=='completed' and train.get('returncode')==0,
+                'measurement_failure_scope':measurement.get('where'),
+                'related_policy_handoff':measurement.get('artifact_selection') or {},
+                'data_consumption':usage,'scope':'pre-evaluation data-proof failure; historical training is not a failed native attempt'})
+        return {**evidence,'failure_category':'training_data_consumption_unverified',
+            'failure_scope':'training_data_consumer','repair_owner':'data',
+            'training_attempt_id':train.get('attempt_id'), 'measurement_label':label,
+            'related_policy_handoff':measurement.get('artifact_selection') or {},
+            'data_consumption':usage,'why':reason,'retryable':False,
+            'retry_when':'Do not repeat the unchanged sealed consumer log or invent reader/batch counts. '
+                'Delegate Data/Fix source analysis and choose new evidence or an audited candidate '
+                'when needed; preserve the completed model and every original failure.',
+            'evidence_refs':[evidence['evidence_ref'],*([reference] if reference else [])]}
+
+    def _step_correct_policy_handoff(self, *, label: str, checkpoint_ref: str = '',
+                                   job_id: str = '',
+                                   artifact_revision: dict[str,Any] | None = None) -> dict[str, Any]:
+        if artifact_revision is not None and (job_id or checkpoint_ref):
+            raise ValueError('CPU locator recovery, checkpoint_ref and job_id are mutually exclusive')
+        if job_id and checkpoint_ref:
+            raise ValueError('completed evaluation job_id and checkpoint_ref are mutually exclusive; '
+                'omit job_id to evaluate a completed training bundle, or omit checkpoint_ref '
+                'to link an offered completed EVALUATE job; '
+                'a training attempt ID is not an evaluation job_id')
         from .handoff_correction import correct
         research, _ = self._research_controller()
-        result = correct(research, label=label)
+        if artifact_revision is not None:
+            from .completed_score_recovery import record
+            try:
+                linked=record(research,label=label,artifact_revision=artifact_revision)
+            except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+                return self._business_refusal(operation='correct_policy_handoff',
+                    because=f'completed development score recovery refused: {exc}',
+                    category='completed_score_recovery_failed',owner='fix',
+                    context={'label':label,'locator_review_ref':getattr(exc,'review_ref',None),
+                        'locator_review':getattr(exc,'review',None)},
+                    next_action='Read the exact source/locator refusal; preserve completed work. '
+                        'Do not repeat evaluation, alter the frozen metric or force approval.')
+            return {'outcome':'measurement_recorded','because':'completed native score independently '
+                    'recovered on CPU; original failure, baseline and incumbent unchanged',
+                'native_replayed':False,'metric_value':linked['metric_value'],
+                'measurement_ref':f"research/{self.run_id}/measurements/{linked['label']}.json",
+                'evidence_refs':[f"research/{self.run_id}/measurements/{linked['label']}.json",
+                    f"research/{self.run_id}/"+linked['scoring_recovery']['attachment_ref']]}
+        if job_id:
+            from .completed_evaluation_recovery import record
+            linked=record(research,label=label,job_id=job_id)
+            return {'outcome':'measurement_recorded','because':'linked verified completed native evaluation; '
+                    'no retraining, evaluation replay, baseline replacement or best adoption',
+                    'metric_value':linked['metric_value'],'training_reused':True,
+                    'training_attempt_id':linked['train']['attempt_id'],
+                    'evaluation_attempt_id':linked['evaluate']['attempt_id'],
+                    'measurement_ref':f"research/{self.run_id}/measurements/{linked['label']}.json",
+                    'evidence_refs':[f"research/{self.run_id}/measurements/{linked['label']}.json",
+                        f"research/{self.run_id}/"+linked['completed_evaluation_link']['attachment_ref']]}
+        result = correct(research, label=label, **({'checkpoint_ref':checkpoint_ref} if checkpoint_ref else {}))
         return {'outcome':'measurement_recorded' if result.get('ok') else 'not recovered',
                 'because':result.get('why') or 'additive corrected-policy evaluation; original score preserved',
                 'training_reused':bool(result.get('handoff_correction', {}).get('training_reused')),
                 'metric_value':result.get('metric_value'),
                 'correction':result.get('handoff_correction'),
                 'training_progress_revalidation':result.get('training_progress_revalidation'),
-                'evidence_refs':result.get('evidence_refs') or []}
+                'evidence_refs':result.get('evidence_refs') or [],
+                **(result.get('recovery_failure') or {}),
+                **self._native_evaluation_failure(research,result),
+                **self._data_consumer_failure(research,result,operation='corrected_policy_data_validation')}
 
     def _step_adopt_linked_measurement(self, *, label: str, expected_best: str,
                                      measurement_sha256: str) -> dict[str, Any]:
@@ -7342,6 +9084,23 @@ class Preparation:
         if not self.base_settings.get("_confirm"):
             return {"outcome": "not attempted",
                     "because": "independent confirmation was not explicitly requested"}
+        from .data_campaign import pending
+        try:
+            from .research_brief import view as study_intent
+            intent = study_intent(self.output)
+            require_campaign = (intent.get('requirements') or {}).get('data_comparison') is True
+            outstanding = pending(self.output,self.run_id,
+                **({'require_campaign':True} if require_campaign else {}))
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            return self._business_refusal(operation='confirm_best',because=str(exc),
+                category='data_campaign_obligations',owner='data',
+                next_action='repair the frozen data plan/outcome evidence before independent finalization')
+        if outstanding:
+            return self._business_refusal(operation='confirm_best',
+                because='prespecified data arms remain unresolved; do not close development before completing them',
+                category='data_campaign_obligations',owner='data',context={'pending':outstanding[:16]},
+                next_action='complete native acquisition/consumption/evaluation and record_data_campaign_arm; '
+                            'or use its boundary field with positive evidence for independent review')
         report_path = self.output / "research" / self.run_id / "research_report.json"
         try:
             report = read_json(report_path)
@@ -7366,10 +9125,9 @@ class Preparation:
                     'failure_category': 'candidate_source_invalid'}
         research, _ = self._research_controller()
         before = research.confirmation_state()
-        if before.get("status") != "available_not_taken":
+        if before.get("status") not in {"available_not_taken", "admission_refused", "engineering_recovery_approved"}:
             return {"outcome": "not attempted",
-                    "because": f"confirmation is {before.get('status')}: "
-                               f"{before.get('why') or 'not available'}"}
+                    "because": f"confirmation is {before.get('status')}; independent Supervisor review is required; held-out details are not returned"}
         result = research.confirm()
         after = research.confirmation_state()
         report["confirmation"] = after
@@ -7380,6 +9138,37 @@ class Preparation:
             "training_performed": False,
         }
         atomic_json(report_path, report)
+        failure = result.get("engineering_failure") or {}
+        if not result.get("ok") and failure:
+            preflight = failure.get("held_out_exposure") == "not_started"
+            if not preflight:
+                # Old and new launched failures both get a score-free engineering packet.
+                # It grants diagnosis only; exposure remains an independent decision.
+                try:
+                    from .confirmation_execution_recovery import engineering_summary
+                    from .operation_failure import seal
+                    safe = engineering_summary(research.run_root, self.output)
+                    sealed = seal(self.output, operation='confirm_best_engineering',
+                        exc=RuntimeError('native setup/API/resource traceback requires CPU diagnosis'),
+                        context=safe)
+                    failure = {**failure, **sealed, 'repair_owner': 'fix',
+                        'because': 'confirmation failed; inspect sealed traceback locations, diagnose on CPU, then request independent exposure review'}
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass  # Unknown evidence stays closed, never invent a diagnostic.
+            return {"outcome": "not attempted" if preflight else "confirmation failed",
+                    "because": failure["because"], "training_performed": False,
+                    "failure_category": failure["failure_category"],
+                    "repair_owner": failure["repair_owner"],
+                    "retryable": failure.get("retryable") is True,
+                    "native_operation_status": "not_started" if preflight else "not_inferred",
+                    "held_out_exposure": failure["held_out_exposure"],
+                    "where": failure.get("where"), "evidence_id": failure["evidence_id"],
+                    "evidence_refs": [failure["evidence_ref"], failure["receipt_ref"]],
+                    "repair_handoff": {"owner": failure["repair_owner"],
+                        "evidence_id": failure["evidence_id"],
+                        "next_action": "inspect sealed engineering failure; repair source identity only; preserve protocol and recheck exposure before any retry" if preflight else
+                                       "CPU-only engineering diagnosis; review_confirmation_failure with sealed repair probe; no rollout or retry before independent approval",
+                        "authority": "advisory_not_edit_or_retry_authorization"}}
         return {"outcome": "measurement_recorded" if result.get("ok") else
                 "measurement_unavailable",
                 "because": ("the authorized held-out evaluation produced a record; its "
@@ -7389,6 +9178,79 @@ class Preparation:
                             "in the run evidence and the Scheduler does not receive held-out "
                             "values"),
                 "training_performed": False}
+
+    def _step_diagnose_confirmation_failure(self) -> dict[str, Any]:
+        from .common import immutable_json
+        from .confirmation_execution_recovery import engineering_summary, probe_connections
+        from .operation_failure import seal
+        root = self.output / 'research' / self.run_id
+        try:
+            safe = engineering_summary(root, self.output)
+            path = root / 'confirmation_engineering_handoffs' / (safe['subject_sha256'] + '.json')
+            if path.exists():
+                return {'outcome': 'already diagnosed', 'because': 'reuse sealed diagnosis for this exact failure',
+                        'evidence_id': read_json(path)['evidence_id']}
+            probe = {}
+            try:
+                research, _ = self._research_controller()
+                probe = probe_connections(root, self.output, interpreter=self.interpreter,
+                    original_repo=self.repo, snapshots=research.snapshots,
+                    timeout=min(30, self.budget.remaining()) if self.budget else 30)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+                probe = {'status': 'unverified', 'because': str(exc)[:300]}
+            row = seal(self.output, operation='confirm_best_engineering',
+                exc=RuntimeError('native resource/import/API failure; CPU diagnosis required'),
+                context={**safe, 'connection_probe': probe})
+            immutable_json(path, row)
+            return {'outcome': 'diagnosis required', 'because': safe['guidance'],
+                    'evidence_id': row['evidence_id'], 'repair_owner': 'fix',
+                    'failure_category': 'confirmation_engineering', 'retryable': False,
+                    'connection_probe': probe}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            return {'outcome': 'blocked', 'because': f'engineering evidence unavailable: {exc}'[:500]}
+
+    def _step_review_confirmation_failure(self, *, diagnostic_evidence_id: str,
+                                         reason: str) -> dict[str, Any]:
+        from .confirmation_execution_recovery import review, cached_review
+        from .baseline_reference import source_evidence
+        from .agent_client import role_scope
+        from .execution_derive import _object
+        if not isinstance(reason, str) or not 1 <= len(reason) <= 1000:
+            return {'outcome': 'not attempted', 'because': 'bounded review reason required'}
+        def independent(packet):
+            cached = cached_review(self.output / 'research' / self.run_id, self.output,
+                                   diagnostic_evidence_id=packet['diagnostic_evidence_id'])
+            if cached:
+                value = {**cached[0], 'reused_independent_review_ref': cached[1]}
+            else:
+                with role_scope(self.client, 'supervisor'):
+                    answer, _ = self.client.chat_with_metadata(
+                        'Independently audit a LAUNCHED confirmation engineering failure. '
+                        'Inspect source control flow and ALL historic native failures. Missing scores, '
+                        'an attempt ID, lack of log markers, or a generic successful CPU probe are NOT '
+                        'proof of no exposure. Require positive evidence the exception happened before '
+                        'any reserved-state reset/rollout/metric observation, and the CPU probe validates '
+                        'the SAME repaired resource/import/API connection using development inputs. '
+                        'Inspect frozen policy/protocol preservation. Never relay held-out values. '
+                        'Return JSON verdict=setup_only|unknown|exposed, booleans '
+                        'setup_only_positive_evidence,no_rollout_or_metric_exposure,'
+                        'repair_probe_covers_original_failure,frozen_policy_protocol_preserved, '
+                        'positive_evidence (1..12000 characters), and source_refs '
+                        '(nonempty exact checkout-relative ref/quote objects). Unknown stays closed.',
+                        json.dumps(packet, ensure_ascii=False), max_tokens=2400,
+                        read_only=True, include_research_context=False)
+                value = _object(answer)
+            value['source_refs'] = source_evidence(self.repo, value.get('source_refs'), output=self.output)
+            value['_source_hashes'] = {str(self.repo / row['ref'].split(':')[0]): row['sha256']
+                for row in value['source_refs'] if not row['ref'].startswith(('native-source:', 'checkout-source:'))}
+            return value
+        try:
+            value = review(self.output / 'research' / self.run_id, self.output,
+                           diagnostic_evidence_id=diagnostic_evidence_id, reviewer=independent)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            return {'outcome': 'not attempted', 'because': f'confirmation recovery review refused: {exc}'[:500]}
+        return {'outcome': 'recovery approved' if value['approved'] else 'blocked',
+                'because': value['because'], 'confirmation_recovery': value}
 
     def _step_stop(self, *, because: str = "") -> dict[str, Any]:
         return {"outcome": "stopped", "because": because or "the model chose to stop"}
@@ -7599,6 +9461,7 @@ class Preparation:
             "data_assets": [{key:row.get(key) for key in ('id','kind','record_sha256')}
                 for row in (facts.get('data_versions') or [])[-16:] if isinstance(row,dict)],
             "research_brief_sha256": (facts.get('research_brief') or {}).get('sha256'),
+            "research_requirements_sha256": (facts.get('research_brief') or {}).get('requirements_sha256'),
             "data_campaigns_digest": object_digest(facts.get('data_campaigns') or []),
             "baseline_diagnosis": {key:(facts.get('baseline_diagnosis') or {}).get(key)
                                    for key in ('status','subject_sha256','decision')},
@@ -7764,6 +9627,18 @@ class Preparation:
         call a model. Heartbeat presentation continues through the cheap record path.
         """
         facts = self.state()
+        from .round_extension import allocation_view
+        facts['local_round_allocation']=allocation_view(facts.get('research_progress'),
+                                                       facts.get('available') or [])
+        facts['total_wall_budget'] = {
+            'scope':'whole_run', 'observed_at':now(),
+            'remaining_seconds':max(0,self.budget.remaining()) if self.budget else None,
+            'authority':'current executor observation, not a grant or job-window reservation',
+            'rule':'Job windows must fit the remaining total wall at actual submission. '
+                'GPU seconds and model dollars are separate constraints, not wall allowances. '
+                'Main/Resource choose local windows and evaluation/recovery headroom; '
+                'the executor rechecks current hard totals without silently clipping a request.',
+        }
         from .operation_contracts import schema
         from .experiment_view import view as experiment_view
         from .usage_reconciliation import due
@@ -7774,13 +9649,98 @@ class Preparation:
         from .execution_interface import catalog as interface_catalog
         facts['usage_reconciliation'] = due(self.output)
         facts['experiment_lifecycle'] = experiment_view(self.output, self.run_id)
+        from .main_agent import report_delivery_view
+        facts['report_delivery_recovery'] = report_delivery_view(self.output)
         facts['research_milestones'] = milestone_view(self.output,self.run_id,facts)
         facts['data_versions'] = catalog(self.output)
+        from .data_registration_review import latest as latest_registration_review
+        facts['latest_data_registration_review'] = latest_registration_review(
+            self.output, facts['data_versions'])
+        from .development_evidence import reader_failure_diagnostics
+        facts['sealed_training_reader_failures'] = reader_failure_diagnostics(
+            self.output/'research'/self.run_id)
+        from .source_continuity import view as source_continuity_view
+        facts['current_source_continuity'] = source_continuity_view(
+            self.output, self.repo, self.run_id)
         facts['baseline_diagnosis'] = diagnosis_view(self.output, self.run_id)
         facts['research_efficiency'] = efficiency_view(self.output, lifecycle=facts['experiment_lifecycle'])
         facts['execution_interfaces'] = interface_catalog(self.output)
+        # Main must see the constraints the executor applies, even before a baseline.
+        # Native inspection deliberately does not mount private framework/scouting
+        # files; the Agent should not have to search there for declared axis bounds.
+        try:
+            facts['declared_space'] = space_from(self.declaration).describe()
+            facts['declared_space_status'] = 'current_declaration_constraints_not_native_verification'
+        except (ValueError, TypeError, KeyError) as exc:
+            facts['declared_space'] = {}
+            facts['declared_space_status'] = 'unreadable'
+            facts['declared_space_error'] = redact(f'{type(exc).__name__}: {exc}')[:500]
         facts['operation_contracts'] = {name:schema(getattr(self,f'_step_{name}'))
             for name in facts.get('available',[]) if callable(getattr(self,f'_step_{name}',None))}
+        from .training_work import consumes_input
+        # This is public grammar, not an observed dataset identity. Naming the
+        # container `dataset` makes the privacy projection erase the WHOLE guide.
+        facts['executor_input_contracts'] = {'dataset_selection': {
+            'candidate_setting': 'dataset', 'value_format': 'data-version:<registered_id>',
+            'scope_rule':'This is an executor training_settings input, NOT an automatic new '
+                'param/algo idea axis. Those ideas must still name declared_space.training axes. '
+                'Do not rename native axes or assume dataset_root is the same slot. An audited '
+                'code candidate can request this source-backed slot via training_settings; '
+                'it must explicitly include any needed reverted source repair.',
+            'selection_metadata': 'train inputs.selected_training_data is a list of '
+                '{id, setting, path} from verified resolved bindings; includes no expected byte hashes. '
+                'A source-backed builder may route the registered ID and canonical slot through '
+                'a real native parser/config. Existing builders do not adopt this channel automatically; '
+                'inspect/rederive the command if needed. Do not place this metadata in extra, '
+                'which some native builders convert wholesale into CLI flags. Path-derived IDs are not registered IDs.',
+            'native_selection_environment': 'The same labels, and ONLY id/setting/path, are supplied '
+                'to the native process as AUTOSIM_TRAIN_SELECTION_JSON by '
+                'research/derived_research.py:_run_stage (staging: declarative_backend.py; '
+                'verification: execution_derive.py). Empty means []. '
+                'A source-reviewed native reader may consume this without changing the '
+                'frozen train argv builder. After baseline, checkout edits must use an audited '
+                'code candidate; research_task(edit) is not allowed. No expected hashes/counters '
+                'are supplied; actual batch/byte evidence remains mandatory.',
+            'trainer_builder_reads_slot': consumes_input(self.stages.get('train',''), 'dataset'),
+            'route': 'caller dataset -> resolve registered version -> inputs.dataset -> verified native builder',
+            'authority': 'request grammar only; current consumer review, actual byte identity and batch witness still required',
+            'guidance': 'Native flags may differ. Do not guess dataset_root aliases or infer that '
+                        'a version label has already been passed to the native reader.'},
+            'data_acquisition': {
+                'collect_interface_installed': bool(self.stages.get('collect')),
+                'installed_artifact_pattern': (self.verified.get('collect') or {}).get('artifact'),
+                'builder_input_reads': {key: consumes_input(self.stages.get('collect', ''), key)
+                    for key in ('episodes', 'seed', 'collection_controls')},
+                'builder_input_authority': 'static key reads only, not observed control effect; '
+                    'an unconsumed top-level input is not an alias for a native control',
+                'independent_control_review': {
+                    'scope': 'explicit collection_controls and necessary validity dependencies, '
+                        'not every unchanged default or declared axis; an implicated default '
+                        'requires an explicit dependency reason',
+                    'citation_format_repair_limit': 1,
+                    'scientific_denial_precedes_citation_format': True,
+                    'format_repair_scope': 'supplied source IDs only; original scientific verdict unchanged',
+                    'exhausted_delivery_owner': 'supervisor',
+                    'boundary_rule': 'review delivery failure is not a native acquisition capability boundary'},
+                'scope':'interface verification and formal acquisition are different operations',
+                'formal_producer_operation':'submit_native_job',
+                'formal_producer_stage':'collect',
+                'control_path_semantics': 'Native control values are not automatically resolved '
+                    'as run-output resource handles. A relative artifact reference may not exist '
+                    'under the native checkout cwd. Inspect the selected builder and actual '
+                    'consumer; establish a source-backed path binding rather than assume '
+                    'that output-relative and checkout-relative namespaces are interchangeable.',
+                'guidance':'After successful collect derivation, choose explicit collection_settings '
+                    'and resources for a formal job. derivation_native evidence is a probe, not a '
+                    'formal producer; an empty artifact there does not invalidate the installed '
+                    'directory declaration. Inspect the NEW formal receipt before registration. '
+                    'Controls may receive source/routing/label-supply review before the first '
+                    'bounded collection; actual effect remains unverified until native observation. '
+                    'Do not require a prior observed control effect as a prerequisite to its '
+                    'first source-reviewed native test. Agent chooses the experiment and budget.'}}
+        if getattr(self.client, 'supports_main_agent', False):
+            from .prompt_library import scheduler_guidance
+            facts['research_guidance'] = scheduler_guidance(self.output, operation_names=OPERATIONS)
         return facts
 
     def choose(self) -> dict[str, Any]:
@@ -7893,7 +9853,8 @@ class Preparation:
                     request["auto_skills"] = False
                 content, metadata = self.client.chat_with_metadata(
                     scheduler_request_prompt(
-                        operations=operations,permitted=permitted,operation_names=OPERATIONS), payload, **request)
+                        operations=operations, permitted=permitted, operation_names=OPERATIONS,
+                        on_demand=bool(getattr(self.client, 'supports_main_agent', False))), payload, **request)
                 trace = _coding_agent_turn_trace(metadata, decision_attempt_id)
                 if trace is not None:
                     coding_agent_traces.append(trace)
@@ -7944,7 +9905,13 @@ class Preparation:
                     validate(facts['operation_contracts'][requested], row.get('arguments', {}))
                     if requested == 'propose_research_idea':
                         from .ideas import validate_main_proposal
-                        validate_main_proposal(row['arguments']['idea'], repo=self.repo)
+                        proposed_idea = row['arguments']['idea']
+                        if isinstance(proposed_idea, dict) and 'reuse_idea_label' in proposed_idea:
+                            from .idea_reproposal import expand_reproposal
+                            from .ideas import IdeaLibrary
+                            proposed_idea, _ = expand_reproposal(proposed_idea,
+                                IdeaLibrary(self.output/'research'/self.run_id/'ideas.json'))
+                        validate_main_proposal(proposed_idea, repo=self.repo)
                 except (TypeError, ValueError) as exc:
                     action_argument_error = f'{requested} argument contract: {exc}; no action ran'
             if requested == 'derive_a_command':
@@ -8398,7 +10365,7 @@ class Preparation:
                 self.last_action = dict(self.steps[-1])
                 self._persist_run_state(status="budget_exhausted")
                 break
-            self.current_action = {"step": "choose", "status": "running",
+            self.current_action = {"step": "choose", "status": "running", "parent_action": None,
                                    "started_at": now()}
             self._persist_run_state(status="running")
             if self.state_persistence_error:
@@ -8627,7 +10594,8 @@ class Preparation:
                         "candidate_failure", "task_id", "study_id", "screening_result", "screening",
                         "failure_domain", "repair_owner", "recovery_parent_ref",
                         "recovery_owner", "replayed_arguments", "original_failure_reason", "native_operation",
-                        "resume_scope", "retryable", "retry_when", "native_operation_status", "repair_handoff"):
+                        "resume_scope", "retryable", "retry_when", "native_operation_status", "repair_handoff",
+                        "adoption_admission", "independent_review"):
                 value = result.get(key)
                 if value or (key == 'retryable' and value is False):
                     step_result[key] = list(value) if isinstance(value, tuple) else value
@@ -8650,10 +10618,15 @@ class Preparation:
                 step_result["arguments"] = {"stage": arguments["stage"], **(
                     {"timeout_seconds": arguments["timeout_seconds"]}
                     if "timeout_seconds" in arguments else {})}
+                for key in ('draft_ref','checkpoint_ref','draft_rebind_inputs'):
+                    if key in arguments:
+                        step_result['arguments'][key]=arguments[key]
             elif step == "build_the_environment":
                 step_result["arguments"] = {"max_operations": arguments.get("max_operations", 1)}
             elif step == "propose_harness_repair":
                 step_result["arguments"] = {"evidence_id": arguments.get("evidence_id")}
+                if 'source_paths' in arguments:
+                    step_result['arguments']['source_paths']=arguments['source_paths']
                 for key in ("repair_id", "proposal_ref", "failure_evidence_id", "activation_allowed"):
                     if key in result:
                         step_result[key] = result[key]
@@ -8674,6 +10647,11 @@ class Preparation:
                   isinstance(arguments.get("idea"), dict)):
                 step_result["arguments"] = {
                     "idea_label": str(arguments["idea"].get("label") or "")}
+                if 'reuse_idea_label' in arguments['idea']:
+                    step_result['arguments']['reproposal'] = {
+                        key: arguments['idea'][key] for key in
+                        ('reuse_idea_label', 'expected_idea_sha256', 'reason')
+                        if key in arguments['idea']}
             elif (step == "discard_interrupted_candidate" and
                   isinstance(arguments.get("reason"), str)):
                 step_result["arguments"] = {
@@ -8749,7 +10727,8 @@ class Preparation:
                                 "receipt_ref": receipt_ref,
                                 "receipt_sha256": receipt["receipt_sha256"],
                                 **{key:step_result[key] for key in ('evidence_id','failure_category',
-                                    'repair_owner','retryable','retry_when','repair_handoff') if key in step_result},
+                                    'repair_owner','retryable','retry_when','repair_handoff',
+                                    'independent_review') if key in step_result},
                                 "finished_at": now()}
             self._resolve_controller_decision(decision_id, {
                 **step_result})
@@ -8791,12 +10770,18 @@ class Preparation:
                         current="AgentMonitor assessment")
                     if observation.get("status") == "budget_exhausted":
                         break
-            if (step_result.get('failure_domain') != 'framework_plan' and
+            # Most rejected plans belong to their planner, but an explicitly
+            # sealed Fix handoff is a read-only diagnosis request even when the
+            # exception adapter classified it as framework_plan. The recipient
+            # still authenticates its evidence before buying a model turn.
+            if ((step_result.get('failure_domain') != 'framework_plan' or
+                 _sealed_fix_handoff(step_result)) and
                 step_result.get('failure_category') not in {'operation_arguments_invalid','candidate_input_required'} and
                 ((step_result["outcome"] in _FIX_ASSISTANCE_OUTCOMES and
                   step in _FIX_ASSISTANCE_STEPS) or
                  (step == "run_the_loop" and step_result.get("candidate_failure")) or
                  _sealed_fix_handoff(step_result)) and
+                    (step_result.get('candidate_failure') or {}).get('failure_scope') != 'candidate_source_preflight' and
                     step_result.get("delegated_role") != "fix"):
                 failed_step_index = len(self.steps) - 1
                 fix_observation = self._with_heartbeat(
@@ -8853,8 +10838,8 @@ class Preparation:
         progress = report["state"].get("research_progress") or {}
         research_completed = progress.get("status") == "completed"
         confirmation_pending = (bool(self.base_settings.get("_confirm")) and
-                                progress.get("confirmation", {}).get("status") ==
-                                "available_not_taken")
+                                progress.get("confirmation", {}).get("status") in
+                                {"available_not_taken", "admission_refused", "engineering_recovery_approved"})
         budget_exhausted = ((self.budget and self.budget.remaining() <= 0) or
                             last.get("outcome") == "exhausted" or
                             self.monitor_observation.get("status") == "budget_exhausted" or
@@ -8863,9 +10848,7 @@ class Preparation:
         explicitly_stopped = (last.get("step") == "stop" or
                               last.get("outcome") == "stopped")
         interrupted_reconciled = last.get("step") == "reconcile_interrupted_action"
-        if research_completed and measured and not confirmation_pending:
-            report["status"] = "completed"
-        elif last.get("outcome") == "infrastructure_blocked":
+        if last.get("outcome") == "infrastructure_blocked":
             report["status"] = "infrastructure_blocked"
         elif last.get('outcome') == 'paused':
             report['status'] = 'paused'
@@ -8878,6 +10861,15 @@ class Preparation:
                 report['resume_requirement'] = 'provider-backed settlement or explicit additional budget; never clear unknown holds'
         elif last.get("outcome") == "raised":
             report["status"] = "internal_error"
+        elif self.base_settings.get('_confirm') and progress.get('confirmation', {}).get('status') == 'attempted_and_failed':
+            report['status'] = 'confirmation_failed'
+            report['termination_scope'] = 'engineering_or_exposure_review_required'
+        elif research_completed and measured and not confirmation_pending:
+            report["status"] = "completed"
+            report["research_outcome"] = ("confirmed_measurement" if
+                progress.get("confirmation", {}).get("status") == "taken" else
+                "development_only_confirmation_unavailable" if self.base_settings.get("_confirm") else
+                "development_only")
         elif explicitly_stopped:
             report["status"] = "adaptation_unresolved"
             latest_setup = next((row for row in reversed(self.steps)
@@ -8972,7 +10964,7 @@ class Preparation:
             "metric_binding": facts.get("metric_binding"),
             "research_progress": {key: progress.get(key) for key in (
                 "status", "round_count", "measured_rounds", "best_candidate",
-                "next_round", "planned_rounds", "confirmation")},
+                "next_round", "planned_rounds", "confirmation", "recorded_incumbent")},
             "research_options": {
                 "status": options.get("status"),
                 "generation_attempted": options.get("generation_attempted"),

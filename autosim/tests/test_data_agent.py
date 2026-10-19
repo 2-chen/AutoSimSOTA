@@ -72,3 +72,21 @@ def test_data_skill_selection_uses_original_local_window(monkeypatch):
     assert data_agent.remaining_window(100, 40) == 15
     with pytest.raises(TimeoutError, match="local window exhausted"):
         data_agent.remaining_window(100, 25)
+
+
+@pytest.mark.parametrize('method', ['generating-adapted-demonstrations',
+                                   'collecting-expert-corrections',
+                                   'auditing-demonstration-quality'])
+def test_new_method_is_read_only_and_explicitly_selected_without_keywords(method):
+    identity = 'autosimsota.' + method
+    client = Selector({'skill_reads': [{'id': identity, 'why': 'Investigate verified data capability'}]})
+    result = data_agent.select_methods(client, {**ASSIGNMENT, 'task': 'zxyqv pqqvv'}, {}, timeout=10)
+    entries = client.calls[0][1]['skill_catalog']['entries']
+    entry = next(row for row in entries if row['id'] == identity)
+    assert not entry['recommended_by_keyword'] and 'method' not in entry
+    selected = result['method_library']['skills']
+    assert len(selected) == 1 and selected[0]['id'] == identity
+    assert selected[0]['body_sha256']
+    assert not result['skill_selection_issues'] and len(client.calls) == 1
+    assert result['method_library']['selection'][0]['selected_by'] == 'data_agent'
+    assert client.calls[0][2]['read_only'] is True

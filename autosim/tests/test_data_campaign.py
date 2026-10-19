@@ -61,6 +61,22 @@ def plan():
                            'seeds': [0, 1], 'compute_accounting': '包括失败采集、转换、训练、rollout及模型调用。'}}
 
 
+def test_v2_fields_without_version_give_an_exact_repair_not_a_hidden_upgrade(tmp_path):
+    score(tmp_path)
+    proposal=plan();proposal['comparison']['budget_axis']='accepted_episodes'
+    with pytest.raises(ValueError,match=r'explicit campaign.schema_version=2') as error:
+        data_campaign.register(tmp_path,'derived',proposal)
+    assert "unsupported=['budget_axis']" in str(error.value)
+    assert not (tmp_path/'data_campaigns/failure_slice/plan.json').exists()
+
+
+def test_linked_label_spelling_alone_cannot_qualify_a_data_measurement(tmp_path):
+    label='round_4_eval_'+('b'*12)
+    score(tmp_path,label=label)
+    with pytest.raises(ValueError,match='exact completed-job proof'):
+        data_campaign._measurement(tmp_path,'derived',label)
+
+
 def test_register_is_immutable_hypothesis_not_an_experiment(tmp_path):
     score(tmp_path)
     record = data_campaign.register(tmp_path, 'derived', plan())

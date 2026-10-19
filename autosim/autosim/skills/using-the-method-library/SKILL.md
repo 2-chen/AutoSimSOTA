@@ -44,6 +44,9 @@ benchmark scope 限制历史材料适用范围；general 只表示方法可跨�
 - [where-successes-come-from](../where-successes-come-from/SKILL.md)：谁提供动作，是否能自主产生训练轨迹？
 - [connecting-native-data-collection](../connecting-native-data-collection/SKILL.md)：原生采集→转换→真实 loader 如何接通？
 - [targeting-simulation-data](../targeting-simulation-data/SKILL.md)：从开发失败选择训练场景及正确动作来源，再核验成功、字段和消费；零成功不能自举。
+- [generating-adapted-demonstrations](../generating-adapted-demonstrations/SKILL.md)：MimicGen对象/子任务适配，及DexMimicGen、SkillGen后端；先查接口，不复制关节数组。
+- [collecting-expert-corrections](../collecting-expert-corrections/SKILL.md)：DAgger状态查询、聚合和动作块标签，按能力考虑DART、AIM或恢复分支。
+- [auditing-demonstration-quality](../auditing-demonstration-quality/SKILL.md)：同步、监督、来源重复与覆盖分开检查，默认seed与动作重复不掩盖真实价值。
 - [curating-simulation-datasets](../curating-simulation-datasets/SKILL.md)：采什么/多少、可逆清洗、来源混合、真实曝光与数据价值方法的成本。
 - [preserving-research-data](../preserving-research-data/SKILL.md)：raw/派生版本/缓存区分、来源血缘、复用条件、备份和数据保护；不授权删除或上传。
 - [budget-attempts-not-episodes](../budget-attempts-not-episodes/SKILL.md)：失败重试和接受目标实际花多少资源？

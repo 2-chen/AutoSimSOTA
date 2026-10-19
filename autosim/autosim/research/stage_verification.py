@@ -76,7 +76,10 @@ def recent_attempts(output: Path, limit: int = 6) -> list[dict]:
             if record.get('id') != identity:
                 continue
             row = {key:record.get(key) for key in ('id','stage','status','started_at',
-                'finished_at','seconds','argv','verification_output')}
+                'finished_at','seconds','argv','verification_output','gpu_allowed')}
+            row['resource_scope'] = ('GPU access granted; not a utilization measurement'
+                if record.get('gpu_allowed') is True else 'CPU-only execution grant'
+                if record.get('gpu_allowed') is False else 'resource grant unknown')
             row['receipt_ref'] = path.relative_to(output).as_posix()
             if record.get('evidence_id') == identity:
                 evidence_path = output/'evidence'/f'{identity}.json'

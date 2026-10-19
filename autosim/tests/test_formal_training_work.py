@@ -9,6 +9,64 @@ from autosim.research.common import atomic_json, digest, read_json
 from autosim.research.ideas import Idea, execution_compatibility
 
 
+@pytest.mark.parametrize('fault', ['', 'valid', 'changed_log', 'changed_selection',
+    'changed_card', 'wrong_producer', 'wrong_scope', 'wrong_environment', 'wrong_settings'])
+def test_sealed_reader_failure_is_visible_without_recertifying_or_mutating(tmp_path, fault):
+    from autosim.research import data_versions as versions
+    from autosim.research.development_evidence import reader_failure_diagnostics
+    from autosim.research.evidence_store import capture_attempt_evidence
+    from autosim.research.common import object_digest
+    output = tmp_path/'out'; repo = output/'checkout'; repo.mkdir(parents=True)
+    data = output/'extra.json'; data.write_text('[1,2]')
+    versions.register(output, repo,
+        dict(id='extra', dataset_ref='extra.json', source_refs=[], reason='fixture'),
+        dict(allowed_training_data=True, loader_connection_supported=True, sources_supported=True))
+    settings, bindings = versions.resolve(output, repo, {'dataset':'data-version:extra', 'steps':1000})
+    attempt = 'd'*32; root = output/'research/derived'
+    proof = {**versions.seal_selection(output, 'derived', 'round_16', settings, bindings),
+             'training_attempt_id':attempt}
+    environment = {'AUTOSIM_TRAIN_SELECTION_JSON':json.dumps(versions.training_metadata(bindings, settings))}
+    train = dict(attempt_id=attempt, status='completed', returncode=0, environment=environment)
+    row = dict(label='round_16', ok=False, where='policy_artifact', train=train,
+               settings=settings, data_selection=proof)
+    native = dict(data_version_id='extra' if fault=='valid' else None, setting='dataset',
+                  identity_field=bindings[0]['identity_field'], identity=bindings[0]['identity'], samples_read=8)
+    log = output/'train.log'; log.write_text(versions.MARKER+json.dumps(native)+'\n')
+    receipt_ref = f'research/derived/attempts/{attempt}/receipt.json'
+    receipt = dict(**train, run_id='derived', stage='train', settings_digest=object_digest(settings))
+    if fault=='wrong_scope':receipt['stage']='evaluate'
+    if fault=='wrong_environment':receipt['environment']={}
+    if fault=='wrong_settings':receipt['settings_digest']='0'*64
+    atomic_json(output/receipt_ref, receipt)
+    capture_attempt_evidence(output, attempt_id=attempt, log=log, receipt_ref=receipt_ref,
+        status='completed', returncode=0, termination_reason='normal_exit')
+    if fault=='wrong_producer':row['data_selection']['training_attempt_id']='a'*32
+    atomic_json(root/'measurements/round_16.json', row)
+    # Later successful corrections or unbound trials are not reader failures.
+    # Selecting the last three files BEFORE filtering used to hide round_16.
+    for index in range(20,25):
+        atomic_json(root/f'measurements/round_{index}.json',
+                    {'label':f'round_{index}','ok':False,'where':'policy_artifact',
+                     'train':train,'data_selection':None})
+    atomic_json(root/'measurements/round_25_handoff_correction.json',
+                {'label':'round_25_handoff_correction','ok':True})
+    if fault=='changed_log':log.write_text('changed')
+    if fault=='changed_selection':atomic_json(output/proof['record_ref'], {})
+    if fault=='changed_card':atomic_json(output/'data_versions/extra.json', {})
+    before = {str(p):p.read_bytes() for p in output.rglob('*') if p.is_file()}
+    got = reader_failure_diagnostics(root)
+    if fault:
+        assert got == []
+    else:
+        assert len(got)==1 and got[0]['status']=='sealed_reader_events_invalid'
+        assert got[0]['training_attempt_id']==attempt
+        assert 'no valid data-consumption witness' in got[0]['why']
+        assert 'bundle-only' in got[0]['guidance']
+        assert 'metric_value' not in got[0] and 'samples_read' not in got[0]
+    assert summaries(root)==[]  # Scored evidence remains a separate, unchanged contract.
+    assert before == {str(p):p.read_bytes() for p in output.rglob('*') if p.is_file()}
+
+
 @pytest.mark.parametrize('value',[None,0,-1,True,1.0,1.5,'1024',float('inf')])
 def test_formal_work_requires_explicit_integral_updates(value):
     assert missing_formal_work('def stage_argv_train(i):\n    return [str(i["steps"])]',{'steps':value})
@@ -109,8 +167,10 @@ def test_main_training_settings_are_persisted_and_cannot_rewrite_baseline(tmp_pa
         execution_graph=None
         space=OptimizationSpace(training=(Axis('steps','integer','updates',low=1,high=200000,default=100000),)
                                 if declared_axis else ())
-        sources={'train':'def stage_argv_train(i):\n    return [str(i["steps"])]'}
-        def _inputs(self,stage,*,settings):return {'steps':settings.get('steps',0)}
+        sources={'train':'def stage_argv_train(i):\n    return [str(i["steps"])]',
+                 'evaluate':'def stage_argv_evaluate(i):\n    return [str(i["episodes"])]'}
+        def _inputs(self,stage,*,settings):
+            return {'steps':settings.get('steps',0), 'episodes':settings.get('episodes',1)}
         def run(self,**kwargs):
             seen.append(kwargs)
             atomic_json(self.run_root/'controller_session.json',{'run_id':real.run_id,
@@ -120,7 +180,15 @@ def test_main_training_settings_are_persisted_and_cannot_rewrite_baseline(tmp_pa
                 'repo':str(real.repo),'run_status':'paused'})
             return {'rounds':[],'run_status':'paused','objective':{}}
     monkeypatch.setattr(real,'_research_controller',lambda:(Controller(),{}))
-    assert real._step_run_the_loop()['outcome']=='not attempted' and not seen
+    refused = real._step_run_the_loop(evaluation_settings={'episodes':100,'seed':0})
+    assert refused['outcome']=='not attempted' and not seen
+    assert refused['failure_category']=='formal_training_input_required'
+    assert refused['native_operation_status']=='not_started'
+    assert refused['repair_owner']=='main_agent'
+    assert refused['evidence_id'] and refused['evidence_ref']
+    assert 'evaluation_settings alone' in refused['repair_handoff']['next_action']
+    sealed=read_json(real.output/refused['evidence_ref'])
+    assert sealed['evidence_id']==refused['evidence_id']
     assert real._step_run_the_loop(training_settings={'steps':0})['outcome']=='not attempted'
     real._step_run_the_loop(training_settings={'steps':8192})
     assert seen[-1]['settings']=={'steps':8192}

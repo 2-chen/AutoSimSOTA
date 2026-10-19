@@ -22,7 +22,8 @@ def test_confirmation_is_early_admission_not_missing_native_capability(tmp_path,
     real.interpreter=Path('/usr/bin/python3')
     real.stages={'evaluate':'verified'}
     monkeypatch.setattr(real,'_metric_bound',lambda:True)
-    monkeypatch.setattr(real,'_native_identity_schema_view',lambda *a:{'status':'compatible'})
+    monkeypatch.setattr(real,'_native_identity_schema_view',lambda *a,**kw:{'status':'compatible'})
+    monkeypatch.setattr(real,'_working_plan_required',lambda:False)
     state = real.state()
     assert state['to_measure']['native_ready'] is True
     assert state['to_measure']['ready'] is False

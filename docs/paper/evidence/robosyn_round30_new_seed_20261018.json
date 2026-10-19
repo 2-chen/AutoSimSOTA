@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "kind": "formal_development_registered_random_data_new_training_seed",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_30_handoff_correction",
+  "training": {
+    "attempt_id": "b55300006600402e87bb85c544ee47d2",
+    "status": "completed",
+    "returncode": 0,
+    "seconds": 93.8,
+    "training_seed": 20261031,
+    "evaluation_seed_unchanged": 20261013,
+    "completed_updates": 1000,
+    "dataset_version": "click_bell_random_quality_20ep_007_v1",
+    "dataset_bytes_sha256": "761ba7673b04866c661be93fe5198f3ee20886c90f9568a78c5eeeea9203716f",
+    "data_consumption_status": "verified",
+    "consumption_stage": "training_batch"
+  },
+  "physical_log_diagnostic": {
+    "training_batch_events": 1000,
+    "non_batch_witness_events": 8064,
+    "malformed_witness_json_lines": 0,
+    "training_batch_readers": 1,
+    "terminal_samples_read_including_repeats": 8000,
+    "strictly_increasing": true
+  },
+  "evaluation": {
+    "attempt_id": "10571771dffb4dbdad571d72b27b9164",
+    "status": "completed",
+    "returncode": 0,
+    "seconds": 495.2,
+    "development_score": 0.06,
+    "episodes": 50,
+    "successes_derived_from_score_and_episodes": 3,
+    "policy_bundle_sha256": "58923e673ab0b21f3afc2fe7d4a086a1131be3e4cd012235dadab07acc4bbcb6",
+    "result_sha256": "9fe414fb0f871ffaa477d54fda5c0485259252238ee415e5e51c766fc47be6b4",
+    "data_consumption": "verified",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified"
+  },
+  "recovery": {
+    "main_action_id": "693575f5c4e00fd7",
+    "original_label": "round_30",
+    "original_record_preserved_unscored": true,
+    "training_reused": true,
+    "checkpoint_boundary": "checkpoints/001000/pretrained_model",
+    "job_id_omitted": true,
+    "fix_automatically_invoked": true
+  },
+  "autonomy": {
+    "scientific_parameters_native_patch_training_and_recovery": "Main/Fix system agents; no operator native edits or real experiment execution",
+    "operator_during_this_round": "read-only monitoring and paper/progress evidence archive only",
+    "host_version": "v67",
+    "no_new_operator_host_code_budget_or_restart_during_round": true,
+    "not_an_unassisted_cold_start_study": true
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "matched_acquisition_comparison_complete": false,
+  "method_gain_claim_supported": false,
+  "limits": [
+    "This is the previously collected random-quality 007 dataset, not new acquisition during round 30.",
+    "Training seed differs from round 20 (1000 -> 20261031); unchanged evaluation seed 20261013 and 50 episodes are development, not independent held-out confirmation.",
+    "Both random-data seed1000 (R20) and seed20261031 (R30) score 6%; two observations alone do not establish robustness or data-method superiority.",
+    "Common frozen initialization, full matched recipe/mixing, supervision and source-family quality remain unaudited.",
+    "8000 counts repeat sample uses, not unique samples or newly acquired episodes.",
+    "Original round_30 failure stays unscored; only the additive handoff-correction measurement is scored.",
+    "No SOTA, acquisition-method gain, or complete fair campaign claim is supported."
+  ],
+  "source_hashes": {
+    "action_receipts/75659561036d6066.json": "bcc8436861e1bbb5737a59f92461ced44188c1eccbf8c73e8f46c081ab87e8fa",
+    "action_receipts/5a9ed97168e9d2f5.json": "7ccb6588e1fc7042df23e7cd80abb0228f68f3dd2ba5cd2e3aa533704fb40005",
+    "action_receipts/693575f5c4e00fd7.json": "2bc8c42682f67893a6d697b195a8733643d1bcf55c744583f3b7169ce454abfb",
+    "data_versions/click_bell_random_quality_20ep_007_v1.json": "46560f1f394060b531b24d59919a146858c5614dab67c6736e79ab4fd77f7998",
+    "research/derived/measurements/round_30.json": "1e1cfefc1b3c259037adadefd88d9a95b4a75edd7a631095759b481cf8e4b1c8",
+    "research/derived/measurements/round_30_handoff_correction.json": "9899802a87aefeee67d7dca6c0efa06e7c55f81a2835500903a513b9764f228d",
+    "research/derived/attempts/b55300006600402e87bb85c544ee47d2/receipt.json": "1d8ba7160bf514bab44e6f774b1654029b1c0781edf7aaf8668c80a5ad0f0288",
+    "research/derived/attempts/10571771dffb4dbdad571d72b27b9164/receipt.json": "f7f22bf41c29861441d989f163b9fcfb7eb6cfa2d70b51069030ef0491363633",
+    "evidence/b55300006600402e87bb85c544ee47d2.json": "24920dc1a762a2827d5533e2f6f01d28070d4a595b15c1beb88bc9f075241570",
+    "evidence/10571771dffb4dbdad571d72b27b9164.json": "f5c8e0fe12e11b72e35c0d443f6a305334f7b60955b02eb95ff432bad714cda4",
+    "research/derived/train/attempts/b55300006600402e87bb85c544ee47d2/output.log": "0d64e0795c5fc60441ca6f13d7e6ee7890b4330bbfa2d7f9d39864caed91eacf",
+    "research/derived/evaluate/attempts/10571771dffb4dbdad571d72b27b9164/output.log": "d6ad1e78088fa8fde4aec2abbd10597b26599633f00d6612ba8bfcdf06a2ff62",
+    "research/derived/code_changes/round-30.json": "0c23ebfd07cd5b39c22772903980bff2c515197c23f206120ae9d89923614dde",
+    "training_progress_audits/9097b5364f25cce5dbbc39ffafc8f45f040625793cc60b4a1deec654725e7459.json": "8526d63e30d616877a8f0a615f6653dc433f3a283a96f87820e9f07ef2d1a7d3",
+    "verification_checkpoint_handoffs/c5bb33e8d75c6a09172c5e61a2d2d8268b492972a4bb6094895d2e66fd784770.json": "04452f975ad910cac73b0bfa1dde5097fdca2717c893dcffa2429ed768bff17a",
+    "research/derived/experiments/round_30_handoff_correction/10571771dffb4dbdad571d72b27b9164/result.json": "9fe414fb0f871ffaa477d54fda5c0485259252238ee415e5e51c766fc47be6b4",
+    "candidate_execution_reviews/ae821a308f4ac7700882ed162d7d0657b0fd88335889b9458f4c276434ebbe9b.json": "acd4719396d3fc78204ec4e85c37dfbf442520d2f343b4f4bd7cd5550b28070e",
+    "candidate_execution_reviews/validation_trials/7f132c6731ac16ed8e71014cf084233693c55e739cfe5c713c7a141d150055ff.json": "fffcb92b60f27ba325c6990701e755d95ea98a24f1148dcfd081bbe877e5b918",
+    "data_campaigns/click_bell_random_quality_vs_agent_targeted_v3/plan.json": "df8f801721037ebc01ec9a40a961a0a5912438d9521f493d6a2ea5acdba904bb",
+    "data_campaigns/click_bell_random_quality_vs_agent_targeted_v3/random_quality-20261031.json": "baa56c9976fb44c5f1a5a37099cce7d7d932a68cfe3765313692382d4c8162a9",
+    "action_receipts/d999732755ebc8da.json": "15a20cadbf6d587ace93caf0dcd7a6c739d165ac8414589fc32a0a242d56bf9c"
+  },
+  "campaign_registration": {
+    "campaign_id": "click_bell_random_quality_vs_agent_targeted_v3",
+    "arm": "random_quality",
+    "seed": 20261031,
+    "status": "consumed_and_measured",
+    "comparison_ready": false,
+    "main_action_id": "d999732755ebc8da"
+  }
+}

@@ -75,15 +75,19 @@ def view(output, run_id):
             measurement = _read(root, ref_path)
             subject['reference']['measurement_sha256'] = digest(ref_path)
             subject['evidence_refs'].extend([reference['record_ref'],reference['measurement_ref']])
-            identity = (measurement.get('evaluate') or {}).get('evidence_id')
+            identity = ((measurement.get('evaluate') or {}).get('evidence_id') or
+                        measurement.get('evidence_id'))
             if re.fullmatch(r'[0-9a-f]{32}', str(identity or '')):
                 subject['evidence_ids'].append(identity)
         except (OSError,ValueError,TypeError,KeyError):
             subject['problems'].append('reference_evidence_unreadable')
+    if subject['problems'] and not subject['evidence_ids']:
+        subject['problems'].append('sealed_failure_evidence_missing')
     subject['evidence_ids'] = list(dict.fromkeys(subject['evidence_ids']))
     subject['evidence_refs'].extend(f'evidence/{identity}.json' for identity in subject['evidence_ids'])
     identity = object_digest(subject)
     result = {'status':'required' if subject['problems'] else 'not_required',
+        'diagnosis_recordable':bool(subject['evidence_ids']),
         'subject_sha256':identity, 'subject':subject,
         'authority':'triage obligation, not an assertion that a valid zero score is an executor failure',
         'next_operation':'research_task', 'repair_owner':'main_agent',
@@ -96,6 +100,11 @@ def view(output, run_id):
             'expected_result':'Evidence-backed four-part diagnosis (training/data/policy/evaluation), '
                               'explicit unknowns, and a concrete next operation; preserve old scores.',
             'evidence_refs':subject['evidence_refs']}}
+    if subject['problems'] and not subject['evidence_ids']:
+        result['evidence_gap'] = ('Historical failure has no sealed native/operation evidence ID. '
+            'Do not fabricate an ID or repeat record_baseline_diagnosis. Inspect original ownership '
+            'and receipts; if proven idle, explicitly request bounded reference revalidation '
+            'under the current harness to seal the current cause. Frozen protocol and old measurements stay unchanged.')
     path = root/'research'/run_id/'baseline_diagnoses'/(identity+'.json')
     try:
         record = _read(root, path)
@@ -132,7 +141,7 @@ def record(output, repo, run_id, diagnosis):
         if identity not in expected:
             raise ValueError('unrelated evidence cannot resolve baseline triage')
         read_attempt_evidence(Path(output), identity)
-    sources = source_evidence(Path(repo), diagnosis['source_refs'])
+    sources = source_evidence(Path(repo), diagnosis['source_refs'], output=Path(output))
     held = {**diagnosis, 'source_refs':sources}
     row = {'schema_version':1,'at':now(), 'subject':current['subject'],
            'subject_sha256':current['subject_sha256'],'diagnosis':held,

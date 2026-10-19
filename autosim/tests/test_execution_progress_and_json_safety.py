@@ -7,6 +7,26 @@ from autosim.research.execution_paths import ExecutionPaths
 from autosim.research.execution_progress import execution_progress
 
 
+@pytest.mark.parametrize('text', [
+    'Training-data randomization slice; never changes ranking evaluation.',
+    'Collect expert suffixes from parent-policy states.',
+    'A model-data connection is not a policy-output improvement.',
+])
+def test_hyphenated_public_prose_is_not_a_cli_resource_argument(text):
+    safe = text
+    for _ in range(3):
+        safe = sanitize_model_payload_text(safe)
+    assert safe == text
+
+
+@pytest.mark.parametrize('prefix', ['cmd ', '(', '=', "'", '\n'])
+@pytest.mark.parametrize('flag', ['--data', '-data', '--dataset', '--policy', '--output', '--checkpoint'])
+def test_true_cli_resource_arguments_still_hide_extensionless_private_values(prefix, flag):
+    safe = sanitize_model_payload_text(prefix + flag + ' private-resource-value')
+    assert 'private-resource-value' not in safe
+    assert '[LOCAL_RESOURCE]' in safe
+
+
 @pytest.mark.parametrize('scrub', [sanitize_model_text, sanitize_model_payload_text])
 def test_public_mask_labels_survive_but_standalone_credentials_remain_redacted(scrub):
     labels = ['code-train-mask-padding-loss', 'code-train-dp-mask-padding-loss',

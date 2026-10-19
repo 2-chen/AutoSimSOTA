@@ -58,7 +58,8 @@ def test_correction_requests_reuse_and_preserves_original_score_and_selection(tm
         assert kwargs['settings'] == {'steps':8192}
         assert kwargs['label'] == 'round_4_handoff_correction'
         return {'ok':True, 'metric_value':0.2, 'label':kwargs['label']}
-    research = SimpleNamespace(run_root=root, output=tmp_path, measure=measure,
+    research = SimpleNamespace(run_root=root, output=tmp_path, repo=tmp_path/'checkout',
+                               run_id=root.name, measure=measure,
                                _append_local_event=lambda event: None)
     result = hc.correct(research, label='round_4')
     assert result['handoff_correction']['training_reused']
@@ -72,6 +73,24 @@ def test_path_injection_is_not_a_correction_target(tmp_path):
     root, _ = fixture(tmp_path)
     research = SimpleNamespace(run_root=root)
     assert hc.correct(research, label='../round_4')['ok'] is False
+
+
+@pytest.mark.parametrize('proof', [{'id':'missing_original_selection'}, {}])
+def test_handoff_catalog_exposes_original_registered_data_failure_without_replaying(tmp_path, proof):
+    root, folder = fixture(tmp_path)
+    assert hc.eligible(root)
+    path = root/'measurements/round_4.json'
+    measurement = read_json(path)
+    measurement['data_selection'] = proof
+    atomic_json(path, measurement)
+    old = path.read_bytes()
+    blocked = []
+    assert hc.eligible(root, _blocked=blocked) == []
+    assert len(blocked) == 1 and blocked[0]['status'] == 'blocked_registered_training_data'
+    assert blocked[0]['label'] == 'round_4'
+    assert blocked[0]['training_attempt_id'] == 'a'*32
+    assert blocked[0]['next_action'] == 'research_task'
+    assert path.read_bytes() == old
 
 
 def test_graph_correction_does_not_silently_execute_training(tmp_path):
@@ -179,7 +198,8 @@ def test_completed_unscored_candidate_is_offered_without_claiming_a_score(tmp_pa
             assert kw['_audit_training_progress'] is True
             assert '_selection_correction_ref' not in kw
             return {'ok':True,'label':kw['label'],'metric_value':0.1}
-        research=SimpleNamespace(run_root=root,output=tmp_path,measure=measure,
+        research=SimpleNamespace(run_root=root,output=tmp_path,repo=tmp_path/'checkout',
+                                 run_id=root.name,measure=measure,
                                  _append_local_event=lambda row:None)
         assert hc.correct(research,label='round_4')['ok']
         assert len(calls)==1 and all(p.read_bytes()==data for p,data in originals.items())

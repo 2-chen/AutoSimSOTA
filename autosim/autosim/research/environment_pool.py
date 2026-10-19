@@ -150,9 +150,12 @@ def describe(prefix: Path) -> dict[str, Any]:
             unsafe.append("external site-packages directory")
             continue
         for distribution in importlib.metadata.distributions(path=[str(site)]):
-            name = str(distribution.metadata.get("Name") or "")
+            # Distribution.version reparses the same METADATA property. Keep one
+            # per-distribution read within this observation, never a cross-call cache.
+            headers = distribution.metadata
+            name = str(headers.get("Name") or "")
             if name:
-                packages[name.lower().replace("_", "-")] = distribution.version
+                packages[name.lower().replace("_", "-")] = headers['Version']
             direct = distribution.read_text("direct_url.json")
             if direct:
                 try:

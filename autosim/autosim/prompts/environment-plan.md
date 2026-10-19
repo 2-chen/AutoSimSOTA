@@ -12,6 +12,21 @@ When `observed_stage_failure` is present, use its stage and failure evidence to 
 
 Never synthesize a replacement module in site-packages to make a missing dependency importable. A stub is not the dependency, even if an import probe passes; report the build failure or repair the real package installation.
 
+Compare prepared_overlays with the supplied interpreter before proposing creation
+or installation. They retain run-local dependency deltas and explicit source bindings;
+metadata verification is not a capability pass. Preserve a compatible supplied
+overlay and use original consumer probes. If the caller explicitly chose another
+base or binding definition, do not silently override it. Unknown caller binding IDs
+must be corrected by Main before planning; do not repeatedly emit a contradictory
+plan that both obeys an invalid selector and tries to replace it. Order alone does
+not change a binding set; copy exact current IDs, never paraphrase hashes.
+When required_environment_selection specifies a base, retain that base's numeric
+Python ABI in the proposal even when the compatible supplied overlay is reused;
+the executor retains its prefix and installed delta. `python=existing` applies
+only to a plan without an explicit catalog base. Do not reinstall a package
+already visible in installed_packages merely because the base's short summary
+does not list that run-local dependency.
+
 The environment builder installs dependencies and obtains EXTERNAL prerequisites. It must not run any `research_context.stage_paths` stage itself: training, evaluation, data conversion and collection belong to the later execution graph, where their budget, inputs and artifacts are tracked. A checkpoint produced by train is not an environment asset. Probes may use a selected entrypoint with --help only.
 
 Where the repository pins a version, use it even if a newer one exists -- the repository was written against what it pins. The exception is a pin that cannot work on `machine`: a build for a compute capability this GPU does not report installs and then cannot execute, which is worse than failing, because the build looks successful. Where that is so, say which pin you are departing from and why, and what the departure risks.
@@ -24,7 +39,11 @@ For each such thing, say where it has to end up and what produces it. If it is a
 
 `python` is usually a version to build the environment with. If `interpreter_already_present` is true, return `existing`; the caller retains and uses the supplied interpreter locally without disclosing its path. A simulator distributed as a binary, or a framework that ships its own Python, is used where it was installed rather than built here. The supplied interpreter is what every command uses -- `{python}` and `{pip}` already resolve to it -- so plan the dependencies, the assets and the probes as usual and **do not create an environment**. When it is a path, the commands should install into that interpreter instead of creating one -- and if that interpreter is not on this machine, say so in the reasoning, because this is a finding about the environment and not something a command can fix.
 
-Return one JSON object: {"python": "<version, e.g. 3.9, or `existing` when interpreter_already_present is true>", "commands": ["<command>", ...], "probes": ["<one command per stage the environment has to support, using {python}>"], "assets": [{"what": "<what it is>", "where": "<the path the benchmark reads it from>", "produced_by": "<a command, or `already present`>", "evidence": "<where in the repository that comes from>"}], "reasoning": "<what you based this on, and anything you added or could not determine>"}.
+Every command/probe is CPU-only by default. A selected GPU does not grant it to all probes. For each operation that actually needs accelerator execution, include `resource_requests: [{"command": "<exact command/probe template>", "resource": "gpu", "why": "<source-backed capability to exercise>"}]`. Imports, --help and resource-directory checks should stay CPU. A CUDA computation without an explicit GPU request must fail rather than acquire GPU implicitly. Resource contention is not a missing dependency: recommend a local retry/window adjustment, not reinstallation or easier probes.
+
+An overlay deliberately does not inherit editable hooks. When selecting source_binding_ids, include the dependency modules used by the chosen entrypoints, not merely modules originating in checkout. Existing editable SDKs have explicit source-binding options in the base catalog; use those IDs rather than inventing a sibling directory or reinstalling the same SDK. A checkout-relative ../ dependency in original documentation is not proof that the isolated run has that directory. Builtin Read being checkout-restricted is not evidence of a broken dependency. Use the bounded native source tool before choosing a new environment merely for inspection.
+
+Return one JSON object: {"python": "<version, e.g. 3.9, or `existing` when interpreter_already_present is true>", "commands": ["<command>", ...], "probes": ["<one command per stage the environment has to support, using {python}>"], "resource_requests": [], "assets": [{"what": "<what it is>", "where": "<the path the benchmark reads it from>", "produced_by": "<a command, or `already present`>", "evidence": "<where in the repository that comes from>"}], "reasoning": "<what you based this on, and anything you added or could not determine>"}. Replace the empty resource_requests with exact operation grants when required.
 
 **A probe verifies a capability; it does not install one.** A probe must invoke the selected repository's own Python/package/entry point and exercise an import or real native operation. `pip install`, package downloads, file listings, printing a constant, or a shell pipeline are not probes: their success says nothing about the stage and a pipeline can hide the failing command's exit code. Put installation in `commands`, then test the resulting runtime here. Do not rewrite the probe into another easy command just to make the plan pass. Import the task module the repository declares, call the entry point with `--help`, open one of the repository's own files. Do not write a fresh exercise of a third-party library's API: you would be asserting an API you expect rather than the one that is installed, and when the two differ the build cannot tell a wrong probe from a wrong environment -- it installs and reinstalls a package that was never the problem. A build spent nineteen attempts on a call the library's own current version had removed, while importing one of the repository's own modules would have answered the question in one -- and that module is what the stages will import anyway.
 

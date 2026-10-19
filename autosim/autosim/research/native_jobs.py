@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -62,11 +63,11 @@ def active_jobs(output: Path) -> list[str]:
     return _active(output)
 
 
-def source_identity(output: Path, repo: Path, *, stage_scope: list[str] | None = None) -> str:
-    """Bind pre-existing checkout files without treating new training outputs as source."""
+def _checkout_source(output: Path, repo: Path) -> dict:
+    """The original source identity payload, independent of stage adapter updates."""
     manifest_path = Path(output) / "workspace_snapshot.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
-        return ""
+        raise ValueError('checkout source manifest is missing')
     manifest = read_json(manifest_path)
     if (not isinstance(manifest, dict) or manifest.get("schema_version") != 2 or
             manifest.get("destination") != str(Path(repo).resolve(strict=True))):
@@ -96,6 +97,31 @@ def source_identity(output: Path, repo: Path, *, stage_scope: list[str] | None =
     original = {str(row[1]) for row in entries}
     materialized = [(str(name), digest(Path(repo) / name))
                     for name in materialized_files(Path(repo)) if str(name) not in original]
+    return {"base": manifest["source_tree_fingerprint"], "existing_files": current,
+            "materialized_source": materialized}
+
+
+def checkout_identity(output: Path, repo: Path) -> str:
+    """Exact code/binding context for a no-op edit; not a dependency independence proof."""
+    source = _checkout_source(output, repo)
+    manifest = read_json(Path(output) / 'workspace_snapshot.json')
+    environment = Path(output) / 'environment.json'
+    if environment.is_symlink():
+        raise ValueError('unsafe edit environment identity')
+    return object_digest({'source': source,
+        'modes': [(name, stat.S_IMODE((Path(repo) / name).lstat().st_mode))
+                  for name in sorted({str(row[1]) for row in manifest['source_entries']}
+                                     | {name for name, _ in source['materialized_source']})],
+        'bindings': manifest.get('resource_bindings', manifest.get('resources', [])),
+        'environment': digest(environment) if environment.is_file() else None})
+
+
+def source_identity(output: Path, repo: Path, *, stage_scope: list[str] | None = None) -> str:
+    """Bind pre-existing checkout files without treating new training outputs as source."""
+    manifest_path = Path(output) / 'workspace_snapshot.json'
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return ''
+    source = _checkout_source(output, repo)
     stages_path = Path(output) / 'derived_stages.json'
     if stages_path.is_symlink():
         raise ValueError('unsafe derived stage identity')
@@ -110,9 +136,7 @@ def source_identity(output: Path, repo: Path, *, stage_scope: list[str] | None =
         if not isinstance(document, dict) or any(s not in document for s in stage_scope):
             raise ValueError('native job stage scope disappeared')
         stages = {'scope_version': 1, 'stages': {s: document[s] for s in stage_scope}}
-    return object_digest({"base": manifest["source_tree_fingerprint"],
-                          "existing_files": current,
-                          "materialized_source": materialized,
+    return object_digest({**source,
                           # Early source investigation precedes command derivation.
                           # Absence is part of identity, not a fabricated verified stage.
                           "derived_stages": stages})
@@ -223,9 +247,94 @@ def bind_completed_source(output: Path, repo: Path, request: dict) -> dict:
     return {'status':'bound','ref':base+'source_binding.json'}
 
 
+def checkpoint_overrides(output: Path, stage: str, selection: dict | None) -> dict:
+    """An explicit run-owned choice, revalidated before every native replay."""
+    if selection is None:
+        return {}
+    if stage != 'evaluate' or not isinstance(selection,dict):
+        raise ValueError('checkpoint selection requires an evaluate job')
+    from .experiment_transaction import safe
+    from .checkpoint_handoff import validate
+    identity = selection.get('id')
+    if (not isinstance(identity,str) or not re.fullmatch(r'[0-9a-f]{64}',identity) or
+            selection.get('evidence_ref') != f'verification_checkpoint_handoffs/{identity}.json'):
+        raise ValueError('checkpoint selection lacks its exact registered proof')
+    path = safe(output, selection['evidence_ref'])
+    if not path.is_file() or path.stat().st_size > 1048576:
+        raise ValueError('checkpoint selection proof unavailable')
+    expected = {k:v for k,v in selection.items() if k!='evidence_ref'}
+    if (read_json(path) != expected or not selection.get('files') or
+            identity != object_digest({'producer':selection.get('producer_evidence_ref'),
+                                       'files':selection['files']})):
+        raise ValueError('checkpoint selection proof changed')
+    validate(output,selection)
+    return {'checkpoint':selection['selected_path']}
+
+
+def completed_evaluation(output: Path, *, repo: Path, run_id: str,
+                         settings: dict, checkpoint_selection: dict | None,
+                         source_stamp: str) -> str | None:
+    """Reuse an exact completed detached diagnostic, never training/collection work."""
+    from .evidence_store import read_attempt_evidence
+    if checkpoint_selection is None:
+        return None
+    for path in sorted((output/'native_jobs').glob('*/request.json'))[-128:]:
+        try:
+            if path.is_symlink() or path.parent.is_symlink() or not _JOB_ID.fullmatch(path.parent.name):
+                continue
+            request = read_json(path)
+            if (request.get('job_id') != path.parent.name or request.get('stage') != 'evaluate' or
+                    request.get('run_id') != run_id or request.get('repo') != str(repo) or
+                    request.get('source_identity') != source_stamp or
+                    object_digest(request.get('settings')) != object_digest(settings) or
+                    (request.get('checkpoint_selection') or {}).get('id') != checkpoint_selection['id']):
+                continue
+            result_path = path.with_name('result.json')
+            if result_path.is_symlink():
+                continue
+            result = read_json(result_path)
+            native = result.get('stage_result') or {}
+            attempt = str(native.get('attempt_id') or '')
+            if (result.get('job_id') != request['job_id'] or result.get('status') != 'completed' or
+                    result.get('source_identity_after') != source_stamp or
+                    not _JOB_ID.fullmatch(attempt) or native.get('returncode') != 0):
+                continue
+            proof = read_attempt_evidence(output, attempt, limit=1)
+            if (proof.get('status') == 'completed' and proof.get('returncode') == 0 and
+                    proof.get('receipt_ref') == f'research/{run_id}/attempts/{attempt}/receipt.json'):
+                return request['job_id']
+        except (OSError,ValueError,TypeError,KeyError,AttributeError):
+            continue
+    return None
+
+
+def training_overrides(output: Path, repo: Path, request: dict) -> dict:
+    """Revalidate detached data bindings and preserve labels at the real caller.
+
+    Old requests without registered selections keep their original behavior. No
+    byte identities or counters are supplied to the native argv/reader.
+    """
+    if request['stage'] != 'train':
+        return {}
+    bindings = request.get('data_bindings') or (request.get('candidate_binding') or {}).get('data_versions') or []
+    if not bindings:
+        return {}
+    from .data_versions import PREFIX, resolve, training_metadata
+    settings = request['settings']
+    labels = training_metadata(bindings, settings)  # Validate shape before indexing.
+    handles = {**settings, **{row['setting']: PREFIX + row['id'] for row in labels}}
+    resolved, current = resolve(output, repo, handles)
+    if resolved != settings or current != bindings:
+        raise ValueError('detached training data bindings changed before native start')
+    return {'selected_training_data': training_metadata(current, resolved)}
+
+
 def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
            requested_seconds: float, reason: str, run_id: str = "derived",
-           resources: dict | None = None, candidate_binding: dict | None = None) -> dict[str, Any]:
+           resources: dict | None = None, candidate_binding: dict | None = None,
+           checkpoint_selection: dict | None = None,
+           collection_control_contract: dict | None = None,
+           repeat_job_id: str = '') -> dict[str, Any]:
     output = Path(output).resolve(strict=True)
     repo = Path(repo).resolve(strict=True)
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", stage):
@@ -244,12 +353,33 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
             isinstance(requested_seconds, bool) or not math.isfinite(requested_seconds) or requested_seconds <= 0):
         raise ValueError("job window must be positive")
     budget = RunBudget.existing(output)
-    if budget is None or requested_seconds > budget.remaining():
-        raise ValueError("job window exceeds the existing hard run budget")
+    remaining_wall = max(0,budget.remaining()) if budget is not None else 0
+    if budget is None or requested_seconds > remaining_wall:
+        raise ValueError('job window exceeds the existing hard run budget: '
+            f'requested_seconds={requested_seconds:.3f}; remaining_wall_seconds={remaining_wall:.3f}. '
+            'GPU availability is separate. Main/Resource must choose a fitting local window '
+            'and allow for evaluation/recovery; no window is silently shortened or budget extended.')
     # Only commands already accepted by the derivation can be submitted.
     verified = read_json(output / "derived_stages.json")
     if not isinstance(verified, dict) or stage not in verified or not verified[stage].get("source"):
         raise ValueError("native stage has no verified command")
+    if stage == 'collect':
+        from .data_acquisition import verify_control_contract
+        verify_control_contract(output=output, repo=repo, source=verified[stage]['source'],
+                                settings=settings, contract=collection_control_contract)
+        from .training_work import missing_formal_collection_work
+        problem = missing_formal_collection_work(verified[stage]['source'], settings)
+        if problem:
+            raise ValueError(problem)
+    data_bindings = []
+    if stage == 'train':
+        from .data_versions import resolve
+        settings, data_bindings = resolve(output, repo, settings)
+        if candidate_binding:
+            data_bindings = candidate_binding.get('data_versions') or data_bindings
+        training_overrides(output, repo, {'stage':stage, 'settings':settings,
+                                         'data_bindings':data_bindings})
+    checkpoint_overrides(output,stage,checkpoint_selection)
     stage_scope = [stage]
     source_stamp = source_identity(output, repo, stage_scope=stage_scope)
     profile = resource_profile(resources, gpu=settings.get("device") != "cpu") if scheduling else None
@@ -264,6 +394,15 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
     root.mkdir(parents=True, exist_ok=True)
     with (root / "submission.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if repeat_job_id and (stage != 'evaluate' or not _JOB_ID.fullmatch(repeat_job_id)):
+            raise ValueError('repeat_job_id is an explicit completed-evaluation replicate only')
+        cached = completed_evaluation(output, repo=repo, run_id=run_id, settings=settings,
+            checkpoint_selection=checkpoint_selection, source_stamp=source_stamp) if stage == 'evaluate' else None
+        if repeat_job_id and cached != repeat_job_id:
+            raise ValueError('replicate must identify the exact completed evaluation with unchanged inputs')
+        if cached and not repeat_job_id:
+            return {**status(output,cached), 'reused_completed_diagnostic':True,
+                    'reuse_scope':'same policy/source/settings; no new GPU work and not formal score adoption'}
         active = _active(output)
         if len(active) >= int(scheduling.get("native_slots", 1)):
             raise ValueError("another native job has an unresolved outcome")
@@ -284,6 +423,14 @@ def submit(output: Path, *, repo: Path, stage: str, settings: dict[str, Any],
                "submitted_epoch": started}
     if candidate_binding is not None:
         request['candidate_binding'] = candidate_binding
+    if data_bindings:
+        request['data_bindings'] = data_bindings
+    if repeat_job_id:
+        request['replicate_of'] = repeat_job_id
+    if checkpoint_selection is not None:
+        request['checkpoint_selection'] = checkpoint_selection
+    if collection_control_contract is not None:
+        request['collection_control_contract'] = collection_control_contract
     if scheduling:
         request["resources"] = profile
         if request["resources"]["gpu"] is False:
@@ -584,20 +731,36 @@ def _worker(output: Path, job_id: str) -> int:
             repo=Path(request["repo"]), output=output, client=None,
             scouting=Path(output) / "scouting", run_id=request["run_id"],
             base_settings=request["settings"])
+        # A detached worker reconstructs Preparation without calling _run_cycle,
+        # where its wall budget is normally initialized. The requested job window
+        # is a mutable soft limit, never a replacement for the persisted hard cap.
+        if preparation.budget is None:
+            preparation.budget = RunBudget.existing(output)
+        if preparation.budget is None:
+            raise ValueError("detached native job requires an existing hard run budget")
         if preparation.interpreter is None or request["stage"] not in preparation.stages:
             raise ValueError("verified interpreter or native stage was not recoverable")
+        if request["stage"] == "collect":
+            from .data_acquisition import verify_control_contract
+            verify_control_contract(output=output, repo=preparation.repo,
+                source=preparation.stages["collect"], settings=request["settings"],
+                contract=request.get("collection_control_contract"))
         research, _ = preparation._research_controller()
         research.controller_decision_id = job_id
+        research.job_request_context = {'request_ref':str((directory/'request.json').relative_to(output)),
+                                        'request_sha256':digest(directory/'request.json')}
         research.job_control_path = directory / "control.json"
         research.job_resources = request.get("resources")
         if request.get("source_identity") and request_source_identity(
                 output, Path(request["repo"]), request) != request['source_identity']:
             raise ValueError("source changed between job submission and native start")
         while True:
+            overrides = checkpoint_overrides(output,request['stage'],request.get('checkpoint_selection'))
+            overrides.update(training_overrides(output, Path(request['repo']), request))
             result = research.run_stage(
                 request["stage"], settings=request["settings"],
-                timeout=max(0.1, preparation.budget.remaining()
-                            if preparation.budget else request["requested_seconds"]))
+                timeout=max(0.1, preparation.budget.remaining()),
+                **overrides)
             evidence = (result.get("resource_block") or {}).get("evidence") or {}
             transient = (result.get("termination_reason") == "gpu_lease_busy" or
                 result.get("termination_reason") == "gpu_unavailable" and evidence.get("busy_devices"))

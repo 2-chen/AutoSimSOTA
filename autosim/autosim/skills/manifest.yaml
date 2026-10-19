@@ -19,7 +19,7 @@ skills:
   - <<: *defaults
     id: autosimsota.curating-simulation-datasets
     file: curating-simulation-datasets/SKILL.md
-    version: "1.1.0"
+    version: "1.2.0"
     scope: general
     confidence: Methodological guidance from primary research; current-run validation required.
     evidence: 2026-10-06 native data-card and exposure contracts plus CPU pipeline tests; not a robot collection or policy improvement.
@@ -84,16 +84,59 @@ skills:
   - <<: *defaults
     id: autosimsota.targeting-simulation-data
     file: targeting-simulation-data/SKILL.md
-    version: "1.3.0"
+    version: "1.4.0"
     capabilities: [data.collection, data.correction, yield.analysis, experiment.design]
     keywords: [targeted, failure, recovery, coverage, DAgger, DART, MimicGen, self-bootstrap, 针对性采集, 恢复示范, 扰动, 失败状态, 覆盖, 纠错, 自举]
     preconditions: [Legal development failures or training-coverage evidence can guide a data acquisition target.]
     invalid_when: [Uses held-out feedback or invents an expert, successful labels or collector compatibility.]
     verification: [Trace real production and accepted labels to native loader consumption and comparable policy scores.]
   - <<: *defaults
+    id: autosimsota.generating-adapted-demonstrations
+    file: generating-adapted-demonstrations/SKILL.md
+    version: "1.0.0"
+    confidence: Primary-source method guidance; backend and score need native validation.
+    evidence: 2026-10-13 MimicGen and official AutoData documentation review; no cross-repository integration result.
+    capabilities: [data.collection, data.demo_adaptation, capability.mapping, experiment.design]
+    keywords: [MimicGen, DexMimicGen, SkillGen, AutoData, object-centric, 示范适配, 子任务, 对象坐标, 轨迹生成]
+    inputs: [Legal source demos, object/subtask/controller interfaces, development targets and resource evidence.]
+    outputs: [Source-backed generation route and minimal execute-record-load comparison, or missing interfaces.]
+    preconditions: [Source demonstrations and a possible task-space adaptation route are being considered.]
+    invalid_when: [Used to certify arbitrary joint-array or video transformations, invent recovery expertise or silently change simulator.]
+    verification: [Check native transformations, segment execution and lineage, actual batches and comparable scores.]
+
+  - <<: *defaults
+    id: autosimsota.collecting-expert-corrections
+    file: collecting-expert-corrections/SKILL.md
+    version: "1.0.0"
+    confidence: Primary-source guidance; native state expert and sequence-label support need proof.
+    evidence: 2026-10-13 DAgger, AIM 2025, RESample v4 and WM-DAgger 2026 review; not a DAgger experiment.
+    capabilities: [data.correction, data.collection, data.sequence_labels, experiment.design]
+    keywords: [DAgger, DART, AIM, RESample, WM-DAgger, expert, query, 接管, 专家查询, 偏离状态, 恢复, 动作块标签]
+    inputs: [Frozen learner, legal state access, expert/takeover source and native sequence-label semantics.]
+    outputs: [Bounded query-aggregate-train proposal with distinct actions, context and costs, or a capability fallback.]
+    preconditions: [Policy-visited or perturbed states need correct supervision rather than only reset demos.]
+    invalid_when: [Used to relabel failed learner actions, count suffixes as episodes or treat reset seeds as full-state restoration.]
+    verification: [Verify queried states and expert labels, temporal masks, actual aggregate consumption and scores.]
+
+  - <<: *defaults
+    id: autosimsota.auditing-demonstration-quality
+    file: auditing-demonstration-quality/SKILL.md
+    version: "1.0.0"
+    confidence: Read-only format and source diagnostics; no automatic label or utility certification.
+    evidence: 2026-10-13 source and RoboSyn collection audit; no target-coverage or policy-benefit proof.
+    capabilities: [data.quality, data.coverage, data.provenance, data.consumer_validation]
+    keywords: [quality, timestamp, FPS, PTS, finite, duplicate, 数据质量, 视频同步, 重复, 新颖性, 成功标签, 种子]
+    inputs: [Sealed producer/data, native supervision/recording source and development coverage.]
+    outputs: [Scoped validity, novelty and target findings with unresolved edges and next consumer checks.]
+    preconditions: [Collected or processed data needs acceptance, repetition or expansion decisions.]
+    invalid_when: [Used to delete raw, certify labels from readable files or change frozen evaluation.]
+    verification: [Read actual rows and decoded timing, then verify expert/source meaning, batches and outcomes.]
+
+  - <<: *defaults
     id: autosimsota.choosing-simulation-improvements
     file: choosing-simulation-improvements/SKILL.md
-    version: "1.2.0"
+    version: "1.3.0"
+    evidence: "2026-10-16 review of pinned ENPIRE and autoresearch-robotics loops plus native-port evidence; reflection and actual-consumer checks are guidance, not verified policy gains."
     capabilities: [research.direction, experiment.design, skill.routing]
     keywords: [SOTA, improve, optimization, hypothesis, policy, research, 提分, 优化, 假设, 方法, 研究方向]
     preconditions: [A research direction must be selected using current protocol and resource evidence.]
@@ -160,7 +203,7 @@ skills:
   - <<: *defaults
     id: autosimsota.connecting-native-data-collection
     file: connecting-native-data-collection/SKILL.md
-    version: "1.4.0"
+    version: "1.5.0"
     capabilities: [data.collection, workflow.mapping, data.consumer_validation, experiment.design]
     keywords: [collect, collector, collection, expert, planner, demonstrations, data root, loader, 采集, 专家, 数据根目录, 训练数据]
     inputs: [Current producer source and configuration, native stage receipts, trainer loader and data protocol.]
@@ -172,9 +215,10 @@ skills:
   - <<: *defaults
     id: autosimsota.adapting-an-unfamiliar-benchmark
     file: adapting-an-unfamiliar-benchmark/SKILL.md
+    version: "1.2.0"
     scope: "general"
     confidence: "methodological — requires current source and runtime verification"
-    evidence: "Reviewed 2026-09-29; historical incidents motivate the method but do not establish universal defaults."
+    evidence: "Reviewed 2026-10-16 against pinned ENPIRE contract/interfaces and native-port failures: shortest native path and environment-difference checks; not a verified cross-repository improvement."
     capabilities: [repository.discovery, evidence.validation, capability.mapping]
     keywords: [repository, unfamiliar, survey, source, evidence, task, asset, declaration]
     preconditions: [A benchmark checkout or bounded source snapshot is available to inspect.]
@@ -405,7 +449,7 @@ skills:
 
   - <<: *defaults
     id: autosimsota.using-the-method-library
-    version: "1.6.0"
+    version: "1.7.0"
     file: using-the-method-library/SKILL.md
     scope: "general"
     confidence: "orientation — not an experimental result"

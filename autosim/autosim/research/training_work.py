@@ -22,6 +22,19 @@ def consumes_steps(source: str) -> bool:
     return consumes_input(source, 'steps')
 
 
+def missing_formal_collection_work(source: str, inputs: dict) -> str:
+    """Do not replace a producer's native default with a silent zero-work request."""
+    if not consumes_input(source, 'episodes'):
+        return ''  # A source-backed native configuration may own the acquisition budget.
+    value = inputs.get('episodes')
+    if type(value) is not int or value <= 0:
+        return ('formal collection requires an explicit positive episode target: '
+                'submit_native_job(stage="collect", collection_settings={episodes: ...}); '
+                'choose the target from the registered campaign, measured yield and total budget. '
+                'Neither the evaluation count nor the verification sample is a collection default.')
+    return ''
+
+
 def missing_formal_evaluation_work(source: str, inputs: dict) -> str:
     if not consumes_input(source, 'episodes'):
         return ''  # Native configuration can own the evaluation budget.

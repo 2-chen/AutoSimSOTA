@@ -98,3 +98,22 @@ def test_invalid_grant_still_charges_tool_call_and_elapsed_time(tmp_path):
     with pytest.raises((ValueError, OSError)):
         executor.native_probe({'code':'print(1)', 'purpose':'missing owner', 'policy_request':{}})
     assert executor.calls == 1 and executor.tool_seconds > 0
+
+
+def test_readonly_data_worker_inspects_exact_parent_policy_via_global_owner(tmp_path):
+    import subprocess
+    from autosim.research.agent_runtime import _McpExecutor
+    from autosim.research.native_context import publish_context
+    real,row,request=owned_fixture(tmp_path,True)
+    worker=real.output/'agent_workers'/'data';repo=worker/'checkout';repo.mkdir(parents=True)
+    atomic_json(worker/'worker_parent.json',{'output':str(real.output),'read_only':True})
+    atomic_json(worker/'workspace_snapshot.json',{'destination':str(repo)})
+    subprocess.run(['/usr/bin/python3','-m','venv','--copies','--without-pip',str(worker/'env')],check=True)
+    publish_context(worker,repo,worker/'env/bin/python',{})
+    executor=_McpExecutor(output=worker,workspace=repo,allow_commands=False,allow_native=True)
+    result=executor.native_probe({'purpose':'read development archive without GPU', 'policy_request':request,
+        'code':"import os; from pathlib import Path; p=Path(os.environ['AUTOSIM_DIAGNOSTIC_POLICY']); print((p/'model.bin').read_text())"})
+    assert result['status']=='completed' and result['diagnostic_policy_binding_stable'] is True
+    assert result['stdout'].strip()=='two'
+    assert not (worker/'evidence').exists()
+    assert (real.output/'evidence'/f'{result["evidence_id"]}.json').is_file()

@@ -19,8 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .common import atomic_json, atomic_text, read_json
-from .readings import named_numbers
+from .common import atomic_json, atomic_text, immutable_json, object_digest, read_json
 
 _STEP_NAMES = ("global_step", "optimizer_step", "update_step", "step", "iteration", "epoch")
 _EVENT_DISCOVERY_SECONDS = 30.0
@@ -31,6 +30,19 @@ _MAX_STDOUT_BYTES_PER_POLL = 2 * 1024 * 1024
 _MAX_PARTIAL_LINE_BYTES = 64 * 1024
 _MAX_SERIES = 12
 _MAX_POINTS_PER_SERIES = 800
+_PARSER_VERSION = 'autosim-telemetry-v2'
+# Observation parsing is deliberately separate from formal metric/progress readers.
+# Require a full named numeric token, not the numeric prefix of sha256, resnet18,
+# a hash, a date or a quoted configuration string. Native compact counts and
+# scientific notation are common across trainers, not benchmark-specific axes.
+_SCALAR = re.compile(
+    r'(?<![A-Za-z0-9_./-])(?<!best )(?<!Best )(?<!max )(?<!Max )'
+    r'([A-Za-z][A-Za-z0-9_./-]{0,159})(?:\s*[:=]\s*|\s+)'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'([KMGkmg]?)(?![A-Za-z0-9_.+\-])')
+_LOG_PREFIX = re.compile(
+    r'^\s*(?:INFO|DEBUG|TRACE)\s+\d{4}-\d{2}-\d{2}[ T]'
+    r'\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+\S+:\d+\s+')
 _DIAGNOSTIC_LINE = re.compile(
     r'(?:^|\s|\[)(?:WARNING|WARN|ERROR|CRITICAL)(?=\s|:|\])'
     r'|(?:^|\s)[A-Za-z_]*(?:Warning|Error|Exception):'
@@ -95,8 +107,31 @@ class TelemetrySpec:
 
 
 def _finite(value: Any) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool) and
-            math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _stdout_readings(line: str) -> dict[str, float]:
+    line = _LOG_PREFIX.sub('', line).strip()
+    if line.startswith(('AUTOSIM_', 'args.', 'cfg.', 'Namespace(', 'command:')):
+        return {}
+    if line.startswith('{'):
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            return {}
+        return {key.lower():float(value) for key,value in record.items()
+                if isinstance(key,str) and 1<=len(key)<=160 and _finite(value)}
+    result = {}
+    for match in _SCALAR.finditer(line):
+        value = float(match[2]) * {'':1,'k':1000,'m':1_000_000,'g':1_000_000_000}[match[3].lower()]
+        if _finite(value):
+            result[match[1].lower()] = value
+    return result
 
 
 def _chart_priority(name: str) -> tuple[int, str]:
@@ -198,6 +233,11 @@ def _render_svg(series: dict[str, dict[str, Any]], *, status: str) -> str:
             f'fill="#777" font-family="sans-serif">{high:.4g}</text>',
             f'<text x="{left - 7}" y="{graph_bottom + 3}" text-anchor="end" font-size="9" '
             f'fill="#777" font-family="sans-serif">{low:.4g}</text>',
+            f'<text x="{left}" y="{graph_bottom + 14}" font-size="9" '
+            f'fill="#777" font-family="sans-serif">{x_low:.5g}</text>',
+            f'<text x="{right}" y="{graph_bottom + 14}" text-anchor="end" font-size="9" '
+            f'fill="#777" font-family="sans-serif">{x_high:.5g} '
+            f'{"native step" if use_steps else "observation"}</text>',
         ])
         if len(points) > 1:
             polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
@@ -268,6 +308,17 @@ class LiveTelemetryWriter:
         if (not isinstance(prior, dict) or prior.get("attempt_id") != self.attempt_id or
                 prior.get("schema_version") != 1):
             return
+        if prior.get('parser_version') != _PARSER_VERSION:
+            # Reparse preserved native evidence instead of mixing known-wrong
+            # old steps with new points. Keep the old derived view for audit;
+            # this never modifies native logs, receipts, weights or scores.
+            history = self.report_dir/'parser_history'
+            archive = history/f'{self.attempt_id}-{object_digest(prior)}.json'
+            if history.is_symlink() or archive.is_symlink():
+                raise ValueError('unsafe telemetry parser-history destination')
+            immutable_json(archive, prior)
+            self._note_error('telemetry_parser_changed_replaying_preserved_sources')
+            return
         rows = prior.get("series") or []
         if isinstance(rows, list):
             self.series = {str(row.get("metric_name")): row for row in rows
@@ -317,7 +368,7 @@ class LiveTelemetryWriter:
                   "native_step": native_step if _finite(native_step) else None,
                   "step_unit": None, "observed_at": float(observed_at),
                   "source_ref": str(source_ref), "source_position": str(source_position),
-                  "parser_version": "autosim-telemetry-v1",
+                  "parser_version": _PARSER_VERSION,
                   "verification": verification}
         samples = row["samples"]
         if samples and samples[-1].get("source_ref") == sample["source_ref"] and \
@@ -370,7 +421,7 @@ class LiveTelemetryWriter:
                 # suppress only this derived numeric projection, without a metric allowlist.
                 if (stripped and not _DIAGNOSTIC_LINE.search(stripped)
                         and not stripped.startswith(("args.", "Namespace(", "command:"))):
-                    values = named_numbers(stripped)
+                    values = _stdout_readings(stripped)
                     native_step = next((values[name] for name in _STEP_NAMES
                                         if name in values), None)
                     for name, value in values.items():
@@ -509,7 +560,8 @@ class LiveTelemetryWriter:
 
     def _state(self, status: str) -> dict[str, Any]:
         series = [self.series[name] for name in sorted(self.series)]
-        return {"schema_version": 1, "stage": self.stage, "attempt_id": self.attempt_id,
+        return {"schema_version": 1, "parser_version":_PARSER_VERSION,
+                "stage": self.stage, "attempt_id": self.attempt_id,
                 "started_at": self.started_epoch, "updated_at": time.time(),
                 "status": status, "series": series,
                 "sample_count": sum(int(row.get("samples_seen", 0)) for row in series),

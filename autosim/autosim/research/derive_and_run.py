@@ -28,9 +28,120 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .common import read_json
+from .common import object_digest, read_json
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def _main_owned_unscored_baseline(output: Path, root: Path, session: dict) -> bool:
+    """Resume control of paid work, not certify a policy or adopt a score.
+
+    Requiring a scored baseline here deadlocks recovery of a Main-selected baseline
+    whose training succeeded but policy selection failed. Preserve full frozen inputs;
+    only sealed parent/child ownership can authorize the narrower launcher assertion.
+    """
+    try:
+        from .action_receipt import read_action_receipt
+        from .evidence_store import read_attempt_evidence
+        def safe_record(path: Path, maximum: int = 2 * 1024**2):
+            if (not path.is_file() or path.stat().st_size > maximum or
+                    not path.resolve().is_relative_to(output) or
+                    any(p.is_symlink() for p in (path, *path.parents)
+                        if p.is_relative_to(output))):
+                raise ValueError('unsafe Main baseline resume proof')
+            return read_json(path)
+        baseline = safe_record(root/'measurements/baseline.json', 4 * 1024**2)
+        settings = session['base_settings']
+        selection_failure = (baseline.get('status') == 'unscored' and
+            baseline.get('where') == 'policy_artifact' and not baseline.get('evaluate'))
+        consumer_failure = baseline.get('where') == 'evaluate'
+        if (baseline.get('label') != 'baseline' or baseline.get('ok') is not False
+                or not (selection_failure or consumer_failure) or baseline.get('settings') != settings
+                or (session.get('input_component_sha256') or {}).get('settings') != object_digest(settings)):
+            return False
+        if any((root/'confirmation_attempts').glob('*.json')) or (root/'confirmation.json').exists():
+            return False
+        train = baseline.get('train') or {}
+        attempt = str(train.get('attempt_id') or '')
+        if len(attempt) != 32 or any(c not in '0123456789abcdef' for c in attempt):
+            return False
+        relative = f'research/derived/attempts/{attempt}/receipt.json'
+        receipt = safe_record(output/relative)
+        decision = str(receipt.get('controller_decision_id') or '')
+        if (len(decision) != 16 or any(c not in '0123456789abcdef' for c in decision)
+                or receipt.get('attempt_id') != attempt or receipt.get('run_id') != 'derived'
+                or receipt.get('node_id') != 'train' or receipt.get('status') != 'completed'
+                or type(receipt.get('returncode')) is not int or receipt['returncode'] != 0
+                or receipt.get('settings_digest') != object_digest(settings)
+                or receipt.get('evidence_id') != train.get('evidence_id')):
+            return False
+        safe_record(output/'action_receipts'/f'{decision}.json')
+        parent = read_action_receipt(output, f'action_receipts/{decision}.json',
+            run_id='derived', repository=Path(session['repository']))
+        evidence = read_attempt_evidence(output, str(receipt.get('evidence_id') or ''), limit=1)
+        if consumer_failure:
+            def owned_consumer(measured, depth=0):
+                # Ownership authorizes resuming Fix/Main, never adopting a score or
+                # replaying native work. Follow only the bounded exact recovery chain.
+                if (depth>=64 or measured.get('label')!='baseline' or measured.get('ok') is not False
+                        or measured.get('where')!='evaluate' or measured.get('settings')!=settings
+                        or (measured.get('train') or {}).get('attempt_id')!=attempt):
+                    return False
+                identity=str((measured.get('evaluate') or {}).get('attempt_id') or '')
+                if len(identity)!=32 or any(c not in '0123456789abcdef' for c in identity):return False
+                evaluation_ref=f'research/derived/attempts/{identity}/receipt.json'
+                native=safe_record(output/evaluation_ref)
+                sealed=read_attempt_evidence(output,identity,limit=1)
+                failed=(native.get('status')=='failed' and type(native.get('returncode')) is int
+                    and native['returncode']!=0 and native.get('termination_reason')=='nonzero_exit')
+                missing=(native.get('status')=='completed' and type(native.get('returncode')) is int
+                    and native['returncode']==0 and native.get('termination_reason')=='normal_exit'
+                    and (measured.get('metric_artifact_evidence') or {}).get('status')=='missing'
+                    and measured.get('metric_value') is None and not measured.get('result_artifact'))
+                if (native.get('attempt_id')!=identity or native.get('run_id')!='derived'
+                        or native.get('stage')!='evaluate' or native.get('node_id')!='evaluate'
+                        or native.get('ran') is not True or not (failed or missing)
+                        or native.get('settings_digest')!=object_digest(settings)
+                        or sealed.get('status')!=native.get('status')
+                        or sealed.get('returncode')!=native.get('returncode')
+                        or sealed.get('receipt_ref')!=evaluation_ref):return False
+                owner=native.get('controller_decision_id')
+                if owner==decision:
+                    return identity in parent['child_attempt_ids'] and evaluation_ref in parent['evidence_refs']
+                if not isinstance(owner,str) or len(owner)!=16 or any(c not in '0123456789abcdef' for c in owner):return False
+                safe_record(output/'action_receipts'/f'{owner}.json')
+                action=read_action_receipt(output,f'action_receipts/{owner}.json',
+                    run_id='derived',repository=Path(session['repository']))
+                if action.get('action')!='recover_unscored_baseline' or action.get('status')!='not recovered':return False
+                recovery=measured.get('recovery') or {};failure=recovery.get('failure_evidence_id')
+                if not isinstance(failure,str) or len(failure)!=32 or any(c not in '0123456789abcdef' for c in failure):return False
+                backup_ref=f'attempts/{attempt}/baseline_unscored_{failure}.json'
+                if (recovery.get('kind')!='repair_development_consumer_handoff'
+                        or recovery.get('training_reused') is not True
+                        or recovery.get('training_attempt_id')!=attempt
+                        or recovery.get('original_measurement_ref')!=backup_ref):return False
+                backup=safe_record(root/backup_ref,4*1024**2)
+                journal=safe_record(root/f'attempts/{attempt}/baseline_handoff_recovery_{failure}.json')
+                if (journal.get('status')!='failed' or journal.get('training_attempt_id')!=attempt
+                        or journal.get('training_reused') is not True
+                        or journal.get('recovery_kind')!='repair_development_consumer_handoff'
+                        or (journal.get('settings_digest') is not None and
+                            journal['settings_digest']!=object_digest(settings))
+                        or journal.get('original_measurement_sha256')!=object_digest(backup)
+                        or journal.get('measurement_sha256')!=object_digest(measured)
+                        or journal.get('evaluation_attempt_id')!=identity
+                        or journal.get('superseded_evaluation_attempt_id')!=failure
+                        or recovery.get('superseded_evaluation_attempt_id')!=failure
+                        or (backup.get('evaluate') or {}).get('attempt_id')!=failure):return False
+                return owned_consumer(backup,depth+1)
+            if not owned_consumer(baseline):
+                return False
+        return (parent.get('decision_id') == decision and parent.get('action') == 'run_the_loop'
+                and parent.get('status') == 'yielded' and attempt in parent['child_attempt_ids']
+                and relative in parent['evidence_refs'] and evidence.get('status') == 'completed'
+                and type(evidence.get('returncode')) is int and evidence['returncode'] == 0)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 
 def validate_paused_research_resume(output: Path, *, rounds: int,
@@ -119,7 +230,7 @@ def validate_paused_research_resume(output: Path, *, rounds: int,
                     decision = receipt.get('controller_decision_id')
                     verified_main_baseline = (isinstance(decision, str) and len(decision) == 16
                         and all(c in '0123456789abcdef' for c in decision))
-        if not verified_main_baseline:
+        if not verified_main_baseline and not (subset and _main_owned_unscored_baseline(output, root, session)):
             raise ValueError("paused research session has different frozen rounds/settings; "
                              "resume with the original inputs or start a new output directory")
     if session['rounds']!=rounds:
@@ -197,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
                              "repeat for multiple resources; never overlays copied code")
     parser.add_argument('--research-brief', type=Path,
                         help='UTF-8 study intent, frozen separately from native settings; new runs only')
+    parser.add_argument('--require-data-comparison', action='store_true', default=None,
+                        help='freeze a required v2 data campaign before confirmation; '
+                             'new brief/run only, inherited unchanged on resume')
     parser.add_argument("--copy-limit-bytes", type=int, default=4 * 1024**3,
                         help="maximum source bytes copied with --isolated-copy")
     parser.add_argument("--framework", choices=("legacy_v1", "autosota_sim_v1"),
@@ -237,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
     settings = json.loads(args.settings_json)
     if not isinstance(settings, dict):
         parser.error("settings-json must be an object")
+    from .run_successor import assert_not_retired, validate_inheritance
+    try:
+        assert_not_retired(output)
+        validate_inheritance(output)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        parser.error(str(exc))
     if args.keep_only and args.rederive:
         print("--keep-only and --rederive contradict each other; pick one")
         return 2
@@ -257,7 +377,8 @@ def main(argv: list[str] | None = None) -> int:
     output.mkdir(parents=True, exist_ok=True)
     from .research_brief import persist as persist_brief
     try:
-        persist_brief(output, args.research_brief)
+        persist_brief(output, args.research_brief,
+                      **({'require_data_comparison':True} if args.require_data_comparison else {}))
     except (OSError, ValueError, UnicodeError) as exc:
         parser.error(str(exc))
     for amendment_path in (output / 'budget_amendments').glob('*.json'):

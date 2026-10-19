@@ -748,11 +748,17 @@ def numbers(source: dict[str, Any]) -> Section:
                      f"所以上面的最佳值仍然是搜索自己那些点里的最大值。", ""]
         elif state == "not_declared":
             body += [f"**没有未参与搜索的测量**：{confirmation.get('why')}。", ""]
+        elif state == "admission_refused":
+            body += [f"**确认评测在启动前被拒绝**：{confirmation.get('why')}。"
+                     "没有执行留出 rollout，也没有确认分数；修复启动条件并复核未曝光证据后可重试，不能继续开发搜索。", ""]
         elif state == "attempted_and_failed":
             body += [f"**未参与搜索的确认测量失败了**：{confirmation.get('why')}。"
-                     + ("评测已接触留出状态，不能重试或继续搜索。" if not confirmation.get(
+                     + ("评测已接触留出状态或曝光情况未知，不能重试或继续搜索。" if not confirmation.get(
                          "retryable", False) else
                         "评测尚未启动，修复启动条件后可重试，但不能继续搜索。"), ""]
+        elif state == "engineering_recovery_approved":
+            body += ["**确认故障已通过独立工程审核**：证据支持故障发生在 rollout 前，"
+                     "且已有 CPU 修复复验。允许重试原冻结确认操作，当前尚无确认分数。", ""]
         else:
             body += [f"**确认测量不可用**：{confirmation.get('why')}", ""]
     selection = source.get("selection")

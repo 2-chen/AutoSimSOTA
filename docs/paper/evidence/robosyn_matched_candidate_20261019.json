@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-10-19",
+  "study": "robosyn_matched_data_20261019_v1",
+  "run_ref": "autoresearch_runs/robosyn_matched_data_20261019_v1",
+  "task": "click_bell",
+  "claim_scope": "development_candidate_negative_observation_not_acquisition_effect",
+  "baseline": {"value": 0.56, "episodes": 100},
+  "candidate": {
+    "label": "round_1_handoff_correction",
+    "value": 0.5,
+    "episodes": 100,
+    "raw_difference_percentage_points": -6,
+    "training_attempt_id": "b73054f3325b47dda6692da5d47d23b8",
+    "evaluation_attempt_id": "8979f92c4c4943f3b89f43f2b4a23e2e",
+    "main_recovery_action_id": "2ed58e8b4b7d9280",
+    "data_consumption_status": "unknown",
+    "policy_consumption_status": "verified",
+    "rollout_evidence_status": "verified",
+    "metric_lineage_status": "verified"
+  },
+  "operator_readonly_verification": {
+    "baseline": {"status": "consistent", "issues": []},
+    "round_1_handoff_correction": {"status": "consistent", "issues": []}
+  },
+  "sources": [
+    {"ref": "research/derived/measurements/baseline.json", "sha256": "d1f58ebc216f0de91129fa7972b3f3aa758ac53f486248e6ba9c1a89658efdfd"},
+    {"ref": "research/derived/measurements/round_1_handoff_correction.json", "sha256": "ba78727dc3c525e52846415d171b2a8340b550b79056bfc0bf70e1b920beadf4"},
+    {"ref": "action_receipts/2ed58e8b4b7d9280.json", "sha256": "003648a12d2638d8dfce7ed393d8eb493c3d0dd9bc89234b3cfb13af9cda0c50"}
+  ],
+  "limitations": [
+    "single development task and training replicate; no statistical significance claim",
+    "same recorded evaluation protocol does not establish fully matched learning conditions",
+    "no reviewed acquisition selection was transported; actual new-data training use is not established",
+    "this is neither a targeted-versus-random comparison nor a method gain or SOTA",
+    "operator host maintenance and warm bootstrap prevent an unassisted cold-start claim"
+  ]
+}

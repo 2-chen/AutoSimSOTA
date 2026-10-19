@@ -1,0 +1,1257 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-10-16T13:44:40.371975+00:00",
+  "study": "autoresearch_runs/external_systems_20261016_v1",
+  "formal_comparison_eligible": false,
+  "scope": "Operator-assisted native-port development pilots; no system ranking or SOTA claim",
+  "measurements": [
+    {
+      "arm": "enpire_robosyn",
+      "name": "baseline",
+      "scope": "text_diagnostic",
+      "successes": 11,
+      "episodes": 20,
+      "success_rate": 0.55,
+      "setting": "random",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "random",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/benchmark/outputs/baseline_dev_20_seed2026/click_bell/act/random/None/ACT_sim_click_bell/2026-10-16_17-15-11/evaluation_metrics.json",
+          "sha256": "99e8d35d92ddd84a7ff76fa9d3e26f7caf92f9d7477d6b731195e085d682fe74"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robosyn",
+      "name": "cand1_n_action_steps_25",
+      "scope": "text_diagnostic",
+      "successes": 10,
+      "episodes": 20,
+      "success_rate": 0.5,
+      "setting": "random",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "random",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": 25,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/benchmark/outputs/cand1_nact25_dev_20_seed2026/click_bell/act/random/None/ACT_sim_click_bell/2026-10-16_17-17-42/evaluation_metrics.json",
+          "sha256": "526c0c35ea8ec429888ccc17945c9688ee92ca39d245ae8a6f0b4e56cfb4e13e"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robosyn",
+      "name": "cand2_n_action_steps_10",
+      "scope": "text_diagnostic",
+      "successes": 6,
+      "episodes": 20,
+      "success_rate": 0.3,
+      "setting": "random",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "random",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": 10,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/benchmark/outputs/cand2_nact10_dev_20_seed2026/click_bell/act/random/None/ACT_sim_click_bell/2026-10-16_17-20-29/evaluation_metrics.json",
+          "sha256": "bde232f85c9a2dbb0ab56c8fe687928affd30c1302f253596ed9d6e7b5b63d14"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robosyn",
+      "name": "baseline_confirmation",
+      "scope": "text_diagnostic",
+      "successes": 21,
+      "episodes": 50,
+      "success_rate": 0.42,
+      "setting": "random",
+      "seed": 2027,
+      "episode_seeds": [
+        1295221513,
+        1133915827,
+        1734953821,
+        1743494987,
+        1205453784,
+        132151355,
+        1610509144,
+        1548551416,
+        145342206,
+        1016954540,
+        472293939,
+        596314405,
+        1467891936,
+        534295819,
+        993710963,
+        1469326241,
+        1486296503,
+        221254875,
+        1554418603,
+        2056934353,
+        1596289346,
+        1523289374,
+        1681178107,
+        1192920408,
+        1999102322,
+        1360435501,
+        117467705,
+        813827171,
+        2124714910,
+        478011296,
+        1283507578,
+        80013172,
+        1457817055,
+        373121703,
+        10312470,
+        284185374,
+        2036309678,
+        2043144318,
+        1690649144,
+        836957773,
+        41784551,
+        363344509,
+        2041607399,
+        662567876,
+        958614728,
+        1938905132,
+        633666400,
+        850945563,
+        1834524635,
+        531136115
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "random",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 50,
+        "timeout_action_steps": 361,
+        "seed": 2027,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/benchmark/outputs/baseline_confirm_50_seed2027/click_bell/act/random/None/ACT_sim_click_bell/2026-10-16_17-27-55/evaluation_metrics.json",
+          "sha256": "3fd9e25b46e32e2856dd20a8b7c5591a90116b8c77815db90717a6966ba39bf1"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robosyn",
+      "name": "probe_temporal_ensemble_0.01",
+      "scope": "post_confirmation_exploration_excluded",
+      "successes": 7,
+      "episodes": 20,
+      "success_rate": 0.35,
+      "setting": "random",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "random",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/benchmark/outputs/probe_te_dev_20_seed2026/click_bell/act/random/None/ACT_sim_click_bell/2026-10-16_17-34-39/evaluation_metrics.json",
+          "sha256": "038c01f1bc0e424e283da0e17319acc3a8c80eba924382e158e100e7c517045d"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robotwin",
+      "name": "baseline_dev20",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700000,
+        202700001,
+        202700007,
+        202700010,
+        202700012,
+        202700015,
+        202700017,
+        202700018,
+        202700019,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700033,
+        202700035,
+        202700053,
+        202700054,
+        202700058,
+        202700059
+      ],
+      "terminations": {
+        "truncated": 20
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/summary.json",
+          "sha256": "26c2c48f55cb0264cbf0481a2c0447bbdb5a28e873d2095fa8f2a1179eb175ba"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep000/result.json",
+          "sha256": "8f608a6f4ecbea98a7647e4cf0d0d8cace3f30349df9260864dad6c40cbe2d77"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep001/result.json",
+          "sha256": "18e77e72464b4f93e0284113f2580a1109e9747bfc29cd6e599434bd3792858b"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep002/result.json",
+          "sha256": "29b941613c2a3374ad5f2bbfe90414a993df8b566456b548f3d9c2a411ff6754"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep003/result.json",
+          "sha256": "c3f734f0efc5e6f28df0167f0df90c4311cd004ec9827f2b4591368df2ca2cf7"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep004/result.json",
+          "sha256": "84d6de1c6a5452a842aec09e1c3f535bb6f388da59bf95ff6879405aca346484"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep005/result.json",
+          "sha256": "4c3e933bde57fb6972858d886651b0414c25f8fe7b13174f6745289cb2caf1ac"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep006/result.json",
+          "sha256": "f4992076310137a744e78291cce577e59a2d165653de1bb060c062f5da5030d7"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep007/result.json",
+          "sha256": "cf6cd1cf6a06808b2512de37c3dd098aba18d1afd63f08bd6fa1a098df70f579"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep008/result.json",
+          "sha256": "be6521e1198d3d66008243e63c3f82138e3034560110cca0a0f904a5bf8e98f3"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep009/result.json",
+          "sha256": "b1c34aac9ba2f391e2d71b5b7d9b1738718ccd742df320446365b95cbab1e4a4"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep010/result.json",
+          "sha256": "e08ae8a0e88b6fa9c5e25047ef5effc343a3171ab09b6f79628fa78cba073833"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep011/result.json",
+          "sha256": "97a7026df2eb35407f9a5385b83275efb048d7f23b291fcee07239d276cdf5b4"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep012/result.json",
+          "sha256": "8ebda430fbd0c772a0ca062b1f177428f1ac758358c797b42b1d83464d622d8a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep013/result.json",
+          "sha256": "81175b4ccc11e2e04bb3a9af9f352f5f110a3314df5d82ff1563e931b809a95d"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep014/result.json",
+          "sha256": "ba18f1b2449c13526996c0dcfa850c81f87340ab463e87b7a5d296370b12e408"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep015/result.json",
+          "sha256": "7eccf1d843a34e5f1cd00fc4c0db7d6318852dd1de3d02e6c6beae00371453e8"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep016/result.json",
+          "sha256": "a06f11613010fdb588c7d246c6c5ff1b84ddc5ee0dcf0ebfbf355cd0d1a2631d"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep017/result.json",
+          "sha256": "9d1a2a0a4263b494abb3bfbfe3229a6300d65c87c507e7384730deddeab6ee44"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep018/result.json",
+          "sha256": "87646c9fa28558e94383d5f0329c62ecc425930b925da1d88dccc556a4ff4a32"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/baseline_dev20/ep019/result.json",
+          "sha256": "00f55c62067d01f21b077c666ddc40471ef8f1c947ff6a54755a4981d3268d45"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robotwin",
+      "name": "cand_bestckpt_dev20",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700000,
+        202700001,
+        202700002,
+        202700007,
+        202700012,
+        202700015,
+        202700017,
+        202700018,
+        202700019,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700035,
+        202700038,
+        202700039,
+        202700041,
+        202700044,
+        202700053
+      ],
+      "terminations": {
+        "truncated": 20
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/summary.json",
+          "sha256": "2a12367056317268595a136fcf6b3e6dae9fea55ce24b2c82de3017355c96176"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep000/result.json",
+          "sha256": "b2aa09ab1b4828ae877bb7f0f718a8187d34baa7d969aaa55a41f8bc36d0c72f"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep001/result.json",
+          "sha256": "bc8ebc8a2c80995d4d654306e62755c7abcfaeb69100a1e56c09d7a4ac47834a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep002/result.json",
+          "sha256": "c5895aefeb7d2f0d9905b4fbe756aa5ff6d87dd2cfe334dc8c33c5c94c910dbe"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep003/result.json",
+          "sha256": "a136992583dfed5e2546703b679b554a060597cb18c8359b6189b165709b4a8b"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep004/result.json",
+          "sha256": "e10da76d1717fb877750629211014d569fffe1e74a579a0a13509db599a083b1"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep005/result.json",
+          "sha256": "9b026d9b9a69a8b6b38d1554cb0a37c3ec79477d4e7c4a672b738cfd402cf466"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep006/result.json",
+          "sha256": "e4ee0766786532128991e3f0c4804051d33a3935d04f1ab81904a24ea256afe0"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep007/result.json",
+          "sha256": "f4b5d28db5f1b6c905fd063f6d7d4b6ec3bfdd63fbf9a0cffa8b15af0c0514f6"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep008/result.json",
+          "sha256": "fa9e467614a20837c707cb2c341a3a2709e37a53e8f5d6aa2e3d46d81a5f337e"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep009/result.json",
+          "sha256": "0a946b7f55e4624a749193f6b2cddefb6991ca79d2bde974111bc42f6e716fb8"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep010/result.json",
+          "sha256": "20710b9946463530ae2e632ea96f6c54bc79f61558a7e3faa1990da2d304a913"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep011/result.json",
+          "sha256": "bbf7b32009d62ffcd2a643bdfcd56d560ef60dd0c864e5a16ee9d9a7d9ec8a58"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep012/result.json",
+          "sha256": "e0d4fd1c9ff79d160655a8ce6d25bd9c3c3cad1b0dad543365add9f66ff52509"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep013/result.json",
+          "sha256": "03466b2c9db0ae194cf49b3ae7b33e4c529af4878e3759f508cbd621fd2c86a7"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep014/result.json",
+          "sha256": "4d7fde6e4ee728e4c4102c765a4bd476ae5ff4f23253ef32ef11c9267fe222ed"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep015/result.json",
+          "sha256": "744f935d0edff1b9009c0c3d19ee4b6fe5db39d0f54072c4bf931c2f9638e427"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep016/result.json",
+          "sha256": "3753e26c3a12461d02683b525edd078ab18d32acd77e67c76cb0b6d7b9797da6"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep017/result.json",
+          "sha256": "6333633ef0a28878202cccd988d5fe6cae90814f7fde9e77267d5066a57c576f"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep018/result.json",
+          "sha256": "0069a693f592dcb985c5ac6a5bd1584a82d2a3fabf7cf72df44ce9c9a7e5a351"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_bestckpt_dev20/ep019/result.json",
+          "sha256": "ef66380d28151e47b6116c5f0522a61f3f71c55478277f4994dcd5c42c8862b4"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robotwin",
+      "name": "cand_notemporal_dev20",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700000,
+        202700001,
+        202700002,
+        202700007,
+        202700012,
+        202700013,
+        202700017,
+        202700019,
+        202700022,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700033,
+        202700034,
+        202700036,
+        202700038,
+        202700039,
+        202700041
+      ],
+      "terminations": {
+        "truncated": 20
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/summary.json",
+          "sha256": "1b9af4fbd1b266181ea72f1470db4a90f80eb34cc6fbea23c76c5d0680e7773a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep000/result.json",
+          "sha256": "a10e08a15e9b3d0aa37c567754d5c37fce80b7b09cc7155f8ce23fd42925d508"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep001/result.json",
+          "sha256": "02aeeb3d4d850a730279d205966725d9ec46e82a92929574a265960d62921af8"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep002/result.json",
+          "sha256": "9443691b7d7833a8468d8865ec07435e1746162ecf89187e96398ed055439657"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep003/result.json",
+          "sha256": "0abef0300bd78572e7267983da8e2004c2d22297a593aa6393c20da0e3beb92a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep004/result.json",
+          "sha256": "d350addc9d5e852646e51e5f7ab4aac86899c77cf0bddb7e0d13abc3d05570a8"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep005/result.json",
+          "sha256": "54091187b32520c88bcce62674997a96cf0c489a585b41c2a7df9db8d3973182"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep006/result.json",
+          "sha256": "c072a60c37739b09c317b66d0e20baa09c29e5a0c6572e90bb53418d2806f60a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep007/result.json",
+          "sha256": "8e8c22ed7269606fa8aadbea6123e4fa70928549d7b110753298640c708bcd08"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep008/result.json",
+          "sha256": "4e2b581a6aaf0fed352deda7f570d3c4641f99fa7474d4072c6317c5554fda65"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep009/result.json",
+          "sha256": "669086e31d181304b2c2953df88b95c874cb5e6cd4050815e0a4b947381d3bbd"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep010/result.json",
+          "sha256": "3905c17754cde36d0165aeb2baf76c53105d132c53fd24505f26fc72ee8ad9ea"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep011/result.json",
+          "sha256": "81078cf0451e4e68cbdd938eb690de56b67746eac3f7853879866c4a73cc3e95"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep012/result.json",
+          "sha256": "4f5e287f11ef80e4357a1307d80db5dcf3c1829b30053c5d5b2d1bca4ce4ca2a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep013/result.json",
+          "sha256": "8f720d11f05757393bf5b25ac28f1b25ec0de00534f58ced5619ad826fc99381"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep014/result.json",
+          "sha256": "b6df9097a38bbc46c16c2a025a79271bfc12b76a28d8cf1bd8ad70ea0d9d7457"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep015/result.json",
+          "sha256": "3fcbbc105caf7b6abda3951d44cfc4c990a80283a13820903338002970ad4d4f"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep016/result.json",
+          "sha256": "17ce0a3051542933cea1c773f1d565f021fb81ae07035716996396d23d8699da"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep017/result.json",
+          "sha256": "05858316b3a4d3c51e8b5218da8744a4ecc3819f023d79ffce555ab732147839"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep018/result.json",
+          "sha256": "d2b14312f89fa65f6af770c4be68f5468a4d3fa330211de8e93d75b022804b08"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/benchmark/outputs/cand_notemporal_dev20/ep019/result.json",
+          "sha256": "8e2fa5784ce693dca95e571d298ae2d2cc5601a57a7c6fafb7256267a003852f"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robotwin",
+      "name": "baseline",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700001,
+        202700002,
+        202700007,
+        202700010,
+        202700012,
+        202700015,
+        202700017,
+        202700018,
+        202700019,
+        202700022,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700033,
+        202700035,
+        202700038,
+        202700039,
+        202700041,
+        202700044
+      ],
+      "loaded_checkpoint": {
+        "path": "/home/wbc/下载/autoresearch/test/RoboTwin/policy/ACT/act_ckpt/act-beat_block_hammer/baseline/policy_last.ckpt",
+        "sha256": "13fe9e28f9713c2dfcdc39357c81e2c7079269db7dffd696187026ecd1280c01"
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/baseline/eval_baseline_seed2026.log",
+          "sha256": "41f6bba091f7819f55e744f7bad750853aacda10f5827824a8c90963a4866174"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/benchmark/eval_result/beat_block_hammer/ACT/demo_clean/act-beat_block_hammer/2026-10-16 19:27:08/_result.txt",
+          "sha256": "5dea8204e5eec909091ca479a392c1075f3381111fa998b11799e51d7cff2f28"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robotwin",
+      "name": "cand1_ta",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700000,
+        202700001,
+        202700002,
+        202700010,
+        202700012,
+        202700013,
+        202700015,
+        202700019,
+        202700022,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700033,
+        202700035,
+        202700038,
+        202700039,
+        202700041,
+        202700044
+      ],
+      "loaded_checkpoint": {
+        "path": "/home/wbc/下载/autoresearch/test/RoboTwin/policy/ACT/act_ckpt/act-beat_block_hammer/baseline/policy_last.ckpt",
+        "sha256": "13fe9e28f9713c2dfcdc39357c81e2c7079269db7dffd696187026ecd1280c01"
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand1_ta/eval_cand1_ta_seed2026.log",
+          "sha256": "033e125c57648273434703551aa1c84b887c731a878389b2be00a634a348b51a"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/benchmark/eval_result/beat_block_hammer/ACT/demo_clean/act-beat_block_hammer/2026-10-16 19:46:00/_result.txt",
+          "sha256": "f77ecd8b35a4517aace908eba662c713d392bfd9bf128fa871454a3920f8dcd8"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robotwin",
+      "name": "cand2_ft",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700000,
+        202700001,
+        202700002,
+        202700007,
+        202700010,
+        202700012,
+        202700015,
+        202700016,
+        202700017,
+        202700018,
+        202700019,
+        202700022,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700032,
+        202700033,
+        202700035,
+        202700038
+      ],
+      "loaded_checkpoint": {
+        "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand2_ft/ckpt/policy_last.ckpt",
+        "sha256": "4bde4295d53c54563e17f82aaa96b1fe7e30929a67ed4fad3261c535f8174fdb"
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand2_ft/eval_cand2_ft_seed2026.log",
+          "sha256": "eb7efe628d5dd3592793725f89a94ff12c5e27affa35e7d27b783f1407b34829"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/benchmark/eval_result/beat_block_hammer/ACT/demo_clean/act-beat_block_hammer/2026-10-16 20:09:55/_result.txt",
+          "sha256": "a688454a9836f2778d712674209ee82e5c6d8b3737a1594e3d0fda5152529f56"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robotwin",
+      "name": "cand3_ft_ta",
+      "scope": "native_port_development",
+      "successes": 0,
+      "episodes": 20,
+      "success_rate": 0.0,
+      "seed": 2026,
+      "setting": "demo_clean",
+      "episode_seeds": [
+        202700002,
+        202700007,
+        202700010,
+        202700012,
+        202700013,
+        202700015,
+        202700017,
+        202700018,
+        202700019,
+        202700020,
+        202700022,
+        202700025,
+        202700027,
+        202700029,
+        202700030,
+        202700031,
+        202700033,
+        202700035,
+        202700038,
+        202700039
+      ],
+      "loaded_checkpoint": {
+        "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand2_ft/ckpt/policy_last.ckpt",
+        "sha256": "4bde4295d53c54563e17f82aaa96b1fe7e30929a67ed4fad3261c535f8174fdb"
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand3_ft_ta/eval_cand3_ft_ta_seed2026.log",
+          "sha256": "58251255a75c735e6956f6abd1fdd40b3469d0b496f1849ab064b8857700fd55"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/benchmark/eval_result/beat_block_hammer/ACT/demo_clean/act-beat_block_hammer/2026-10-16 20:24:23/_result.txt",
+          "sha256": "6cca682b21205ab02c5c7141a1352cf42194d48b990bb9ed0ccd5f0109283d36"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robosyn",
+      "name": "clear_seed2026_20ep_baseline",
+      "scope": "off_protocol_clear_diagnostic",
+      "successes": 12,
+      "episodes": 20,
+      "success_rate": 0.6,
+      "setting": "clear",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "clear",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/benchmark/research_out/eval_result/click_bell/act/clear/None/ACT_sim_click_bell/2026-10-16_19-00-15/evaluation_metrics.json",
+          "sha256": "c70a865c676f48f5723dd010cebb20f0f60309d149ba74e16c016bda739be95f"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robosyn",
+      "name": "clear_seed2026_20ep_candidate_nas25",
+      "scope": "off_protocol_clear_diagnostic",
+      "successes": 3,
+      "episodes": 20,
+      "success_rate": 0.15,
+      "setting": "clear",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "clear",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": 25,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/benchmark/research_out/eval_result_cand/click_bell/act/clear/None/ACT_sim_click_bell/2026-10-16_19-05-23/evaluation_metrics.json",
+          "sha256": "fd1666f170b7bf1a4a813c603096868c534f61a46f8174e1bd5873302d959776"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robosyn",
+      "name": "clear_seed2026_20ep_candidate_actstep5",
+      "scope": "off_protocol_clear_diagnostic",
+      "successes": 12,
+      "episodes": 20,
+      "success_rate": 0.6,
+      "setting": "clear",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305,
+        1145077126,
+        1773871898,
+        1980789688,
+        2047133773,
+        1988008269,
+        381818397,
+        889207412,
+        2058534300,
+        84665779,
+        2094013439,
+        523372485,
+        851009484,
+        1252261916,
+        1768303234,
+        1247170998,
+        250182349,
+        313680923,
+        1216461280,
+        1122980601
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "clear",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 20,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/benchmark/research_out/eval_result_c2/click_bell/act/clear/None/ACT_sim_click_bell/2026-10-16_19-16-41/evaluation_metrics.json",
+          "sha256": "80ce3054afe682c3786b12024cf97089560b8d28cc03eaff141f58efe7d80871"
+        }
+      ]
+    },
+    {
+      "arm": "autoresearch_robotics_robosyn",
+      "name": "clear_seed2027_50ep_baseline_confirmation",
+      "scope": "off_protocol_clear_diagnostic",
+      "successes": 32,
+      "episodes": 50,
+      "success_rate": 0.64,
+      "setting": "clear",
+      "seed": 2027,
+      "episode_seeds": [
+        1295221513,
+        1133915827,
+        1734953821,
+        1743494987,
+        1205453784,
+        132151355,
+        1610509144,
+        1548551416,
+        145342206,
+        1016954540,
+        472293939,
+        596314405,
+        1467891936,
+        534295819,
+        993710963,
+        1469326241,
+        1486296503,
+        221254875,
+        1554418603,
+        2056934353,
+        1596289346,
+        1523289374,
+        1681178107,
+        1192920408,
+        1999102322,
+        1360435501,
+        117467705,
+        813827171,
+        2124714910,
+        478011296,
+        1283507578,
+        80013172,
+        1457817055,
+        373121703,
+        10312470,
+        284185374,
+        2036309678,
+        2043144318,
+        1690649144,
+        836957773,
+        41784551,
+        363344509,
+        2041607399,
+        662567876,
+        958614728,
+        1938905132,
+        633666400,
+        850945563,
+        1834524635,
+        531136115
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "clear",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 50,
+        "timeout_action_steps": 361,
+        "seed": 2027,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/benchmark/research_out/eval_result_conf/click_bell/act/clear/None/ACT_sim_click_bell/2026-10-16_19-21-51/evaluation_metrics.json",
+          "sha256": "6aacc159eb98801ed54405736d9dbaeac7af7efcd4c2d395a9a737db2b53fe14"
+        }
+      ]
+    },
+    {
+      "arm": "enpire_robosyn_vision",
+      "name": "clear_smoke",
+      "scope": "off_protocol_clear_smoke",
+      "successes": 1,
+      "episodes": 1,
+      "success_rate": 1.0,
+      "setting": "clear",
+      "seed": 2026,
+      "episode_seeds": [
+        942082305
+      ],
+      "native_config": {
+        "policy": "act",
+        "task": "click_bell",
+        "setting": "clear",
+        "checkpoint_path": "/home/wbc/下载/autoresearch/test/RoboSynChallenge/checkpoints/ACT_sim_click_bell",
+        "dp_num_inference_steps": null,
+        "episode_count": 1,
+        "timeout_action_steps": 361,
+        "seed": 2026,
+        "diagnostic_profile": null,
+        "act_n_action_steps_override": null,
+        "ranking_eligible": true
+      },
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn_vision/outputs/eval/diag_clear/native_result/click_bell/act/clear/None/ACT_sim_click_bell/2026-10-16_21-09-38/evaluation_metrics.json",
+          "sha256": "4613a403d7026d9985b94bb82ed18334646c4a77a9c1a84c131765f8766af67a"
+        }
+      ]
+    }
+  ],
+  "trials": [
+    {
+      "name": "enpire_robosyn",
+      "upstream_commit": "99ee90acf65b5b18957c8382ad580db999528be3",
+      "launcher_status": "submitted_needs_audit",
+      "model": "deepseek-flash",
+      "provider_priced_usd": 0.123676632,
+      "unsettled_held_usd": 0.14256773999999997,
+      "unknown_reserved_usd": 0,
+      "cost_complete": false,
+      "requests": 112,
+      "image_request_receipts": 0,
+      "conservative_device_occupancy_seconds": 1742,
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/state.json",
+          "sha256": "4e2bea81e7c68b1eedf39803e1664a352fcf390e5d7b6db187e62f0c43478506"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn/model_usage.json",
+          "sha256": "e13469484bae143bde91d19a74b4820a31b738abe4a7dbba7b0650b39d41305a"
+        }
+      ]
+    },
+    {
+      "name": "enpire_robotwin",
+      "upstream_commit": "99ee90acf65b5b18957c8382ad580db999528be3",
+      "launcher_status": "submitted_needs_audit",
+      "model": "deepseek-flash",
+      "provider_priced_usd": 0.13156787999999997,
+      "unsettled_held_usd": 0,
+      "unknown_reserved_usd": 0.0,
+      "cost_complete": true,
+      "requests": 149,
+      "image_request_receipts": 52,
+      "conservative_device_occupancy_seconds": 3555.080092502758,
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/state.json",
+          "sha256": "c4c50dd4f1c1226b8a3fcb1dd6e02688ff5c4edc4dae0c43388c7b98b9bee658"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robotwin/model_usage.json",
+          "sha256": "2fe6b9d6455ab2981888ba93280e8c1f3202823447d76903fd342fa7142be78d"
+        }
+      ]
+    },
+    {
+      "name": "autoresearch_robotics_robosyn",
+      "upstream_commit": "ff30cc481af9343b9c96f448b5ed72b75bfcd562",
+      "launcher_status": "needs_followup",
+      "model": "deepseek-flash",
+      "provider_priced_usd": 0.11201905199999995,
+      "unsettled_held_usd": 0,
+      "unknown_reserved_usd": 0,
+      "cost_complete": true,
+      "requests": 188,
+      "image_request_receipts": 60,
+      "conservative_device_occupancy_seconds": 2697.649970036,
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/state.json",
+          "sha256": "95ed74b11057b789edc6751094444039efb2e28fe846a876e8d83de98be28e51"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robosyn/model_usage.json",
+          "sha256": "9caec5f2c848b00cf95329b007d0e743bb898e38925968ab34e24ad4b9ed694b"
+        }
+      ]
+    },
+    {
+      "name": "autoresearch_robotics_robotwin",
+      "upstream_commit": "ff30cc481af9343b9c96f448b5ed72b75bfcd562",
+      "launcher_status": "submitted_needs_audit",
+      "model": "deepseek-flash",
+      "provider_priced_usd": 0.051079115999999966,
+      "unsettled_held_usd": 0,
+      "unknown_reserved_usd": 0,
+      "cost_complete": true,
+      "requests": 97,
+      "image_request_receipts": 53,
+      "conservative_device_occupancy_seconds": 4300.133168630302,
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/state.json",
+          "sha256": "248ab4a81f95367870fd32a3512be9fd532502f22f2de598d7a086dcabfb0c94"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/model_usage.json",
+          "sha256": "1f3e82664da5a17e07b4b25df114dae6a3c37fa8ff2fe2d3059ebf696bf89fdb"
+        }
+      ]
+    },
+    {
+      "name": "enpire_robosyn_vision",
+      "upstream_commit": "99ee90acf65b5b18957c8382ad580db999528be3",
+      "launcher_status": "agent_finished",
+      "model": "deepseek-flash",
+      "provider_priced_usd": 0.080954172,
+      "unsettled_held_usd": 0,
+      "unknown_reserved_usd": 0,
+      "cost_complete": true,
+      "requests": 154,
+      "image_request_receipts": 0,
+      "conservative_device_occupancy_seconds": 3058.169003047049,
+      "evidence": [
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn_vision/state.json",
+          "sha256": "e77b1bb49bc10676da0dbc03ac301ca484624c4e0d5252886585c23f7bc349e7"
+        },
+        {
+          "path": "autoresearch_runs/external_systems_20261016_v1/enpire_robosyn_vision/model_usage.json",
+          "sha256": "46ac48f0b55e3ce673c5264177d757291b171d5333877e8b68f32d5138ece8aa"
+        }
+      ]
+    }
+  ],
+  "training": {
+    "variant": "cand2_ft",
+    "git": "3aed09b",
+    "data_key": "sim-beat_block_hammer-demo_clean-50",
+    "epochs": 400,
+    "lr": 3e-05,
+    "kl_weight": 10.0,
+    "budget_s": 560,
+    "cmd": "/home/wbc/下载/autoresearch/AutoSimSOTA/.venv/bin/python /home/wbc/下载/autoresearch/AutoSimSOTA/autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/benchmark/policy/ACT/imitate_episodes.py --task_name sim-beat_block_hammer-demo_clean-50 --ckpt_dir /tmp/act_train/ckpt_cand2_ft --policy_class ACT --kl_weight 10 --chunk_size 50 --hidden_dim 512 --dim_feedforward 3200 --batch_size 8 --num_epochs 400 --lr 3e-05 --save_freq 50 --state_dim 14 --seed 42",
+    "start": "2026-10-16T20:02:51.804600",
+    "short_cwd": "/tmp/act_train",
+    "end": "2026-10-16T20:08:48.143584",
+    "elapsed_s": 356.33896946907043,
+    "returncode": 0,
+    "log": "/home/wbc/下载/autoresearch/AutoSimSOTA/autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand2_ft/train.log",
+    "evidence": {
+      "path": "autoresearch_runs/external_systems_20261016_v1/autoresearch_robotics_robotwin/trials/cand2_ft/train_meta.json",
+      "sha256": "68efabc27f4ac03ae1c7691222765e3d8f7f851c7cd29bfcc7a39819e9cd148e"
+    }
+  },
+  "checkpoint_report_discrepancy": "autoresearch_robotics_robotwin pilot_results.json names policy_best.ckpt; native load logs show policy_last.ckpt for both retrained-policy evaluations. The actual loaded file is authoritative; best-validation loss is not assigned to it.",
+  "sources_unchanged": {
+    "robosyn": true,
+    "robotwin": true
+  },
+  "unresolved": [
+    "Both image-enabled RoboSyn random arms lack a measured baseline; native material initialization failed/hung. Earlier text arm succeeded: environment equivalence/root cause unresolved.",
+    "RoboTwin accepted seed vectors differ across some runs; a common seed label does not establish paired initial states.",
+    "RoboTwin arms start with different temporal_agg defaults; not a frozen matched-head-to-head comparison.",
+    "Launcher missed benchmark/pilot_results.json; needs_followup is not evidence that the agent produced no report.",
+    "RUN.md native metric index omits ENPIRE summary.json and RoboSyn research_out; index counts are not scientific results.",
+    "These trials do not verify targeted new-data acquisition, batch consumption, or held-out candidate improvement."
+  ]
+}

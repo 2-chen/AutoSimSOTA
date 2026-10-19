@@ -38,14 +38,33 @@ def extend(output: Path, *, model_usd: float, wall_seconds: float, reason: str,
                   operator_gpu_ceiling_seconds=operator_gpu_ceiling_seconds)
 
 
+def constrain_gpu(output: Path, *, cap_seconds: float, reason: str,
+                  preserve_stopped_holds: bool = False) -> dict:
+    """Operator-only downward allocation, without shrinking unrelated budgets.
+
+    For example, leave headroom for already-accounted sibling studies instead
+    of showing Main GPU time that a hidden service lifetime would later remove.
+    This cannot increase compute authority or rewrite historical charges.
+    """
+    if (isinstance(cap_seconds, bool) or not isinstance(cap_seconds, (int,float))
+            or not math.isfinite(cap_seconds) or cap_seconds <= 0):
+        raise ValueError('GPU allocation must be finite and positive')
+    return _amend(output, factor=1.0, reason=reason, model_scope='gpu_ceiling',
+        preserve_stopped_holds=preserve_stopped_holds, gpu_limit_seconds=cap_seconds)
+
+
 def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
            preserve_stopped_holds: bool, model_usd: float = 0, wall_seconds: float = 0,
-           gpu_seconds: float = 0, operator_gpu_ceiling_seconds: float | None = None) -> dict:
+           gpu_seconds: float = 0, operator_gpu_ceiling_seconds: float | None = None,
+           gpu_limit_seconds: float | None = None) -> dict:
     extension = model_scope == 'extension'
-    if not math.isfinite(factor) or not (factor == 1 if extension else 0 < factor < 1) or not reason.strip() or model_scope not in {'total', 'remaining', 'extension'}:
+    gpu_only = model_scope == 'gpu_ceiling'
+    if not math.isfinite(factor) or not (factor == 1 if extension or gpu_only else 0 < factor < 1) or not reason.strip() or model_scope not in {'total', 'remaining', 'extension', 'gpu_ceiling'}:
         raise ValueError('explicit reduction requires 0<factor<1, reason and total/remaining scope')
     output = Path(output).resolve(strict=True)
     request = {'factor':factor, 'reason':reason, 'model_scope':model_scope}
+    if gpu_only:
+        request['gpu_limit_seconds'] = gpu_limit_seconds
     if extension:
         request.update(model_add_usd=model_usd, wall_add_seconds=wall_seconds)
         # Preserve identity/verification of existing model+wall-only amendments.
@@ -100,8 +119,11 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
             raise ValueError('operator GPU addition exceeds the 24-hour task cap')
         if spec['total_budget_usd'] != raw['limit_usd']:
             raise ValueError('runtime and model ledger limits disagree')
+        if gpu_only and (gpu_limit_seconds is None or
+                not gpu_record['charged_seconds'] <= gpu_limit_seconds <= gpu_record['cap_seconds']):
+            raise ValueError('GPU allocation may only decrease the cap, never below historical charges')
         available = max(0.0, raw['limit_usd'] - spent - held)
-        limit = (raw['limit_usd'] + model_usd if extension else
+        limit = (raw['limit_usd'] if gpu_only else raw['limit_usd'] + model_usd if extension else
                  raw['limit_usd']*factor if model_scope == 'total' else spent + held + available*factor)
         amendment = {'id':request_id, 'status':'prepared', 'factor':factor,
             'reason':reason, 'at':now(), 'model_scope':model_scope,
@@ -116,6 +138,9 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
                 'model_entries_digest':object_digest(raw['entries']), 'model_entry_count':len(raw['entries']),
                 'spent_usd':spent, 'reserved_usd':held},
             'model_available_before':available, 'model_available_after':max(0.0, limit-spent-held)}
+        if gpu_only:
+            amendment['gpu_limit_seconds'] = gpu_limit_seconds
+            amendment['after']['gpu_seconds'] = gpu_limit_seconds
         if extension:
             amendment.update(model_add_usd=model_usd, wall_add_seconds=wall_seconds)
             if gpu_seconds:
@@ -139,7 +164,7 @@ def _amend(output: Path, *, factor: float, reason: str, model_scope: str,
 
 
 def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -> dict:
-    """Validate an audit record and its unchanged historical ledger prefix."""
+    """Validate a grant and its exact original prefix, including proved accounting."""
     if not isinstance(identity, str) or len(identity) != 64 or any(c not in '0123456789abcdef' for c in identity):
         raise ValueError('invalid amendment identity')
     path = output/'budget_amendments'/f'{identity}.json'
@@ -150,6 +175,9 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
         raise ValueError('unapplied amendment')
     keys = ('factor','reason','model_scope')
     extension = amendment.get('model_scope') == 'extension'
+    gpu_only = amendment.get('model_scope') == 'gpu_ceiling'
+    if gpu_only:
+        keys += ('gpu_limit_seconds',)
     if extension:
         keys += ('model_add_usd', 'wall_add_seconds')
         if 'gpu_add_seconds' in amendment:
@@ -160,7 +188,7 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
         raise ValueError('changed authorization')
     before, after, preserved = amendment['before'], amendment['after'], amendment['preserved']
     factor = amendment['factor']
-    if not (factor == 1 if extension else 0 < factor < 1):
+    if not (factor == 1 if extension or gpu_only else 0 < factor < 1):
         raise ValueError('invalid amendment factor')
     if extension:
         model_add, wall_add = amendment['model_add_usd'], amendment['wall_add_seconds']
@@ -177,6 +205,13 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
         expected = {**before, 'model_usd':before['model_usd'] + model_add,
                     'wall_seconds':before['wall_seconds'] + wall_add,
                     'gpu_seconds':before['gpu_seconds'] + gpu_add}
+    elif gpu_only:
+        ceiling = amendment['gpu_limit_seconds']
+        if (isinstance(ceiling,bool) or not isinstance(ceiling,(int,float))
+                or not math.isfinite(ceiling) or not 0 < ceiling
+                or not preserved['charged_gpu_seconds'] <= ceiling <= before['gpu_seconds']):
+            raise ValueError('invalid downward GPU allocation')
+        expected = {**before, 'gpu_seconds':ceiling}
     else:
         if amendment['model_scope'] not in {'total', 'remaining'}:
             raise ValueError('invalid reduction scope')
@@ -186,9 +221,10 @@ def _verified_amendment(output: Path, identity: str, ledger: dict, wall: dict) -
         expected = {key:value * factor for key,value in before.items()}
         expected['model_usd'] = limit
     count = preserved['model_entry_count']
+    from .ledger_history import matches
     if (after != expected or preserved['wall_started_epoch'] != wall['started_epoch']
-            or not isinstance(count, int) or not 0 <= count <= len(ledger['entries'])
-            or object_digest(ledger['entries'][:count]) != preserved['model_entries_digest']):
+            or type(count) is not int or not 0 <= count <= len(ledger['entries'])
+            or not matches(output, ledger, count=count, sha256=preserved['model_entries_digest'])):
         raise ValueError('amendment does not preserve authorized history')
     return amendment
 

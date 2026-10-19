@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "kind": "formal_development_original_data_20000_updates_matches_incumbent_not_method_gain",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_39_handoff_correction",
+  "training": {
+    "attempt_id": "a29314388cea4f369f45116035be7ff8",
+    "returncode": 0,
+    "seconds": 1549.7,
+    "completed_updates": 20000,
+    "counter_field": [
+      "step"
+    ],
+    "seed": 20261013,
+    "steps_requested": 20000,
+    "batch_size": 8,
+    "resume": false,
+    "policy_pretrained_path_present": false,
+    "registered_version": "click_bell_source_cobotmagic_sim_v1",
+    "consumption_stage": "training_batch",
+    "reader_streams": 1,
+    "witness_events": 801,
+    "terminal_sample_uses_including_repeats": 160000,
+    "malformed_witness_json_lines": 0,
+    "log_bytes": 299905
+  },
+  "evaluation": {
+    "attempt_id": "43c2edceb2334548952aba92bc44c67f",
+    "returncode": 0,
+    "seconds": 434.5,
+    "development_score": 0.24,
+    "successes": 12,
+    "episodes": 50,
+    "policy_bundle_sha256": "0259687bb5cc7ffc9022bacb52e201232074df93788f981c2cbcbf12a4155537",
+    "data_consumption": "verified",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified"
+  },
+  "recovery": {
+    "main_train_action": "755204374f4c0ec3",
+    "fix_attempt_id": "4d5dcf3d525c4567",
+    "main_handoff_action": "e176373f26b7ba17",
+    "training_reused": true,
+    "original_unscored_measurement_preserved": true,
+    "prelaunch_uncertain_review_refusal_preserved": true
+  },
+  "autonomy": {
+    "host_version": "v74",
+    "candidate_settings_training_fix_handoff": "system Main/Fix agents",
+    "operator_prior_maintenance": "added audited non-scoring workflow patch lifecycle; no native changes",
+    "operator_during_execution": "read-only monitoring and documentation; no scientific parameter selection, native edits, model/GPU/wall grant or restart",
+    "new_workflow_patch_tool_used_in_this_trial": false,
+    "unassisted_cold_start_claim": false
+  },
+  "incumbent_development_score": 0.24,
+  "new_primary_gain": false,
+  "method_gain_claim_supported": false,
+  "matched_acquisition_comparison_complete": false,
+  "limits": [
+    "This trial used original provided data; no new acquisition or acquisition-method contrast occurred.",
+    "Matches the existing development score; 20000 versus prior 80000 updates is descriptive, not proof of fourfold efficiency without matched initialization/full recipes and repetitions.",
+    "160000 counts sample uses including repeats, not unique trajectories.",
+    "The six acquisition pilot observations retain their missing common warm-start and quality/family boundaries.",
+    "New source-only workflow software was not used in this training/recovery trial and has no causal ablation here.",
+    "No held-out or benchmark-SOTA claim."
+  ],
+  "source_hashes": {
+    "action_receipts/1a94bafe4f0b3050.json": "b29ea51b94e72c9bd4523aeaebda90fb8ee9c07900128d8eacddb57d478ee27e",
+    "action_receipts/21d8b699e2192b35.json": "66f13bc72acb7461008c95e1e1885f2667683fa727da360ce63a9ab07acc3ece",
+    "action_receipts/755204374f4c0ec3.json": "76928a53b2f35214622a99c926ff9440115372532d1f37cc7fe7ea0a62c12a9c",
+    "action_receipts/e176373f26b7ba17.json": "12a3643e2550bb30b8adaa2c809c2af4581be3421d348666974b2fef78bc4f5e",
+    "data_versions/click_bell_source_cobotmagic_sim_v1.json": "0b965dc70f2a12d5c24bfc5660c744dc4ddb3f3aed03a73871cfc99a80c6049e",
+    "research/derived/measurements/round_39.json": "0b8cb5f6e096df8330f3248d95be2b22bcf00ea9bda055c16e0a086c00fefe29",
+    "research/derived/measurements/round_39_handoff_correction.json": "2bee36b0ce4c5d49f5f25deca5f278f97a0351ba6e8f8b5713017061d056d81e",
+    "research/derived/code_changes/round-39.json": "c0fc474dbaa7680977cf0c64f0e0fbbd7f25d208c35b0614b11ef89ddc11e8ae",
+    "research/derived/train/native_outputs/a29314388cea4f369f45116035be7ff8/checkpoints/020000/pretrained_model/train_config.json": "3bea62f6b85a636dfe48178e4beaf732d2d0fc088f6a22df6b808046c759519a",
+    "research/derived/train/native_outputs/a29314388cea4f369f45116035be7ff8/checkpoints/020000/training_state/training_step.json": "316bf2df11fa04c3caa837d97170f6f7656281da85967084c0f643e8c1d53087",
+    "training_progress_audits/bb748ec2b70821eb5f58bbd707cc637c65ea5b5bb3ef875126e92ffeab507ee2.json": "88cf740f2ea2f0af9abe185b4c5b829ff3e291ceb2f3ab50b95d38f097ecae07",
+    "verification_checkpoint_handoffs/20af8d81acdaf6f08524ecab9777385a6a89a7e88584314003d03d8c7a7d01e5.json": "5ef810a0caee8ad67e251109c5a2a708a1419222dacc8b9aaa2b70b748766852",
+    "research/derived/attempts/a29314388cea4f369f45116035be7ff8/receipt.json": "e6dc029a78bdd293afe8eed88750cc25f85a17c8dedac7bbafa2258462d2b01e",
+    "evidence/a29314388cea4f369f45116035be7ff8.json": "78ff85ddd41f8ec0fc2b71c1dfd11541428fcdabf0aec9f0b59cdd1bcdfaa548",
+    "research/derived/train/attempts/a29314388cea4f369f45116035be7ff8/output.log": "0228a1e8bb738c8e4ceda4d9a22a78473857fef23e35dc11585ecc9d48c374c6",
+    "research/derived/attempts/43c2edceb2334548952aba92bc44c67f/receipt.json": "1d2a66c00dce76be89f307d0c68d7610efefd0e9464cad8833e5fd671c76dbf9",
+    "evidence/43c2edceb2334548952aba92bc44c67f.json": "58c92473085050c06deaf2f377cc2d7ce8844a79eb9a269f3ba286cc51cc7640",
+    "research/derived/evaluate/attempts/43c2edceb2334548952aba92bc44c67f/output.log": "587650a3bde29511b9bfbd4b1fd9731a67cd4ecd1a514752b6c2cee537585ea2",
+    "research/derived/evaluate/native_outputs/43c2edceb2334548952aba92bc44c67f/eval_result/click_bell/act/random/policy/2026-10-19_01-08-51/evaluation_metrics.json": "0eeed15887204084265144d98fd3637ccc0e35151ce5215fdec9336616e8b44c"
+  }
+}

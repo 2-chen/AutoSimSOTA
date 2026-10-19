@@ -41,6 +41,69 @@ def old_observation():
         'run_budget':{'limit_usd':3,'remaining_usd':0,'entry_count':2}}
 
 
+def test_current_admission_rules_are_source_bound_and_stale_routes_not_permanent(tmp_path):
+    from autosim.research.common import digest
+    from autosim.research import runtime_freshness
+    old={'step':'submit_native_job','outcome':'rejected','because':'protocol changed'}
+    original=copy.deepcopy(old)
+    row=controller_context(tmp_path,[old])
+    assert row['historical_admission_revalidation']['operations']==['submit_native_job']
+    assert row['previous_action_failures'][0]['validity']=='unverified_in_current_runtime'
+    assert old==original
+    rules=row['current_admission_contracts']
+    assert 'ONLY explicitly requested' in rules['candidate_settings']['rule']
+    for contract in rules.values():
+        path=runtime_freshness.__file__
+        from pathlib import Path
+        assert contract['source_sha256']==digest(Path(path).parent/Path(contract['source_ref']).name)
+    assert 'verified repair' in row['historical_admission_revalidation']['authority']
+    assert not (tmp_path/'native_jobs').exists()
+
+
+def test_current_contract_distinguishes_available_transport_from_stale_builder(tmp_path):
+    source = 'def stage_argv_train(i): return [i["python"], i["dataset"]]'
+    facts = controller_context(tmp_path, [], train_source=source)
+    rule = facts['current_admission_contracts']['training_selection_transport']['rule']
+    assert 'selected_training_data' in rule and 'NOT expected hashes or counters' in rule
+    assert 'AUTOSIM_TRAIN_SELECTION_JSON' in rule and 'new campaign ID' in rule
+    assert 'AUDITED CODE CANDIDATES' in rule and 'not research_task(edit)' in rule
+    assert facts['current_admission_contracts']['candidate_settings']['current_train_builder']['text'] == source
+    assert not list(tmp_path.iterdir())
+
+
+def test_main_uncertainty_contract_is_explicit_not_an_automatic_review_override(tmp_path):
+    rule=controller_context(tmp_path,[])['current_admission_contracts'][
+        'candidate_uncertainty_validation']['rule']
+    assert 'execution_uncertainty' in rule and 'stage_window_seconds' in rule
+    assert 'NOT approval' in rule and 'unavailable/malformed' in rule
+    assert 'Existing actual-data' in rule and 'unchanged hard totals' in rule
+    assert not list(tmp_path.iterdir())
+
+
+def test_consumer_format_recovery_is_not_research_approval_or_an_unbounded_retry(tmp_path):
+    rule=controller_context(tmp_path,[])['current_admission_contracts'][
+        'consumer_review_response']['rule']
+    assert 'consumer_review_unavailable' in rule
+    assert 'One format-only' in rule and 'valid negative verdict' in rule
+    assert 'Legacy cached format failures alone' in rule and 'format-v2' in rule
+    assert 'format-v3' in rule and '8192' in rule
+    assert 'sealed older paid responses' in rule and 'strict booleans/citations' in rule
+    assert 'no training' in rule and 'remain cached unavailable' in rule
+    assert 'ALREADY' in rule and '64 KiB' in rule and 'raw JSON datasets' in rule
+    assert 'without deleting the old' in rule and 'legacy approvals stay valid' in rule
+    assert not list(tmp_path.iterdir())
+
+
+def test_current_runtime_refusal_is_not_offered_as_stale_retry(tmp_path):
+    ref=write_action_receipt(tmp_path,ActionReceipt(action_id='b'*16,run_id='r',
+        repository=str(tmp_path),action='submit_native_job',decision_id='b'*16,
+        state_revision=1,started_at='before',finished_at='after',status='rejected',reason='refused',
+        resource_limits={'enforced':{'controller_runtime_id':controller_identity()}}))[0]
+    row=controller_context(tmp_path,[{'step':'submit_native_job','outcome':'rejected','receipt_ref':ref}])
+    assert row['historical_admission_revalidation']['operations']==[]
+    assert row['previous_action_failures'][0]['validity']=='observed_in_current_runtime'
+
+
 def test_historical_budget_snapshot_is_retained_but_not_current_admission():
     original = old_observation()
     before = copy.deepcopy(original)
@@ -132,8 +195,20 @@ def test_exhausted_harness_proposal_is_not_a_scheduler_option(tmp_path):
     real.client.fork_readonly = lambda **kw: None
     for index in range(3):
         atomic_json(real.output/f'harness_repairs/{index}/proposal.json',
-                    {'id':str(index),'status':'candidate','created_at':str(index)})
+                    {'id':str(index),'status':'candidate','created_at':str(index),
+                     'runtime_identity':controller_identity()})
     view = real.state()
     assert view['harness_repair']['proposal_count'] == 3
     assert view['harness_repair']['can_propose'] is False
     assert 'propose_harness_repair' not in view['available']
+
+
+def test_historical_harness_proposal_cap_does_not_lock_new_controller(tmp_path):
+    real=make(tmp_path);real.client.fork_readonly=lambda **kw:None
+    for index in range(3):
+        atomic_json(real.output/f'harness_repairs/{index}/proposal.json',
+            {'id':str(index),'status':'candidate','created_at':str(index),'runtime_identity':'old'})
+    view=real.state()
+    assert view['harness_repair']['proposal_count']==3
+    assert view['harness_repair']['current_version_proposal_count']==0
+    assert 'propose_harness_repair' in view['available']

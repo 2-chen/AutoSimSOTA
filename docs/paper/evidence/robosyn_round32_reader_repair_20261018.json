@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "kind": "formal_development_reader_witness_repair_not_batch_required_data_arm",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_32_handoff_correction",
+  "training": {
+    "attempt_id": "46106ba8145245e690ec882c8f53cbb4",
+    "status": "completed",
+    "returncode": 0,
+    "seconds": 93.6,
+    "seed": 20261031,
+    "completed_updates": 1000,
+    "registered_version": "click_bell_agent_targeted_20ep_008_v1",
+    "data_consumption": "verified",
+    "exposure": [
+      {
+        "data_version_id": "click_bell_agent_targeted_20ep_008_v1",
+        "setting": "dataset",
+        "status": "basic_read_only",
+        "samples_read": 8064,
+        "consumption_stage": "sample_read",
+        "reader_streams": 24,
+        "witness_events": 8064
+      }
+    ],
+    "argv_has_pretrained_policy": false,
+    "argv_has_resume": false
+  },
+  "physical_log_diagnostic": {
+    "sample_read_events": 8064,
+    "training_batch_events": 0,
+    "malformed_witness_json_lines": 0,
+    "reader_streams": 24,
+    "nonmonotonic_stream_events": 0,
+    "terminal_reads_including_prefetch_and_repeats": 8064
+  },
+  "evaluation": {
+    "attempt_id": "7e5d21690e4e45d3bfb08f8b39d57538",
+    "status": "completed",
+    "returncode": 0,
+    "seconds": 504.6,
+    "development_score": 0,
+    "episodes": 50,
+    "policy_bundle_sha256": "ff8e6c1d23fe127ec74f7aab242188812d1b9ad6912a4dc464bf5e55d9035e5d",
+    "result_sha256": "4955c2bea0d520844fe5d78b0f4126a30e829229537f493e46f89134f1aa8536",
+    "data_consumption": "verified",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified"
+  },
+  "recovery": {
+    "data_advisor_action": "0635f368e2e51a84",
+    "main_proposal_action": "0d683d311046edbc",
+    "main_train_action": "941365c563fef351",
+    "main_handoff_action": "2340731b2367a19f",
+    "original_round32_unscored_preserved": true,
+    "training_reused": true,
+    "old_round31_failure_not_rewritten": true
+  },
+  "autonomy": {
+    "host_version_during_trial": "v68",
+    "native_patch_settings_training_fix_and_handoff": "system Main/Data/Fix agents",
+    "operator_during_trial": "read-only monitoring, own-process CPU profiling, isolated /tmp prototype tests and archive; no native edits or scientific parameter choice",
+    "operator_maintenance_after_round": "v69 short-view semantic repair, finite +10 USD/+4h; no GPU extension, old accounts retained",
+    "unassisted_cold_start_claim": false
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "method_gain_claim_supported": false,
+  "matched_acquisition_comparison_complete": false,
+  "batch_required_campaign_arm_eligible": false,
+  "limits": [
+    "No new acquisition in this round; the registered 008 pool was acquired earlier.",
+    "8064 counts reader uses including prefetch and repetition; no training_batch event was emitted.",
+    "24 streams are whole-trial reader identities, not 24 concurrent workers.",
+    "The native trainer completed 1000 updates, but this log does not establish actual batch-level exposure; do not substitute sample_read for the frozen v2 batch requirement.",
+    "This is an independent formal diagnostic score, not a new accepted campaign row.",
+    "The actual argv has no policy warm-start/resume flags; common frozen policy initialization remains unverified/nonconforming to the existing v3 requirement.",
+    "An uncertain static review and an explicit bounded validation are not native success certificates; actual post-run proofs are separately recorded.",
+    "No method improvement, causal acquisition comparison, held-out confirmation or SOTA is supported."
+  ],
+  "source_hashes": {
+    "action_receipts/0635f368e2e51a84.json": "db2e030e0ac2495b9c70c24bc324d5396e044cafe4a08e8768d9ae017640cd32",
+    "evidence/0c515c33bc224e9d894c20c4ba43102d.json": "6f120fc29fc7ddd119d5397ee3a21b1d005376210e8022549848baa67e5372c7",
+    "report_handoffs/0c515c33bc224e9d894c20c4ba43102d.log": "728a11aafa0bdd4de8542295cb44cbd1d371b9ca488a713ad35e7ab280615f1c",
+    "action_receipts/0d683d311046edbc.json": "73493d5785ce40da3f52c41eff8006e16da4b659c66a47e55b46b1e403f689ad",
+    "action_receipts/941365c563fef351.json": "2cdd5664bcba70997fff6d6c6751c86a264a08407c83e61097199daded074e28",
+    "action_receipts/2340731b2367a19f.json": "96adcb5d53d5f90e5879487a03468e64d28ef643e5ca679489c20529e13fcd0a",
+    "data_versions/click_bell_agent_targeted_20ep_008_v1.json": "36a4afd6acbc98e2717da9f5840f80cbd820b3275b20c9be3f0591be0164ff10",
+    "research/derived/measurements/round_32.json": "d983ea74fe96458f1aa40601531925d391d20c7946e0268dd61ad516417f2f3f",
+    "research/derived/measurements/round_32_handoff_correction.json": "fe7428c106d1f2763c184a6ad1dd4f81fef526088c222d6d49d2cafb63ed7923",
+    "research/derived/attempts/46106ba8145245e690ec882c8f53cbb4/receipt.json": "59e02b55eb0ae1ac9078a7154b41d49ed46da9c3b2845ef616bb132b980215fd",
+    "research/derived/attempts/7e5d21690e4e45d3bfb08f8b39d57538/receipt.json": "a229f7893d93c110d4fed3fcae126aafd9b898452285f46c96a82543a525ac91",
+    "evidence/46106ba8145245e690ec882c8f53cbb4.json": "5759db572df211a9245dce926cf0bb043bf3fc186563cec96b76e6eebef2f067",
+    "evidence/7e5d21690e4e45d3bfb08f8b39d57538.json": "04f93f57a8f301e6304ad0849ba5bb2c6b54f6261752a0050ae075b4f8442718",
+    "research/derived/train/attempts/46106ba8145245e690ec882c8f53cbb4/output.log": "f96129d0d74b3bdd41492d75d87649d0a1b65e4a978a52004d6184627c36b517",
+    "research/derived/evaluate/attempts/7e5d21690e4e45d3bfb08f8b39d57538/output.log": "6a3cf9ee81f4aa60a60cfa3de2abc6fab17649f691d0e1db6b653e63489c41be",
+    "research/derived/code_changes/round-32.json": "4a3732b3a5b5325bd234968caaf5c6e90253cd8573c1138005aafc160b4e35d8",
+    "training_progress_audits/f54c92c63611c0c5e338d0dc239b260e5c8e3950482bfd322b65b87129e4a052.json": "de73654366299a80627e123b82740636edba249a372f9b90b8a9505917442f25",
+    "verification_checkpoint_handoffs/a270207b3719e514ebe17f8b0854300e470d64809913f2fbd1c4142d6f21fd44.json": "6dee93e7e657b06f14613ab01f6552fb1a133b5d74e3f06cc27dee69a9f21c79",
+    "research/derived/experiments/round_32_handoff_correction/7e5d21690e4e45d3bfb08f8b39d57538/result.json": "4955c2bea0d520844fe5d78b0f4126a30e829229537f493e46f89134f1aa8536",
+    "research/derived/train/native_outputs/46106ba8145245e690ec882c8f53cbb4/checkpoints/001000/pretrained_model/train_config.json": "c497dc5e6b2edc7419c8c19c859ae2b82a3308e724f4e4b509cf88752a61e942",
+    "candidate_execution_reviews/validation_trials/c44596ebad357ffc6fd1c6f171a21344cec1919d229ad7cc814df0f90d886165.json": "b83a1814216a3e50ff075033e38dc0850c93dbdee3459c38d4c7938df3810111",
+    "candidate_execution_reviews/0b5a201cacbb5420d718280b82fe7b57c9139018c44b1e8d8d3a4967f3ca4abe.json": "4194f9c548ac466d9534de1bed5775cac29a6ee9587cca4354659d155891d01e"
+  }
+}

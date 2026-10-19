@@ -87,7 +87,12 @@ def build(*, repo: Path, output: Path, declaration: dict[str, Any],
                 "telemetry_spec": telemetry_spec,
                 "evaluation_entrypoint": (stages.get("evaluate") or {}).get("entrypoint"),
                 "status": "claimed_not_frozen"}
-    frozen = _read(output / "research" / run_id / "protocol_frozen.json")
+    from .protocol_revision import effective
+    frozen_path,revision=effective(output/'research'/run_id)
+    frozen = _read(frozen_path)
+    if revision:
+        protocol['protocol_revision_id']=revision['id']
+        protocol['original_protocol_preserved']=True
     if frozen.get("hashes") is not None:
         protocol["frozen_file_hashes"] = frozen["hashes"]
         protocol["status"] = "files_frozen_for_local_run"

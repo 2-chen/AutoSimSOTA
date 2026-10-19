@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "kind": "operator_readonly_research_contract_transport_audit",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "observed_after_round": 31,
+  "author": "operator/Codex, not autonomous Main discovery",
+  "findings": {
+    "old_review_material_sha256": "33f869a23b1be4f3c0fec7f9468c20fa4fea5d540e83814741c9ad23edd6e796",
+    "old_review_verdict": "uncertain",
+    "old_request_has_current_main_goal": false,
+    "old_request_has_frozen_data_studies": false,
+    "round30_native_argv_has_pretrained_policy": false,
+    "round30_native_argv_has_resume": false,
+    "round30_saved_resume": false,
+    "round30_policy_initialization_keys": [
+      "pretrained_backbone_weights"
+    ],
+    "round31_train_rc": 0,
+    "round31_train_seconds": 93.6,
+    "round31_registered_data_consumption": "unverified",
+    "round31_training_batch_events": 0,
+    "round31_malformed_witness_lines": 20,
+    "round31_other_parseable_witness_events": 8020
+  },
+  "interpretation": [
+    "The frozen v3 comparison explicitly calls for a common policy warm-start directory. Observed R30 argv and saved configuration do not route a policy warm start; component pretraining is different. The 6% measurement remains valid but cannot be claimed to conform to that frozen factor.",
+    "Main could see frozen factors in its state; this audit does not claim the main model had no information. The independent execution reviewer lacked both the current Main contract and full frozen study declarations.",
+    "The old R31 review was uncertain, not an approval of consumption. Main selected a bounded diagnostic. Training completion cannot establish batch consumption; the actual consumer correctly kept it unverified.",
+    "No retrospective score/row/plan rewrite, fabricated consumption witness or new scientific parameter is authorized by this audit."
+  ],
+  "host_repair": {
+    "version": "v68",
+    "goals": "forward current Main goal and full frozen data requirements into existing source-bound review and bounded-validation recheck; expose observation authority; prompt Main/Data/Fix to inspect actual bindings",
+    "generic_not_benchmark_flag_rules": true,
+    "scientific_parameters_chosen_by_operator": false,
+    "existing_verdicts_preserved": true,
+    "real_new_llm_review_verified": true,
+    "regressions": {
+      "related_suite": 619,
+      "focused_suite": 15,
+      "overlap_not_additive": true
+    },
+    "real_new_llm_review_verified_scope": "transport only; independent verdict remains uncertain, no native approval inferred"
+  },
+  "source_hashes": {
+    "data_campaigns/click_bell_random_quality_vs_agent_targeted_v3/plan.json": "df8f801721037ebc01ec9a40a961a0a5912438d9521f493d6a2ea5acdba904bb",
+    "action_receipts/68262ac015528c35.json": "bdf9ef6ce3dc63e2ae32b7b5e3c26cd4779628a94a34ecae6da9466559160bd0",
+    "research/derived/attempts/b55300006600402e87bb85c544ee47d2/receipt.json": "1d8ba7160bf514bab44e6f774b1654029b1c0781edf7aaf8668c80a5ad0f0288",
+    "research/derived/train/native_outputs/b55300006600402e87bb85c544ee47d2/checkpoints/001000/pretrained_model/train_config.json": "73fabd96817a54e43ade51a7f6b5cda53ebaebb34ddf07a47480afb3f49c035f",
+    "research/derived/attempts/15499f7b9d3a4a99844c76fb107a197b/receipt.json": "c3e56afd9937909502a77d10022afc4da6ac7d70cbe47c0d1a15932198175c9d",
+    "research/derived/train/native_outputs/15499f7b9d3a4a99844c76fb107a197b/checkpoints/001000/pretrained_model/train_config.json": "408e99eb701cd0ed2778cfb660d5630998f90c99c9a42a6daf3682ea4149450e",
+    "research/derived/measurements/round_31.json": "81f294043a91ef835f0aefe3b5abc1dc4527280909285115856bec5fcfd7154c",
+    "research/derived/train/attempts/15499f7b9d3a4a99844c76fb107a197b/output.log": "0a9b4defaa243ed60f757a0e8ae4a79154f78640603d883201040d22dd8d55d4",
+    "candidate_execution_reviews/33f869a23b1be4f3c0fec7f9468c20fa4fea5d540e83814741c9ad23edd6e796.json": "16a678c4d8a5e6d53216f8ac4fc8bbf992a9ea40dff30e24729252f28c8a4b79",
+    "candidate_execution_reviews/requests/33f869a23b1be4f3c0fec7f9468c20fa4fea5d540e83814741c9ad23edd6e796.json": "84a68dfab1f26176d807c0aa5697ab8cf16a1dba3a96ada7f0ab300beb3f5773",
+    "candidate_execution_reviews/12a5fdad966a02364fddd84d4265bdd9cb7fb6d3d9c123675e4a4a980e6ab8e7.json": "eafca503de63f7ff687ff975e93333206c4448fbd47d04f293a647681f5f48d7",
+    "candidate_execution_reviews/requests/12a5fdad966a02364fddd84d4265bdd9cb7fb6d3d9c123675e4a4a980e6ab8e7.json": "30c165afe620ebfd768601e639d17d5b104501e19a61aa19da397df9d95e7f0a"
+  },
+  "post_deployment": {
+    "review_material_sha256": "12a5fdad966a02364fddd84d4265bdd9cb7fb6d3d9c123675e4a4a980e6ab8e7",
+    "review_contract_version": 13,
+    "current_main_goal_delivered": true,
+    "frozen_protocols_delivered": 2,
+    "complete_recipe_lengths": [
+      904,
+      514
+    ],
+    "verdict": "uncertain",
+    "requested_next_step": "cheap multiworker CPU contract probe before paid training",
+    "scope": "runtime transport only; not approval, scientific correctness, actual consumption, warm-start repair or method gain"
+  }
+}

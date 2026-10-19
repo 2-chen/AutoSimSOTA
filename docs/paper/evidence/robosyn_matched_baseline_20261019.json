@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-10-19",
+  "study": "robosyn_matched_data_20261019_v1",
+  "run_ref": "autoresearch_runs/robosyn_matched_data_20261019_v1",
+  "task": "click_bell",
+  "claim_scope": "verified_local_development_baseline_only",
+  "metric": {"name": "success_rate", "value": 0.56, "verified_native_episodes": 100},
+  "training": {"attempt_id": "27247e61a977463685ef1375fa9c342c", "completed_updates": 2048, "returncode": 0},
+  "evaluation": {"attempt_id": "b31741533af14b419e512a52c4f2302f", "returncode": 0},
+  "recovery": {
+    "main_action_id": "87bbdd6bf257a803",
+    "native_replayed": false,
+    "journal_ref": "research/derived/baseline_score_recovery.json",
+    "journal_status": "completed",
+    "original_failed_measurement_ref": "research/derived/measurements/baseline_score_source_2076e7b4cc73a3a5.json",
+    "scoring_attachment_ref": "research/derived/metric_recoveries/e4ba1d55609402836b3526cfdac35fa1410af1a2c65c3226f97ff7f4fce8ca84.json"
+  },
+  "verification": {"status": "consistent", "issues": [], "operator_readonly_reverification": true},
+  "autonomy": {
+    "main_selected_training_and_recovery": true,
+    "internal_fix_diagnosed_native_load_and_locator_failures": true,
+    "operator_selected_scientific_parameters": false,
+    "operator_host_repairs_and_restarts": true,
+    "unassisted_cold_start": false
+  },
+  "not_established": [
+    "official baseline reproduction",
+    "method improvement or SOTA",
+    "new acquisition effect",
+    "matched continuation/random/targeted comparison",
+    "multi-seed or cross-task robustness",
+    "fully unattended end-to-end execution"
+  ],
+  "comparison_warning": "Do not compare this baseline numerically as a method gain against the parent study's 12%/24% or the separately unregistered released-reference log observation. Protocols, starting policies and evidence scopes differ."
+}

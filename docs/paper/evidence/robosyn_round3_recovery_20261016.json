@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "development_handoff_recovery_observation",
+  "observed_on": "2026-10-16",
+  "run": "robosyn_required_data_20261013_v1",
+  "task": "click_bell",
+  "label": "round_3_handoff_correction",
+  "original_label": "round_3",
+  "settings": {"episodes": 50, "seed": 20261013, "steps": 1000, "task": "click_bell"},
+  "metric": {"name": "click_bell_random_task_success_rate", "unit": "ratio", "direction": "maximize"},
+  "result": {"successes": 4, "episodes": 50, "value": 0.08},
+  "incumbent_value_unchanged": 0.18,
+  "training_reused": true,
+  "training_attempt_id": "b4da6e8f52c0403d91517e9872d03d31",
+  "evaluation_attempt_id": "d47739f8eda04e94986de105cfdc4e95",
+  "policy_sha256": "a484381470360a44239bd7c25ca5b7a78b45c86e74f718d4a980c40b5d27bd8e",
+  "verification": {
+    "receipt_verifier": "consistent",
+    "issues": [],
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "data_consumption": "unknown"
+  },
+  "source_file_sha256": {
+    "comparison_protocol": "bd65c957005f7c06cfe449cd22e05d01aaf40909a8744fd4f4ea16c7d42d06c0",
+    "original_unscored_measurement": "01d9efeea3e1499f286dba8504cb7aabcc5ecd7d7489f882665ddd8e427a6423",
+    "corrected_measurement": "d509b31a8dbd35562d97a847596f385b1567341531cdcb9b320d2db630c50e85",
+    "training_receipt": "66d0a082d4e2c2302b18ac5ea0b3e23181f8b7f55f33064d04478543b0d4a934",
+    "evaluation_receipt": "7ed7a040618ab818744751fdf439c0d4108e9a19fbd19741bc41afe2848bf73e"
+  },
+  "separate_unscored_probe": {
+    "job_id": "d344ac416b4a408aadf3d9e7dff68bfd",
+    "attempt_id": "7c25ba546ca447b8b851453cf4994fec",
+    "episodes": 50,
+    "value": 0.12,
+    "source_unchanged": true,
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "authority": "detached diagnostic, not a formal measurement or substitute for the lower formal result"
+  },
+  "limits": [
+    "Framework-maintained development run, not a frozen zero-intervention systems trial.",
+    "Diagnostic training-batch instrumentation candidate; no performance improvement was established.",
+    "No reviewed training-data binding; this is not evidence of new-data consumption or acquisition benefit.",
+    "Probe and formal evaluation used the same policy identity, but physical initial-state pairing was not established.",
+    "Do not pool the two evaluations or count them as independent research repetitions.",
+    "Not an independent held-out confirmation or public SOTA claim."
+  ]
+}

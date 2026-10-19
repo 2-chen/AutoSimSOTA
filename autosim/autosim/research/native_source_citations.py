@@ -17,6 +17,30 @@ def roots(context):
             *(Path(p) for p in context.get('dependency_roots', []))]
 
 
+def catalog(output, repo):
+    """A bounded discovery route for the already-authorized dependency roots."""
+    context = load_context(Path(output), Path(repo))
+    rows = []
+    for index, root in enumerate(roots(context)):
+        entries = []
+        for p in sorted(root.iterdir(), key=lambda p: p.name):
+            name = p.name
+            if (p.is_symlink() or name.startswith('.') or
+                    any(s in name.lower() for s in ('credential', 'secret', 'id_rsa', 'id_ed25519'))):
+                continue
+            if p.is_dir() or p.suffix.lower() in {'.py', '.pyi', '.sh', '.yaml', '.yml', '.toml'}:
+                entries.append(name + ('/' if p.is_dir() else ''))
+            if len(entries) >= 65:
+                break
+        rows.append({'root_index': index, 'entries': entries[:64], 'truncated': len(entries) > 64})
+    if load_context(Path(output), Path(repo))['identity'] != context['identity']:
+        raise ValueError('native source context changed during discovery')
+    return {'status': 'source_catalog', 'context_identity': context['identity'], 'roots': rows,
+            'authority': 'authorized-root names only; not source bytes or protocol approval',
+            'guidance': 'Select source_request={root_index,path} to capture exact public source bytes. '
+                        'Builtin Read cannot read external dependencies; no edit-mode escalation required.'}
+
+
 def locate(context, request):
     if not isinstance(request,dict) or set(request) != {'root_index','path'}:
         raise ValueError('source_request requires root_index and dependency-root-relative path')

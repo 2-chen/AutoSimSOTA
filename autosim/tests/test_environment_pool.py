@@ -27,6 +27,23 @@ def prefix_at(path, *, name="torch", version="2.7.1", editable=False):
     return path
 
 
+def test_inventory_reads_each_metadata_once_but_observes_next_call_changes(tmp_path, monkeypatch):
+    import importlib.metadata as metadata
+    base=prefix_at(tmp_path/'base')
+    original=metadata.Distribution.metadata.fget
+    reads=[]
+    def observed(distribution):
+        reads.append(str(distribution._path))
+        return original(distribution)
+    monkeypatch.setattr(metadata.Distribution,'metadata',property(observed))
+    first=pool.describe(base)
+    assert first['packages']['torch']=='2.7.1' and len(reads)==1
+    (base/'lib/python3.10/site-packages/torch-2.7.1.dist-info/METADATA').write_text('Name: torch\nVersion: 2.8.0\n')
+    second=pool.describe(base)
+    assert second['packages']['torch']=='2.8.0' and len(reads)==2
+    assert second['fingerprint']!=first['fingerprint']
+
+
 def cached_wheel(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:

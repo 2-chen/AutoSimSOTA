@@ -39,6 +39,229 @@ def preparation(tmp_path, choices=()):
                        scouting=tmp_path / "scouting")
 
 
+@pytest.mark.parametrize('fault', ['source_changed', 'wrong_target', 'symlink', 'invalid_json', None])
+def test_current_metric_binding_must_match_executable_before_admission(tmp_path, fault):
+    real = preparation(tmp_path)
+    real.output.mkdir(parents=True)
+    real.declaration = {'benchmark':'toy', 'research_goal':{'primary_metric':{
+        'name':'success_rate','direction':'maximize','source':'log'}}}
+    real.interpreter = Path(sys.executable)
+    real.stages = {'evaluate':'def stage_argv_evaluate(i): return [i["python"]]'}
+    binding = {'score_target':'evaluate', 'stage_source_sha256':hashlib.sha256(
+        real.stages['evaluate'].encode()).hexdigest()}
+    if fault == 'source_changed':
+        binding['stage_source_sha256'] = '0' * 64
+    elif fault == 'wrong_target':
+        binding['score_target'] = 'train'
+    path = real.output / 'metric_binding.json'
+    if fault == 'symlink':
+        other = tmp_path / 'other.json'
+        other.write_text(json.dumps(binding))
+        path.symlink_to(other)
+    else:
+        path.write_text('not json' if fault == 'invalid_json' else json.dumps(binding))
+    before = path.read_bytes()
+    assert real._metric_bound() is (fault is None)
+    assert ('an explicit primary metric bound to native output' in
+            real._research_admission_missing(native_only=True)) is (fault is not None)
+    assert path.read_bytes() == before
+
+
+def test_stale_metric_binding_offers_agent_rebind_after_fresh_score_probe(tmp_path):
+    real = preparation(tmp_path)
+    real.output.mkdir(parents=True)
+    real.declaration = {'benchmark':'toy', 'research_goal':{'primary_metric':{
+        'name':'success_rate','direction':'maximize','source':'json'}}}
+    real.interpreter = Path(sys.executable)
+    real.stages = {'evaluate':'new native builder'}
+    (real.output/'metric_binding.json').write_text(json.dumps({
+        'score_target':'evaluate','stage_source_sha256':hashlib.sha256(b'old builder').hexdigest()}))
+    real._verified_score_output_available = lambda: True
+    real._declaration_refresh_is_justified = lambda **_: False
+    real._checkout_read_is_justified = lambda: False
+    real._surveyed_runnable_stages = lambda: {'evaluate':{}}
+    real.steps = [{'step':'derive_a_command','outcome':'done','arguments':{'stage':'evaluate'}}]
+    offered = real._available_operations()
+    assert 'bind_metric' in offered
+    assert 'run_the_loop' not in offered
+
+
+def test_detached_eval_requires_agent_policy_choice_not_derivation_default(tmp_path,monkeypatch):
+    real = preparation(tmp_path)
+    real.stages={'evaluate':'builder'}
+    monkeypatch.setattr('autosim.research.checkpoint_handoff.catalog',lambda _: {'status':'available'})
+    monkeypatch.setattr('autosim.research.native_jobs.submit',lambda *a,**k:pytest.fail('must not launch without choice'))
+    result=real._step_submit_native_job(stage='evaluate',window_seconds=100,reason='evaluate paid policy')
+    assert result['outcome']=='not attempted'
+    assert result['failure_category']=='native_evaluation_context'
+    assert result['repair_owner']=='main_agent' and result['evidence_id']
+
+
+def test_main_gets_declared_axis_constraints_before_first_baseline(tmp_path):
+    real = preparation(tmp_path)
+    real.declaration = {'benchmark': 'toy', 'optimization_space': {'collection': [], 'training': [
+        {'name': 'steps', 'kind': 'integer', 'low': 100, 'high': 20000,
+         'default': 1000, 'description': 'Native optimizer updates'},
+    ]}, 'research_goal': {'confirmation': {'private_reserved_seed': 987654321}}}
+    facts = real._decision_facts()
+    assert facts['research_progress'] is None
+    assert 'NOT an automatic new' in facts['executor_input_contracts']['dataset_selection']['scope_rule']
+    assert facts['declared_space']['training']['steps']['min'] == 100
+    assert facts['declared_space']['training']['steps']['max'] == 20000
+    assert facts['declared_space']['training']['steps']['default'] == 1000
+    assert facts['declared_space_status'] == 'current_declaration_constraints_not_native_verification'
+    assert '987654321' not in json.dumps(facts['declared_space'])
+    assert 'private_reserved_seed' not in json.dumps(facts['declared_space'])
+    assert not (real.output / 'research' / real.run_id / 'measurements' / 'baseline.json').exists()
+
+
+def test_main_axis_projection_survives_malformed_declaration(tmp_path):
+    real = preparation(tmp_path)
+    # Observe an unusable draft without silently inventing axis bounds.
+    real.declaration = {'benchmark': 'toy', 'optimization_space': {'training': False}}
+    # Other declaration consumers reject invalid drafts independently.
+    real._declared_task = lambda: ''
+    facts = real._decision_facts()
+    assert facts['declared_space'] == {}
+    assert facts['declared_space_status'] == 'unreadable'
+
+
+def test_main_and_specialists_receive_current_total_wall_not_gpu_as_wall(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    real=preparation(tmp_path)
+    # Bypass unrelated state readers: this test is the common decision handoff,
+    # not a budget reset, filesystem grant or actual model/native invocation.
+    monkeypatch.setattr(real,'state',lambda:{'available':[],
+        'task_gpu_budget':{'available_gpu_seconds':25000},
+        'current_model_budget':{'remaining_usd':10}})
+    real.budget=SimpleNamespace(remaining=lambda:11800.25)
+    facts=real._decision_facts()
+    wall=facts['total_wall_budget']
+    assert wall['remaining_seconds']==11800.25 and wall['scope']=='whole_run'
+    assert wall['observed_at']
+    assert 'GPU' in wall['rule'] and 'not a grant' in wall['authority']
+    assert facts['task_gpu_budget']['available_gpu_seconds']==25000
+
+
+@pytest.mark.parametrize('value', [100000, False])
+def test_rejected_learning_work_seals_exact_constraints_without_launch(tmp_path, monkeypatch, value):
+    from types import SimpleNamespace
+    from autosim.research.adapter_protocol import Axis, OptimizationSpace
+    real = preparation(tmp_path)
+    real.stages = {'train': 'native trainer'}
+    space = OptimizationSpace(training=(Axis('steps', 'integer', 'optimizer work',
+                                             low=100, high=20000, default=1000),))
+    research = SimpleNamespace(space=space, sources={'train': 'def f(i): return i["steps"]'})
+    monkeypatch.setattr(real, '_research_controller', lambda: (research, {}))
+    monkeypatch.setattr('autosim.research.native_jobs.submit',
+                        lambda *a, **k: pytest.fail('invalid settings must not launch'))
+    result = real._step_submit_native_job(stage='train', window_seconds=100,
+        reason='test explicit training work', training_settings={'steps': value})
+    assert result['outcome'] == 'not attempted'
+    assert result['failure_category'] == 'native_learning_settings'
+    assert result['repair_owner'] == 'main_agent'
+    assert result['native_operation_status'] == 'not_started'
+    assert result['invalid_setting'] == 'steps'
+    assert '[100, 20000]' in result['because']
+    assert result['training_setting_constraints']['steps']['max'] == 20000
+    receipt = json.loads((real.output / result['receipt_ref']).read_text())
+    assert receipt['context']['training_setting_constraints']['steps']['max'] == 20000
+    assert receipt['evidence_id'] == result['evidence_id']
+
+
+def test_detached_eval_cannot_bypass_requested_confirmation_admission(tmp_path,monkeypatch):
+    real=preparation(tmp_path);real.client.supports_main_agent=True
+    real.base_settings={'_confirm':True};real.stages={'evaluate':'builder'}
+    monkeypatch.setattr('autosim.research.native_jobs.submit',lambda *a,**k:pytest.fail('no native launch permitted'))
+    result=real._step_submit_native_job(stage='evaluate',window_seconds=100,reason='development probe',
+        checkpoint_ref='producer/policy',evaluation_settings={'episodes':7,'seed':19})
+    assert result['outcome']=='not attempted' and result['native_operation_status']=='not_started'
+    assert result['failure_category']=='confirmation_protocol_required'
+
+
+def test_evaluator_verification_cannot_close_requested_reservation_boundary(tmp_path,monkeypatch):
+    from tests.test_main_agent import make
+    prep = make(tmp_path)
+    monkeypatch.setattr(prep, '_confirmation_admission_problem', lambda: 'reservation missing')
+    result = prep._step_derive_a_command(stage='evaluate')
+    assert result['native_operation_status'] == 'not_started'
+    assert result['repair_owner'] == 'objective'
+    assert result['failure_category'] == 'confirmation_protocol_required'
+    assert not prep.client.calls
+    assert result['repair_owner']=='objective' and result['evidence_id']
+
+
+def test_detached_eval_preserves_agent_selected_context_in_request(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    real=preparation(tmp_path);real.output.mkdir(parents=True)
+    real.stages={'evaluate':'builder'};real.base_settings={'task':'toy'}
+    real.budget=SimpleNamespace(limit=100)
+    (real.output/'task_gpu_budget.json').write_text('{}')
+    choice={'selected_path':'toy-policy','id':'choice'}
+    monkeypatch.setattr('autosim.research.checkpoint_handoff.catalog',lambda _: {'status':'available'})
+    monkeypatch.setattr('autosim.research.checkpoint_handoff.select',lambda *a:choice)
+    real._research_controller=lambda:(SimpleNamespace(_comparison_protocol_violation=lambda *a,**k:''),None)
+    seen=[]
+    def submit(output,**kwargs):
+        seen.append(kwargs);return {'job_ref':'native_jobs/toy/request.json'}
+    monkeypatch.setattr('autosim.research.native_jobs.submit',submit)
+    result=real._step_submit_native_job(stage='evaluate',window_seconds=100,reason='probe selected policy',
+        checkpoint_ref='producer/policy',evaluation_settings={'episodes':7,'seed':19})
+    assert result['outcome']=='submitted'
+    assert seen[0]['checkpoint_selection'] is choice
+    assert seen[0]['settings']=={'task':'toy','episodes':7,'seed':19}
+    assert real.base_settings=={'task':'toy'}
+
+
+@pytest.mark.parametrize('collection_settings', [None, {}, {'episodes': 0},
+    {'episodes': -1}, {'episodes': True}, {'episodes': '100'}, {'seed': 0}])
+def test_detached_collection_requires_explicit_positive_target(tmp_path, monkeypatch, collection_settings):
+    real = preparation(tmp_path)
+    real.stages = {'collect': 'def stage_argv_collect(i): return [str(i["episodes"])]'}
+    real.base_settings = {'task': 'toy', 'episodes': 100, 'eval.n_eval': 100}
+    monkeypatch.setattr('autosim.research.native_jobs.submit',
+        lambda *a, **k: pytest.fail('invalid collection must not launch'))
+    result = real._step_submit_native_job(stage='collect', window_seconds=100,
+        reason='registered acquisition', collection_settings=collection_settings)
+    assert result['outcome'] == 'not attempted'
+    assert result['failure_category'] == 'native_collection_context'
+    assert result['repair_owner'] == 'main_agent' and result['evidence_id']
+    assert real.base_settings['episodes'] == 100
+
+
+def test_detached_collection_preserves_agent_quantity_not_eval_default(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    real = preparation(tmp_path)
+    real.stages = {'collect': 'def stage_argv_collect(i): return [str(i["episodes"]), str(i["seed"])]'}
+    real.base_settings = {'task': 'toy', 'episodes': 100, 'eval.n_eval': 100}
+    real.output.mkdir(parents=True)
+    (real.output/'task_gpu_budget.json').write_text('{}')
+    real.budget = SimpleNamespace(limit=1000)
+    seen = []
+    def capture(*args, **kwargs):
+        seen.append(kwargs)
+        return {'job_id': 'c'*32, 'job_ref': 'native_jobs/request.json'}
+    monkeypatch.setattr('autosim.research.native_jobs.submit', capture)
+    result = real._step_submit_native_job(stage='collect', window_seconds=100,
+        reason='registered acquisition', collection_settings={'episodes': 7, 'seed': 19})
+    assert result['outcome'] == 'submitted'
+    assert seen[0]['settings'] == {'task': 'toy', 'episodes': 7, 'eval.n_eval': 100, 'seed': 19}
+    assert real.base_settings == {'task': 'toy', 'episodes': 100, 'eval.n_eval': 100}
+
+
+@pytest.mark.parametrize('stage,extra', [('train', {}), ('evaluate', {}),
+    ('collect', {'evaluation_settings': {'episodes': 100}}),
+    ('collect', {'training_settings': {'steps': 20000}})])
+def test_collection_settings_cannot_mix_stage_authority(tmp_path, monkeypatch, stage, extra):
+    real = preparation(tmp_path)
+    real.stages = {stage: 'def builder(i): return [str(i["episodes"])]'}
+    monkeypatch.setattr('autosim.research.native_jobs.submit',
+        lambda *a, **k: pytest.fail('mixed stage authority must not launch'))
+    result = real._step_submit_native_job(stage=stage, window_seconds=100,
+        reason='acquisition', collection_settings={'episodes': 7}, **extra)
+    assert result['failure_category'] == 'native_collection_context'
+
+
 def test_main_decision_does_not_inherit_closed_research_parent(tmp_path):
     from autosim.research.research_state import ResearchStateStore
     store=ResearchStateStore(tmp_path/'out',run_id='derived',repository=tmp_path)
@@ -54,9 +277,49 @@ def test_main_decision_does_not_inherit_closed_research_parent(tmp_path):
     assert real.recovery_after_interruption['parent_action'] is None
 
 
+def test_explicitly_unparented_model_turn_does_not_inherit_open_research(tmp_path):
+    from autosim.research.research_state import ResearchStateStore
+    store = ResearchStateStore(tmp_path/'out', run_id='derived', repository=tmp_path)
+    parent = {'step':'round_4','status':'running','controller_decision_id':'a'*16}
+    store.record('research','research_action_started',status='running',
+        phase_state={'parent_action':parent,'current_action':parent})
+    action = {'step':'coding_agent_turn','role':'monitor','status':'running','parent_action':None}
+    store.record('agent_runtime','coding_agent_turn_started',status='running',
+        phase_state={'current_action':action},event_patch={'current_action':action})
+    real = preparation(tmp_path)
+    assert real.recovery_after_interruption['action'] == action
+    assert real.recovery_after_interruption['parent_action'] is None
+
+
+@pytest.mark.parametrize('association', ['explicit_none','explicit_parent','missing'])
+@pytest.mark.parametrize('step',['coding_agent_turn','choose'])
+def test_model_reconciliation_never_rewrites_unowned_candidate(tmp_path,association,step):
+    from autosim.research.common import atomic_json
+    real = preparation(tmp_path)
+    parent = {'step':'round_4','status':'running','controller_decision_id':'a'*16}
+    action = {'step':step,'role':'monitor','status':'running'}
+    if association != 'missing':
+        action['parent_action'] = None if association=='explicit_none' else parent
+    session = real.output/'research/derived/controller_session.json'
+    atomic_json(session,{'schema_version':1,'run_id':'derived','repository':str(real.repo),
+        'status':'interrupted','action':'round_4','pending_action':{'phase':'preparing_idea'}})
+    before = session.read_bytes()
+    # Reproduce an old saved recovery with incorrectly inherited parent metadata.
+    real.recovery_after_interruption = {'action':action,'parent_action':parent,
+                                       'process_status':{'status':'not_running'}}
+    result = real._step_reconcile_interrupted_action()
+    assert session.read_bytes() == before
+    if association == 'explicit_none' or (step=='choose' and association=='missing'):
+        assert result['resume_scope'] == 'preparation' and result['research_action'] is None
+        assert result['outcome_known'] is False
+        assert not real.recovery_after_interruption
+    else:
+        assert result['outcome'] == 'blocked' and real.recovery_after_interruption
+
+
 @pytest.mark.parametrize('closed_step',['round_9','research_complete'])
 @pytest.mark.parametrize('matching',[True,False])
-def test_saved_choose_recovery_requires_matching_closed_parent(tmp_path,closed_step,matching):
+def test_pure_choose_recovery_never_claims_inherited_research_ownership(tmp_path,closed_step,matching):
     real=preparation(tmp_path)
     parent={'step':'round_9','status':'running','controller_decision_id':'a'*16}
     real.state_store.record('research','research_action_finished',status='completed',
@@ -66,26 +329,49 @@ def test_saved_choose_recovery_requires_matching_closed_parent(tmp_path,closed_s
     real.recovery_after_interruption={'action':{'step':'choose','status':'running'},
                                     'parent_action':parent,'process_status':{'status':'not_recorded'}}
     result=real._step_reconcile_interrupted_action()
-    if matching:
-        assert result['resume_scope']=='preparation'
-        assert real.recovery_after_interruption=={}
-    else:
-        assert result['outcome']=='blocked'
-        assert real.recovery_after_interruption
+    assert result['resume_scope']=='preparation'
+    assert real.recovery_after_interruption=={}
     assert not (real.output/'research/derived/controller_session.json').exists()
+
+
+def test_explicitly_unparented_outer_choose_does_not_inherit_stale_running_research(tmp_path):
+    from autosim.research.research_state import ResearchStateStore
+    store=ResearchStateStore(tmp_path/'out',run_id='derived',repository=tmp_path)
+    parent={'step':'round_7','status':'running','controller_decision_id':'a'*16}
+    store.record('research','research_action_started',status='running',
+        phase_state={'parent_action':parent,'current_action':parent})
+    action={'step':'choose','status':'running','parent_action':None}
+    store.record('preparation','action_started',status='running',
+        phase_state={'current_action':action},event_patch={'current_action':action})
+    real=preparation(tmp_path)
+    assert real.recovery_after_interruption['action']==action
+    assert real.recovery_after_interruption['parent_action'] is None
+    result=real._step_reconcile_interrupted_action()
+    assert result['resume_scope']=='preparation' and result['outcome_known'] is False
+    assert store.load()['phases']['research']['current_action']==parent
+
+
+def test_choose_with_native_attempt_reference_cannot_drop_its_parent(tmp_path):
+    real=preparation(tmp_path)
+    real.recovery_after_interruption={'action':{'step':'choose','status':'running','attempt_id':'a'*32},
+        'parent_action':{'step':'round_7','controller_decision_id':'b'*16},
+        'process_status':{'status':'not_recorded'}}
+    assert real._step_reconcile_interrupted_action()['outcome']=='blocked'
+    assert real.recovery_after_interruption
 
 
 def test_preparation_steps_are_closed_and_named():
     """The set is closed and named, including the mandatory interruption recovery step."""
-    assert set(OPERATIONS) == {'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference",
+    assert set(OPERATIONS) == {'recover_reference_score', 'revise_presearch_protocol', 'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference",
                                'inspect_storage','configure_storage_controls','register_storage_artifact',
                                'plan_storage_gc','commit_storage_gc','reconcile_storage_gc',
                                "extend_research_rounds", "read_the_checkout", "declare", "build_the_environment",
                                "derive_a_command", "reconcile_interrupted_action",
                                "discard_interrupted_candidate",
-                               "bind_metric", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement", "run_the_loop",
+                               "bind_metric", "recover_unscored_baseline", "correct_policy_handoff", "diagnose_development_failure", "adopt_linked_measurement", "run_the_loop",
                                "generate_research_ideas", "propose_research_idea",
-                               "confirm_best", "stop", "research_task", "propose_harness_repair",
+                               "apply_workflow_candidate", "restore_workflow_candidate",
+                               "confirm_best", "diagnose_confirmation_failure", "review_confirmation_failure", "stop", "research_task", "propose_harness_repair",
                                "update_research_plan", "retry_failed_action",
                                "submit_native_job", "inspect_native_job",
                                "adjust_native_job", "cancel_native_job", "review_report_demo",
@@ -242,6 +528,10 @@ def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_pa
     findings=[{'evidence_id':'c'*32,'native_attempt_id':'d'*32,
                'origin':'operator_diagnostic','summary':'synthetic CPU counterexample, intentional cancellation'}]
     monkeypatch.setattr(real,'_monitor_findings',lambda:findings)
+    completed=[{'label':'recovered_policy','metric_value':0.06,'data_consumption_status':'verified'}]
+    monkeypatch.setattr(real,'_development_evidence',lambda **kwargs:completed)
+    continuity=[{'all_changed_files_match_postimage':False,'rule':'archived patch is not installed'}]
+    monkeypatch.setattr('autosim.research.source_continuity.view',lambda *a:continuity)
     action = {"step": "run_the_loop", "outcome": "yielded",
               "candidate_failure": {"idea_label": "bad_candidate"},
               "evidence_id": "a" * 32,
@@ -250,11 +540,107 @@ def test_candidate_fix_is_read_only_and_cannot_be_replayed_as_preparation(tmp_pa
     assert observation["assessment"] == "no_safe_repair"
     assert client.seen[-1][2]["read_only"] is True
     assert json.loads(client.seen[-1][1])['monitor_findings']==findings
+    assert json.loads(client.seen[-1][1])['latest_development_measurements']==completed
+    assert json.loads(client.seen[-1][1])['current_source_continuity']==continuity
     assert 'failed_action.candidate_failure' in client.seen[-1][0]
     assert 'receipt-bound handoff recovery instead of retraining' in client.seen[-1][0]
     real.steps.append({"step": "run_the_loop", "receipt_ref": action["receipt_ref"]})
     real.fix_observation = {**observation, "assessment": "repair_attempted"}
     assert real._repair_retry_available() is False
+
+
+@pytest.mark.parametrize('proposal,expected', [
+    ({'step':'reconcile_interrupted_action', 'arguments':{}}, 'schema_valid_not_executed'),
+    ({'step':'discard_interrupted_candidate', 'arguments':{'reason':'sealed pre-native refusal'}},
+     'schema_valid_not_executed'),
+    ({'step':'correct_policy_handoff', 'arguments':{'label':'round_1',
+        'checkpoint_ref':'producer/complete_bundle'}}, 'schema_valid_not_executed'),
+    ({'step':'correct_policy_handoff', 'arguments':{'label':'round_1','job_id':'a'*32}},
+     'schema_valid_not_executed'),
+    ({'step':'correct_policy_handoff', 'arguments':{'label':'round_1','job_id':'a'*32,
+        'checkpoint_ref':'producer/complete_bundle'}}, 'rejected'),
+    ({'step':'reconcile_interrupted_action', 'arguments':{'replay':True}}, 'rejected'),
+    ({'step':'discard_interrupted_candidate', 'arguments':{}}, 'rejected'),
+    ({'step':'run_the_loop', 'arguments':{}}, 'rejected'),
+    ({'step':'research_task','arguments':{'role':'data','task':'Inspect sealed reader failures',
+        'expected_result':'Source-backed diagnosis of all unverified fields','mode':'inspect'}},
+     'schema_valid_not_executed'),
+    ({'step':'research_task','arguments':{'role':'data','task':'Inspect failure',
+        'expected_result':'Diagnosis','mode':'edit'}}, 'rejected'),
+    ({'step':'research_task','arguments':{'role':'unsupported','task':'Inspect failure',
+        'expected_result':'Diagnosis'}}, 'rejected'),
+    ({'step':'propose_research_idea','arguments':{'idea':{
+        'label':'correct reader contract','granularity':'param',
+        'mechanism':'Explicit repair advice, not execution','change':{'steps':1},
+        'risk':'low','crosses':'none','why':'source-backed diagnosis',
+        'evidence':['sealed failure'],'touches':[]}}}, 'schema_valid_not_executed'),
+    ({'step':'propose_research_idea','arguments':{'idea':{'label':'incomplete'}}}, 'rejected'),
+    ('not an operation object', 'rejected'),
+    (None, 'not_provided'),
+])
+def test_fix_diagnosis_survives_optional_action_errors_without_execution(
+        tmp_path, monkeypatch, proposal, expected):
+    class Client(_Client):
+        supports_agent_fix = True
+        @contextmanager
+        def as_role(self, role):
+            assert role == 'fix'
+            yield
+        def chat_with_metadata(self, system, user, **kwargs):
+            assert kwargs['read_only'] is True
+            payload = json.loads(user)
+            assert 'reconcile_interrupted_action' in payload['repair_operations']
+            assert 'discard_interrupted_candidate' in payload['repair_operations']
+            assert 'research_task' in payload['repair_operations']
+            assert 'propose_research_idea' in payload['repair_operations']
+            assert 'sealed_training_reader_failures' in payload
+            return json.dumps({'assessment':'repair_proposed',
+                'summary':'The registered selection is not connected to the actual dataset.',
+                'changes':['Resolve the opened root before assigning its registered label.'],
+                'evidence_refs':[], 'proposed_action':proposal}), {
+                    'role':'fix', 'turn_id':'d'*32,
+                    'process_ref':'agent/processes/'+'d'*32+'.json',
+                    'proposed_action':{'step':'run_the_loop', 'arguments':{}}}
+    real = preparation(tmp_path)
+    real.client = Client([])
+    monkeypatch.setattr(real, 'do', lambda *a, **k: pytest.fail('Fix may only recommend'))
+    result = real._fix_failed_action(action_id='b'*16, action={
+        'step':'run_the_loop', 'outcome':'raised',
+        'candidate_failure':{'idea_label':'reader_repair'}})
+    assert result['status'] == 'assessed' and result['assessment'] == 'repair_proposed'
+    assert result['summary'] == 'The registered selection is not connected to the actual dataset.'
+    assert result['changes'] and result['proposed_action_status'] == expected
+    if expected == 'schema_valid_not_executed':
+        assert result['proposed_action'] == proposal and 'protocol_failure' not in result
+    elif expected == 'rejected':
+        assert 'proposed_action' not in result
+        failure = result['protocol_failure']
+        from autosim.research.evidence_store import read_attempt_evidence
+        proof = read_attempt_evidence(real.output, failure['evidence_id'], limit=8000)
+        assert proof['status'] == 'operation_contract_failed' and failure['error']
+        assert 'fix_report_protocol' in proof['text'] and 'response_sha256' in proof['text']
+        assert 'not_inferred' in proof['text']
+    else:
+        assert 'proposed_action' not in result and 'protocol_failure' not in result
+
+
+def test_malformed_required_fix_report_keeps_precise_sealed_protocol_error(tmp_path):
+    class Client(_Client):
+        supports_agent_fix = True
+        @contextmanager
+        def as_role(self, role):
+            yield
+        def chat_with_metadata(self, *args, **kwargs):
+            return json.dumps({'assessment':'invented_success', 'summary':'invalid claim'}), {}
+    real = preparation(tmp_path)
+    real.client = Client([])
+    result = real._fix_failed_action(action_id='b'*16, action={
+        'step':'run_the_loop', 'outcome':'raised', 'candidate_failure':{'idea_label':'bad'}})
+    assert result['status'] == 'unavailable'
+    assert 'unknown assessment' in result['protocol_failure']['error']
+    from autosim.research.evidence_store import read_attempt_evidence
+    proof = read_attempt_evidence(real.output, result['protocol_failure']['evidence_id'])
+    assert 'invented_success' in proof['text']
 
 
 def test_formal_run_local_declaration_store_rejects_symlink_escape(tmp_path, monkeypatch):
@@ -359,6 +745,17 @@ def test_autosota_monitor_assesses_failed_action_and_scheduler_retains_control(
                                        "why": "inspect the source before other work"}), {}
                 return json.dumps({"do": "stop", "why": "the current evidence is sufficient"}), {}
             if self.role == "monitor":
+                assert _kwargs.get('max_tokens')==1800
+                assert _kwargs.get('decision_only') is True
+                assert _kwargs.get('read_only') is True
+                assert _kwargs.get('include_research_context') is False
+                assert _kwargs.get('resume_session') is False
+                assert _kwargs.get('auto_skills') is False
+                payload=json.loads(_args[1])
+                assert 'budget_observations' in payload
+                assert payload['latest_development_measurements']==[
+                    {'label':'recovered_policy','metric_value':0.06,'data_consumption_status':'verified'}]
+                assert payload['budget_observations']['authority'].startswith('current executor')
                 return json.dumps({"progress": "blocked",
                                    "summary": "The selected survey did not produce stage evidence.",
                                    "guidance": "Review the source-backed failure and consider a "
@@ -370,6 +767,8 @@ def test_autosota_monitor_assesses_failed_action_and_scheduler_retains_control(
     client = RoleClient()
     real = Preparation(repo=tmp_path, output=tmp_path / "run", client=client,
                        scouting=tmp_path / "run" / "scouting")
+    monkeypatch.setattr(real,'_development_evidence',lambda **kwargs:[
+        {'label':'recovered_policy','metric_value':0.06,'data_consumption_status':'verified'}])
     monkeypatch.setattr(real, "_step_read_the_checkout",
                         lambda: {"outcome": "blocked",
                                  "because": "the read-only source survey failed"})
@@ -476,6 +875,76 @@ def test_recoverable_preparation_failure_handoffs_monitor_then_fix_then_schedule
     assert "not independent proof" in run_doc
     assert "## Injected" not in run_doc
     assert "[open](https://invalid.test)" not in run_doc
+
+
+@pytest.mark.parametrize('owner,valid_evidence', [
+    ('fix', True), ('fix', False), ('environment_planner', True),
+    ('resource', True), ('main_agent', True)])
+def test_main_cycle_dispatches_authenticated_fix_owned_framework_plan_readonly(
+        tmp_path, monkeypatch, owner, valid_evidence):
+    """Exercise the outer dispatch, not just the Fix helper in isolation."""
+    from autosim.research.operation_failure import seal
+    client = _Client([])
+    client.supports_agent_fix = True
+    client.role = 'scheduler'
+    calls = []
+
+    @contextmanager
+    def scope(role):
+        previous = client.role
+        client.role = role
+        try:
+            yield
+        finally:
+            client.role = previous
+
+    real = Preparation(repo=tmp_path/'repo', output=tmp_path/'out', client=client,
+                       scouting=tmp_path/'scouting')
+    real.repo.mkdir()
+    operation = seal(real.output, operation='data_consumer_revalidation',
+        exc=ValueError('registered id is a relative path; no reader match'),
+        native_operation_status='not_started', context={'repair_owner':owner})
+    identity = operation['evidence_id'] if valid_evidence else 'f'*32
+
+    def answer(system, user, **kwargs):
+        assert client.role == 'fix' and kwargs['read_only'] is True
+        payload = json.loads(user)
+        assert payload['failed_action']['evidence_id'] == identity
+        assert payload['failed_action']['native_operation_status'] == 'not_started'
+        assert 'Diagnose the sealed failure' in payload['boundary']
+        calls.append(payload)
+        return json.dumps({'assessment':'repair_proposed',
+            'summary':'Match the actual opened root before assigning a registered label.',
+            'changes':[], 'evidence_refs':[operation['evidence_ref']],
+            'proposed_action':{'step':'reconcile_interrupted_action', 'arguments':{}}}), {}
+
+    client.as_role = scope
+    client.chat_with_metadata = answer
+    monkeypatch.setattr(real, 'choose', lambda: {
+        'do':'run_the_loop', 'why':'exercise one sealed failure', 'arguments':{}})
+    # Fake only the operation boundary; use the REAL main loop, durable receipt,
+    # evidence authentication, Fix helper, role scope and report persistence.
+    monkeypatch.setattr(real, 'do', lambda step, **kwargs: {
+        'outcome':'raised', 'because':'consumer review refused before native',
+        'failure_domain':'framework_plan', 'repair_owner':owner,
+        'failure_category':'data_consumer_review_required',
+        'native_operation_status':'not_started', 'evidence_id':identity})
+    report = real._run_cycle(max_steps=1)
+    failed = report['steps'][-1]
+    assert failed['failure_domain'] == 'framework_plan'
+    assert failed['native_operation_status'] == 'not_started'
+    if owner == 'fix' and valid_evidence:
+        assert len(calls) == 1
+        assert failed['fix']['assessment'] == 'repair_proposed'
+        assert report['state']['fix_observation']['failed_action_id']
+        assert report['state']['fix_observation']['proposed_action'] == {
+            'step':'reconcile_interrupted_action', 'arguments':{}}
+        receipt = read_action_receipt(real.output, failed['receipt_ref'],
+                                      run_id=real.run_id, repository=real.repo)
+        assert receipt['role_handoff']['to'] == 'fix'
+    else:
+        assert calls == [] and 'fix' not in failed
+    assert not (real.output/'native_jobs').exists()
 
 
 def test_fix_budget_exhaustion_is_terminal_without_another_scheduler_turn(
@@ -1009,19 +1478,70 @@ def test_the_state_is_read_from_the_records(tmp_path):
     assert state["stages_the_checkout_has"] == {"train": "kept from an earlier run",
                                                 "collect": "no command"}
     assert state["available"] == [name for name in OPERATIONS
-                                          if name not in {'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds",
+                                              if name not in {'recover_reference_score', 'revise_presearch_protocol', 'record_baseline_diagnosis', 'configure_confirmation_protocol', 'register_data_campaign', 'record_data_campaign_arm', 'register_data_version', "configure_baseline_reference", "evaluate_baseline_reference", "extend_research_rounds",
                                                           "research_task", "propose_harness_repair", "update_research_plan", "review_report_demo", "capture_environment_demo",
                                                       "retry_failed_action", "submit_research_task",
                                                       "cancel_research_task", "wait_for_jobs",
                                                       "configure_screening", "run_screening_trial", "inspect_screening",
                                                       "submit_native_job", "inspect_native_job",
                                                       "adjust_native_job", "cancel_native_job",
-                                                       "confirm_best", "recover_unscored_baseline", "correct_policy_handoff", "adopt_linked_measurement",
+                                                       "confirm_best", "recover_unscored_baseline", "correct_policy_handoff", "diagnose_development_failure", "adopt_linked_measurement",
                                                        "build_the_environment", "derive_a_command",
                                                        "bind_metric", "reconcile_interrupted_action",
                                                        "discard_interrupted_candidate",
                                                        "run_the_loop", "generate_research_ideas",
-                                                   "propose_research_idea"}]
+                                                       "propose_research_idea", "diagnose_confirmation_failure", "review_confirmation_failure"}]
+
+
+@pytest.mark.parametrize('main_agent,keep_only,has_plan', [
+    (True, False, False), (True, False, True),
+    (False, False, False), (True, True, False),
+])
+def test_working_plan_gate_has_truthful_readiness_and_agent_owned_remedy(
+        tmp_path, monkeypatch, main_agent, keep_only, has_plan):
+    real = preparation(tmp_path)
+    real.client.supports_main_agent = main_agent
+    real.keep_only = keep_only
+    real.main_agent = {'plan': {'objective': 'test'} if has_plan else {}, 'handoffs': []}
+    real.declaration = {'benchmark': 'toy'}
+    real.interpreter = Path(sys.executable)
+    real.stages = {'evaluate': 'native scorer', 'train': 'native trainer'}
+    monkeypatch.setattr(real, '_metric_bound', lambda: True)
+    monkeypatch.setattr(real, '_selected_train_command_missing', lambda: False)
+    monkeypatch.setattr(real, '_native_identity_schema_view', lambda _, **kw: {'status': 'compatible'})
+    monkeypatch.setattr(real, '_confirmation_admission_problem', lambda: '')
+    monkeypatch.setattr(real, '_surveyed_runnable_stages', lambda: {'train': {}, 'evaluate': {}})
+    facts = real.state()
+    gated = main_agent and not keep_only and not has_plan
+    admission = facts['to_measure']
+    assert admission['native_ready'] is True
+    assert admission['planning_required'] is gated
+    assert admission['ready'] is (not gated)
+    if gated:
+        assert 'run_the_loop' not in facts['available']
+        assert 'submit_native_job' not in facts['available']
+        assert 'update_research_plan' in facts['available']
+        assert admission['next_action'] == 'update_research_plan'
+        assert admission['repair_owner'] == 'scheduler'
+        assert 'persisted Main working plan' in admission['because']
+        assert 'update_research_plan' in admission['admission_blockers'][0]
+        assert real.main_agent['plan'] == {}  # Observation never writes an operator plan.
+        saved = real.do('update_research_plan', plan={
+            'objective': 'Establish a scored local baseline', 'hypotheses': [],
+            'open_questions': ['Which measured training budget is sufficient?'],
+            'next_actions': ['Submit source-backed training and score its actual artifact'],
+            'evidence_refs': ['run_state.json#phases.preparation.state'],
+        })
+        assert saved['outcome'] == 'recorded'
+        resumed = real.state()
+        assert resumed['to_measure']['ready'] is True
+        assert resumed['to_measure']['planning_required'] is False
+        assert 'run_the_loop' in resumed['available']
+        assert 'submit_native_job' in resumed['available']
+    else:
+        assert admission['admission_blockers'] == []
+        assert admission['next_action'] is None
+    assert 'to_measure.planning_required' in STEP_SYSTEM
 
 
 def test_action_availability_tracks_evidence_and_readiness(tmp_path):
@@ -1131,6 +1651,31 @@ def test_missing_declaration_hides_impossible_steps_and_caps_repeated_drafts(tmp
     assert "declare" not in available
     assert "read_the_checkout" not in available
     assert "stop" in available
+
+
+def test_unscored_candidate_does_not_relabel_valid_baseline_as_unscored(tmp_path,monkeypatch):
+    real=preparation(tmp_path)
+    real.interpreter=Path(sys.executable)
+    real.output.mkdir(parents=True)
+    root=real.output/'research'/real.run_id
+    (root/'measurements').mkdir(parents=True)
+    baseline=root/'measurements/baseline.json'
+    baseline.write_text(json.dumps({'label':'baseline','ok':True,'metric_value':.12}))
+    baseline_bytes=baseline.read_bytes()
+    history=[{'round':0,'label':'baseline','status':'measured','metric_value':.12},
+             {'round':1,'label':'round_1','status':'nothing was measured','metric_value':None,
+              'failure':{'stage':'policy_artifact'}}]
+    for name,body in [('controller_session.json',{'schema_version':1,'run_id':real.run_id,
+            'repository':str(tmp_path),'status':'paused','history':history,'next_round':2}),
+        ('research_report.json',{'run_id':real.run_id,'repo':str(tmp_path),'run_status':'paused','rounds':history})]:
+        (root/name).write_text(json.dumps(body))
+    monkeypatch.setattr(real,'_unscored_baseline_recovery_status',lambda:{'available':False})
+    facts=real.state()
+    reason=facts['to_measure']['because']
+    assert 'latest development measurement' in reason
+    assert 'recorded baseline is unscored' not in reason
+    assert facts['research_progress']['unscored_baseline_recovery']['available'] is False
+    assert baseline.read_bytes()==baseline_bytes
 
 
 def test_state_offers_baseline_recovery_only_for_matching_receipt_and_selection(tmp_path):
@@ -1975,6 +2520,50 @@ def test_completed_research_is_not_launched_twice(tmp_path):
     assert "rather than repeating training" in result["because"]
 
 
+def test_live_confirmation_preflight_proof_overrides_stale_report_without_leaking_values(tmp_path):
+    from tests.test_confirmation_recovery import legacy
+    from autosim.research.confirmation_recovery import review
+    from autosim.research.common import atomic_json
+    real = preparation(tmp_path)
+    root, _, _ = legacy(real.output)
+    atomic_json(root / 'research_report.json', {'run_id': real.run_id, 'repo': str(real.repo),
+        'run_status': 'completed', 'rounds': [],
+        'confirmation': {'status': 'attempted_and_failed', 'metric_value': .999, 'held_out': {'seed': 998877}}})
+    result = review(root, real.output, authorization='operator reviewed unexecuted identity refusal')
+    before = (root / 'research_report.json').read_bytes()
+    confirmation = real.state()['research_progress']['confirmation']
+    assert confirmation['status'] == 'admission_refused'
+    assert confirmation['failure_evidence_id'] == result['evidence_id']
+    assert '998877' not in json.dumps(confirmation)
+    assert '0.999' not in json.dumps(confirmation)
+    assert (root / 'research_report.json').read_bytes() == before
+
+
+@pytest.mark.parametrize('session', [False, True])
+@pytest.mark.parametrize('score', [.24, 0, True, None, '0.24'])
+def test_main_sees_recorded_incumbent_without_recent_measurement_or_heldout(tmp_path, session, score):
+    from autosim.research.common import atomic_json
+    real = preparation(tmp_path)
+    root = real.output/'research'/real.run_id
+    report = {'run_id':real.run_id,'repo':str(real.repo),'run_status':'completed',
+        'rounds':[], 'best':{'name':'old_adopted','score':score},
+        'confirmation':{'metric_value':.987,'held_out':{'seed':987654}}}
+    atomic_json(root/'research_report.json',report)
+    if session:
+        atomic_json(root/'controller_session.json',{'schema_version':1,'run_id':real.run_id,
+            'repository':str(real.repo),'status':'completed','history':[]})
+    before = (root/'research_report.json').read_bytes()
+    progress = real.state()['research_progress']
+    if type(score) in (int,float):
+        assert progress['recorded_incumbent']['candidate']=='old_adopted'
+        assert progress['recorded_incumbent']['metric_value']==score
+        assert 'not a new measurement' in progress['recorded_incumbent']['authority']
+    else:
+        assert 'recorded_incumbent' not in progress
+    assert '.987' not in json.dumps(progress) and '987654' not in json.dumps(progress)
+    assert (root/'research_report.json').read_bytes()==before
+
+
 def test_paused_research_state_allows_only_a_safe_next_action(tmp_path):
     real = preparation(tmp_path)
     real.declaration = {"benchmark": "toy", "task_contract": {"primary_metric": {
@@ -2157,6 +2746,11 @@ def test_research_observation_exposes_safe_actual_training_parameters(tmp_path):
     (receipt_dir / "receipt.json").write_text(json.dumps({
         "attempt_id": attempt_id, "node_id": "train", "status": "completed",
         "returncode": 0,
+        "training_progress": {"status":"observed", "audit_ref":
+            "training_progress_audits/"+'d'*64+".json", "evidence":{
+                "native_counter":{"field":["step"], "value":20000,
+                    "path":"/private/checkpoint/training_step.json"},
+                "private_debug":"never-ship-this-value"}},
         "argv": ["python", "train.py", "--total_timesteps", "1024",
                  "--num_envs=32", "--checkpoint=/private/model.pt",
                  "--api-key=sk-12345678901234567890",
@@ -2172,6 +2766,13 @@ def test_research_observation_exposes_safe_actual_training_parameters(tmp_path):
     assert observation["actual_training"]["receipt_ref"].endswith(
         f"attempts/{attempt_id}/receipt.json")
     assert observation["actual_training"]["status"] == "completed"
+    assert observation['actual_training']['registered_data_transport']['status'] == 'unknown'
+    completed = observation['actual_training']['completed_work_review']
+    assert completed['status'] == 'observed'
+    assert completed['native_counter'] == {'field':['step'], 'value':20000}
+    assert completed['audit_ref'] == 'training_progress_audits/'+'d'*64+'.json'
+    assert 'not a new progress audit' in completed['authority']
+    assert 'private_debug' not in json.dumps(observation)
     parameters = observation["actual_training"]["parameters"]
     assert {"name": "--total_timesteps", "value": "1024"} in parameters
     assert {"name": "--num_envs", "value": "32"} in parameters
@@ -2461,6 +3062,56 @@ def test_confirm_best_requires_explicit_request_and_never_trains(tmp_path):
     assert "0.75" not in json.dumps(controller_confirmation)
 
 
+def test_confirmation_preflight_delivers_readable_fix_evidence_without_heldout_values(tmp_path):
+    from autosim.research.operation_failure import seal
+    from autosim.research.evidence_store import read_attempt_evidence
+
+    real = Preparation(repo=tmp_path, output=tmp_path / "out", client=_Client([]),
+                       scouting=tmp_path / "scouting", base_settings={"_confirm": True})
+    root = real.output / "research" / real.run_id
+    root.mkdir(parents=True)
+    (root / "research_report.json").write_text(json.dumps({
+        "run_id": real.run_id, "repo": str(real.repo)}))
+    why = "canonical source/resource identity differs"
+    evidence = seal(real.output, operation="confirm_best", exc=ValueError(why),
+                    native_operation_status="not_started")
+    failure = {**evidence, "because": why, "where": "source_identity",
+               "held_out_exposure": "not_started", "retryable": True,
+               "repair_owner": "fix", "failure_category": "confirmation_admission"}
+
+    class Engine:
+        def confirmation_state(self):
+            return {"status": "admission_refused", "retryable": True,
+                    "engineering_failure": failure, "held_out": {"seed": 998877},
+                    "metric_value": .987654}
+
+        def confirm(self):
+            return {"ok": False, "ran": False, "engineering_failure": failure}
+
+    real._research_controller = lambda: (Engine(), {})
+    action = real._step_confirm_best()
+    assert action["outcome"] == "not attempted"
+    assert action["repair_owner"] == "fix" and action["evidence_id"] == evidence["evidence_id"]
+    assert action["native_operation_status"] == "not_started"
+    assert why in read_attempt_evidence(real.output, action["evidence_id"])["text"]
+    view = real._confirmation_controller_view(Engine().confirmation_state())
+    assert view["recorded"] and view["retryable"]
+    assert "998877" not in json.dumps(action) + json.dumps(view)
+    assert "0.987654" not in json.dumps(action) + json.dumps(view)
+
+
+def test_completed_development_does_not_hide_later_model_budget_failure(tmp_path, monkeypatch):
+    real = preparation(tmp_path)
+    real.steps = [{"step": "run_the_loop", "outcome": "done", "verification_level": "L2"},
+                  {"step": "choose", "outcome": "exhausted", "because": "run_model_budget"}]
+    original_state = real.state
+    monkeypatch.setattr(real, "state", lambda: {**original_state(), "research_progress": {
+        "status": "completed", "confirmation": {"status": "attempted_and_failed"}}})
+    monkeypatch.setattr(real, "_review_final_study", lambda: pytest.fail("no paid final review after exhausted budget"))
+    report = real._run_cycle(max_steps=0)
+    assert report["status"] == "budget_exhausted"
+
+
 def test_metric_binding_needs_a_label_in_verified_output_and_source(tmp_path):
     real = preparation(tmp_path)
     real.declaration = {"benchmark": "toy"}
@@ -2491,7 +3142,8 @@ def test_metric_binding_needs_a_label_in_verified_output_and_source(tmp_path):
 
 
 @pytest.mark.parametrize("mapping_fault", [None, "name", "json_key", "changed_bytes"])
-def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_path, mapping_fault):
+@pytest.mark.parametrize("timestamp_pattern", [False, True])
+def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_path, mapping_fault, timestamp_pattern):
     real = preparation(tmp_path)
     real.declaration = {"benchmark": "toy"}
     real.stages = {"evaluate": "def stage_argv_evaluate(i): return [i['python']]"}
@@ -2505,6 +3157,16 @@ def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_
     artifact.write_text(json.dumps({"episodes": [
         {"episode_id": 0, "success": False},
         {"episode_id": 1, "success": True}]}), encoding="utf-8")
+    if timestamp_pattern:
+        folder=tmp_path/'results'/'timestamp_one';folder.mkdir(parents=True)
+        artifact=artifact.rename(folder/artifact.name)
+        real.verified['evaluate']['artifact']='results/**/episode_records.json'
+        real.declaration['research_goal']={'primary_metric':{
+            'name':'eval_success_once_mean','direction':'maximize','unit':'fraction',
+            'source':'json','artifact_root':'working_directory',
+            'artifact_pattern':'results/older_timestamp/episode_records.json',
+            'json_key':'episodes','json_value_key':'success','episode_id_column':'episode_id',
+            'aggregation':'mean','min_samples':2}}
     attempts = real.output / "derivation_attempts"
     attempts.mkdir(parents=True)
     (attempts / "evaluate.json").write_text(json.dumps({"attempts": [{
@@ -2515,7 +3177,7 @@ def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_
             "output_directory": str(real.output / "v"),
             "structured_candidates": [{
                 "path": str(artifact), "root": "working_directory",
-                "relative_path": artifact.name, "suffix": ".json",
+                "relative_path": artifact.relative_to(tmp_path).as_posix(), "suffix": ".json",
                 "size_bytes": artifact.stat().st_size,
                 "mtime": artifact.stat().st_mtime,
                 "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}]}}]}),
@@ -2528,6 +3190,8 @@ def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_
         "aggregation": "mean", "min_samples": 2},
         "evidence": "the native source maps each completed rollout record's boolean success"}
     real.client.choices = [good_answer]
+    if timestamp_pattern:
+        assert real._structured_metric_upgrade_available()
     if mapping_fault:
         bad_answer = json.loads(json.dumps(good_answer))
         bad_answer["primary_metric"]["name" if mapping_fault == "name" else "json_key"] = (
@@ -2563,6 +3227,18 @@ def test_metric_binding_uses_only_fresh_verified_json_schema_and_pins_bytes(tmp_
     bound = json.loads((real.output / "metric_binding.json").read_text())
     assert bound["verified_artifact"]["sha256"] == hashlib.sha256(
         artifact.read_bytes()).hexdigest()
+    if timestamp_pattern:
+        from autosim.research.metric_contract import MetricSpec, resolve_metric_artifact
+        spec=MetricSpec.from_declaration(real.declaration)
+        assert spec.artifact_pattern=='results/**/episode_records.json'
+        assert not real._structured_metric_upgrade_available()
+        import os, time
+        os.utime(artifact,(1,1))
+        folder=tmp_path/'results'/'timestamp_two';folder.mkdir()
+        fresh=folder/'episode_records.json';fresh.write_text(artifact.read_text())
+        resolved=resolve_metric_artifact(spec,roots={'working_directory':tmp_path},
+            started_at=time.time()-1,allowed_roots=[tmp_path])
+        assert resolved['status']=='matched' and resolved['path']==str(fresh)
     sent = json.loads(real.client.seen[-1])
     assert "true" not in json.dumps(sent).lower()
     assert "false" not in json.dumps(sent).lower()
@@ -3518,7 +4194,10 @@ def test_the_state_says_whether_the_run_is_ready_to_measure(tmp_path):
     ready = real.state()["to_measure"]
     assert ready["ready"] is True
     assert "can start" in ready["because"]
-    assert "training is optional" in ready["what_it_would_do"]
+    assert ready['verification_policy_automatically_reused'] is False
+    assert 'explicit training_settings' in ready['what_it_would_do']
+    assert 'not merely an existing checkpoint' in ready['what_it_would_do']
+    assert 'training is optional' not in ready['what_it_would_do']
 
 
 def test_successful_derivation_is_saved_used_and_reloaded(tmp_path, monkeypatch):

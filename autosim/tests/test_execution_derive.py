@@ -21,6 +21,26 @@ from autosim.research.execution_derive import STAGES, problems_in
 PROJECT = Path(__file__).resolve().parents[1]
 
 
+def test_argv_request_agrees_with_source_object_contract():
+    class Client:
+        def chat_with_metadata(self, system, user, **kwargs):
+            request = json.loads(user)
+            assert "Return the argv only" not in request["note"]
+            assert "source/reasoning/shape_was_accepted/parameters JSON object" in request["note"]
+            assert '"source"' in system
+            return json.dumps({
+                "source": "def stage_argv_train(i):\n    return [i['python']]\n",
+                "reasoning": "fixture executable", "shape_was_accepted": None,
+            }), {}
+
+    source, _, log = execution_derive.generate_argv(
+        Client(), "train", entrypoint="train.py", invocation="python train.py",
+        repository_files=[], inputs_for_verify={"python": sys.executable},
+        verify=lambda argv: {"ok": True}, attempts=1)
+    assert source is not None
+    assert log[-1]["status"] == "accepted"
+
+
 def test_checkpoint_probe_preserves_exact_discovered_artifact(tmp_path):
     checkpoint = tmp_path / "policy.pt"
     checkpoint.write_bytes(b"model")
@@ -694,6 +714,31 @@ def test_missing_argv_response_field_is_not_diagnosed_as_repository_config(tmp_p
     assert row['invocation'] == 'python native.py'
 
 
+@pytest.mark.parametrize('staging_code',[0,7])
+def test_silent_staging_failure_cannot_launch_consumer(tmp_path,monkeypatch,staging_code):
+    calls=[]; seen=[]
+    def bounded(argv,**kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv,staging_code if argv[0]=='sh' else 0,'','')
+    def generate(*args,**kwargs):
+        result=kwargs['verify']([sys.executable,'-c','pass']);seen.append(result)
+        return None,{},[{'status':'rejected','error':str(result.get('error') or 'test stops after probe')}]
+    monkeypatch.setattr(execution_derive,'bounded_run',bounded)
+    monkeypatch.setattr(execution_derive,'isolated_argv',lambda argv,**kwargs:argv)
+    monkeypatch.setattr(execution_derive,'generate_argv',generate)
+    monkeypatch.setattr(execution_derive,'diagnose',lambda *a,**k:{'finding':'staging prerequisite'})
+    monkeypatch.setattr(execution_derive,'revise_invocation',lambda *a,**k:{})
+    execution_derive.make_runnable(object(),'train',{'entrypoint':'native.py',
+        'invocation':'python native.py','parameters':[],'staging':['exit '+str(staging_code)]},
+        repo=tmp_path,repository_files=[],inputs_for_verify={'python':sys.executable},rounds=1,attempts=1)
+    assert calls[0][0]=='sh'
+    if staging_code:
+        assert len(calls)==1 and seen[0]['ok'] is False
+        assert 'returncode=7' in seen[0]['error']
+    else:
+        assert len(calls)==2 and calls[1][0]==sys.executable
+
+
 def test_training_verification_requires_a_bound_step_budget():
     class Client:
         def __init__(self):
@@ -1217,6 +1262,20 @@ def test_retry_key_keeps_inputs_seeds_and_opaque_shell_distinct():
     assert key(['/input/one'], {'output': ''}) == ('/input/one',)
 
 
+def test_auxiliary_source_generation_opt_in_reaches_role_adapter_without_changing_native_work():
+    seen=[]
+    class Client:
+        supports_bounded_generation=True
+        def chat_with_metadata(self,*a,**kw):
+            seen.append(kw)
+            return json.dumps({'source':"def stage_argv_evaluate(i): return ['python', 'eval.py']"}),{}
+    source,_,_=execution_derive.generate_argv(Client(),'evaluate',entrypoint='eval.py',
+        invocation='python eval.py',repository_files=[],attempts=1,
+        verify=lambda argv:{'ok':True})
+    assert source and seen[0]['bounded_generation'] is True
+    assert seen[0]['max_tokens']==3000 and seen[0]['thinking']=='disabled'
+
+
 def test_agent_can_yield_failed_native_to_invocation_repair_without_replay():
     replies = iter([{'source': "def stage_argv_train(i): return ['python', 'train.py']"},
         {'invocation_handoff': {'reason': 'native runtime needs environment repair',
@@ -1440,6 +1499,35 @@ def test_successful_native_artifact_failure_keeps_stable_execution_evidence(tmp_
     assert log[0]['native_diagnostics']['returncode'] == 0
     assert 'native evaluation finished' in log[0]['native_diagnostics']['stdout_tail']
     assert 'fresh declared artifact' in log[0]['error']
+
+
+def test_outer_artifact_repair_retains_generator_value_proposals(tmp_path, monkeypatch):
+    calls = []
+    def generate(client, stage, **kwargs):
+        calls.append(kwargs['declared_parameters'])
+        if len(calls)==1:
+            return None, {'--render-mode':'offscreen'}, [{'status':'rejected',
+                'error':'native completed but declared artifact is missing',
+                'native_diagnostics':{'returncode':0}, 'argv':['python','eval.py','--render-mode','offscreen']}]
+        assert kwargs['declared_parameters']['--render-mode']=='offscreen'
+        return 'def stage_argv_evaluate(i): return [i["python"]]', kwargs['declared_parameters'], [{'status':'accepted'}]
+    def diagnose(*args, **kwargs):
+        row = args[2]
+        proposal = next(p for p in row['parameters'] if p['name']=='--render-mode')
+        assert proposal['value']=='offscreen'
+        assert 'verification still required' in proposal['evidence']
+        return {'finding':'native writer uses a different result layout', 'about':'the invocation'}
+    monkeypatch.setattr(execution_derive,'generate_argv',generate)
+    monkeypatch.setattr(execution_derive,'diagnose',diagnose)
+    monkeypatch.setattr(execution_derive,'revise_invocation',lambda *a,**kw:
+        {'artifact':'**/metrics.json','why':'source-backed writer layout'})
+    source, parameters, _, row = execution_derive.make_runnable(object(),'evaluate',
+        {'entrypoint':'eval.py','invocation':'python eval.py','artifact':'missing.json',
+         'parameters':[{'name':'--render-mode','value':'viewer','evidence':'original example'}]},
+        repo=tmp_path, repository_files=[], inputs_for_verify={}, rounds=2, attempts=1)
+    assert len(calls)==2 and source is not None
+    assert parameters['--render-mode']=='offscreen'
+    assert row['artifact']=='**/metrics.json'
 
 
 def test_verification_staging_receives_fresh_caller_output(tmp_path, monkeypatch):

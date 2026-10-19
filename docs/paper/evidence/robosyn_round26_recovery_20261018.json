@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "kind": "development_native_recovery_result_not_matched_acquisition_effect",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_26_handoff_correction",
+  "training": {
+    "attempt_id": "357c48785f0f42de919b26979dacdcbc",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 92.4,
+    "seed": 20261013,
+    "completed_optimizer_updates": 1000,
+    "data_version_id": "click_bell_random_quality_20ep_007_v1",
+    "data_identity_sha256": "761ba7673b04866c661be93fe5198f3ee20886c90f9568a78c5eeeea9203716f",
+    "consumption": {
+      "status": "verified",
+      "evidence_id": "357c48785f0f42de919b26979dacdcbc",
+      "versions": [
+        "click_bell_random_quality_20ep_007_v1"
+      ],
+      "exposure": [
+        {
+          "data_version_id": "click_bell_random_quality_20ep_007_v1",
+          "setting": "dataset",
+          "status": "basic_read_only",
+          "samples_read": 8064,
+          "consumption_stage": "sample_read",
+          "reader_streams": 24,
+          "witness_events": 8064
+        }
+      ],
+      "authority": "sealed loader witness under independently reviewed source; not a quality/SOTA claim"
+    },
+    "physical_log_diagnostic": {
+      "valid_records": 8064,
+      "malformed_records": 0,
+      "reader_streams": 24,
+      "stages": [
+        "sample_read"
+      ],
+      "authority": "operator read-only scan of sealed log, not new native experiment or batch-use certification"
+    }
+  },
+  "evaluation": {
+    "attempt_id": "0e4914af72854af48d38799ae3ab3e37",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 496.4,
+    "seed": 20261013,
+    "setting": "random",
+    "completed_episodes": 50,
+    "successful_episodes": 4,
+    "metric_value": 0.08,
+    "policy_sha256": "3f70ab61a5351300285ad21497c898ce08a6b39cdf6cfe9da71eb1c180dd61fb",
+    "policy_model_file_sha256": "7f611e6d013d8e7243e5db43d19394a8245b7cf5004183c22a6b1f3d489c957a",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "result_sha256": "f0190ab02818540624c0af17c52464b22abdf247d0701923404b1f08e2317007"
+  },
+  "recovery": {
+    "training_reused": true,
+    "original_measurement_status": "unscored",
+    "first_handoff_action": "a124b034b899bdc0",
+    "first_handoff_outcome": "rejected_mutually_exclusive_arguments_no_evaluation_started",
+    "successful_handoff_action": "86a14339504f08ad",
+    "old_failures_rewritten": false,
+    "baseline_and_incumbent_unchanged": true
+  },
+  "autonomy": {
+    "native_candidate_and_settings": "system Main",
+    "diagnosis": "system automatic Fix",
+    "handoff_choice_and_evaluation": "system Main and trusted executor",
+    "operator": "host shared argument contract, CPU regressions, committed-idle restart, read-only diagnostics and paper bookkeeping; no native candidate/parameter/data/evaluation edits or manual scoring"
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "matched_data_comparison_complete": false,
+  "policy_gain_from_this_data_available": false,
+  "limits": [
+    "Only 20 collected episodes and 1000 optimizer updates; this is a small development diagnostic, not an improved incumbent or SOTA.",
+    "sample_read includes repeated reads and prefetch; 8064 is not new data or exact completed-training-batch exposure.",
+    "Training seed 20261013 differs from R20 seed1000 and is outside the preregistered v3 seed list; no fair random-versus-targeted comparison or independent method-gain claim.",
+    "Original supervision/source-family semantic unknowns remain.",
+    "This formal 8% is distinct from R16 unlinked raw 8%; old unverified data-consumption records remain unverified."
+  ],
+  "source_hashes": {
+    "action_receipts/1b61c3f5f30d85ab.json": "98829faaa449556a345d5cbc6b1390dc53327eab73aaf65d3dc5ad137d241bfc",
+    "action_receipts/9ce573e5b6d5379f.json": "913ae6ff66075dada26d77b527554bc2fd52d8dfbacf57e3f61cb2c0db214949",
+    "action_receipts/a124b034b899bdc0.json": "5c58c38a598b0d54123f0a3e5fe4256d8fc168d1472c1172d416b78a762843e0",
+    "action_receipts/86a14339504f08ad.json": "7a09b99489547ef9a454a37cad2efc1caa633dba5d1a7941c775e72207be4c14",
+    "data_versions/click_bell_random_quality_20ep_007_v1.json": "46560f1f394060b531b24d59919a146858c5614dab67c6736e79ab4fd77f7998",
+    "data_consumer_reviews/click_bell_random_quality_20ep_007_v1/0675ed223f49d3a3e457a18345008e617c6b92b73e36b329cc98cf60dfcca0b3.json": "884b588eb95df1dbd6ac07ca9cb3464d4c590614aec0ff25db6091677d2c5fd2",
+    "research/derived/measurements/round_26.json": "ca6453c0a7535cddf9b56c0700cb5684d8ae99e5af78d15b90a3815790898597",
+    "research/derived/measurements/round_26_handoff_correction.json": "4e3562434f6bde63713ffa0cc04e568ce804e49705070e612733d95f1659f013",
+    "research/derived/attempts/357c48785f0f42de919b26979dacdcbc/receipt.json": "fa37cecc5baa2ae27fa5529c906a461d22686de51a32baaa770f1eb95253bfc1",
+    "research/derived/attempts/0e4914af72854af48d38799ae3ab3e37/receipt.json": "3adddd467ec3bb7a959bd11be7f4ddd2ec82ceb2eadb453fad3eb5f05446c8e1",
+    "evidence/357c48785f0f42de919b26979dacdcbc.json": "07ac5ad13036fb17759df73b18d8a729a90fa5ddf426b52c42f969a6ceaf16e7",
+    "evidence/0e4914af72854af48d38799ae3ab3e37.json": "98fb338b1c8f3b64babacd920fd0681375c037b9d0dc8df18a43c509b5132231",
+    "research/derived/train/attempts/357c48785f0f42de919b26979dacdcbc/output.log": "3ee0e23f14577344d7c4bc24c88176f818392251c7059256b36ee8f433fa2dcd",
+    "research/derived/evaluate/attempts/0e4914af72854af48d38799ae3ab3e37/output.log": "b37c8c131d72e296039c0fb288a4a5e22a18f69e98f9fd37507499a5cae09228",
+    "evidence/4b6286aa01fb4f3bba9c3ea6659fcf3e.json": "ef4e9eff9714b9cc6688c66779663a74bdddcfe0554e69c75716054883408b73",
+    "agent/operation_failures/4b6286aa01fb4f3bba9c3ea6659fcf3e.json": "c6280d7a4cc2f682f4aad7354c95cd265c49d980b15f582a29ab6a83788a3c7d",
+    "training_progress_audits/c1b2a8a6f3f5e760f2dd39dcb74bb58253cb46d74fc53d23e89fb86524dfdd65.json": "76eaf0ebbabc9d2479912613ecc51364add1964f6785cb4d7fd3a1e5ef822688",
+    "verification_checkpoint_handoffs/62bb38f492fa1f187c1caf32edc356210f7e602d02315155c03b269ac65fe897.json": "fa7460d930f304902cf1fd5683b6eeda460df338b5d5b674030708096e980ed7",
+    "research/derived/data_selections/cde8e652b613609ff3ad3b61512b8476f08cb23ab6e66f6d90e6ea7f5e2e37ff.json": "d4724174d366bfe9484a6a1a8c41c01612d6467d8ce9804930db6c66d07f0a83",
+    "research/derived/experiments/round_26_handoff_correction/0e4914af72854af48d38799ae3ab3e37/result.json": "f0190ab02818540624c0af17c52464b22abdf247d0701923404b1f08e2317007"
+  }
+}

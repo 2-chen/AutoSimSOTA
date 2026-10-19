@@ -45,6 +45,9 @@ uncertainties (list of strings), evidence_refs (list of relative references), an
 recommended_next_actions (list of strings). This is a model report, not an accepted score.
 Each list must contain at most 20 entries; the entire JSON object must be at most 16000
 UTF-8 bytes. Group related citations by source instead of listing every line separately.
+Every list item must be at most 1500 characters. Do not paste a large patch or source
+body into one finding: cite its sealed evidence ID and give a compact connection summary.
+Prefer a short handoff with the exact next prerequisite over a second full research report.
 
 When enough evidence exists, optionally add operation_proposals (at most three objects):
 {do, arguments, why, evidence_refs, expected_postcondition}. Use an operation in the

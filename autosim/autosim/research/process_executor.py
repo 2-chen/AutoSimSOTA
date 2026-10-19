@@ -61,10 +61,12 @@ def requested_containment(command: list[str] | str) -> str:
     return "process_group_only"
 
 
-def _live_group_members(pgid: int) -> list[int]:
-    """Best-effort Linux audit after the direct process exits."""
+def _live_group_members(pgid: int, *, strict: bool = False) -> list[int]:
+    """Linux group audit; strict absence cannot hide inspection failures."""
     directory = Path("/proc")
     if not directory.is_dir():
+        if strict:
+            raise OSError('host /proc is unavailable for strict group inspection')
         return []
     found: list[int] = []
     for entry in directory.iterdir():
@@ -73,9 +75,15 @@ def _live_group_members(pgid: int) -> list[int]:
         try:
             raw = (entry / "stat").read_text(encoding="utf-8")
             fields = raw[raw.rfind(")") + 2:].split()
+            if len(fields) <= 2 and strict:
+                raise ValueError('incomplete process group record')
             if len(fields) > 2 and fields[0] not in {"Z", "X"} and int(fields[2]) == pgid:
                 found.append(int(entry.name))
+        except FileNotFoundError:
+            continue  # Process exited during the scan.
         except (OSError, ValueError):
+            if strict:
+                raise
             continue
     return found
 
@@ -94,6 +102,13 @@ def _audit_group_cleanup(process, containment_mode: str) -> tuple[bool, dict[str
     if orphaned:
         terminate_group(process)
     after = _live_group_members(process.pid) if orphaned else []
+    if after:
+        # SIGKILL delivery and /proc teardown are asynchronous after a launcher
+        # has exited. Bound the settle wait; persistent members still fail closed.
+        deadline = time.monotonic() + 0.3
+        while after and time.monotonic() < deadline:
+            time.sleep(0.01)
+            after = _live_group_members(process.pid)
     status = ("remaining" if after else "terminated_orphans" if orphaned else
               "namespace_settled" if first else "clean")
     return orphaned, {"observed_pids": first, "persistent_pids": remaining,
@@ -196,6 +211,20 @@ def inspect_process_identity(identity: dict[str, Any]) -> dict[str, Any]:
         return {"status": "not_running", "why": "recorded process is absent"}
     if (current["pgid"] != pgid or current["start_ticks"] != start_ticks or
             current["command_sha256"] != command_sha256):
+        # Long studies can outlive the host PID allocator's wraparound. Never
+        # signal the unrelated replacement, nor call an exec/setsid of the SAME
+        # process settled. Require a later birth, a different group, an original
+        # isolated group, and no surviving members of that original group.
+        if (pgid == pid and 0 < start_ticks < current['start_ticks']
+                and current['pgid'] != pgid):
+            try:
+                remaining = _live_group_members(pgid, strict=True)
+            except (OSError, ValueError):
+                return {'status':'unverifiable','why':'original group inspection failed after PID reuse'}
+            if not remaining:
+                return {'status':'not_running',
+                    'why':'PID reused by a later unrelated process; original isolated group is absent',
+                    'reused_pid':pid,'observed_start_ticks':current['start_ticks']}
         return {"status": "identity_mismatch",
                 "why": "PID exists but process group, start time, or command differs"}
     return {"status": "matching_running", "pid": pid, "pgid": pgid}
@@ -414,7 +443,8 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
     callbacks = {"stdout": on_stdout_line, "stderr": on_stderr_line}
     selector = selectors.DefaultSelector()
     streams = {"stdout": process.stdout, "stderr": process.stderr}
-    deadline = time.monotonic() + timeout
+    hard_deadline = time.monotonic() + timeout
+    deadline = hard_deadline
     last_heartbeat = time.monotonic()
     timed_out = False
     cancelled = False
@@ -493,7 +523,12 @@ def run_process_stream(command: list[str] | str, *, cwd: Path, env: dict[str, st
     def read_loop():
         nonlocal timed_out, cancelled, overflow, last_heartbeat, deadline
         while selector.get_map() and not stop_reader.is_set():
-            if live_control is not None and process.poll() is None:
+            # Extensions may move a soft window, never the immutable hard ceiling.
+            # min(previous_soft_deadline, new_window) silently forbids extensions.
+            deadline = hard_deadline
+            # Inherited pipes may remain owned by workers after the launcher exits.
+            # A live job still obeys cancellation and its window during that drain.
+            if live_control is not None:
                 control=live_control()
                 if control.get('cancelled') is True:
                     cancelled=True

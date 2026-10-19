@@ -9,6 +9,8 @@ def pending(steps: list[dict[str, Any]], fix: dict[str, Any]) -> dict[str, Any]:
     if fix.get("status") == "assessed" and fix.get("assessment") == "repair_attempted":
         for index in range(len(steps) - 1, -1, -1):
             original = steps[index]
+            if original.get('retry_original_arguments') is False:
+                continue
             if not failed_ref or not fix_id or original.get("receipt_ref") != failed_ref:
                 continue
             later = steps[index + 1:]
@@ -30,6 +32,8 @@ def pending(steps: list[dict[str, Any]], fix: dict[str, Any]) -> dict[str, Any]:
     if not builds:
         return {}
     index, original = builds[-1]
+    if original.get('retry_original_arguments') is False:
+        return {}  # Caller selection must change; a planner cannot obey an invalid ID.
     domain = original.get("failure_domain")
     if domain == "repair_contract":
         # Proposal rejection launched nothing. It remains Scheduler-owned, not another
@@ -72,6 +76,10 @@ def view(steps: list[dict[str, Any]], fix: dict[str, Any]) -> dict[str, Any]:
             break
         if row.get("failure_domain") in {"native_install", "native_probe", "framework_plan"}:
             unresolved = {key: row.get(key) for key in ("failure_domain", "repair_owner", "evidence_id", "receipt_ref", "native_operation")}
+            if row.get('retry_original_arguments') is False:
+                unresolved.update(next_action='build_the_environment',
+                    required_input='corrected caller selection from current catalog or prepared overlay',
+                    retry_original_arguments=False, guidance=row.get('recovery_guidance'))
             break
     return {"status": "revalidation_required" if target else
             "unresolved_requires_new_evidence" if unresolved else "no_pending_revalidation",

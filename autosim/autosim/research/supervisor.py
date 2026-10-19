@@ -263,6 +263,7 @@ def build_audit_packet(*, output: Path, repo: Path, run_id: str
     if _safe_json(research_root / "snapshots.json", root=research_root):
         refs.append("source_snapshots")
 
+    from .experiment_view import _consumption_scope
     measurements = []
     confirmation_receipts = []
     measurement_dir = research_root / "measurements"
@@ -313,7 +314,17 @@ def build_audit_packet(*, output: Path, repo: Path, run_id: str
                            "checks": {}, "issues": ["receipt verification raised"]}
             metric = row.get("metric") if isinstance(row.get("metric"), dict) else {}
             reading = row.get("metric_reading") if isinstance(row.get("metric_reading"), dict) else {}
+            from .evidence_store import read_attempt_evidence
+            execution = _training_execution(output, run_id, label, row,
+                read_json=_safe_json, read_evidence=read_attempt_evidence)
+            if execution['status'] == 'sealed_development_train_invocation':
+                execution['evidence_ref'] = 'training_execution:'+label
+                refs.append(execution['evidence_ref'])
             measurements.append({
+                "training_execution": execution,
+                "data_consumption": {
+                    "status": (row.get('data_consumption') or {}).get('status', 'unknown'),
+                    **_consumption_scope(row)},
                 "label": label, "metric": {key: metric.get(key) for key in
                     ("name", "direction", "unit", "aggregation", "min_samples")
                     if key in metric},
@@ -356,10 +367,11 @@ def build_audit_packet(*, output: Path, repo: Path, run_id: str
         "status": (str(confirmation.get("status") or "")[:40]
                    if isinstance(confirmation, dict) else "not_recorded"),
     }
-    from .data_campaign import view as campaign_view
+    from .data_campaign import view as campaign_view, execution_protocols
     from .data_versions import catalog as data_catalog
     campaigns = campaign_view(output, run_id)
     campaign_packet = []
+    requirements = {row["id"]: row for row in execution_protocols(output, run_id)} if campaigns else {}
     for campaign in campaigns:
         identity = campaign['id']
         ref = f'data_campaign:{identity}'
@@ -368,6 +380,11 @@ def build_audit_packet(*, output: Path, repo: Path, run_id: str
         campaign_packet.append({
             **{k: v for k, v in campaign.items() if k not in ('plan_ref', 'observations')},
             'evidence_ref': ref,
+            'comparison': requirements[identity]['comparison'] if identity in requirements else campaign.get('comparison', {}),
+            'protocol_projection': {
+                'status': 'full_frozen_protocol_available' if identity in requirements else 'not_available',
+                'plan_content_sha256': requirements.get(identity, {}).get('plan_sha256'),
+                'authority': 'frozen requirements only; not recipe conformance or data effectiveness'},
             'observations': [{k: v for k, v in arm.items() if k != 'record_ref'}
                              for arm in campaign['observations']]})
     packet = {
@@ -450,6 +467,21 @@ def validate_response(answer: Any, *, allowed_refs: list[str],
         if status == 'real' and (f'data_campaign:{identity}' not in cited
                 or not campaign_map[identity].get('observations')):
             status = 'uncertain'
+        if status == 'real' and campaign_map[identity].get('schema_version') == 2:
+            campaign = campaign_map[identity]
+            expected = {(a, s) for a in campaign.get('comparison', {}).get('arms', [])
+                        for s in campaign.get('comparison', {}).get('seeds', [])}
+            observed = {(r.get('arm'), r.get('seed')) for r in campaign.get('observations', [])}
+            labels = [r.get('measurement_label') for r in campaign.get('observations', [])
+                      if r.get('status') == 'consumed_and_measured']
+            executions = {r.get('label'):r.get('training_execution') or {}
+                          for r in packet.get('measurements', [])}
+            if (campaign.get('protocol_projection', {}).get('status') != 'full_frozen_protocol_available'
+                    or not expected or not expected <= observed or not labels
+                    or any(executions.get(label, {}).get('status') != 'sealed_development_train_invocation'
+                           or executions.get(label, {}).get('evidence_ref') not in cited for label in labels)):
+                status = 'uncertain'
+                why = why[:650] + ' Full frozen requirements, prespecified outcomes and cited sealed training invocations are required; registration and real metrics alone do not establish a matched data comparison.'
         campaign_reviews.append({'id': identity, 'verdict': status, 'why': why[:1000], 'evidence_refs': cited})
     for identity, campaign in campaign_map.items():
         if not any(x['id'] == identity for x in campaign_reviews):
@@ -489,3 +521,83 @@ def validate_response(answer: Any, *, allowed_refs: list[str],
 
 def packet_digest(packet: dict[str, Any]) -> str:
     return object_digest(packet)
+
+
+"""Sealed development invocation projection, never effective-initialization proof."""
+import re
+import shlex
+from pathlib import Path
+
+from autosim.research.common import digest, sanitize_model_payload_text
+
+
+_SECRET_OPTION = re.compile(r'(?i)(?:^|[-_.])(?:api[-_]?key|access[-_]?token|auth[-_]?token|secret|password|passwd|credential|authorization|auth|cookie|token|key|header|headers)$')
+
+
+def _display_argv(argv, root):
+    parts=[]
+    secret_value=False
+    for token in argv:
+        if secret_value:
+            parts.append('[REDACTED]');secret_value=False;continue
+        name, separator, value=token.partition('=')
+        if _SECRET_OPTION.search(name) and (name.startswith('-') or separator):
+            parts.append(name+'=[REDACTED]' if separator else name)
+            secret_value=not separator
+        else:
+            parts.append(token)
+    return sanitize_model_payload_text(shlex.join(parts),local_roots=(root,))
+
+
+def _training_execution(output, run_id, label, measurement, *, read_json, read_evidence):
+    """Read only the identified public train receipt; never scan configs or held-out work."""
+    unavailable = {'status': 'unavailable', 'authority':
+        'No sealed development training invocation was projected; no initialization or recipe certification.'}
+    if (measurement.get('confirmation') or str(label).startswith('confirmation')
+            or not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', str(run_id))
+            or run_id in {'.', '..'}):
+        return unavailable
+    training = measurement.get('train') or measurement.get('training_outcome') or {}
+    attempt = training.get('attempt_id') if isinstance(training, dict) else None
+    if not isinstance(attempt, str) or not re.fullmatch('[0-9a-f]{32}', attempt):
+        return unavailable
+    root = Path(output).resolve(strict=True)
+    expected = 'research/'+run_id+'/attempts/'+attempt+'/receipt.json'
+    try:
+        proof = read_evidence(root, attempt, limit=1)
+        if proof.get('receipt_ref') != expected:
+            return unavailable
+        path = root/expected
+        if (not path.is_file() or path.stat().st_size > 2*1024*1024
+                or any(p.is_symlink() for p in [path, *list(path.parents)[:4]])):
+            return unavailable
+        fingerprint=digest(path)
+        expected={v.get('training_receipt_sha256') for v in
+            (measurement.get('handoff_correction') or {}, measurement.get('recovery') or {})
+            if isinstance(v,dict) and v.get('training_receipt_sha256')}
+        if expected and expected!={fingerprint}:
+            return unavailable
+        record = read_json(path, root=root)
+        if (record.get('attempt_id') != attempt or record.get('run_id') != run_id
+                or record.get('stage') != 'train' or record.get('status') != 'completed'
+                or record.get('returncode') != 0 or proof.get('status') != 'completed'
+                or proof.get('returncode') != 0):
+            return unavailable
+        argv = record.get('argv')
+        if (not isinstance(argv,list) or not argv or len(argv)>256
+                or any(not isinstance(v,str) or '\x00' in v for v in argv)
+                or len(shlex.join(argv).encode())>24000):
+            return unavailable
+        display = _display_argv(argv,root)
+        if digest(path)!=fingerprint:
+            return unavailable
+        return {'status':'sealed_development_train_invocation',
+            'receipt_content_sha256':fingerprint,
+            'invocation_display':display,
+            'display_is_executable':False,
+            'requested_seed':record.get('requested_seed') if type(record.get('requested_seed')) is int else None,
+            'authority':'Sealed invocation, not evidence of effective configuration, '
+                'shared initial parameter bytes, completed updates, matched recipe, data quality or method effect. '
+                'Redacted paths cannot establish resource equality; missing consumer proof remains unknown.'}
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):
+        return unavailable

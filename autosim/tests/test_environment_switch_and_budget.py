@@ -134,6 +134,58 @@ def budgets(output):
     return ledger
 
 
+def test_downward_gpu_allocation_does_not_shrink_wall_model_or_rewrite_usage(tmp_path):
+    from autosim.research.budget_amendment import constrain_gpu
+    output=tmp_path/'run'; ledger=budgets(output)
+    before=read_json(ledger.path); wall=read_json(output/'budget.json')
+    result=constrain_gpu(output,cap_seconds=60000,reason='reserve sibling-study occupancy')
+    assert result['after']=={**result['before'],'gpu_seconds':60000}
+    assert read_json(ledger.path)['entries']==before['entries']
+    assert read_json(output/'budget.json')['started_epoch']==wall['started_epoch']
+    assert authorizes_transition(output,old_limit=60,new_limit=60,run_id='run')
+    assert constrain_gpu(output,cap_seconds=60000,reason='reserve sibling-study occupancy')==result
+    extend(output,model_usd=0,wall_seconds=3600,reason='independent CPU maintenance')
+    assert TaskGPUBudget(output).snapshot()['cap_gpu_seconds']==60000
+    assert read_json(ledger.path)['limit_usd']==60
+
+
+@pytest.mark.parametrize('limit',[True,-1,0,float('inf'),float('nan'),86401])
+def test_gpu_allocation_cannot_add_authority_or_accept_invalid_limit(tmp_path,limit):
+    from autosim.research.budget_amendment import constrain_gpu
+    output=tmp_path/'run';budgets(output)
+    before=(output/'task_gpu_budget.json').read_bytes()
+    with pytest.raises(ValueError):
+        constrain_gpu(output,cap_seconds=limit,reason='invalid allocation')
+    assert (output/'task_gpu_budget.json').read_bytes()==before
+
+
+def test_gpu_allocation_cannot_erase_charges_or_reallocate_a_live_lease(tmp_path):
+    from autosim.research.budget_amendment import constrain_gpu
+    output=tmp_path/'run';budgets(output)
+    gpu=TaskGPUBudget(output)
+    with gpu.locked() as row:
+        row['charged_seconds']=100
+        atomic_json(gpu.path,row)
+    with pytest.raises(ValueError,match='historical'):
+        constrain_gpu(output,cap_seconds=99,reason='cannot erase use')
+    gpu.reserve('owned','test-gpu',requested_seconds=30)
+    with pytest.raises(ValueError,match='reservations'):
+        constrain_gpu(output,cap_seconds=60000,reason='cannot race live use')
+
+
+def test_gpu_allocation_preserves_above_default_authorization_and_rejects_tampering(tmp_path):
+    from autosim.research.budget_amendment import constrain_gpu,authorizes_gpu_cap
+    output=tmp_path/'run';budgets(output)
+    extend(output,model_usd=0,wall_seconds=0,gpu_seconds=21600,
+        operator_gpu_ceiling_seconds=108000,reason='explicit 30 hour authorization')
+    result=constrain_gpu(output,cap_seconds=100000,reason='sibling budget carveout')
+    assert authorizes_gpu_cap(output,100000)
+    path=output/'budget_amendments'/f'{result["id"]}.json'
+    row=read_json(path);row['after']['model_usd']=600
+    atomic_json(path,row)
+    assert not authorizes_gpu_cap(output,100000)
+
+
 def test_reduce_remaining_budget_preserves_entries_gpu_usage_and_wall_start(tmp_path):
     output = tmp_path/'run'
     ledger = budgets(output)

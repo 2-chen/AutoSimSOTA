@@ -8,6 +8,17 @@ from autosim.research.prepare import Preparation
 from autosim.research.main_agent import memory_view, validate_plan, validate_task, validate_report
 
 
+def test_decision_facts_exposes_extendability_before_local_allocation_exhaustion(tmp_path,monkeypatch):
+    from tests.test_prepare import preparation
+    real=preparation(tmp_path)
+    monkeypatch.setattr(real,'state',lambda:{'research_progress':{
+        'planned_rounds':13,'next_round':13},'available':['extend_research_rounds']})
+    allocation=real._decision_facts()['local_round_allocation']
+    assert allocation['remaining_candidate_rounds']==1
+    assert allocation['extension_available'] and allocation['extension_expected_rounds']==13
+    assert not allocation['is_hard_total_budget']
+
+
 PLAN = {"objective": "Establish a reproducible baseline then improve it",
         "hypotheses": ["The loader consumes top-level folder"],
         "open_questions": ["Where is the dataset actually stored?"],
@@ -299,6 +310,20 @@ def test_data_agent_cannot_request_edit_mode():
                        "mode": "edit"})
     assert validate_task({"role": "data", "task": "Inspect collector",
                           "expected_result": "probe", "mode": "inspect"})["role"] == "data"
+
+
+def test_post_baseline_edit_refusal_has_recoverable_evidence_not_a_silent_gate(tmp_path, monkeypatch):
+    real = make(tmp_path)
+    original = real.state
+    monkeypatch.setattr(real, 'state', lambda: {**original(), 'research_progress':{'status':'paused'}})
+    result = real.do('research_task', role='init', mode='edit',
+        task='Connect registered data labels', expected_result='Audited reader patch')
+    assert result['outcome'] == 'rejected'
+    assert result['failure_category'] == 'candidate_source_edit_required'
+    assert result['repair_owner'] == 'main_agent'
+    assert result['native_operation_status'] == 'not_started'
+    assert result['evidence_id'] and (real.output / result['evidence_ref']).is_file()
+    assert 'audited' in result['repair_handoff']['next_action']
 
 
 def test_data_handoff_survives_unrelated_reports_with_bounded_advisory_view():

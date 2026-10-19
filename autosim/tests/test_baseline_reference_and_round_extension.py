@@ -11,6 +11,17 @@ from autosim.research.derive_and_run import validate_paused_research_resume
 from tests.test_derived_research import research
 
 
+def test_remaining_local_round_is_an_extendable_allocation_not_hard_total():
+    from autosim.research.round_extension import allocation_view
+    view=allocation_view({'planned_rounds':13,'next_round':13},['extend_research_rounds'])
+    assert view['remaining_candidate_rounds']==1 and not view['is_hard_total_budget']
+    assert view['extension_available'] and view['extension_expected_rounds']==13
+    closed=allocation_view({'planned_rounds':13,'next_round':14},[])
+    assert closed['remaining_candidate_rounds']==0 and not closed['extension_available']
+    assert closed['extension_expected_rounds'] is None
+    assert allocation_view({},[])['status']=='unknown'
+
+
 def test_authorized_resource_ref_has_distinct_backing_and_native_paths(tmp_path,monkeypatch):
     output=tmp_path/'run';repo=output/'checkout';repo.mkdir(parents=True)
     source=tmp_path/'resources';source.mkdir();(source/'model.bin').write_bytes(b'weights')
@@ -90,6 +101,12 @@ def measurement(output, frozen, value=0.51, samples=100):
     row = dict(ok=True, metric_value=value, metric_reading=dict(samples=samples),
                policy_artifact=copied, **{k:dict(status='verified') for k in
                ('policy_consumption','rollout_evidence','metric_lineage')})
+    sha=copied.get('content_sha256') or copied['sha256']
+    row.update(metric={'episode_id_column':'episode_id'},
+        policy_consumption={'status':'verified','sha256':sha},
+        rollout_evidence={'status':'verified','policy_sha256':sha,'episodes_completed':samples,
+                          'episode_ids':[str(i) for i in range(samples)]},
+        metric_lineage={'status':'verified','policy_sha256':sha,'episodes_completed':samples,'value':value})
     rel = 'measurements/reference.json'
     atomic_json(output/rel, row)
     refs.begin(output, 'published', measurement_ref=rel)
@@ -115,6 +132,17 @@ def test_unrelated_policy_cannot_reproduce_reference(tmp_path):
     row['policy_artifact']['source'] = str(output/'unrelated')
     atomic_json(output/rel, row)
     assert refs.complete(output, 'published', row, rel)['status'] == 'evaluation_failed'
+
+
+def test_scalar_reference_summary_counts_verified_native_episodes(tmp_path,monkeypatch):
+    monkeypatch.setattr('autosim.research.receipt_verifier.verify_measurement',lambda *a:dict(status='consistent'))
+    _,output,_,frozen=reference(tmp_path)
+    row,rel=measurement(output,frozen)
+    row['metric']={'episode_id_column':''};row['metric_reading']={'value':.51}
+    atomic_json(output/rel,row)
+    result=refs.complete(output,'published',row,rel)
+    assert result['status']=='reproduced'
+    assert read_json(output/'baseline_references/published.json')['evaluation']['samples']==100
 
 
 def test_reference_requires_exact_public_source_and_immutable_bytes(tmp_path):
@@ -165,6 +193,36 @@ def test_extension_forbidden_after_heldout_or_without_budget(tmp_path):
     atomic_json(real.run_root/'confirmation_attempts/one.json', {})
     with pytest.raises(RuntimeError):
         extend(real, additional_rounds=1, expected_rounds=1, reason='No test leakage')
+
+
+@pytest.mark.parametrize('fault',[None,'pending','active_action','heldout','changed_protocol'])
+def test_idle_finalizing_can_extend_but_not_reopen_active_or_exposed_research(tmp_path,fault):
+    real=research(tmp_path)
+    real.run(rounds=1,yield_after_action=True)
+    real.run(rounds=1,yield_after_action=True)
+    root=real.run_root
+    session=read_json(root/'controller_session.json')
+    report=read_json(root/'research_report.json')
+    session.update(status='finalizing',action='',pending_action=None)
+    report['run_status']='finalizing'
+    if fault=='pending':session['pending_action']={'phase':'confirmation'}
+    if fault=='active_action':session['action']='confirmation'
+    atomic_json(root/'controller_session.json',session)
+    atomic_json(root/'research_report.json',report)
+    if fault=='heldout':atomic_json(root/'confirmation_attempts/one.json',{})
+    if fault=='changed_protocol':atomic_json(root/'comparison_protocol.json',{'changed':True})
+    real.budget=SimpleNamespace(remaining=lambda:1000)
+    before=digest(root/'measurements/baseline.json')
+    if fault:
+        with pytest.raises((RuntimeError,ValueError)):
+            extend(real,additional_rounds=1,expected_rounds=1,reason='continue development')
+    else:
+        result=extend(real,additional_rounds=1,expected_rounds=1,reason='continue development')
+        assert result['new_rounds']==2
+        after=read_json(root/'controller_session.json')
+        assert after['status']=='paused' and after['history']==session['history']
+        assert after['next_round']==session['next_round']
+    assert digest(root/'measurements/baseline.json')==before
 
 
 def test_released_reference_evaluation_never_invokes_trainer(tmp_path, monkeypatch):
@@ -291,6 +349,34 @@ def test_preparation_reference_uses_reviewed_samples_not_local_or_verification_d
     assert controller.base_settings['episodes']==2
 
 
+def test_completed_reference_postcondition_has_distinct_fix_evidence(tmp_path,monkeypatch):
+    from tests.test_prepare import preparation
+    from autosim.research.evidence_store import read_attempt_evidence
+    controller=preparation(tmp_path/'controller');real=research(tmp_path/'native')
+    install_reference(real)
+    controller.output=real.output;controller.repo=real.repo;controller.run_id=real.run_id
+    controller.base_settings={'episodes':100}
+    monkeypatch.setattr(controller,'_research_controller',lambda:(real,{}))
+    native_id='b'*32
+    def measured(**kwargs):
+        row={'ok':False,'where':'evaluate','why':'structured result missing',
+             'settings':kwargs['settings'],'metric_reading':{'why_not':'JSON result artifact missing'},
+             'metric_artifact_evidence':{'status':'missing'},
+             'evaluate':{'ran':True,'status':'completed','returncode':0,
+                         'evidence_id':native_id,'evidence_ref':f'evidence/{native_id}.json'}}
+        atomic_json(real.run_root/'measurements'/(kwargs['label']+'.json'),row)
+        return row
+    monkeypatch.setattr(real,'measure',measured)
+    result=controller._step_evaluate_baseline_reference(reference_id='published')
+    assert result['reference_status']=='evaluation_failed'
+    assert result['native_operation_status']=='completed'
+    assert result['evidence_id']!=native_id and result['repair_owner']=='fix'
+    evidence=read_attempt_evidence(controller.output,result['evidence_id'])
+    assert evidence['returncode'] is None
+    assert 'JSON result artifact missing' in evidence['text']
+    assert native_id in evidence['text'] and 'recover_reference_score' in evidence['text']
+
+
 @pytest.mark.parametrize('receipt_created',[False,True])
 def test_reference_exception_has_fix_evidence_and_never_replays_unknown_native_work(tmp_path,monkeypatch,receipt_created):
     from tests.test_prepare import preparation
@@ -314,6 +400,36 @@ def test_reference_exception_has_fix_evidence_and_never_replays_unknown_native_w
         again=controller._step_evaluate_baseline_reference(reference_id='published',retry_reason='inspect unknown outcome')
         assert again['failure_category']=='reference_operation_failed'
         assert len(calls)==1
+
+
+@pytest.mark.parametrize('early_guard',[False,True])
+def test_reference_returned_failure_reaches_fix_with_original_cause(tmp_path,monkeypatch,early_guard):
+    from tests.test_prepare import preparation
+    from autosim.research.operation_failure import seal
+    from autosim.research.evidence_store import read_attempt_evidence
+    controller=preparation(tmp_path/'controller');real=research(tmp_path/'native')
+    install_reference(real)
+    controller.output=real.output;controller.repo=real.repo;controller.run_id=real.run_id
+    monkeypatch.setattr(controller,'_research_controller',lambda:(real,{}))
+    cause='frozen protocol changed: evaluator source'
+    proof=seal(real.output,operation='measurement_protocol_guard',exc=ValueError(cause),
+        native_operation_status='not_started')
+    def failed(**kwargs):
+        row={'ok':False,'why':cause,'settings':kwargs['settings']}
+        if early_guard:
+            row.update(proof)
+        else:
+            row['evaluate']={'ran':False,**proof}
+        atomic_json(real.run_root/'measurements'/(kwargs['label']+'.json'),row)
+        return row
+    monkeypatch.setattr(real,'measure',failed)
+    result=controller._step_evaluate_baseline_reference(reference_id='published')
+    assert result['reference_status']=='evaluation_failed'
+    assert cause in result['because']
+    assert result['repair_owner']=='fix' and result['retryable'] is True
+    assert result['native_operation_status']=='not_started'
+    assert proof['evidence_ref'] in result['evidence_refs']
+    assert cause in read_attempt_evidence(real.output,result['evidence_id'])['text']
 
 
 def test_reference_cannot_accept_unsealed_receipt(tmp_path):

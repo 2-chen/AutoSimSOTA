@@ -10,6 +10,44 @@ from autosim.research.experiment_bundle import freeze_artifact
 from autosim.research.experiment_bundle import export_best
 
 
+@pytest.mark.parametrize('directory',[False,True])
+def test_store_can_preserve_native_leaf_without_rewriting_legacy_slot(tmp_path,directory):
+    from autosim.research.common import digest
+    source=tmp_path/('native_bundle' if directory else 'native_weights.bin')
+    if directory:
+        source.mkdir();(source/'config.json').write_text('{"native":true}')
+        (source/'model.bin').write_bytes(b'policy')
+    else:source.write_bytes(b'policy')
+    store=tmp_path/'store'
+    old=freeze_artifact(source,tmp_path/'unused',max_bytes=1024,store=store)
+    old_manifest=Path(old['path']).parent/'manifest.json';old_hash=digest(old_manifest)
+    new=freeze_artifact(source,tmp_path/'unused2',max_bytes=1024,store=store,preserve_basename=True)
+    assert Path(new['path']).name==source.name and new['sha256']==old['sha256']
+    assert Path(new['path']).parent!=Path(old['path']).parent
+    assert digest(old_manifest)==old_hash
+    again=freeze_artifact(source,tmp_path/'unused3',max_bytes=1024,store=store,preserve_basename=True)
+    assert again['path']==new['path']
+    assert Path(old['path']).exists()
+
+
+def test_same_bytes_different_native_bundle_names_have_distinct_preserved_slots(tmp_path):
+    sources=[tmp_path/'bundle_A',tmp_path/'bundle_B']
+    for source in sources:
+        source.mkdir();(source/'weights.bin').write_bytes(b'same bytes')
+    rows=[freeze_artifact(source,tmp_path/'unused',max_bytes=1024,
+        store=tmp_path/'store',preserve_basename=True) for source in sources]
+    assert rows[0]['sha256']==rows[1]['sha256'] and rows[0]['path']!=rows[1]['path']
+    assert [Path(row['path']).name for row in rows]==['bundle_A','bundle_B']
+
+
+@pytest.mark.parametrize('name',['manifest.json','lock'])
+def test_preserved_store_refuses_reserved_native_leaf(tmp_path,name):
+    source=tmp_path/name;source.write_bytes(b'bytes')
+    with pytest.raises(ValueError,match='unsafe native artifact basename'):
+        freeze_artifact(source,tmp_path/'unused',max_bytes=1024,
+            store=tmp_path/'store',preserve_basename=True)
+
+
 def test_freeze_a_policy_file_and_preserve_the_old_bytes(tmp_path):
     source = tmp_path / "model.pt"
     source.write_bytes(b"candidate one")

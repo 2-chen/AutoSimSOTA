@@ -18,6 +18,7 @@ import math
 import os
 import uuid
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -192,6 +193,7 @@ class AgentCostLedger:
             raise ValueError("required reservation must be finite and positive")
         with self._locked():
             ledger = self._read()
+            before = deepcopy(ledger)
             entry = next((row for row in ledger["entries"]
                           if row.get("reservation_id") == reservation_id), None)
             if entry is None or entry.get("status") != "reserved":
@@ -209,7 +211,8 @@ class AgentCostLedger:
                 "from_usd": current, "to_usd": entry["reserved_usd"],
                 "reason": "request ceiling exceeds local allowance"})
             ledger["updated_at"] = now()
-            atomic_json(self.path, ledger)
+            from .ledger_history import persist
+            persist(self, before, ledger, operation='extend')
             return float(entry["reserved_usd"])
 
     def settle(self, reservation_id: str, *, actual_usd: float | None,
@@ -221,6 +224,7 @@ class AgentCostLedger:
             raise ValueError("provider-reported model cost must be finite and non-negative")
         with self._locked():
             ledger = self._read()
+            before = deepcopy(ledger)
             rows = ledger["entries"]
             entry = next((row for row in rows if isinstance(row, dict) and
                           row.get("reservation_id") == reservation_id), None)
@@ -264,7 +268,8 @@ class AgentCostLedger:
                     entry.update(status="settled", actual_usd=float(actual_usd),
                                  reserved_usd=0.0, finished_at=now())
                 ledger["updated_at"] = now()
-                atomic_json(self.path, ledger)
+                from .ledger_history import persist
+                persist(self, before, ledger, operation='settle')
         return self.snapshot()
 
     def reconcile_unknown(self, reservation_id: str, *, actual_usd: float,
@@ -282,6 +287,7 @@ class AgentCostLedger:
         evidence = evidence.strip()
         with self._locked():
             ledger = self._read()
+            before = deepcopy(ledger)
             entry = next((row for row in ledger["entries"] if isinstance(row, dict) and
                           row.get("reservation_id") == reservation_id), None)
             if entry is None:
@@ -299,7 +305,8 @@ class AgentCostLedger:
                              reserved_usd=0.0, reconciled_at=now(),
                              reconciliation_evidence=evidence)
                 ledger["updated_at"] = now()
-                atomic_json(self.path, ledger)
+                from .ledger_history import persist
+                persist(self, before, ledger, operation='reconcile_unknown')
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:

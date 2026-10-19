@@ -11,24 +11,49 @@ from autosim.research.runtime_recovery import seal_protocol_stream
 from tests.test_main_agent import make, Client, REPORT
 
 
-def test_report_recovery_preserves_original_and_only_requests_format(tmp_path):
+def test_oversized_typed_report_preserves_original_without_another_model_turn(tmp_path):
     original = json.dumps({**REPORT, 'findings':['汉'*1000]*8,
                            'uncertainties':['未知'*700]*8}, ensure_ascii=False)
     class CompressionClient:
         def chat_with_metadata(self, system, user, **kwargs):
-            payload = json.loads(user)
-            assert 'already completed investigation' in system
-            assert kwargs['read_only'] is True
-            assert kwargs['auto_skills'] is False
-            assert payload['original_report_complete'] is True
-            assert '16000' in payload['validation_error']
-            return json.dumps(REPORT), {}
+            raise AssertionError('well-typed prose should be paged, not buy another investigation')
     result = receive_report(original, client=CompressionClient(), output=tmp_path,
         workspace=tmp_path/'checkout', timeout=20)
-    assert result['summary'] == REPORT['summary']
+    assert REPORT['summary'] in result['summary']
+    assert result['delivery_projection']['status'] == 'partial_advisory_view'
     assert result['delivery_recovery_evidence_ref']
     raw = next((tmp_path/'report_handoffs').glob('*.log')).read_text()
     assert '汉'*1000 in raw
+
+
+def test_long_single_finding_is_paged_with_all_original_evidence_available(tmp_path):
+    from autosim.research.evidence_store import read_attempt_evidence
+    class NoCalls:
+        def chat_with_metadata(self,*a,**k): raise AssertionError('no paid format repair')
+    original = {**REPORT,'findings':['patch-before-after-'*200]}
+    result = receive_report(json.dumps(original),client=NoCalls(),output=tmp_path,
+                            workspace=tmp_path/'checkout',timeout=20,metadata={'turn_id':'b'*32})
+    assert 'PARTIAL DELIVERY VIEW' in result['summary']
+    proof = read_attempt_evidence(tmp_path,result['delivery_projection']['evidence_id'],limit=8000)
+    assert original['findings'][0] in proof['text']
+    assert len(result['findings'][0]) < 1500
+    from autosim.research.main_agent import report_delivery_view
+    view = report_delivery_view(tmp_path)
+    assert view[0]['evidence_id'] == result['delivery_projection']['evidence_id']
+    assert view[0]['authority'] == 'unaccepted_model_report_delivery_only'
+
+
+def test_bad_report_shape_still_needs_explicit_format_correction(tmp_path):
+    class FormatClient:
+        calls = 0
+        def chat_with_metadata(self,system,user,**kw):
+            self.calls += 1
+            assert '1500 characters' in system and kw['read_only']
+            return json.dumps(REPORT),{}
+    client = FormatClient()
+    result = receive_report(json.dumps({**REPORT,'findings':'not a list'}),client=client,
+        output=tmp_path,workspace=tmp_path/'checkout',timeout=20)
+    assert client.calls == 1 and result['summary'] == REPORT['summary']
 
 
 def test_valid_report_never_adds_a_model_turn(tmp_path):
@@ -37,6 +62,49 @@ def test_valid_report_never_adds_a_model_turn(tmp_path):
             raise AssertionError('valid handoff should not trigger compression')
     assert receive_report(json.dumps(REPORT), client=NoCalls(), output=tmp_path,
         workspace=tmp_path/'checkout', timeout=20)['summary'] == REPORT['summary']
+
+
+def test_structured_advisory_findings_with_empty_proposals_are_paged_not_researched_again(tmp_path):
+    from autosim.research.evidence_store import read_attempt_evidence
+    class NoCalls:
+        def chat_with_metadata(self,*a,**k): raise AssertionError('no paid repair for advisory JSON rendering')
+    original = {**REPORT, 'findings':[{'verdict':'unknown', 'quote':'x'*1800,
+                                      'do':'not an executable proposal'}], 'operation_proposals':[]}
+    result = receive_report(json.dumps(original), client=NoCalls(), output=tmp_path,
+        workspace=tmp_path/'checkout', timeout=20, metadata={'turn_id':'b'*32})
+    assert result['delivery_projection']['status'] == 'partial_advisory_view'
+    assert 'Unaccepted advisory JSON:' in result['findings'][0]
+    assert 'operation_proposals' not in result
+    proof = read_attempt_evidence(tmp_path,result['delivery_projection']['evidence_id'],limit=8000)
+    assert json.loads(proof['text']) == original
+    from autosim.research.main_agent import report_delivery_view
+    assert report_delivery_view(tmp_path)[0]['delivery_view']['delivery_projection']['status'] == 'partial_advisory_view'
+
+
+def test_nonempty_typed_proposals_cannot_be_silently_dropped_into_prose():
+    from autosim.research.main_agent import _report_delivery_projection
+    for key in ('operation_proposals','failure_cases','acquisition_proposals'):
+        original = {**REPORT, 'findings':['x'*2000], key:[{'important':'must be explicitly corrected'}]}
+        assert _report_delivery_projection(original,'a'*32) is None
+
+
+def test_completed_long_utf8_structured_report_reappears_without_repair_or_byte_changes(tmp_path):
+    from autosim.research.main_agent import report_delivery_view
+    from autosim.research.common import digest
+    class NoCalls:
+        def chat_with_metadata(self,*a,**k): raise AssertionError('no extra model turn')
+    original = {**REPORT, 'findings':[{'verdict':'未知', 'source':'中文'*4000}],
+                'operation_proposals':[]}
+    result = receive_report(json.dumps(original,ensure_ascii=False),client=NoCalls(),
+        output=tmp_path,workspace=tmp_path/'checkout',timeout=20,metadata={'turn_id':'b'*32})
+    path = next((tmp_path/'report_handoffs').glob('*.log'))
+    before = digest(path)
+    assert path.stat().st_size > 12000
+    row = report_delivery_view(tmp_path)[0]
+    assert row['delivery_view']['delivery_projection']['evidence_id'] == result['delivery_projection']['evidence_id']
+    assert digest(path) == before
+    path.write_text('tampered report')
+    assert report_delivery_view(tmp_path) == []
 
 
 def test_inspect_task_preserves_verified_commands_and_requests_readonly(tmp_path):

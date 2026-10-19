@@ -579,12 +579,35 @@ def test_main_controller_can_discard_only_a_reconciled_pre_stage_candidate(tmp_p
     assert "metric_value" not in session["history"][-1]
     assert session["interruption"]["boundary"]["status"] == "resolved_discarded"
     assert report["rounds"][-1]["interruption_resolution_id"] == result["resolution_id"]
+    shared=preparation.state_store.load()['phases']['research']
+    assert shared['status']=='paused' and shared['parent_action'] is None
+    assert shared['current_action'] is None and shared['last_action']['status']=='discarded'
+    assert shared['last_action']['resolution_id']==result['resolution_id']
     idea = IdeaLibrary(research_root / "ideas.json").get("candidate")
     assert idea.status != CLEARED and idea.times_tried == 1
     assert idea.outcome_event_ids == [result["resolution_id"]]
     repeated = preparation._step_discard_interrupted_candidate(reason="retry")
     assert repeated["outcome"] == "already resolved"
     assert IdeaLibrary(research_root / "ideas.json").get("candidate").times_tried == 1
+
+
+def test_last_candidate_discard_does_not_hide_unexposed_round_extension(tmp_path):
+    from types import SimpleNamespace
+    preparation,_,root,session_path,report_path=_discardable_candidate(tmp_path)
+    preparation.client.supports_main_agent=True
+    preparation.budget=SimpleNamespace(remaining=lambda:1000)
+    session=json.loads(session_path.read_text());session['rounds']=1
+    session_path.write_text(json.dumps(session))
+    report=json.loads(report_path.read_text());report['planned_rounds']=1
+    report_path.write_text(json.dumps(report))
+    result=preparation._step_discard_interrupted_candidate(reason='pre-native candidate declined')
+    assert result['outcome']=='candidate discarded'
+    state=preparation.state()
+    assert state['research_progress']['status']=='finalizing'
+    assert 'extend_research_rounds' in state['available']
+    (root/'confirmation_attempts').mkdir(exist_ok=True)
+    (root/'confirmation_attempts/exposed.json').write_text('{}')
+    assert 'extend_research_rounds' not in preparation.state()['available']
 
 
 def test_discard_retry_after_idea_event_write_is_idempotent(tmp_path):
@@ -611,6 +634,54 @@ def test_discard_retry_after_idea_event_write_is_idempotent(tmp_path):
     completed = json.loads(session_path.read_text(encoding="utf-8"))
     assert completed["interruption_resolution"]["resolution_id"] == resolution_id
     assert completed["status"] == "paused"
+
+
+def test_completed_discard_does_not_hide_a_later_candidate_and_is_archived(tmp_path):
+    preparation, source, root, session_path, report_path = _discardable_candidate(tmp_path)
+    first = preparation.do('discard_interrupted_candidate',reason='First pre-native candidate declined')
+    assert first['outcome'] == 'candidate discarded'
+    session = json.loads(session_path.read_text())
+    old_resolution = dict(session['interruption_resolution'])
+    old_history = list(session['history'])
+    patch = Patch('loader.py','VALUE = 1','VALUE = 2')
+    Snapshots(root/'snapshots').capture([patch.file],repo=tmp_path,name='before-round-2')
+    apply_many([patch],repo=tmp_path)
+    (root/'code_changes/round-2.json').write_text(json.dumps({
+        'schema_version':1,'round':2,'idea_label':'second','snapshot':'before-round-2',
+        'patches':[patch.as_dict()],'status':'applied'}))
+    idea = Idea(label='second',granularity='code',mechanism='second reader repair',
+        change={'file':patch.file,'find':patch.find,'replace':patch.replace},
+        status=CLEARED,touches=[patch.file])
+    IdeaLibrary(root/'ideas.json').add(idea)
+    pending = {'round':2,'phase':'prepared','idea':idea.as_dict(),
+               'changed':{'file':patch.file,'files':[patch.file]}}
+    boundary = {**session['interruption']['boundary'], 'status':'unresolved',
+        'round':2,'controller_action':'round_2','idea':{'label':'second','granularity':'code'},
+        'candidate_measurement':{'status':'missing','ref':'research/derived/measurements/round_2.json'}}
+    interruption = {'controller_action':'round_2','pending_action':pending,'boundary':boundary}
+    session.update(status='interrupted',action='round_2',next_round=2,rounds=3,
+                   pending_action=pending,interruption=interruption)
+    session_path.write_text(json.dumps(session))
+    report = json.loads(report_path.read_text())
+    report.update(run_status='interrupted',planned_rounds=3,interruption=interruption)
+    report_path.write_text(json.dumps(report))
+    assert 'discard_interrupted_candidate' in preparation.state()['available']
+    second = preparation.do('discard_interrupted_candidate',reason='Different pre-native candidate declined')
+    assert second['outcome'] == 'candidate discarded' and second['round'] == 2
+    after = json.loads(session_path.read_text())
+    assert after['history'][:len(old_history)] == old_history
+    assert after['next_round'] == 3 and source.read_text() == 'VALUE = 1\n'
+    archive = root/'interruption_resolutions'/(old_resolution['resolution_id']+'.json')
+    assert json.loads(archive.read_text()) == old_resolution
+    assert preparation._step_discard_interrupted_candidate(reason='repeat')['outcome'] == 'already resolved'
+
+
+@pytest.mark.parametrize('old_round,status',[(1,'completed'),(3,'completed'),(2,'discarding'),(True,'completed')])
+def test_only_a_completed_strictly_older_resolution_can_be_superseded(old_round,status):
+    boundary = {'round':2,'idea':{'label':'current'}}
+    resolution = {'round':old_round,'idea_label':'old','resolution_id':'a'*32,'status':status}
+    assert Preparation._historical_completed_resolution(resolution,boundary) is (
+        type(old_round) is int and old_round==1 and status=='completed')
 
 
 def test_discard_refuses_a_candidate_source_diverged_after_measurement_boundary(tmp_path):

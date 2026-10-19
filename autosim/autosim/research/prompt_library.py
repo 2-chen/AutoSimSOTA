@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "prompts"
 LEGACY_NAMES = frozenset({"onboard_task_prompt", "ideas_task_prompt", "optimize_task_prompt"})
 CORE_ROLES = frozenset({
-    "core", "scheduler", "monitor", "fix", "specialist", "ideator",
+    "core", "scheduler", "scheduler-core", "monitor", "fix", "specialist", "ideator",
     "ideator-leap", "idea-repair", "recorder", "skill-selection", "runtime-tools",
 })
 OPERATION_PROMPTS = frozenset({
@@ -21,7 +21,7 @@ OPERATION_PROMPTS = frozenset({
     "execution-revise", "objective-decompose", "objective-answer",
     "environment-plan", "environment-resume", "environment-reconsider",
     "environment-diagnose", "repository-scout", "repository-triage", "strategy",
-    "supervisor", "candidate-execution-review", "recorder-fact-review", "data", "resource",
+    "supervisor", "candidate-execution-review", "recorder-fact-review", "recorder-fact-reference-repair", "data", "resource",
 })
 PROMPT_NAMES = CORE_ROLES | OPERATION_PROMPTS
 ROLE_PROMPTS = CORE_ROLES - {"core", "runtime-tools"}
@@ -49,13 +49,16 @@ def load_prompt(name: str) -> str:
             if name in ROLE_PROMPTS else content)
 
 
-def scheduler_request_prompt(*, operations: str, permitted, operation_names) -> str:
+def scheduler_request_prompt(*, operations: str, permitted, operation_names,
+                             on_demand: bool = False) -> str:
     """Keep strategic/safety/response rules; omit clauses for unavailable operations.
 
     No summarizing model or heuristic selects the next action. This only projects
     the existing executor capability boundary; complete templates stay versioned.
     The stable strategic prefix is unchanged for provider caching.
     """
+    if on_demand:
+        return load_prompt('scheduler-core').format(operations=operations)
     template=load_prompt('scheduler')
     start='Choose by what is missing and by what failed. A few things are worth knowing:\n'
     end='`method_library` contains candidate methods retrieved from metadata, not executable policy.'
@@ -72,6 +75,45 @@ def scheduler_request_prompt(*, operations: str, permitted, operation_names) -> 
             selected.append(clause)
     result=prefix+start+''.join(selected)+end+suffix
     return result.format(operations=operations)
+
+
+def scheduler_guidance(output: Path, *, operation_names) -> dict:
+    """Publish the COMPLETE existing manual as immutable, explicitly readable pages.
+
+    No model call, guessed keyword routing or new execution permission. Only callers
+    with read_evidence should use the short system prompt; tool-less clients keep the
+    old full prompt. The catalog survives restarts and records exact body identities.
+    """
+    from .common import atomic_text
+    from .experiment_transaction import safe
+    from .evidence_store import capture_attempt_evidence
+    body = _template('scheduler').format(
+        operations='See current state.available and state.operation_contracts.')
+    sections = re.split(r'(?m)(?=^#{1,2} )', body)
+    catalog = []
+    for section in sections:
+        if not section.strip():
+            continue
+        fingerprint = hashlib.sha256(section.encode()).hexdigest()
+        relative = 'agent/guidance/' + fingerprint + '.md'
+        target = safe(output, relative)
+        if target.exists():
+            if target.read_text(encoding='utf-8') != section:
+                raise ValueError('immutable scheduler guidance changed')
+        else:
+            atomic_text(target, section)
+        evidence = capture_attempt_evidence(output, attempt_id=fingerprint[:32], log=target,
+            receipt_ref=relative, status='instruction_reference', returncode=None,
+            termination_reason='on_demand_scheduler_guidance')
+        catalog.append({'title': section.splitlines()[0].lstrip('# ').strip(),
+            'sha256': fingerprint, 'bytes': len(section.encode()),
+            'operations': sorted(set(re.findall(r'`([a-z][a-z0-9_]*)`', section))
+                                 & set(operation_names)),
+            'evidence_id': evidence['evidence_id']})
+    return {'pages': catalog, 'authority': 'instructions, not native execution evidence',
+        'read_instruction': 'Choose relevant pages and explain why. Use read_evidence '
+                            'with evidence_id and byte offsets until the needed section is read. '
+                            'The catalog never selects your research direction.'}
 
 
 def prompt_identity() -> str:

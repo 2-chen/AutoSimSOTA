@@ -17,6 +17,13 @@ def client_for(tmp_path: Path, *, total: float = 2.0) -> RoleAwareAgentClient:
                                 total_budget_usd=total, timeout=90)
 
 
+def test_agent_client_refuses_pro_before_freezing_a_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    with pytest.raises(ValueError, match="must use deepseek-flash"):
+        client_for(tmp_path)
+    assert not (tmp_path / "run/agent/runtime_spec.json").exists()
+
+
 def test_stable_instructions_precede_dynamic_request_and_usage_tracks_bytes(tmp_path, monkeypatch):
     calls = []
     def run(**kwargs):
@@ -33,6 +40,37 @@ def test_stable_instructions_precede_dynamic_request_and_usage_tracks_bytes(tmp_
     assert metadata["prompt_efficiency"]["prompt_bytes"] == len(calls[0]["prompt"].encode())
 
 
+def test_toolless_review_never_receives_inaccessible_context_pages(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr('autosim.research.agent_runtime.run_coding_agent',
+        lambda **kwargs: calls.append(kwargs) or {'status': 'completed', 'final_text': '{}'})
+    client = client_for(tmp_path)
+    body = 'source-' * 4000
+    client.set_research_context({'source_excerpt': body})
+    with client.as_role('supervisor'):
+        _, metadata = client.chat_with_metadata('review', json.dumps({'source_excerpt': body}),
+            decision_only=True, read_only=True)
+    assert body in calls[-1]['prompt']
+    assert metadata['prompt_efficiency']['request_paged_leaves'] == 0
+    assert 'context_paged' not in calls[-1]['prompt']
+    with client.as_role('scheduler'):
+        _, metadata = client.chat_with_metadata('inspect', json.dumps({'source_excerpt': body}))
+    assert body not in calls[-1]['prompt']
+    assert 'read_evidence' in calls[-1]['prompt']
+    assert metadata['prompt_efficiency']['request_paged_leaves'] == 1
+    assert metadata['prompt_efficiency']['deduplicated_fields'] == 1
+
+
+def test_common_role_contract_precedes_different_task_instructions(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr('autosim.research.agent_runtime.run_coding_agent',
+        lambda **kwargs: calls.append(kwargs) or {'status': 'completed', 'final_text': '{}'})
+    client = client_for(tmp_path)
+    client.chat_with_metadata('first task instructions', '{}')
+    client.chat_with_metadata('different task instructions', '{}')
+    assert calls[0]['prompt'].split('## Task instructions')[0] == calls[1]['prompt'].split('## Task instructions')[0]
+
+
 def test_large_role_context_rotates_without_changing_run_budget(tmp_path):
     client = client_for(tmp_path)
     from autosim.research.common import atomic_json
@@ -47,6 +85,53 @@ def test_large_role_context_rotates_without_changing_run_budget(tmp_path):
     assert client._resume_role("init") is False
     assert client.total_budget_usd == 2
     assert json.loads((root / "context_rotation.json").read_text())["input_tokens"] == 160_000
+
+
+def test_warm_session_is_preserved_but_capability_change_still_rotates(tmp_path):
+    from autosim.research.common import atomic_json
+    from autosim.research.agent_runtime import capability_identity
+    from autosim.research.agent_roles import role_profile
+    client = client_for(tmp_path)
+    root = client.output / 'agent'
+    key = 'c' * 32
+    atomic_json(root / 'roles/init.json', {'role': 'init', 'run_id': client.run_id, 'session_key': key})
+    session = {'schema_version': 1, 'status': 'completed', 'pricing_ref': 'agent/pricing/previous.json',
+        'capability_identity': capability_identity(role_profile('init'))}
+    from autosim.research.runtime_freshness import controller_identity
+    session['controller_runtime_id'] = controller_identity()
+    atomic_json(root / f'sessions/{key}.json', session)
+    atomic_json(root / 'pricing/previous.json', {'gateway': {'receipts': [
+        {'status': 'priced', 'usage': {'input_hit_tokens': 95000, 'input_miss_tokens': 5000,
+                                     'output_tokens': 2000}}]}})
+    assert client._resume_role('init') is True
+    assert client.total_budget_usd == 2
+    session['capability_identity'] = 'stale'
+    atomic_json(root / f'sessions/{key}.json', session)
+    assert client._resume_role('init') is False
+    assert 'capability/schema changed' in json.loads((root / 'context_rotation.json').read_text())['reason']
+
+
+@pytest.mark.parametrize('previous', [None, 'old-controller-runtime'])
+def test_controller_deployment_rotates_role_context_without_erasing_memory_or_budget(tmp_path, previous):
+    from autosim.research.common import atomic_json, digest
+    from autosim.research.agent_runtime import capability_identity
+    from autosim.research.agent_roles import role_profile
+    client = client_for(tmp_path)
+    root, key = client.output / 'agent', 'b'*32
+    atomic_json(root / 'roles/scheduler.json', {'role':'scheduler', 'run_id':client.run_id, 'session_key':key})
+    path = root / f'sessions/{key}.json'
+    session = {'schema_version':1, 'status':'completed',
+               'capability_identity':capability_identity(role_profile('scheduler'))}
+    if previous is not None:
+        session['controller_runtime_id'] = previous
+    atomic_json(path, session)
+    before = digest(path)
+    pointer = digest(root / 'roles/scheduler.json')
+    assert client._resume_role('scheduler') is False
+    rotation = json.loads((root / 'context_rotation.json').read_text())
+    assert 'obsolete operation assumptions' in rotation['reason']
+    assert digest(path) == before and digest(root / 'roles/scheduler.json') == pointer
+    assert client.total_budget_usd == 2
 
 
 def test_only_verified_global_exhaustion_is_terminal():
@@ -84,9 +169,19 @@ def test_agent_client_uses_independent_resumable_sessions_per_role(
         role = str(kwargs["role"])
         roles = tmp_path / "run" / "agent" / "roles"
         roles.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        from autosim.research.agent_runtime import capability_identity
+        from autosim.research.agent_roles import role_profile
+        from autosim.research.runtime_freshness import controller_identity
+        key = hashlib.sha256(role.encode()).hexdigest()[:32]
         (roles / f"{role}.json").write_text(json.dumps({
-            "role": role, "run_id": "research-test", "session_key": "a" * 32,
+            "role": role, "run_id": "research-test", "session_key": key,
         }), encoding="utf-8")
+        sessions = roles.parent / 'sessions'
+        sessions.mkdir(exist_ok=True)
+        (sessions / f'{key}.json').write_text(json.dumps({'schema_version':1,
+            'status':'completed', 'controller_runtime_id':controller_identity(),
+            'capability_identity':capability_identity(role_profile(role))}), encoding='utf-8')
         return {"status": "completed", "final_text": '{"do":"stop"}',
                 "session_id": f"session-{role}", "model": "test-model",
                 "total_cost_usd": 0.03, "usage": {"input_tokens": 12},
@@ -198,6 +293,21 @@ def test_generation_controls_are_explicit_only_for_bounded_reviews(tmp_path, mon
     assert calls[-1]['generation_policy']=={'max_output_tokens':1800,'thinking':'disabled'}
 
 
+def test_explicit_auxiliary_bound_preserves_tools_without_limiting_main_by_default(tmp_path,monkeypatch):
+    calls=[]
+    monkeypatch.setattr('autosim.research.agent_runtime.run_coding_agent',
+        lambda **kw:calls.append(kw) or {'status':'completed','final_text':'{}'})
+    client=client_for(tmp_path)
+    with client.as_role('init'):
+        client.chat_with_metadata('argv','bounded engineering response',bounded_generation=True,
+            max_tokens=3000,thinking='disabled')
+    assert calls[-1]['generation_policy']=={'max_output_tokens':3000,'thinking':'disabled'}
+    assert calls[-1]['decision_only'] is False
+    assert 'mcp__autosim_exec__inspect_native_environment' in calls[-1]['prompt']
+    client.chat_with_metadata('main','research decision',max_tokens=6000)
+    assert calls[-1]['generation_policy'] is None
+
+
 def test_agent_client_rejects_noncompleted_or_empty_turn(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("autosim.research.agent_runtime.run_coding_agent",
@@ -213,8 +323,26 @@ def test_agent_client_rejects_noncompleted_or_empty_turn(
 
     monkeypatch.setattr("autosim.research.agent_runtime.run_coding_agent",
                         lambda **_: {"status": "completed", "final_text": "  "})
-    with pytest.raises(AgentRuntimeClientError, match="without a final response"):
+    with pytest.raises(AgentRuntimeClientError, match="without a final response") as empty:
         client.chat_with_metadata("system", "user")
+    assert empty.value.failure_category == 'missing_final_response'
+    assert empty.value.status == 'failed'
+    assert empty.value.runtime_failure['evidence_id']
+    assert empty.value.runtime_failure['native_operation_status'] == 'not_inferred'
+    assert (client.output / empty.value.runtime_failure['evidence_ref']).is_file()
+
+
+def test_empty_final_session_is_rotated_without_changing_old_receipt_or_budget(tmp_path):
+    from autosim.research.common import atomic_json
+    client=client_for(tmp_path)
+    root=client.output/'agent'; key='b'*32
+    atomic_json(root/'roles/scheduler.json',{'role':'scheduler','run_id':client.run_id,'session_key':key})
+    path=root/'sessions'/f'{key}.json'
+    atomic_json(path,{'schema_version':1,'failure_category':'missing_final_response'})
+    original=path.read_bytes()
+    assert client._resume_role('scheduler') is False
+    assert path.read_bytes()==original and client.total_budget_usd==2
+    assert json.loads((root/'context_rotation.json').read_text())['failure_category']=='missing_final_response'
 
 
 def test_agent_client_scopes_recorder_as_read_only_model_role(tmp_path: Path) -> None:

@@ -16,6 +16,33 @@ from .experiment_bundle import artifact_identity
 
 
 MARKER = "AUTOSIM_POLICY_LOADED "
+
+
+def verified_episode_count(measurement: dict) -> int | None:
+    """Count witnessed episodes, not scalar/aggregate metric records.
+
+    The caller still independently rereads native evidence. Explicit per-episode
+    metric mappings must agree with this count; scalar summaries have no row count.
+    """
+    policy=measurement.get('policy_consumption') or {}
+    rollout=measurement.get('rollout_evidence') or {}
+    lineage=measurement.get('metric_lineage') or {}
+    reading=measurement.get('metric_reading') or {}
+    if not all(x.get('status')=='verified' for x in (policy,rollout,lineage)):return None
+    count=rollout.get('episodes_completed');ids=rollout.get('episode_ids')
+    if (type(count) is not int or count<1 or not isinstance(ids,list)
+            or not all(isinstance(x,str) and x for x in ids) or len(ids)!=count
+            or len(set(ids))!=count or lineage.get('episodes_completed')!=count
+            or not policy.get('sha256') or rollout.get('policy_sha256')!=policy['sha256']
+            or lineage.get('policy_sha256')!=policy['sha256']):return None
+    try:
+        value,target=float(lineage['value']),float(measurement['metric_value'])
+        if not math.isfinite(value) or not math.isfinite(target) or not math.isclose(
+                value,target,rel_tol=1e-6,abs_tol=1e-8):return None
+    except (KeyError,TypeError,ValueError,OverflowError):return None
+    if (measurement.get('metric') or {}).get('episode_id_column') and reading.get('samples')!=count:
+        return None
+    return count
 ROLLOUT_MARKER = "AUTOSIM_ROLLOUT_COMPLETED "
 METRIC_MARKER = "AUTOSIM_METRIC_REPORTED "
 

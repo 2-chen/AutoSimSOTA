@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "kind": "formal_development_batch_witness_repair_negative_result_not_method_gain",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_34_handoff_correction",
+  "training": {
+    "attempt_id": "ae12af75269b493c92abe33ad0148b8a",
+    "returncode": 0,
+    "seconds": 94.9,
+    "completed_updates": 1000,
+    "seed": 20261031,
+    "registered_version": "click_bell_agent_targeted_20ep_008_v1",
+    "consumption_stage": "training_batch",
+    "witness_events": 41,
+    "reader_streams": 1,
+    "terminal_sample_uses_including_repeats": 8000,
+    "malformed_witness_json_lines": 0,
+    "argv_has_pretrained_policy": false,
+    "argv_has_resume": false
+  },
+  "evaluation": {
+    "attempt_id": "a9032a1c3594446c9c1e06e5947ec28c",
+    "returncode": 0,
+    "seconds": 520.2,
+    "development_score": 0.0,
+    "successes": 0,
+    "episodes": 50,
+    "policy_bundle_sha256": "d803a9dc4c4d8c6b503f0a640d367fa1d844409f635a7d9eb6a7c1a70a5c70aa",
+    "data_consumption": "verified",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified"
+  },
+  "recovery": {
+    "main_proposal_action": "6b5430bbab4c78ac",
+    "main_train_action": "c98b975c958af587",
+    "fix_attempt_id": "303d1d665d304da1",
+    "main_handoff_action": "31cebc3a69a81085",
+    "training_reused": true,
+    "original_unscored_measurement_preserved": true,
+    "round33_failure_preserved": true
+  },
+  "autonomy": {
+    "host_version_during_execution": "v70",
+    "candidate_proposed_by_main_before_v70_maintenance": true,
+    "native_patch_settings_training_fix_and_handoff": "system Main/Fix agents",
+    "operator_during_execution": "read-only monitoring and documentation; no native edits, science parameter selection, budget addition or restart",
+    "operator_prior_maintenance": "historical producer source read tool; no automatic installation or restoration",
+    "new_historical_source_tool_used_during_this_trial": false,
+    "unassisted_cold_start_claim": false
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "method_gain_claim_supported": false,
+  "matched_acquisition_comparison_complete": false,
+  "limits": [
+    "This round repaired the execution witness and scored the resulting policy; no new collection occurred in this round.",
+    "8000 counts repeated sample uses, not unique trajectories; 41 is the sparse emitted witness count, not the number of optimizer updates.",
+    "The frozen common policy warm-start remains unrouted in the actual argv; batch verification alone cannot certify a conforming comparison arm.",
+    "Semantic supervision, source families, targeting coverage and matched full learning recipes remain unresolved.",
+    "A valid zero is a negative development observation, not proof that data acquisition is ineffective, a fair method comparison, a held-out result or SOTA."
+  ],
+  "source_hashes": {
+    "action_receipts/6b5430bbab4c78ac.json": "c553a5c66fe263ee41401bd1c022088e28a93b86a1f7010323e3eaafebb97de7",
+    "action_receipts/c98b975c958af587.json": "3a64ce9079ef57cc7e320cdc005fed8af065fae45eca8fe33296c6669651efd8",
+    "action_receipts/31cebc3a69a81085.json": "999c5fcd4caedd1f18df595615766d91ae92b74e19f4a92328457282489d7947",
+    "data_versions/click_bell_agent_targeted_20ep_008_v1.json": "36a4afd6acbc98e2717da9f5840f80cbd820b3275b20c9be3f0591be0164ff10",
+    "research/derived/measurements/round_33.json": "6556ff9c962ce24c79573af01665bca3479b22c999465da3f724e6b85fd3df1f",
+    "research/derived/measurements/round_34.json": "fdc82c127d34f58be296a8dfe9dcb50be02d833c394b48749b8ae4120b8ec326",
+    "research/derived/measurements/round_34_handoff_correction.json": "6d0ff31dbd22a921b6af1968b0d5cd7e970a920ef9930f79f929fba74a579cc7",
+    "research/derived/code_changes/round-34.json": "8fb0d54b6bd1481e3b3be166cae61d4fc1d2754864355e7ed17d0bc0553a87a2",
+    "training_progress_audits/e8422c4825ce7d3af0d75c2398c2a30a8485b93605be0c2836b00c623ebe4c8a.json": "3d41004d94af721316f8bcb46029ded662992cd24da7631947f30c9fa258dd4c",
+    "verification_checkpoint_handoffs/fcf86ae53afde1e6eece8d1d4e0e107a76931ca9ccdd05d60cb48d18e70eed5b.json": "402d656ce11eca344732bc3ff7dae9460d6ffe49e65f459b556d5b138d678196",
+    "research/derived/attempts/ae12af75269b493c92abe33ad0148b8a/receipt.json": "727ba53ea087027433d1879ec284471a9cf037896a7baaa27cc2874fff369d5d",
+    "evidence/ae12af75269b493c92abe33ad0148b8a.json": "a72375a7ae956d59fdd0465ac62697ec27ebbd1a53e5d5c3fc613955dc13cec1",
+    "research/derived/train/attempts/ae12af75269b493c92abe33ad0148b8a/output.log": "67864b8acfd06e54e8afef3c24ee8d0dcf3b0168ba4032aa7ea6bc430a09d8ff",
+    "research/derived/attempts/a9032a1c3594446c9c1e06e5947ec28c/receipt.json": "0aabc143c404a009fcfca00fd2dd9007b76cbc88b4efcee13df28c5dd876256e",
+    "evidence/a9032a1c3594446c9c1e06e5947ec28c.json": "2ae6b865689b202facf7e4453d047ae899314aca3888e1fdead345f6959e4b7e",
+    "research/derived/evaluate/attempts/a9032a1c3594446c9c1e06e5947ec28c/output.log": "4b3e28bf513ea78cce37fba8721aaadd4b5b3624e8ae8bbfc918f794055d77f1",
+    "research/derived/evaluate/native_outputs/a9032a1c3594446c9c1e06e5947ec28c/eval_result/click_bell/act/random/policy/2026-10-18_19-18-55/evaluation_metrics.json": "1829324dbcf8c865b1cc6757f0da524af4a334e36888ad4403aeb52dd73f3a31"
+  }
+}

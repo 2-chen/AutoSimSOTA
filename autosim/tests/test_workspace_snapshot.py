@@ -8,7 +8,36 @@ import pytest
 
 from autosim.research.snapshot import Snapshots
 from autosim.research.workspace_snapshot import (apply_state, capture_state, create,
-                                                 existing, verify_state)
+                                                 existing, verify_state, audit_frozen_state)
+
+
+@pytest.mark.parametrize("fault", [None, "resource_binding", "copy_mode", "blob", "unsafe_path", "manifest"])
+def test_stored_source_preflight_uses_canonical_resource_identity(tmp_path, fault):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "policy.py").write_text("original")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    checkout = tmp_path / "run" / "checkout"
+    manifest = create(source, checkout, resources=[{"target": "assets", "source": str(assets)}])
+    snapshots = Snapshots(tmp_path / "run" / "snapshots")
+    (checkout / "policy.py").write_text("candidate")
+    state = capture_state(checkout, manifest, snapshots, name="candidate")
+    if fault == "resource_binding":
+        manifest["resource_bindings"] = []
+    elif fault == "copy_mode":
+        state["copy_mode"] = "tracked_worktree"
+    elif fault == "blob":
+        (snapshots.blobs / state["overlay_files"]["policy.py"]).write_text("tampered")
+    elif fault == "unsafe_path":
+        state["overlay_files"]["../escape"] = ""
+    elif fault == "manifest":
+        manifest["source_entries"] = []
+    review = audit_frozen_state(manifest, state, snapshots, destination=checkout)
+    assert (review["status"] == "verified") is (fault is None)
+    if fault:
+        assert review["issues"] and review["issues"][0]["field"]
+
 
 
 def test_copy_is_independent_and_has_source_identity(tmp_path):

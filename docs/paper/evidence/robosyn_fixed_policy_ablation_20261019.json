@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-10-19",
+  "study": "robosyn_matched_data_20261019_v1",
+  "run_ref": "autoresearch_runs/robosyn_matched_data_20261019_v1",
+  "task": "click_bell",
+  "claim_scope": "verified_fixed_policy_development_ablation_negative_result",
+  "shared_protocol": {
+    "policy_bundle_sha256": "b6b6f2d3d8d29d0267abb8bb45c666aa3a7e0e90ca835e4d7715065afd574426",
+    "policy_parent_measurement": "baseline",
+    "policy_parent_measurement_sha256": "d1f58ebc216f0de91129fa7972b3f3aa758ac53f486248e6ba9c1a89658efdfd",
+    "setting": "random",
+    "evaluation_seed": 0,
+    "episodes_per_condition": 100,
+    "same_ordered_episode_seeds": true,
+    "initial_state_hashes_available": false,
+    "metric": "summary.success_rate",
+    "metric_direction": "maximize",
+    "additional_training": false,
+    "new_data_training_claim": false,
+    "candidate_changed_files": ["policy/act/deploy_policy.yml"]
+  },
+  "conditions": [
+    {"label": "baseline", "executed_actions_per_query": 50,
+     "successes": 56, "episodes": 100, "success_rate": 0.56,
+     "evaluation_seconds": 674.2, "inference_calls_total": 442,
+     "inference_calls_per_episode": 4.42, "mean_action_steps": 196.8,
+     "failure_stage_counts": {"success": 56, "contact_insufficient_press": 44}},
+    {"label": "score_recovered_95e873347ee34b40", "executed_actions_per_query": 4,
+     "successes": 0, "episodes": 100, "success_rate": 0,
+     "evaluation_seconds": 1293.6, "inference_calls_total": 9100,
+     "inference_calls_per_episode": 91, "mean_action_steps": 361,
+     "failure_stage_counts": {"contact_insufficient_press": 100}}
+  ],
+  "descriptive_comparison": {
+    "success_rate_difference_percentage_points": -56,
+    "inference_call_ratio": 20.58823529411765,
+    "evaluation_wall_ratio": 1.9187184811628595,
+    "statistical_significance_claim": false,
+    "physical_initial_state_pairing_claim": false
+  },
+  "recovery": {
+    "native_evaluation_attempt_id": "c6e81c1c29154b8c90ae5e75248a2e39",
+    "native_status": "completed", "native_returncode": 0,
+    "main_action_id": "6b7f2f2d5282573d",
+    "main_outcome": "measurement_recorded", "native_replayed": false,
+    "attachment_ref": "metric_recoveries/f2be206df6feedbf5dcba0ebacdeb00d0aff5f8c55c51c064788ae2f99a41824.json",
+    "locator_review_ref": "reference_locator_reviews/13c68b56e04e0ce61119326b5c8878ca8b8d457f877a472f3638a1ba6f545c1e.json",
+    "failed_requests_preserved": ["3fc259c2acf2d539", "7861a5c7a84b47b0"],
+    "operator_readonly_verification": {
+      "baseline": {"status": "consistent", "issues": []},
+      "score_recovered_95e873347ee34b40": {"status": "consistent", "issues": [],
+        "frozen_policy_parent": true, "frozen_policy_identity": true}
+    }
+  },
+  "autonomy": {"main_selected_scientific_change": true,
+    "internal_fix_repaired_locator_and_source_reference_requests": true,
+    "operator_host_repairs_and_restarts": true,
+    "operator_native_trial_or_scientific_parameter_selection": false,
+    "unassisted_end_to_end_claim": false},
+  "limitations": ["one task and one policy initialization", "development evaluation only",
+    "not a performance improvement or SOTA", "not a data-acquisition comparison",
+    "same episode seeds are not physical-state hash proof", "operator maintenance cost must be disclosed"],
+  "sources": [
+    {"ref": "research/derived/artifact_store/b6b6f2d3d8d29d0267abb8bb45c666aa3a7e0e90ca835e4d7715065afd574426/policy/config.json", "sha256": "f83e502f32b8245081dde2e0d1fb266c404f0e7d8c490c613d7b96a5f199c234"},
+    {"ref": "research/derived/experiments/score_recovered_9e978b313ef14aa4/result.json", "sha256": "f393b101b5d55a1265c722994004cca3007beddf0f54fb5451fe401f65ddcde9"},
+    {"ref": "research/derived/measurements/baseline.json", "sha256": "d1f58ebc216f0de91129fa7972b3f3aa758ac53f486248e6ba9c1a89658efdfd"},
+    {"ref": "research/derived/measurements/round_2.json", "sha256": "0783a80ea1250c564c748c1df98955cfa117a626977699c337e296639eb9ea67"},
+    {"ref": "research/derived/measurements/score_recovered_95e873347ee34b40.json", "sha256": "95b1789ef0e1ebe9c88f221876d0ccd159370a6d6386eeec6c6189dfb9f0d067"},
+    {"ref": "research/derived/metric_recoveries/f2be206df6feedbf5dcba0ebacdeb00d0aff5f8c55c51c064788ae2f99a41824.json", "sha256": "96cc79dd1095934189e6fe5a8e1d6f9825c65eed36ca5637d38312115588d271"},
+    {"ref": "action_receipts/6b7f2f2d5282573d.json", "sha256": "30bb16773d06f7ac8f7b9c04c2fd83d8533d6f039adf56199bf16728f91bd19c"},
+    {"ref": "research/derived/attempts/c6e81c1c29154b8c90ae5e75248a2e39/receipt.json", "sha256": "22992079cb53d7f67a72782fcb97e956ca58f687cfc88925efd965703a7a358b"},
+    {"ref": "research/derived/evaluate/native_outputs/c6e81c1c29154b8c90ae5e75248a2e39/click_bell/act/random/None/policy/2026-10-19_11-09-26/evaluation_metrics.json", "sha256": "53a0697972d1e9522071a9ef5a270b274908905d572c0a53ebf02fdb1d56429c"}
+  ]
+}

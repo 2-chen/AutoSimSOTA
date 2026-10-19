@@ -23,6 +23,10 @@ MAX_READER_BYTES = 64 * 1024**2
 PUBLIC_SOURCE_SUFFIXES = {".py", ".toml", ".md", ".rst", ".sh", ".yaml", ".yml", ".ini", ".cfg", ".lock", ".txt"}
 
 
+class ReaderSourceScopeError(ValueError):
+    """Snapshot preflight refused before any model worker or native operation."""
+
+
 def _materialized_source_files(repo: Path, scope: Path) -> list[Path]:
     from .source_tracking import materialized_files
     return materialized_files(repo, scope)
@@ -59,7 +63,11 @@ def snapshot(output: Path, repo: Path, task_id: str, *, empty: bool = False,
             for scope in scopes:
                 additional = _materialized_source_files(repo, scope)
                 if not additional and not any(Path(row[1]).is_relative_to(scope) for row in selected):
-                    raise ValueError("source scope contains no public files; use actual checkout-relative source paths")
+                    raise ReaderSourceScopeError('source scope contains no public files at checkout-relative '
+                        f'{str(scope)[:160]!r}; source_paths for research tasks names BENCHMARK '
+                        'checkout files only. Read framework catalog files separately with '
+                        'inspect_native_environment(framework_source_request={path: catalog_path}); '
+                        'do not put framework catalog paths in this snapshot argument.')
                 selected.extend(("file", str(name)) for name in additional)
         else:
             from .source_tracking import materialized_files
@@ -74,7 +82,9 @@ def snapshot(output: Path, repo: Path, task_id: str, *, empty: bool = False,
                 raise ValueError("unsafe reader source inventory")
             total += source.stat().st_size
         if total > MAX_READER_BYTES:
-            raise ValueError("reader source snapshot exceeds 64 MiB; supply narrower source_paths (files/directories), not just narrower prose")
+            raise ReaderSourceScopeError("reader source snapshot exceeds 64 MiB; supply narrower source_paths "
+                "(BENCHMARK checkout files/directories), not just narrower prose. Framework "
+                "catalog files use inspect_native_environment.framework_source_request separately.")
         source_names = sorted(row[1] for row in selected)
         scope_identity = _scope_identity(repo, source_names)
         for entry in selected:

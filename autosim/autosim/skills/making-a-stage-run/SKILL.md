@@ -29,4 +29,6 @@ HDF5 句柄在 spawn/pickle 路径下可能失败，num_workers=0 可作为诊�
 
 修复形成可审计差异，重试原失败阶段并比较新回执；后续还须验证实际消费者，文件产生不等于训练/评分成功。候选已回滚时通过新候选复验，不能把 Fix 的说明或探针当正式得分。
 
+框架的输入选择、资源路由和恢复权限也可能出错。Fix 可用 `inspect_native_environment(framework_source_request={path,offset,limit})` 读取已发布 `harness_repair.source_catalog` 的对应源码页；这不是任意宿主文件访问或热修改权限。先判定错误属于调用方、隔离 checkout、安装连接或框架，再返回可执行的审核操作提案。对完成训练后的评测连接故障，优先复用原 producer 并恢复正式测量；遇到“no policy-load event”要继续读原生错误尾部，它常是加载失败的后果而非根因。
+
 已封存的同阶段失败可用于 invocation_handoff，不需为得到“本轮失败”重放已知错误。命令在启动前被结构检查拒绝时，可使用该次提案的精确 response_sha256 作为 proposal_sha256 请求交接，不伪造 native evidence。交接只是诊断/修订请求；修后仍要执行和验收真实消费者，不能将旧失败或配置生成算作通过。

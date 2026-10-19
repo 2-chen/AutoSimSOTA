@@ -55,7 +55,7 @@ def validate_plan(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError('plan must be an object')
     missing = required - set(value)
-    extra = set(value) - required - {"data_strategy", "budget_strategy"}
+    extra = set(value) - required - {"data_strategy", "budget_strategy", "decision_memory"}
     if missing or extra:
         raise ValueError(f'plan: missing fields={sorted(missing)}; unexpected fields={sorted(extra)}; '
                          'authority is server-owned metadata; submit main_agent.writable_plan instead')
@@ -70,7 +70,22 @@ def validate_plan(value: Any) -> dict[str, Any]:
         result["data_strategy"] = validate_data_strategy(value["data_strategy"])
     if "budget_strategy" in value:
         result["budget_strategy"] = validate_budget_strategy(value["budget_strategy"])
+    if "decision_memory" in value:
+        result["decision_memory"] = validate_decision_memory(value["decision_memory"])
     return result
+
+
+def validate_decision_memory(value: Any) -> dict[str, Any]:
+    keys = {"bottleneck", "observations", "lessons", "failed_directions", "next_experiment"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError('decision_memory requires bottleneck, observations, lessons, '
+                         'failed_directions and next_experiment')
+    if len(json.dumps(value, ensure_ascii=False).encode()) > 6000:
+        raise ValueError('decision_memory exceeds 6000 bytes; cite existing evidence')
+    return {"bottleneck": _text(value['bottleneck'], 'bottleneck', 1000),
+            "next_experiment": _text(value['next_experiment'], 'next_experiment', 1500),
+            **{key: _items(value[key], key) for key in ('observations', 'lessons', 'failed_directions')},
+            'authority': 'model_working_memory_not_verified_facts'}
 
 
 def validate_budget_strategy(value: Any) -> dict[str, Any]:
@@ -155,6 +170,13 @@ def validate_report(value: Any) -> dict[str, Any]:
             **{key: _items(value.get(key), key) for key in (
                 "findings", "uncertainties", "evidence_refs", "recommended_next_actions")},
             "authority": "model_report_not_execution_verification"}
+    from .data_acquisition import failure_case, acquisition_proposal
+    for key, check, maximum in (("failure_cases", failure_case, 4),
+                               ("acquisition_proposals", acquisition_proposal, 3)):
+        if key in value:
+            if not isinstance(value[key], list) or len(value[key]) > maximum:
+                raise ValueError(f"{key} requires at most {maximum} entries")
+            result[key] = [check(item) for item in value[key]]
     if 'operation_proposals' in value:
         import re
         proposals = value['operation_proposals']
@@ -174,6 +196,114 @@ def validate_report(value: Any) -> dict[str, Any]:
                 'evidence_refs':_items(proposal['evidence_refs'],'evidence_refs')})
         result['operation_proposals'] = checked
     return result
+
+
+def _report_delivery_projection(value, evidence_id):
+    """Page bounded advisory JSON without interpreting or repairing its claims.
+
+    A structured finding is shown only as a JSON text excerpt. Nonempty typed
+    operation/data proposals still need explicit correction; they are never
+    dropped, adopted or turned into actions. The sealed original remains required.
+    """
+    fields = ('findings','uncertainties','evidence_refs','recommended_next_actions')
+    optional = {'operation_proposals', 'failure_cases', 'acquisition_proposals'}
+    if (not isinstance(value, dict) or not {'summary', *fields} <= set(value)
+            or set(value) - {'summary', *fields, *optional}
+            or any(value[key] != [] for key in optional if key in value)
+            or not isinstance(value['summary'], str) or not value['summary'].strip()
+            or any(not isinstance(value[key], list) or len(value[key]) > 500
+                for key in fields)):
+        return None
+    rendered = {}
+    try:
+        if len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode()) > 256*1024:
+            return None
+        for key in fields:
+            rendered[key] = []
+            for item in value[key]:
+                if isinstance(item, str) and item.strip():
+                    rendered[key].append(item)
+                elif key != 'evidence_refs' and isinstance(item, (dict, list)) and item:
+                    rendered[key].append('Unaccepted advisory JSON: ' +
+                        json.dumps(item, ensure_ascii=False, allow_nan=False))
+                else:
+                    return None
+    except (ValueError, TypeError, RecursionError):
+        return None
+    pointer = 'Full original advisory report: read_evidence('+evidence_id+').'
+    projected = {'summary': 'PARTIAL DELIVERY VIEW. '+pointer+
+        ' Read it before using exact patches/citations or claiming complete findings. '+value['summary'][:400]}
+    for key in fields:
+        if key == 'evidence_refs':
+            projected[key] = [item for item in rendered[key]
+                if len(json.dumps(item,ensure_ascii=False).encode()) <= 300][:4]
+            projected[key].append('evidence/'+evidence_id+'.json')
+        else:
+            projected[key] = [item[:100]+' [excerpt; '+pointer+']' for item in rendered[key][:4]]
+            if len(value[key]) > 4:
+                projected[key].append('Additional '+key+' omitted from this view. '+pointer)
+    result = validate_report(projected)
+    result['delivery_projection'] = {'status':'partial_advisory_view','evidence_id':evidence_id,
+        'authority':'delivery only; no native execution, approval or scientific interpretation'}
+    return result
+
+
+def report_delivery_view(output):
+    """Expose completed but unaccepted handoffs, without rebuying investigation."""
+    from pathlib import Path
+    import re
+    from .common import read_json
+    from .evidence_store import read_attempt_evidence
+    root = Path(output)
+    directory = root/'report_handoffs'
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    rows = []
+    paths = []
+    for path in directory.glob('*.json'):
+        try:
+            if not path.is_symlink():
+                paths.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    for _, path in sorted(paths,key=lambda row:row[0],reverse=True)[:3]:
+        if not re.fullmatch(r'[0-9a-f]{32}',path.stem):
+            continue
+        try:
+            if path.stat().st_size > 65536:
+                continue
+            record = read_json(path)
+            proof = read_attempt_evidence(root,path.stem,limit=1)
+            if (proof['status'] != 'report_delivery_rejected'
+                    or proof['receipt_ref'] != path.relative_to(root).as_posix()
+                    or record.get('original_turn_id') is None):
+                continue
+            row = {'evidence_id':path.stem,'reason':str(record.get('reason') or '')[:300],
+                'read_instruction':'Read the complete original report with read_evidence before '
+                    'commissioning the same investigation again. Recheck cited current source; '
+                    'this report is advisory, not proof of native execution or an accepted patch.',
+                'authority':'unaccepted_model_report_delivery_only'}
+            # Re-expose completed advice after a delivery failure, never execute a
+            # proposal or rewrite the failed action/handoff. Full text stays sealed.
+            try:
+                from .execution_derive import _object
+                from .evidence_store import _log_slice
+                from .experiment_transaction import safe
+                if proof.get('log_bytes', 0) <= 256*1024:
+                    sealed = read_json(safe(root,f'evidence/{path.stem}.json'))
+                    # Read one bounded UTF-8 byte sequence; independent text pages
+                    # can split a multibyte character and alter the advisory JSON.
+                    _, _, raw = _log_slice(safe(root,sealed['log_ref']),offset=0,limit=256*1024,
+                        expected_bytes=proof['log_bytes'],expected_sha256=sealed['log_sha256'])
+                    projection = _report_delivery_projection(_object(raw.decode('utf-8')),path.stem)
+                    if projection is not None:
+                        row['delivery_view'] = projection
+            except (ValueError, TypeError, KeyError, RecursionError):
+                pass
+            rows.append(row)
+        except (OSError,ValueError,TypeError,KeyError):
+            continue
+    return rows
 
 
 def receive_report(content: str, *, client, output, workspace, timeout: float,
@@ -200,11 +330,19 @@ def receive_report(content: str, *, client, output, workspace, timeout: float,
         atomic_json(evidence_root / receipt_ref, {**evidence, "reason": str(exc),
             "original_turn_id": (metadata or {}).get("turn_id"),
             "authority": "unaccepted_model_report"})
+        try:
+            projected = _report_delivery_projection(_object(log.read_text()), identity)
+        except (ValueError, TypeError, KeyError):
+            projected = None
+        if projected is not None:
+            projected['delivery_recovery_evidence_ref'] = evidence['evidence_ref']
+            return projected
         corrected, _ = client.chat_with_metadata(
             "Repair ONLY the JSON delivery of an already completed investigation. "
             "Do not inspect, execute, edit, research or claim new evidence. Preserve uncertainty "
             "and evidence IDs. Return summary plus findings, uncertainties, evidence_refs, "
-            "recommended_next_actions. Use short strings and <=8 entries per list; "
+            "recommended_next_actions. Use short strings, <=1500 characters per list item "
+            "and <=8 entries per list; "
             "the ENTIRE JSON must be <=8000 UTF-8 bytes. Never infer recovery or a score.",
             json.dumps({"validation_error": str(exc), "original_report_evidence_id": identity,
                 "original_report": sanitize_model_text(content[:128000],
@@ -241,6 +379,8 @@ def _handoff_view(row: dict[str, Any], *, compact: bool = False) -> dict[str, An
         "task": str(row.get("task") or "")[:400 if compact else 600],
         "expected_result": str(row.get("expected_result") or "")[:400 if compact else 600],
         "runtime_evidence_refs": row.get("runtime_evidence_refs") or [],
+        "report_ref": row.get("report_ref"),
+        "report_evidence_id": row.get("report_evidence_id"),
         "report": {"summary": str(report.get("summary") or "")[:600 if compact else 800],
                    "authority": "model_report_not_execution_verification",
                    **{key: [str(item)[:240 if compact else 400]
@@ -248,7 +388,15 @@ def _handoff_view(row: dict[str, Any], *, compact: bool = False) -> dict[str, An
                       for key in ("findings", "uncertainties", "evidence_refs",
                                   "recommended_next_actions")},
                    **({'operation_proposals': _proposal_view(report['operation_proposals'],compact=compact)}
-                      if report.get('operation_proposals') else {})},
+                      if report.get('operation_proposals') else {}),
+                   **({"acquisition_proposals": [
+                       {"target": str(p.get("target") or "")[:240],
+                        "sampling_unit": p.get("sampling_unit"), "status": p.get("status"),
+                        "unmet_prerequisites": p.get("unmet_prerequisites") or [],
+                        "budget": {k: (p.get("budget") or {}).get(k) for k in ("axis", "limit")},
+                        "authority": "advisory_not_execution_authorization"}
+                       for p in report["acquisition_proposals"][:1 if compact else 3]]}
+                      if report.get("acquisition_proposals") else {})},
     }
 
 
@@ -263,7 +411,7 @@ def memory_view(memory: dict[str, Any]) -> dict[str, Any]:
         (row for row in reversed(handoffs) if row.get("role") == "resource"), None)
     resource_view = _handoff_view(resource_handoff, compact=True) if resource_handoff else None
     writable = {k:v for k,v in (memory.get('plan') or {}).items() if k != 'authority'}
-    for key in ('data_strategy', 'budget_strategy'):
+    for key in ('data_strategy', 'budget_strategy', 'decision_memory'):
         if isinstance(writable.get(key), dict):
             writable[key] = {k:v for k,v in writable[key].items() if k != 'authority'}
     return {**{key: value for key, value in memory.items()

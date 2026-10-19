@@ -59,6 +59,57 @@ def test_host_admission_blocks_oversubscription_and_releases(tmp_path, monkeypat
         second.release()
 
 
+def test_cpu_placement_spreads_physical_cores_without_expanding_the_grant(monkeypatch):
+    monkeypatch.setattr(scheduling,'_physical_core',lambda cpu:(0,cpu//2))
+    assert scheduling._available_cpu_ids([0,1,2,3],set())==[0,2,1,3]
+    assert scheduling._available_cpu_ids([0,1,2,3,4,5],{0,2})==[4,1,3,5]
+    assert scheduling._available_cpu_ids([1,3],set())==[1,3]
+
+
+def test_cpu_placement_distinguishes_sockets_and_preserves_unknown_topology(monkeypatch):
+    topology={0:(0,0),1:(0,0),2:(1,0),3:(1,0)}
+    monkeypatch.setattr(scheduling,'_physical_core',topology.get)
+    assert scheduling._available_cpu_ids([0,1,2,3],set())==[0,2,1,3]
+    topology[2]=None
+    assert scheduling._available_cpu_ids([0,1,2,3],{1})==[0,2,3]
+
+
+@pytest.mark.parametrize('cpu',[-1,True,'../outside'])
+def test_cpu_topology_does_not_construct_paths_from_invalid_ids(cpu):
+    assert scheduling._physical_core(cpu) is None
+
+
+@pytest.mark.parametrize('core,expected',[('7\n',(1,7)),('-1\n',None),
+    ('unknown',None),(None,None)])
+def test_cpu_topology_is_observed_or_unknown_not_guessed(monkeypatch,core,expected):
+    from io import StringIO
+    def read(path):
+        assert str(path).startswith('/sys/devices/system/cpu/cpu2/topology/')
+        if path.name=='physical_package_id':return StringIO('1\n')
+        if core is None:raise OSError('topology unavailable')
+        return StringIO(core)
+    monkeypatch.setattr(Path,'open',read)
+    assert scheduling._physical_core(2)==expected
+
+
+def test_new_host_lease_spreads_cores_but_keeps_existing_allocations(tmp_path,monkeypatch):
+    monkeypatch.setattr(scheduling,'capacity',lambda:{'cpu':{'effective_cpus':8,
+        'affinity':[0,1,2,3,4,5,6,7]},'memory':{'total_mib':1000,'available_mib':1000}})
+    monkeypatch.setattr(scheduling,'_physical_core',lambda cpu:(0,cpu//2))
+    profile={'cpu':2,'memory_mib':100,'gpu':False}
+    first=scheduling.HostLease('first',profile,directory=tmp_path/'leases')
+    second=scheduling.HostLease('second',profile,directory=tmp_path/'leases')
+    try:
+        assert first.acquire() and first.cores==[0,2]
+        assert second.acquire() and second.cores==[4,6]
+        assert first.acquire() and first.cores==[0,2]
+        rows=read_json(first.path)
+        assert all(row['resources']['cpu']==2 for row in rows.values())
+        assert not set(first.cores)&set(second.cores)
+    finally:
+        first.release();second.release()
+
+
 def test_host_admission_does_not_reclaim_invisible_foreign_namespace(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduling, "capacity", lambda: {
         "cpu": {"effective_cpus": 4}, "memory": {"total_mib": 1000, "available_mib": 1000}})
@@ -444,6 +495,63 @@ def test_wait_ignores_output_age_and_does_not_call_model(tmp_path, monkeypatch):
         "progress": {"seconds_since_output": time.time()}}])
     assert prep._step_wait_for_jobs()["outcome"] == "waiting"
     assert not prep.client.calls
+
+
+def test_wait_reviews_local_deadline_once_without_model_or_budget_mutation(tmp_path, monkeypatch):
+    from tests.test_main_agent import make
+    prep = make(tmp_path)
+    atomic_json(prep.output / 'scheduler_policy.json', {**scheduling.DEFAULTS, 'wait_seconds': .001})
+    clock = [1000.0]
+    monkeypatch.setattr(scheduling.time, 'time', lambda: clock[0])
+    row = {'job_id': 'one', 'status': 'running', 'worker': 'matching_running',
+           'window_seconds': 1000, 'deadline_epoch': 1800.0,
+           'progress': {'attempt_id': 'native-one', 'seconds_since_output': 1},
+           'job_ref': 'native_jobs/one/request.json'}
+    monkeypatch.setattr(prep, '_native_job_view', lambda: [row])
+    assert prep._step_wait_for_jobs()['outcome'] == 'waiting'
+    clock[0] = 1350
+    midpoint = prep._step_wait_for_jobs()
+    assert midpoint['resource_review']['phase'] == 'window_midpoint'
+    assert read_json(prep.output / midpoint['evidence_refs'][0])['review_id'] == midpoint['review_id']
+    assert prep._step_wait_for_jobs()['outcome'] == 'waiting'
+    clock[0] = 1600
+    near = prep._step_wait_for_jobs()
+    assert near['resource_review']['phase'] == 'deadline_near'
+    assert near['review_id'] != midpoint['review_id']
+    assert prep._step_wait_for_jobs()['outcome'] == 'waiting'
+    # A real Agent extension creates a new window, not permanent suppression.
+    row.update(deadline_epoch=2600.0, window_seconds=2000)
+    assert prep._step_wait_for_jobs()['outcome'] == 'event'
+    assert not prep.client.calls
+    assert row['deadline_epoch'] == 2600.0
+
+
+@pytest.mark.parametrize('change', [
+    {'status': 'completed'}, {'status': 'queued'}, {'worker': 'not_running'},
+    {'deadline_epoch': None}, {'deadline_epoch': float('nan')},
+    {'window_seconds': True}, {'window_seconds': 10},
+    {'deadline_epoch': 900}, {'deadline_epoch': 2100},
+])
+def test_native_reviews_do_not_invent_progress_or_stall(change):
+    job = {'job_id': 'one', 'status': 'running', 'worker': 'matching_running',
+           'window_seconds': 1000, 'deadline_epoch': 1500,
+           'progress': {'seconds_since_output': 9000}}
+    job.update(change)
+    assert scheduling.native_review_events([job], epoch=1000) == []
+
+
+def test_native_review_refuses_symlink_destination(tmp_path, monkeypatch):
+    from tests.test_main_agent import make
+    prep = make(tmp_path)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (prep.output / 'native_job_reviews').symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(prep, '_native_job_view', lambda: [{
+        'job_id': 'one', 'status': 'running', 'worker': 'matching_running',
+        'window_seconds': 1000, 'deadline_epoch': time.time() + 200}])
+    with pytest.raises(ValueError, match='unsafe native job review'):
+        prep._step_wait_for_jobs()
+    assert not list(outside.iterdir())
 
 
 def screening_fixture(tmp_path):

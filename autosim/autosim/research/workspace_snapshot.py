@@ -209,6 +209,77 @@ def capture_state(destination: Path, manifest: dict[str, Any], snapshots: Any, *
             "untracked_assets_omitted": bool(manifest.get("untracked_assets_omitted"))}
 
 
+def audit_frozen_state(manifest: dict[str, Any], state: dict[str, Any],
+                       snapshots: Any, *, destination: Path | None = None) -> dict[str, Any]:
+    """Verify stored source identity without observing or rewriting a live checkout.
+
+    Use the SAME identity constructor as capture_state, including resource bindings.
+    This is a preflight, not runtime resource readiness or held-out validation.
+    """
+    issues: list[dict[str, str]] = []
+
+    def problem(field: str, reason: str) -> None:
+        if len(issues) < 20:
+            issues.append({"field": field, "reason": reason})
+
+    expected = ""
+    try:
+        if manifest.get("schema_version") != 2 or state.get("schema_version") != 1:
+            raise ValueError("unsupported workspace/source identity schema")
+        _validated_base(manifest)
+        if destination is not None and manifest.get("destination") != str(destination):
+            problem("destination", "workspace does not identify the measured checkout")
+        for field in ("source_tree_fingerprint", "copy_mode", "untracked_assets_omitted"):
+            default = "full_worktree" if field == "copy_mode" else False if field == "untracked_assets_omitted" else None
+            if state.get(field, default) != manifest.get(field, default):
+                problem(field, "measured field differs from the workspace base")
+        name = state.get("source_snapshot")
+        if not isinstance(name, str) or not name or len(name) > 200:
+            raise ValueError("missing or invalid source snapshot name")
+        files, modes, directories = (state.get("overlay_files"),
+                                     state.get("overlay_modes") or {},
+                                     state.get("overlay_directories") or {})
+        if not all(isinstance(value, dict) and len(value) <= 100000
+                   for value in (files, modes, directories)):
+            raise ValueError("malformed or oversized source overlay")
+        for relative in set(files) | set(modes) | set(directories):
+            if (not isinstance(relative, str) or not relative or Path(relative).is_absolute()
+                    or ".." in Path(relative).parts):
+                raise ValueError("unsafe source overlay path")
+        for key in files.values():
+            if not isinstance(key, str) or (key and
+                    (len(key) != 64 or any(c not in "0123456789abcdef" for c in key))):
+                raise ValueError("invalid content-addressed blob key")
+        for mode in modes.values():
+            if type(mode) is not int or not 0 <= mode <= 0o7777:
+                raise ValueError("invalid source file mode")
+        for mode in directories.values():
+            if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o7777):
+                raise ValueError("invalid source directory mode")
+        expected = _state_identity(manifest, name, files, modes, directories)
+        if state.get("identity_sha256") != expected:
+            problem("identity_sha256", "canonical source/resource identity differs")
+        if snapshots.path.is_symlink() or snapshots.blobs.is_symlink():
+            raise ValueError("unsafe source snapshot storage")
+        snapshot = snapshots.get(name)
+        if snapshot is None:
+            problem("source_snapshot", "content-addressed snapshot is missing")
+        elif dict(snapshot.files) != files:
+            problem("overlay_files", "snapshot and measured file identities differ")
+        else:
+            for key in set(files.values()) - {""}:
+                blob = snapshots.blobs / key
+                if blob.is_symlink() or not blob.is_file() or digest(blob) != key:
+                    problem("snapshot_blob", f"missing or corrupt blob {key}")
+                    if len(issues) >= 20:
+                        break
+    except (OSError, TypeError, ValueError, AttributeError, RuntimeError) as exc:
+        problem("source_state", str(exc)[:300])
+    return {"status": "verified" if not issues else "unverified", "issues": issues,
+            "expected_identity_sha256": expected,
+            "authority": "stored source identity; not resource readiness or confirmation"}
+
+
 def verify_state(destination: Path, manifest: dict[str, Any], state: dict[str, Any],
                  snapshots: Any, *, max_bytes: int = DEFAULT_COPY_LIMIT_BYTES,
                  max_files: int = 100000) -> bool:

@@ -17,12 +17,36 @@ import requests
 
 
 DEFAULT_LLM_BASE_URL = "http://10.1.21.21:3000/v1"
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+DEFAULT_LLM_MODEL = "deepseek-flash"
 DEFAULT_LLM_API_KEY = ""  # Explicit environment/credential configuration required.
 
 #: The checkout this system lives in. Moved here when the research entry point stopped being
 #: one benchmark's runner: a path to the project is not any benchmark's business.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def validate_llm_model(model: str) -> str:
+    """One DeepSeek model policy for direct requests and every coding-agent role.
+
+    Explicit non-DeepSeek providers remain supported. Never silently translate Pro into
+    Flash (or reprice a historical Pro request as Flash); reject it before network use.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("LLM model must be a non-empty string")
+    model = model.strip()
+    if model.lower().startswith("deepseek") and model != DEFAULT_LLM_MODEL:
+        raise ValueError(
+            "AutoSim DeepSeek requests must use deepseek-flash; other DeepSeek models "
+            "are disabled. Set DEEPSEEK_MODEL=deepseek-flash.")
+    return model
+
+
+def configured_llm_model(model: str | None = None, *, legacy_openai: bool = False) -> str:
+    """Resolve model precedence without a different default for auxiliary clients."""
+    return validate_llm_model(
+        model or os.environ.get("DEEPSEEK_MODEL") or os.environ.get("AUTOSIM_LLM_MODEL")
+        or (os.environ.get("OPENAI_MODEL") if legacy_openai else None)
+        or DEFAULT_LLM_MODEL)
 
 
 def load_credential_file(*, project_root: Path | None = None) -> dict[str, Any]:
@@ -59,10 +83,11 @@ def load_credential_file(*, project_root: Path | None = None) -> dict[str, Any]:
                 os.environ[key] = value
                 loaded.append(key)
     os.environ.setdefault("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    os.environ.setdefault("DEEPSEEK_MODEL", "deepseek-flash")
+    os.environ.setdefault("DEEPSEEK_MODEL", DEFAULT_LLM_MODEL)
+    model = configured_llm_model()
     return {"source": str(source) if source else "process_environment_only",
             "loaded_variable_names": sorted(loaded),
-            "model": os.environ["DEEPSEEK_MODEL"],
+            "model": model,
             "base_url": os.environ["DEEPSEEK_BASE_URL"],
             "api_key_available": bool(os.environ.get("DEEPSEEK_API_KEY"))}
 
@@ -90,13 +115,7 @@ class LLMClient:
             or os.environ.get("OPENAI_BASE_URL")
             or DEFAULT_LLM_BASE_URL
         )
-        self.model = (
-            model
-            or os.environ.get("DEEPSEEK_MODEL")
-            or os.environ.get("AUTOSIM_LLM_MODEL")
-            or os.environ.get("OPENAI_MODEL")
-            or DEFAULT_LLM_MODEL
-        )
+        self.model = configured_llm_model(model, legacy_openai=True)
 
     @property
     def available(self) -> bool:
@@ -127,6 +146,8 @@ class LLMClient:
         Authentication failures are terminal.  Rate limits and transient
         provider/server failures receive at most ``retries`` retries.
         """
+        # Guard again at the paid boundary in case a caller mutated the client after init.
+        self.model = validate_llm_model(self.model)
         if not self.api_key:
             return "", {"available": False, "model": self.model, "base_url": self.base_url}
 

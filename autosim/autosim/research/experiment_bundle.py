@@ -42,7 +42,7 @@ def _copy_file(source, destination):
 
 
 def freeze_artifact(source: Path, destination: Path, *, max_bytes: int,
-                    store: Path | None = None) -> dict[str, Any]:
+                    store: Path | None = None, preserve_basename: bool = False) -> dict[str, Any]:
     """Copy a file or directory with a bounded size and verify the copied bytes."""
     source, destination = Path(source), Path(destination)
     if not source.exists() or source.is_symlink():
@@ -66,9 +66,16 @@ def freeze_artifact(source: Path, destination: Path, *, max_bytes: int,
         if lock.is_symlink(): raise ValueError('unsafe artifact store lock')
         with lock.open('a+b') as handle:
             fcntl.flock(handle,fcntl.LOCK_EX)
-            slot=store/fingerprint
+            if preserve_basename and (source.name in {'','.','..','manifest.json','lock'}
+                    or '/' in source.name or '\\' in source.name):
+                raise ValueError('unsafe native artifact basename')
+            # Some native consumers derive configuration/output names from this leaf.
+            # Use a new slot namespace: never rewrite a legacy canonical-policy slot.
+            slot=store/(object_digest({'schema_version':2,'artifact_sha256':fingerprint,
+                'native_basename':source.name}) if preserve_basename else fingerprint)
             if slot.is_symlink(): raise ValueError('unsafe artifact slot')
-            target=slot/('policy'+(source.suffix if source.is_file() else ''))
+            target=slot/(source.name if preserve_basename else
+                         'policy'+(source.suffix if source.is_file() else ''))
             manifest=slot/'manifest.json'
             if manifest.is_symlink(): raise ValueError('unsafe artifact manifest')
             if manifest.exists():

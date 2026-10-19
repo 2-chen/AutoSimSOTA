@@ -278,13 +278,16 @@ class DerivedResearch:
         self._frozen_error = ""
         self._held_out_error = ""
         try:
+            from .protocol_revision import effective
+            frozen_path, self.protocol_revision = effective(self.run_root)
             if frozen_path.is_file():
                 self._frozen = dict(read_json(frozen_path).get("hashes") or {})
             else:
                 self._frozen = redline_rules.protected_hashes(
                     self.repo, self.red_lines(), exclude_roots=(self.run_root,))
-                atomic_json(frozen_path, {"schema_version": 1, "hashes": self._frozen,
-                                          "created_at": now()})
+                # Construction is also used for read-only job/catalog inspection.
+                # Bind this object's snapshot, but do not persist a scientific
+                # freeze before Main has actually requested measurement/execution.
         except (OSError, ValueError, RuntimeError, TypeError) as exc:
             self._frozen, self._frozen_error = {}, f"{type(exc).__name__}: {exc}"
         events_path = self.run_root / "events.json"
@@ -707,7 +710,8 @@ class DerivedResearch:
             suffix = raw.suffix if raw.is_file() else ""
             archived = freeze_artifact(
                 raw, self.run_root / "graph_runs" / attempt / "artifacts" / name /
-                f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store')
+                f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store',
+                preserve_basename=True)
             frozen_artifacts[name] = archived
             return Path(archived["path"])
 
@@ -932,6 +936,12 @@ class DerivedResearch:
         # Resolved data-version handles already carry their authorized native path.
         # Keep absence empty so the derivation's verified default remains intact.
         selected_dataset = overrides.get("dataset", settings.get("dataset", ""))
+        from .candidate_settings import TRAINING_SEED
+        seed = settings.get('seed') or 0
+        if stage == 'train' and TRAINING_SEED in settings:
+            seed = settings[TRAINING_SEED]
+            if type(seed) is not int or seed < 0:
+                raise ValueError('scoped training seed must be a nonnegative integer')
         if not isinstance(selected_dataset, str):
             raise ValueError('canonical dataset input must be a string path; use the verified native setting name for other parameters')
         inputs.update({
@@ -946,8 +956,10 @@ class DerivedResearch:
             # what it knows; without explicit selection the derivation's answer fills it.
             "dataset": selected_dataset, "output": str(self.stage_directory(stage)),
             "steps": training_steps,
-            "episodes": int(settings.get("eval.n_eval") or settings.get("episodes") or 0),
-            "seed": int(settings.get("seed") or 0),
+            "episodes": (settings.get("episodes", 0) if stage == 'collect' else
+                         int(settings.get("eval.n_eval") or settings.get("episodes") or 0)),
+            "collection_controls": dict(settings.get('collection_controls') or {}) if stage == 'collect' else {},
+            "seed": int(seed),
             "device": str(settings.get("device") or ""),
             "device_index": int(settings.get("device_index") or 0), "setting": "",
             # These are protocol/execution controls with dedicated input slots above, not
@@ -955,7 +967,7 @@ class DerivedResearch:
             # generated trainer append invented flags such as --task or --episodes.
             "settings": {key: value for key, value in settings.items()
                          if key not in {"task", "task_name", "dataset", "steps", "episodes", "eval.n_eval",
-                                        "seed", "device", "device_index"}},
+                                        "seed", TRAINING_SEED, "device", "device_index", "collection_controls"}},
         })
         inputs.update(overrides)
         return inputs
@@ -1201,6 +1213,13 @@ class DerivedResearch:
             # Their errors must seal a known non-start, not strand a running candidate.
             inputs = self._inputs(stage, settings=settings, device=decision.device,
                                   device_index=decision.device_index, **overrides)
+            if stage == 'collect':
+                from .training_work import missing_formal_collection_work
+                problem = missing_formal_collection_work(self.backend.sources.get(stage) or '', inputs)
+                if problem:
+                    return {'stage': stage, 'ran': False, 'status': 'blocked',
+                            'returncode': None, 'termination_reason': 'formal_collection_work_required',
+                            'why': problem}
             if stage == 'train':
                 from .training_work import missing_formal_work
                 problem = missing_formal_work(self.backend.sources.get(stage) or '', inputs)
@@ -1228,6 +1247,8 @@ class DerivedResearch:
                     pass
             surroundings = run_local_environment(
                 self.output, {**decision.environment, **self.backend.environment(stage)})
+            from .data_versions import native_selection_payload
+            surroundings['AUTOSIM_TRAIN_SELECTION_JSON'] = native_selection_payload(inputs)
             # The backend supplies verified native names and stage parameters.
             argv = self.backend.argv(stage, inputs)
         except (ValueError, TypeError, KeyError, OSError) as exc:
@@ -1264,10 +1285,13 @@ class DerivedResearch:
         # baseline. Each attempt gets a fresh cache namespace so a code experiment measures
         # the source state it was given rather than an earlier compiled module.
         surroundings["PYTHONPYCACHEPREFIX"] = str(self.run_root / "pycache" / attempt_id)
+        surroundings['PYTHONUNBUFFERED'] = '1'
+        surroundings['PYTHONFAULTHANDLER'] = '1'
         receipt_path = self.run_root / "attempts" / attempt_id / "receipt.json"
         safe_argv = [redact(str(part)) for part in argv]
         receipt = {"schema_version": 1, "run_id": self.run_id, "attempt_id": attempt_id,
                    "node_id": stage, "status": "running", "started_at": now(),
+                   "requested_seed": inputs.get('seed'),
                    "started_epoch": before,
                    "argv": safe_argv, "cwd": str(self.backend.directory(stage)),
                    "output_directory": str(native_output.resolve()),
@@ -1277,10 +1301,19 @@ class DerivedResearch:
                    "timeout_seconds": timeout,
                    "containment_requirement": "pid_namespace",
                    "settings_digest": object_digest(settings),
+                   "source_namespace": getattr(self, '_confirmation_import_binding', None),
                    "storage_admission": _storage_admission,
                    "storage_controls_id": (storage_controls or {}).get('id'),
                    "controller_decision_id": self.controller_decision_id or None}
+        if getattr(self, 'job_request_context', None):
+            receipt['job_request_context'] = self.job_request_context
         comparison_path = self._active_protocol_path()
+        if getattr(self,'protocol_revision',None):
+            from .protocol_revision import effective
+            frozen_path,revision=effective(self.run_root)
+            receipt['protocol_revision_id']=revision['id']
+            receipt['frozen_protocol_ref']=frozen_path.relative_to(self.run_root).as_posix()
+            receipt['frozen_protocol_sha256']=digest(frozen_path)
         if getattr(self, '_reference_protocol_id', ''):
             receipt['reference_protocol_ref'] = comparison_path.relative_to(self.run_root).as_posix()
         if (stage == "evaluate" or _protocol_guard) and comparison_path.is_file():
@@ -1294,11 +1327,22 @@ class DerivedResearch:
                          self._comparison_protocol_violation(settings, target=stage,
                                                              confirmation=confirmation))
             if violation:
+                from .operation_failure import seal
+                from .runtime_freshness import controller_identity
+                proof = seal(self.output, operation=f'{stage}_protocol_guard',
+                    exc=ValueError(violation), attempt_id=attempt_id,
+                    native_operation_status='not_started',
+                    context={'run_id':self.run_id,
+                             'controller_runtime_id':controller_identity(),
+                             'controller_decision_id':self.controller_decision_id,
+                             'receipt_ref':receipt_path.relative_to(self.output).as_posix()})
                 atomic_json(receipt_path, {**receipt, "status": "blocked",
                             "termination_reason": "protocol_changed", "finished_at": now(),
-                            "returncode": None, "why": violation})
+                            "returncode": None, "ran":False, "command_started":False,
+                            "why": violation, **proof})
                 return {"stage": stage, "ran": False, "status": "blocked",
-                        "returncode": None, "why": violation, "attempt_id": attempt_id}
+                        "returncode": None, "why": violation, "attempt_id": attempt_id,
+                        "command_started":False,"termination_reason":"protocol_changed", **proof}
         # Written down before the command runs and removed after. A run that never comes back
         # leaves this behind, and that is the only way "working" is distinguishable from
         # "stuck" from outside -- ten hours passed once because it was not.
@@ -1342,6 +1386,8 @@ class DerivedResearch:
                 with _live_stage_document(self.run_root):
                     staged = bounded_run(isolated_argv(
                         ["sh", "-c", command], output=self.output, repo=self.repo,
+                        import_binding_override=getattr(self, '_confirmation_import_binding', None),
+                        native_working_directory=Path(self.backend.directory(stage)),
                         native_environment=stage_environment,
                         require_pid_namespace=True),
                                          timeout=staging_timeout,
@@ -1523,6 +1569,8 @@ class DerivedResearch:
             try:
                 execution_argv = isolated_argv(
                     argv, output=self.output, repo=self.repo, require_pid_namespace=True,
+                    import_binding_override=getattr(self, '_confirmation_import_binding', None),
+                    native_working_directory=Path(self.backend.directory(stage)),
                     native_environment=surroundings)
             except (OSError, ValueError) as exc:
                 # An unavailable isolation boundary or invalid launcher is a refusal before
@@ -1539,6 +1587,8 @@ class DerivedResearch:
                     storage_watch=StorageWatch(self.output,stage=stage,attempt_id=attempt_id,
                         path=native_output,deadline_epoch=time.time()+timeout,
                         checkpoint_bytes=(storage_controls or {}).get('checkpoint_bytes'))
+                    from .native_fault_watch import NativeFaultWatch
+                    native_fault_watch = NativeFaultWatch(attempt_log)
                     attempt = run_process(
                         execution_argv,
                         cwd=self.backend.directory(stage),
@@ -1548,11 +1598,13 @@ class DerivedResearch:
                             self.run_root, telemetry_writer=telemetry_writer,
                             report_root=self.output, run_id=self.run_id),
                         on_start=record_process_start,
-                        live_control=lambda: storage_watch(read_json(self.job_control_path)
-                            if self.job_control_path else None))
+                        live_control=lambda: native_fault_watch(storage_watch(read_json(self.job_control_path)
+                            if self.job_control_path else None)))
                     code, timed_out = attempt.returncode, attempt.timed_out
                     if attempt.cancelled:
-                        refused = "storage pressure; inspect retained recovery artifacts before retry" if storage_watch.critical else "job cancelled by controller"
+                        refused = ('native assertion detected; original evidence retained for engineering review'
+                            if native_fault_watch.detected else "storage pressure; inspect retained recovery artifacts before retry"
+                            if storage_watch.critical else "job cancelled by controller")
                     if attempt.orphaned_children:
                         code = None
                         refused = "launcher exited while child processes were still running"
@@ -1640,12 +1692,15 @@ class DerivedResearch:
                 }
         record = {"stage": stage, "ran": attempt.launched, "argv": safe_argv,
                   "attempt_id": attempt_id, "returncode": code,
+                  "requested_seed": inputs.get('seed'),
                   "started_epoch": before,
                   "containment_mode": attempt.containment_mode,
                   "process_identity": process_identity_record or None,
                   "status": "timed_out" if timed_out else
                             "failed" if refused or code != 0 else "completed",
-                  "termination_reason": "storage_pressure" if attempt.cancelled and locals().get('storage_watch') and storage_watch.critical else "cancelled" if attempt.cancelled else
+                  "native_fatal_diagnostic": locals().get('native_fault_watch').detected if locals().get('native_fault_watch') else None,
+                  "termination_reason": "native_assertion_guard" if locals().get('native_fault_watch') and native_fault_watch.detected else
+                                        "storage_pressure" if attempt.cancelled and locals().get('storage_watch') and storage_watch.critical else "cancelled" if attempt.cancelled else
                                         "timeout" if timed_out else
                                         "orphaned_children" if attempt.orphaned_children else
                                         "launch_error" if refused else
@@ -1718,6 +1773,10 @@ class DerivedResearch:
                           evidence_ref=sealed_evidence["evidence_ref"])
         except (OSError, ValueError, TypeError) as exc:
             # An uninspectable native run cannot be used as a scientific score.
+            # Sealing is a postcondition, not the cause of the native termination.
+            record.update(native_execution_status=record.get('status'),
+                          native_termination_reason=record.get('termination_reason'),
+                          native_returncode=code)
             record.update(status="failed", termination_reason="evidence_capture_failed",
                           evidence_error=f"{type(exc).__name__}: {exc}")
         if (stage == 'train' and self.require_training_progress and
@@ -1876,6 +1935,24 @@ class DerivedResearch:
 
     def capture_demo(self, *, trigger: str, measurement: dict[str, Any] | None,
                      settings: dict[str, Any]) -> dict[str, Any]:
+        """Optional presentation must not discard an already committed measurement."""
+        try:
+            return self._capture_demo(trigger=trigger, measurement=measurement, settings=settings)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            from .operation_failure import seal
+            try:
+                failure = seal(self.output, operation='capture_demo', exc=exc,
+                    native_operation_status='not_inferred',
+                    context={'trigger': trigger, 'measurement_label': (measurement or {}).get('label')})
+            except (OSError, ValueError, TypeError):
+                failure = {}
+            return {'status': 'failed', 'trigger': trigger,
+                    'why': f'optional recording failed: {type(exc).__name__}',
+                    'measurement_preserved': True, 'native_operation_status': 'not_inferred',
+                    **failure}
+
+    def _capture_demo(self, *, trigger: str, measurement: dict[str, Any] | None,
+                      settings: dict[str, Any]) -> dict[str, Any]:
         """Ask a declared native recording stage for one real demo and keep its lineage."""
         stage = str((self.declaration.get("task_contract") or {}).get("demo_stage") or
                     "record_demo")
@@ -1963,6 +2040,16 @@ class DerivedResearch:
     def confirm(self, *, settings: dict[str, Any] | None = None,
                 label: str = "confirmation") -> dict[str, Any]:
         """Evaluate the frozen winning policy on the reserved settings, without training."""
+        from .data_campaign import pending
+        try:
+            obligations = pending(self.output,self.run_id)
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            return {'label':label,'ok':False,'where':'data_campaign','why':str(exc),
+                    'metric_value':None,'ran':False,'repair_owner':'data'}
+        if obligations:
+            return {'label':label,'ok':False,'where':'data_campaign',
+                    'why':'prespecified data arms remain unresolved; complete them or independently review their boundary',
+                    'pending':obligations[:16],'metric_value':None,'ran':False,'repair_owner':'data'}
         held_out = self._held_out()
         if self._held_out_error:
             return {"label": label, "ok": False, "where": "confirmation",
@@ -1980,14 +2067,16 @@ class DerivedResearch:
                            f"({existing.get('metric_value')}); a second one would be a search "
                            f"of the held-out set",
                     "metric_value": None, "ran": False}
+        from .confirmation_execution_recovery import approved as execution_recovery_approved
+        reviewed_execution = execution_recovery_approved(self.run_root, self.output)
         for attempt_path in (self.run_root / "confirmation_attempts").glob("*.json"):
             try:
                 prior = read_json(attempt_path)
             except (OSError, ValueError):
                 continue
-            if (isinstance(prior, dict) and
+            if (not reviewed_execution and isinstance(prior, dict) and
                     ((prior.get("baseline_evaluate") or {}).get("attempt_id") or
-                     prior.get("attempt_id"))):
+                     prior.get("attempt_id") or prior.get("held_out_exposure") == "unknown")):
                 return {"label": label, "ok": False, "where": "confirmation",
                         "why": "the held-out evaluator was already launched in a failed "
                                "confirmation attempt; repeating it would search the "
@@ -2007,6 +2096,38 @@ class DerivedResearch:
                     "metric_value": None, "ran": False}
 
         def recorded(result: dict[str, Any]) -> dict[str, Any]:
+            native_id = ((result.get("evaluate") or {}).get("attempt_id") or
+                         (result.get("baseline_evaluate") or {}).get("attempt_id"))
+            preflight = (result.get("ran") is False and not native_id and
+                         result.get("where") in {"source_identity", "baseline_source_identity",
+                             "policy_identity", "baseline_identity", "comparison_protocol",
+                             "confirmation"})
+            observed_metric = any(result.get(k) is not None for k in ('metric_value', 'baseline_metric_value'))
+            exposure = "not_started" if preflight else "exposed" if observed_metric else "unknown"
+            result["held_out_exposure"] = exposure
+            if not result.get("ok"):
+                from .operation_failure import seal
+                # Only preflight diagnostics are returned to the research Agent.
+                # An executed evaluation's raw outputs/values stay Supervisor-private.
+                safe_why = (str(result.get("why") or "confirmation preflight refused")
+                            if preflight and result.get("where") != "comparison_protocol" else
+                            "confirmation protocol admission refused; independent review required"
+                            if preflight else
+                            "held-out execution failed or has unknown exposure; do not retry or search")
+                if native_id:
+                    # The result has not been archived yet; sealing the bounded traceback
+                    # below is deferred until packet() can bind the immutable attempts.
+                    safe_why = "confirmation execution failed; CPU engineering diagnosis and independent exposure review required"
+                sealed = seal(self.output, operation="confirm_best", exc=ValueError(safe_why),
+                    context={"where": result.get("where"), "held_out_exposure": exposure,
+                             "source_identity_review": result.get("source_identity_review") or {}},
+                    native_operation_status="not_started" if preflight else "launch_recorded" if native_id else "not_inferred")
+                result["engineering_failure"] = {
+                    **sealed, "because": safe_why, "where": result.get("where"),
+                    "held_out_exposure": exposure, "retryable": preflight,
+                    "repair_owner": "fix" if native_id or (preflight and result.get("where") != "comparison_protocol") else "supervisor",
+                    "review_owner": "supervisor",
+                    "failure_category": "confirmation_admission" if preflight else "heldout_execution_failed"}
             row = {"schema_version": 1, "label": label, "held_out": held_out,
                    "settings": confirmation_settings, "at": now(),
                    "candidate_label": result.get("candidate_label"),
@@ -2021,7 +2142,8 @@ class DerivedResearch:
                    "metric_utility": self._metric_utility(result),
                    "ok": bool(result.get("ok")),
                    "attempt_id": (result.get("evaluate") or {}).get("attempt_id"),
-                   "why": result.get("why") or ""}
+                   "why": result.get("why") or "", "held_out_exposure": exposure,
+                   "engineering_failure": result.get("engineering_failure") or {}}
             # Each failed exposure is durable even if a later attempt succeeds.
             immutable_json(self.run_root / "confirmation_attempts" /
                            f"{uuid.uuid4().hex}.json", row)
@@ -2073,61 +2195,51 @@ class DerivedResearch:
                 return False
             return bool(archived.get(field)) and archived[field] == actual
 
-        def frozen_source_matches(row: dict[str, Any]) -> bool:
+        source_reviews: dict[str, Any] = {}
+
+        def frozen_source_matches(row: dict[str, Any], role: str) -> bool:
             state = row.get("source_state") if isinstance(row.get("source_state"), dict) else {}
             workspace_path = self.output / "workspace_snapshot.json"
             if (not state or workspace_path.is_symlink() or not workspace_path.is_file()):
+                source_reviews[role] = {"status": "unverified", "issues": [
+                    {"field": "workspace_manifest", "reason": "missing or unsafe source identity"}]}
                 return False
             try:
+                from .workspace_snapshot import audit_frozen_state
                 workspace = read_json(workspace_path)
-                name = str(state.get("source_snapshot") or "")
-                overlay = state.get("overlay_files")
-                expected = object_digest({
-                    "schema_version": 1,
-                    "source_tree_fingerprint": workspace.get("source_tree_fingerprint"),
-                    "source_snapshot": name,
-                    "overlay_files": overlay,
-                    "overlay_modes": state.get("overlay_modes") or {},
-                    "overlay_directories": state.get("overlay_directories") or {},
-                    "copy_mode": state.get("copy_mode", "full_worktree"),
-                    "untracked_assets_omitted": bool(
-                        state.get("untracked_assets_omitted")),
-                }) if name and isinstance(overlay, dict) else ""
-                snapshot = self.snapshots.get(name) if name else None
-                if (workspace.get("schema_version") != 2 or
-                    workspace.get("destination") != str(self.repo) or
-                    state.get("source_tree_fingerprint") !=
-                    workspace.get("source_tree_fingerprint") or
-                    not expected or state.get("identity_sha256") != expected or
-                    snapshot is None or dict(snapshot.files) != overlay):
+                review = audit_frozen_state(workspace, state, self.snapshots,
+                                            destination=self.repo)
+                source_reviews[role] = review
+                if review["status"] != "verified":
                     return False
-                for key in snapshot.files.values():
-                    if key:
-                        blob = self.snapshots.blobs / key
-                        if not blob.is_file() or digest(blob) != key:
-                            return False
                 if str(row.get("scored") or "").startswith("a source-defined controller"):
                     source_policy = row.get("source_policy_artifact") or {}
                     if (source_policy.get("kind") != "source_tree" or
-                            source_policy.get("identity_sha256") != expected):
+                            source_policy.get("identity_sha256") != review["expected_identity_sha256"]):
+                        review["issues"].append({"field": "source_policy_artifact",
+                                                "reason": "policy source identity differs"})
+                        review["status"] = "unverified"
                         return False
                 return True
             except (OSError, TypeError, ValueError, AttributeError):
+                source_reviews[role] = {"status": "unverified", "issues": [
+                    {"field": "workspace_manifest", "reason": "source identity could not be read"}]}
                 return False
 
         winner_source_state = bool(winner.get("source_state"))
         baseline_row = next((row for name, row in candidates if name == "baseline"), None)
         baseline_policy = (baseline_row.get("policy_artifact") or {}) if baseline_row else {}
         baseline_source_state = bool((baseline_row or {}).get("source_state"))
-        if (winner_source_state != baseline_source_state or
-                (winner_source_state and
-                 (not frozen_source_matches(winner) or
-                  not frozen_source_matches(baseline_row or {})))):
+        source_matches = (frozen_source_matches(winner, "candidate") &
+                          frozen_source_matches(baseline_row or {}, "baseline")) if (
+                              winner_source_state or baseline_source_state) else True
+        if winner_source_state != baseline_source_state or not source_matches:
             return recorded({"label": label, "ok": False, "where": "source_identity",
                              "why": "baseline and selected policy do not both have matching, "
                                     "content-addressed source states for independent confirmation",
                              "candidate_label": selected, "settings": confirmation_settings,
-                             "metric_value": None, "ran": False, "confirmation": True})
+                             "metric_value": None, "ran": False, "confirmation": True,
+                             "source_identity_review": source_reviews})
         source_state_confirmation = winner_source_state and baseline_source_state
         winner_is_source = str(winner.get("scored") or "").startswith(
             "a source-defined controller")
@@ -2208,6 +2320,16 @@ class DerivedResearch:
                 raise ValueError("the reconstructed confirmation source differs from its identity")
 
             original_repo, original_backend, original_sources = self.repo, self.backend, self.sources
+            previous_binding = getattr(self, '_confirmation_import_binding', None)
+            from .environment_overlay import isolated_source_bindings
+            isolated_binding = isolated_source_bindings(self.interpreter,
+                output=self.output, original_repo=original_repo, repo=checkout)
+            from .environment_overlay import verify_isolated_source_bindings
+            verify_isolated_source_bindings(self.interpreter, output=self.output, repo=checkout,
+                binding=isolated_binding, timeout=min(30, self.budget.remaining()) if self.budget else 30)
+            original_frozen = self._frozen
+            previous_record = getattr(self, '_frozen_record_hashes', None)
+            previous_rebase = getattr(self, '_confirmation_rebase', None)
             old_root, new_root = str(original_repo), str(checkout)
 
             def rebase(value: Any) -> Any:
@@ -2221,21 +2343,33 @@ class DerivedResearch:
 
             sources = rebase(original_backend.sources)
             self.repo = checkout
+            self._confirmation_import_binding = isolated_binding
             self.sources = sources
             self.backend = DeclarativeBackend(
                 repo=checkout, answer=rebase(original_backend.answer), sources=sources,
                 parameters=rebase(original_backend.parameters))
+            # Protected bytes are the same, but guards must inspect the fresh copy
+            # being executed rather than the mutable development checkout. Keep the
+            # immutable record in its original namespace; only runtime paths rebase.
+            self._frozen_record_hashes = original_frozen
+            self._frozen = {name.replace(old_root, new_root): sha
+                            for name, sha in original_frozen.items()}
+            self._confirmation_rebase = (old_root, new_root)
             try:
                 result = action()
+                result["source_state"] = state
+                result["source_isolation"] = "fresh_copy_from_verified_base_and_overlay"
                 if not verify_state(checkout, copied, state, self.snapshots):
                     return {**result, "ok": False, "metric_value": None,
                             "why": "source tree changed during independent confirmation"}
-                result["source_state"] = state
-                result["source_isolation"] = "fresh_copy_from_verified_base_and_overlay"
                 return result
             finally:
                 self.repo, self.backend, self.sources = (
                     original_repo, original_backend, original_sources)
+                self._confirmation_import_binding = previous_binding
+                self._frozen = original_frozen
+                self._frozen_record_hashes = previous_record
+                self._confirmation_rebase = previous_rebase
 
         def score_frozen(path: Path, role: str,
                          measured_row: dict[str, Any]) -> dict[str, Any]:
@@ -2426,14 +2560,31 @@ class DerivedResearch:
                     "comparison": row.get("comparison") or {},
                     "at": row.get("at", "")}
         if row:
+            from .confirmation_execution_recovery import approved as recovery_approved
+            if recovery_approved(self.run_root, self.output):
+                return {"status": "engineering_recovery_approved", "retryable": True,
+                        "why": "independently reviewed setup-only failure; retry frozen operation only"}
             # Attempted and did not produce a number. Not the same as never having tried, and
             # not the same as having confirmed. An evaluator actually launched on held-out
             # states spends the split even if it failed before returning a usable score.
             exposed = bool((row.get("baseline_evaluate") or {}).get("attempt_id") or
                            row.get("attempt_id"))
+            engineering = row.get("engineering_failure") or {}
+            if not engineering and not exposed and "held_out_exposure" not in row:
+                from .confirmation_recovery import reviewed_refusal
+                recovered = reviewed_refusal(self.run_root)
+                if recovered:
+                    return {"status": "admission_refused", "retryable": True,
+                            "engineering_failure": recovered,
+                            "why": recovered.get("because") or "reviewed legacy preflight refusal"}
+            if row.get("held_out_exposure") == "not_started" and not exposed and engineering:
+                return {"status": "admission_refused", "retryable": True,
+                        "engineering_failure": engineering,
+                        "why": engineering.get("because") or "confirmation preflight refused"}
             return {"status": "attempted_and_failed", "held_out": row.get("held_out") or {},
                     "why": row.get("why") or "the held-out measurement produced no number",
-                    "retryable": not exposed}
+                    "retryable": not exposed and row.get("held_out_exposure") != "unknown",
+                    "engineering_failure": engineering}
         held_out = self._held_out()
         if self._held_out_error:
             return {"status": "unavailable", "why": self._held_out_error}
@@ -2463,7 +2614,8 @@ class DerivedResearch:
                 _selection_correction_ref: str = '',
                 _audit_training_progress: bool = False,
                 _data_bindings: list | None = None,
-                _reference_protocol_id: str = '') -> dict[str, Any]:
+                _reference_protocol_id: str = '',
+                _checkpoint_handoff: dict | None = None) -> dict[str, Any]:
         """One arm of the run, noted in the selection record on the way out.
 
         Wrapped rather than instrumented. `_measure` returns from eight places -- a stage that
@@ -2490,6 +2642,9 @@ class DerivedResearch:
             if rebound!=_data_bindings or any(settings.get(k)!=v for k,v in checked.items()):
                 raise ResearchStateError('selected data bindings changed before training')
             data_bindings=rebound
+        from .data_versions import seal_selection
+        data_selection = (seal_selection(self.output, self.run_id, label, settings, data_bindings)
+                          if data_bindings else None)
         # Published reference evaluation owns a separate protocol. It must neither
         # freeze the local search prematurely nor rewrite an existing comparison.
         from contextlib import ExitStack
@@ -2507,7 +2662,8 @@ class DerivedResearch:
                 scope.callback(setattr, self, '_reference_protocol_id', '')
             journal = scope.enter_context(track(self, label=label, settings=settings,
                 confirmation=confirmation, reference=_reference_checkpoint is not None,
-                reused_attempt=_reuse_training_attempt_id))
+                reused_attempt=_reuse_training_attempt_id,
+                **({'data_selection': data_selection} if data_selection else {})))
             result = self._measure(settings=settings, label=label, dataset=dataset,
                                confirmation=confirmation,
                                reuse_training_attempt_id=_reuse_training_attempt_id,
@@ -2518,15 +2674,22 @@ class DerivedResearch:
                                **({'selection_correction_ref':_selection_correction_ref}
                                   if _selection_correction_ref else {}),
                                **({'reference_checkpoint': _reference_checkpoint} if _reference_checkpoint is not None else {}),
-                               **({'data_bindings':data_bindings} if data_bindings else {}))
+                               **({'data_bindings':data_bindings} if data_bindings else {}),
+                               **({'checkpoint_handoff':_checkpoint_handoff} if _checkpoint_handoff else {}))
+            if data_selection:
+                result['data_selection'] = {**data_selection,
+                    'training_attempt_id': (result.get('train') or {}).get('attempt_id')}
             protocol = self._active_protocol_path()
+            if getattr(self,'protocol_revision',None):
+                result['protocol_revision_id']=self.protocol_revision['id']
             if _reference_protocol_id:
                 result['reference_protocol_ref'] = protocol.relative_to(self.run_root).as_posix()
+            if data_selection or _reference_protocol_id or getattr(self,'protocol_revision',None):
                 measured_path = self.run_root/'measurements'/f'{label}.json'
                 # Pre-launch graph/input refusals also need a terminal measurement;
                 # otherwise reference reconciliation is stuck in "evaluating" forever.
                 if measured_path.is_symlink():
-                    raise ValueError('unsafe reference measurement destination')
+                    raise ValueError('unsafe measurement destination')
                 atomic_json(measured_path, result)
             finish_transaction(self, journal, result)
         from .scheduling import policy, note
@@ -3137,13 +3300,14 @@ class DerivedResearch:
             repo=self.repo, client=self.client, allow_model=allow_model,
             failure_details=failure_details)
 
-    def recover_unscored_baseline(self, *, replacement_training_attempt_id: str = "") -> dict[str, Any]:
+    def recover_unscored_baseline(self, *, replacement_training_attempt_id: str = "",
+                                  checkpoint_handoff: dict | None = None) -> dict[str, Any]:
         """Finish a baseline from its exact train receipt without training a second time.
 
-        Supported boundaries are a source-selection abstention and an evaluation refused
-        before process start for a temporary GPU resource conflict. The latter is eligible
-        only while the same physical GPU is available and the exact frozen policy still
-        matches the completed training attempt.
+        Source-selection abstentions and pre-start resource conflicts retain their old
+        bounded contracts. An explicitly selected native handoff also supports a sealed
+        post-launch DEVELOPMENT consumer failure, using the same formal producer and
+        protocol. None of these paths authorizes a held-out retry or new training.
         """
         if self.execution_graph or self.available("train") is False:
             return {"ok": False, "where": "recovery", "ran": False,
@@ -3210,8 +3374,23 @@ class DerivedResearch:
                 return {"ok": False, "where": "recovery", "ran": False,
                         "why": f"prior recovery cannot be safely retried: {type(exc).__name__}: {exc}"}
             retry_after_archive_failure = True
-        resource_retry = original.get("where") == "evaluate"
-        policy_retry = (original.get("where") == "policy_artifact" and
+        handoff_retry = checkpoint_handoff is not None
+        recovery_packet = None
+        if handoff_retry:
+            from .measurement_recovery import offered
+            from .checkpoint_handoff import validate as validate_handoff
+            recovery_packet = next((row for row in offered(self.output, self.run_id)
+                                    if row['label'] == 'baseline'), None)
+            try:
+                validate_handoff(self.output, checkpoint_handoff)
+                if (recovery_packet is None or
+                        checkpoint_handoff.get('producer_evidence_ref') != recovery_packet['required_checkpoint_producer'] or
+                        recovery_packet['measurement_sha256'] != digest(measurement_path)):
+                    raise ValueError('handoff is not bound to the failed baseline formal producer')
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                return {'ok':False, 'where':'recovery', 'ran':False, 'why':str(exc)}
+        resource_retry = original.get("where") == "evaluate" and not handoff_retry
+        policy_retry = (not handoff_retry and original.get("where") == "policy_artifact" and
                         original.get("status") == "unscored")
         training_retry = bool(replacement_training_attempt_id) and original.get('where') == 'train'
         if training_retry:
@@ -3231,13 +3410,13 @@ class DerivedResearch:
             except (OSError, ValueError, TypeError, KeyError):
                 return {'ok': False, 'where': 'recovery', 'ran': False,
                         'why': 'replacement requires exact terminal failed baseline training evidence'}
-        if not (resource_retry or policy_retry or training_retry):
+        if not (resource_retry or policy_retry or training_retry or handoff_retry):
             return {"ok": False, "where": "recovery", "ran": False,
                     "why": "baseline failure is not a supported recovery boundary"}
         outcome = original.get("training_outcome") or {}
         train_outcome = original.get("train") or {}
         attempt_id = str(outcome.get("attempt_id") or original.get("attempt_id") or
-                         (train_outcome.get("attempt_id") if resource_retry else ""))
+                         (train_outcome.get("attempt_id") if resource_retry or handoff_retry else ""))
         if training_retry:
             attempt_id = replacement_training_attempt_id
         settings = original.get("settings")
@@ -3245,6 +3424,9 @@ class DerivedResearch:
             return {"ok": False, "where": "recovery", "ran": False,
                     "why": "failed baseline has no settings bound to its train receipt"}
         blocked_evaluation_id = ""
+        if handoff_retry:
+            attempt_id = recovery_packet['training_attempt_id']
+            blocked_evaluation_id = recovery_packet.get('evaluation_attempt_id') or ''
         if resource_retry:
             if (train_outcome.get("attempt_id") != attempt_id or
                     train_outcome.get("returncode") != 0):
@@ -3344,6 +3526,8 @@ class DerivedResearch:
                                "outputs named by its train receipt"}
         elif training_retry:
             recovery_kind = 'adopt_completed_replacement_training_after_failed_baseline'
+        elif handoff_retry:
+            recovery_kind = 'repair_development_consumer_handoff'
 
         session_path = self.run_root / "controller_session.json"
         report_path = self.run_root / "research_report.json"
@@ -3380,11 +3564,23 @@ class DerivedResearch:
                     "why": f"baseline controller state cannot be safely resumed: "
                            f"{type(exc).__name__}: {exc}"}
 
+        try:
+            from .data_versions import restore_selection
+            recovery_data_bindings = restore_selection(self.output, self.repo,
+                                                       self.run_id, original)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            return {"ok": False, "where": "recovery", "ran": False,
+                    "why": f"original data selection cannot be safely restored: {exc}"}
+
         attempt_dir = self.run_root / "attempts" / attempt_id
         recovery_state_path = (attempt_dir / "baseline_recovery_attempt_2.json"
                                if retry_after_archive_failure else
                                attempt_dir / "baseline_recovery.json")
         backup_path = attempt_dir / "baseline_unscored.json"
+        if handoff_retry:
+            failure_key = recovery_packet['evidence_id']
+            recovery_state_path = attempt_dir / f'baseline_handoff_recovery_{failure_key}.json'
+            backup_path = attempt_dir / f'baseline_unscored_{failure_key}.json'
         additive_retry = self.baseline_selection_retry_plan(original) if policy_retry else {'available':False}
         if additive_retry.get('available'):
             recovery_state_path = Path(additive_retry['state_path'])
@@ -3432,7 +3628,10 @@ class DerivedResearch:
                               _reuse_training_attempt_id=attempt_id,
                               _baseline_recovery=True,
                               _reuse_policy_artifact=(original.get("policy_artifact")
-                                                      if resource_retry else None))
+                                                      if resource_retry else None),
+                              **({'_data_bindings':recovery_data_bindings}
+                                 if recovery_data_bindings else {}),
+                              **({'_checkpoint_handoff':checkpoint_handoff} if handoff_retry else {}))
         result["recovery"] = {
             "training_attempt_id": attempt_id, "training_reused": True,
             "kind": recovery_kind,
@@ -3443,6 +3642,10 @@ class DerivedResearch:
         }
         if training_retry:
             result['recovery']['superseded_training_attempt_id'] = old_id
+        if handoff_retry:
+            result['recovery'].update(failure_evidence_id=recovery_packet['evidence_id'],
+                checkpoint_handoff_ref=checkpoint_handoff['evidence_ref'],
+                checkpoint_producer_unchanged=True)
         atomic_json(measurement_path, result)
         atomic_json(recovery_state_path, {
             "schema_version": 1, "status": "completed" if result.get("ok") else "failed",
@@ -3463,6 +3666,15 @@ class DerivedResearch:
                                                "measurement_ok": False})
             return result
 
+        return self._commit_recovered_baseline(result, attempt_id=attempt_id,
+            backup_path=backup_path, session=session, report=report)
+
+    def _commit_recovered_baseline(self, result, *, attempt_id, backup_path, session, report):
+        """Shared baseline/history promotion after an explicitly verified recovery."""
+        history, rows = session['history'], report['rounds']
+        session_status, report_status = session['status'], report['run_status']
+        session_path = self.run_root / 'controller_session.json'
+        report_path = self.run_root / 'research_report.json'
         prior_failure = {key: history[0][key] for key in ("why_not", "failure")
                          if key in history[0]}
         recovered_row = {**history[0], "measured": True, "status": "measured",
@@ -3527,7 +3739,8 @@ class DerivedResearch:
                  reference_checkpoint: Path | None = None,
                  selection_correction_ref: str = '',
                  audit_training_progress: bool = False,
-                 data_bindings: list | None = None) -> dict[str, Any]:
+                 data_bindings: list | None = None,
+                 checkpoint_handoff: dict | None = None) -> dict[str, Any]:
         """Train and score, which is what one arm of a comparison consists of.
 
         The two stages are run in the order the benchmark needs them, and the second is
@@ -3653,12 +3866,23 @@ class DerivedResearch:
                             'evidence_refs':[review_failure['audit_ref']]
                                 if review_failure.get('audit_ref') else [],
                             'training_reused':True}
-            trained = self._select_policy_artifact(trained, revalidate_abstained=True,
-                                                  retry_unavailable=audit_training_progress,
-                                                  correction_ref=selection_correction_ref)
+            if checkpoint_handoff:
+                from .checkpoint_handoff import validate as validate_handoff
+                validate_handoff(self.output, checkpoint_handoff)
+                if checkpoint_handoff.get('producer_evidence_ref') != trained.get('evidence_ref'):
+                    raise ValueError('checkpoint handoff must preserve the exact reused training producer')
+                trained = {**trained, 'explicit_checkpoint_handoff':checkpoint_handoff}
+            else:
+                trained = self._select_policy_artifact(trained, revalidate_abstained=True,
+                                                      retry_unavailable=audit_training_progress,
+                                                      correction_ref=selection_correction_ref)
         else:
             self._prepare_once(settings)
+            from .data_versions import training_metadata
+            selected_training_data = training_metadata(data_bindings or [], settings)
             trained = (self.run_stage("train", settings=settings,
+                                      **({'selected_training_data': selected_training_data}
+                                         if selected_training_data else {}),
                                       **({"dataset": dataset} if dataset else {}))
                        if self.available("train")
                        else {"ran": False, "returncode": None, "why":
@@ -3678,6 +3902,15 @@ class DerivedResearch:
         progress_unverified = (self.require_training_progress and train_available and
                                (trained.get("training_progress") or {}).get("status") !=
                                "observed")
+        # Expose independent, read-only postconditions together. A completed
+        # bundle repair cannot repair an unusable, already sealed data stream.
+        from .data_versions import verify_consumption
+        prechecked_data_consumption = None
+        if (data_bindings and trained.get("status") == "completed" and
+                trained.get("ran") and trained.get("returncode") == 0 and
+                not zero_work and not progress_unverified):
+            prechecked_data_consumption = verify_consumption(
+                self.output, data_bindings, trained, training_performed=train_available)
         policy_artifact_unresolved = (
             trained.get("status") == "completed" and trained.get("returncode") == 0 and
             bool(train_artifact.get("matched")) and
@@ -3712,14 +3945,25 @@ class DerivedResearch:
                               "training did not exit successfully"),
                       "zero_work_reported": zero_work,
                       "training_progress": trained.get("training_progress")}
+            if prechecked_data_consumption is not None:
+                failed['data_consumption'] = prechecked_data_consumption
+            if (trained.get('artifact_selection') or {}).get('status') == 'native_boundary_review_required':
+                from .operation_failure import seal
+                boundary_failure = seal(self.output, operation='policy_checkpoint_boundary',
+                    exc=ValueError(str((trained.get('artifact_selection') or {}).get('why'))),
+                    context={'training_attempt_id':trained.get('attempt_id'),
+                             'consumer_example':(trained.get('artifact_selection') or {}).get('consumer_example')},
+                    native_operation_status='not_started')
+                failed['policy_handoff_failure'] = {**boundary_failure,
+                    'failure_category':'checkpoint_boundary_review_required', 'repair_owner':'fix'}
             atomic_json(self.run_root / "measurements" / f"{label}.json", failed)
             return failed
         produced = (Path(reference_checkpoint) if reference_checkpoint is not None
                     else self._recorded_artifact(trained) if trained.get("ran")
                     else Path(self.checkpoint) if self.checkpoint else None)
-        from .data_versions import verify_consumption
-        data_consumption=verify_consumption(self.output,data_bindings or [],trained,
-                                            training_performed=train_available)
+        data_consumption = (prechecked_data_consumption if prechecked_data_consumption is not None
+                            else verify_consumption(self.output,data_bindings or [],trained,
+                                                    training_performed=train_available))
         if data_bindings and data_consumption['status']!='verified':
             failed={'label':label,'ok':False,'where':'training_data','settings':settings,
                     'metric_value':None,'train':trained,'data_consumption':data_consumption,
@@ -3771,7 +4015,8 @@ class DerivedResearch:
                 attempt = str(trained.get("attempt_id") or uuid.uuid4().hex)
                 archived = freeze_artifact(
                     produced, self.run_root / "experiments" / label / attempt /
-                    f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store')
+                    f"policy{suffix}", max_bytes=cap,store=self.run_root/'artifact_store',
+                    preserve_basename=True)
             except (OSError, ValueError, RuntimeError) as exc:
                 archive_error = f"{type(exc).__name__}: {exc}"
         if produced is not None and not archived:
@@ -3810,7 +4055,7 @@ class DerivedResearch:
                                 confirmation=confirmation)
         policy_consumption: dict[str, Any] = {"status": "not_required"}
         rollout_evidence: dict[str, Any] = {"status": "not_required"}
-        if self.require_policy_consumption and archived:
+        if self.require_policy_consumption and archived and scored.get('ran'):
             eval_attempt = str(scored.get("attempt_id") or "")
             candidate_log = (self.run_root / "evaluate" / "attempts" /
                              eval_attempt / "output.log")
@@ -3827,6 +4072,10 @@ class DerivedResearch:
                 except (OSError, ValueError, RuntimeError) as exc:
                     rollout_evidence = {"status": "unverified", "reason":
                                         f"rollout proof unavailable: {type(exc).__name__}"}
+        elif self.require_policy_consumption and archived:
+            policy_consumption = {'status':'not_observed',
+                'reason':'evaluation did not start; read evaluate receipt before diagnosing policy loading'}
+            rollout_evidence = {'status':'not_observed', 'reason':'evaluation did not start'}
         source_state_error = ""
         if source_state is not None:
             try:
@@ -3862,7 +4111,7 @@ class DerivedResearch:
                                         artifact=(Path(result_archive["path"])
                                                   if result_archive else None))
         metric_lineage: dict[str, Any] = {"status": "not_required"}
-        if self.require_policy_consumption and archived and reading["value"] is not None:
+        if self.require_policy_consumption and archived and scored.get('ran') and reading["value"] is not None:
             try:
                 metric_lineage = verify_metric_lineage(
                     candidate_log, policy_sha256=str(policy_consumption.get("sha256") or ""),
@@ -3887,6 +4136,8 @@ class DerivedResearch:
                   "where": ("source_identity" if source_state_error else
                             "evaluate" if not scored_ok else ""),
                   "why": (source_state_error or
+                          (scored.get('why') if scored.get('ran') is not True or
+                           scored.get('status') != 'completed' or scored.get('returncode') != 0 else '') or
                           (policy_consumption.get("reason") if
                            self.require_policy_consumption and archived and
                            policy_consumption.get("status") != "verified" else "") or
@@ -3921,13 +4172,21 @@ class DerivedResearch:
                   **({"dataset": dataset} if dataset else {}),
                   "data_consumption": data_consumption,
                   "train": {"returncode": trained.get("returncode"),
+                            "requested_seed": trained.get('requested_seed'),
                             "attempt_id": trained.get("attempt_id"),
                             "evidence_id": trained.get("evidence_id"),
                             "evidence_ref": trained.get("evidence_ref"),
                             "reused": bool(reuse_training_attempt_id),
                             "artifact": trained.get("artifact"),
-                            "artifact_selection": trained.get("artifact_selection")},
+                            "artifact_selection": trained.get("artifact_selection"),
+                            **({'checkpoint_handoff_ref':trained['explicit_checkpoint_handoff']['evidence_ref']}
+                               if trained.get('explicit_checkpoint_handoff') else {})},
                   "evaluate": {"returncode": scored.get("returncode"),
+                               "requested_seed": scored.get('requested_seed'),
+                               'ran':bool(scored.get('ran')),
+                               'status':scored.get('status'),
+                               'termination_reason':scored.get('termination_reason'),
+                               'why':scored.get('why'),
                                "attempt_id": scored.get("attempt_id"),
                                "evidence_id": scored.get("evidence_id"),
                                "evidence_ref": scored.get("evidence_ref"),
@@ -4161,6 +4420,17 @@ class DerivedResearch:
         artifact = dict(record.get("artifact") or {})
         matched = int(artifact.get("matched") or 0)
         if matched <= 1 or record.get("status") != "completed" or record.get("returncode") != 0:
+            if matched == 1 and record.get('status') == 'completed' and record.get('returncode') == 0:
+                from .measurement_recovery import verified_consumer_kind
+                boundary = verified_consumer_kind(self.output)
+                produced = self._recorded_artifact(record)
+                if produced is not None and boundary and ('directory' if produced.is_dir() else 'file') != boundary['kind']:
+                    record['artifact_selection'] = {'status':'native_boundary_review_required',
+                        'consumer_example':boundary,
+                        'why':'One matched payload is not a proven native load boundary. The verified '
+                              'consumer used a different file/directory shape. Fix/Main must inspect '
+                              'save/load source and choose a policy file or complete bundle inside '
+                              'this exact completed producer; do not strip configuration or retrain.'}
             return record
         record["artifact"] = artifact
         attempt_id = str(record.get("attempt_id") or "")
@@ -4732,9 +5002,10 @@ class DerivedResearch:
             # differ in metadata/weights nesting depth; parent.parent is not a
             # portable checkpoint contract. Never broaden through another counter
             # or bind several distinct policies using a root-level progress file.
-            peers = [(output/row['path']).resolve(strict=True) for row in docs
+            peers = {(output/row['path']).resolve(strict=True) for row in docs
                      if row['path'] != counter['path'] and any(
-                         item['field'] == counter['field'] for item in row['fields'])]
+                         item['field'] == counter['field'] for item in row['fields'])}
+            peers.discard(counter_path)  # Exact physical aliases are not competing counters.
             container = None
             for ancestor in counter_path.parents:
                 if ancestor == output or not ancestor.is_relative_to(output):
@@ -4745,20 +5016,61 @@ class DerivedResearch:
                     if len(targets) == 1 and not any(p.is_relative_to(ancestor) for p in peers):
                         container = ancestor
                     break
+            payload_root = None
             if container is None:
-                return {}, [], ''
+                # A broad native artifact glob can enumerate a complete bundle, its
+                # nested files and optimizer state. File-count ambiguity is not policy
+                # ambiguity. Use only metadata explicitly covered by the independent
+                # review to locate ONE sibling payload subtree; never infer it from
+                # filenames/extensions or widen through another progress counter.
+                selection = proof['evidence'].get('counter_selection') or {}
+                reviewed = selection.get('reviewed_documents')
+                offered = {row['path'] for row in docs}
+                if (selection.get('kind') not in {'terminal_completed', 'native_best'}
+                        or not isinstance(reviewed, list) or len(reviewed) < 2
+                        or any(not isinstance(x, str) for x in reviewed)
+                        or len(reviewed) != len(set(reviewed))
+                        or counter['path'] not in reviewed or not set(reviewed) <= offered
+                        or not isinstance(selection.get('why'), str) or not selection['why'].strip()):
+                    return {}, [], ''
+                anchors = {(output/name).resolve(strict=True) for name in reviewed}
+                for ancestor in counter_path.parents:
+                    if ancestor == output or not ancestor.is_relative_to(output):
+                        break
+                    if not all(p.is_relative_to(ancestor) for p in anchors):
+                        continue
+                    if any(p.is_relative_to(ancestor) for p in peers):
+                        return {}, [], ''
+                    counter_branch = counter_path.relative_to(ancestor).parts[0]
+                    branches = {ancestor/p.relative_to(ancestor).parts[0] for p in anchors
+                                if p.relative_to(ancestor).parts[0] != counter_branch
+                                and len(p.relative_to(ancestor).parts) > 1}
+                    if len(branches) != 1:
+                        return {}, [], ''
+                    payload_root = next(iter(branches))
+                    if not payload_root.is_dir() or not any(
+                            p.is_relative_to(payload_root) for p in physical_groups):
+                        return {}, [], ''
+                    container = ancestor
+                    break
+                if container is None:
+                    return {}, [], ''
             for alias, candidate in candidate_ids.items():
                 path = Path(candidate)
                 path = path if path.is_absolute() else output/path
                 resolved = path.resolve(strict=True)
                 if (resolved.is_relative_to(container) and resolved.is_relative_to(output)
-                        and resolved != counter_path):
+                        and resolved != counter_path and
+                        (payload_root is None or resolved.is_relative_to(payload_root))):
                     bindings[alias] = {'completed_work': counter['value'],
                         'counter_field': counter['field'],
                         'counter_selection': proof['evidence'].get('counter_selection') or {},
                         'association': 'candidate and audited metadata share a native checkpoint container',
                         'equivalent_candidate_ids': sorted(physical_groups[resolved]),
                         'physical_identity_basis': 'exact same resolved target inside this attempt output',
+                        'association_basis': ('independently_reviewed_metadata_sibling_payload'
+                            if payload_root is not None else 'unique_physical_candidate_container'),
+                        'native_save_load_selection_still_required': True,
                         'not_a_score_or_best_checkpoint_claim': True}
             cited = {entry['source_id'] for entry in proof['evidence']['source_evidence']}
             producer_sources = [{'path': f'native_source_{row["id"]}', 'sha256': row['sha256'],
@@ -4893,7 +5205,7 @@ class DerivedResearch:
         if exact.get('status') != 'missing' or spec.artifact_root != 'output':
             return exact
         binding_path = self.output/'metric_binding.json'
-        protocol_path = self.run_root/'comparison_protocol.json'
+        protocol_path = self._active_protocol_path()
         try:
             if binding_path.is_symlink() or protocol_path.is_symlink():
                 return exact
@@ -4919,7 +5231,8 @@ class DerivedResearch:
                 return exact
             # Resolve the producer rule first, never a recursive basename search over
             # the repository. More than one declared product is not auto-selected.
-            relocated = resolve_metric_artifact(replace(spec, artifact_pattern=producer), **kwargs)
+            relocated = resolve_metric_artifact(replace(spec, artifact_pattern=producer),
+                required_basename=specimen.name, **kwargs)
             if (relocated.get('status') != 'matched' or
                     Path(relocated['path']).name != specimen.name):
                 return {**exact, 'producer_resolution': relocated.get('status'),
@@ -4927,6 +5240,7 @@ class DerivedResearch:
             return {**relocated, 'pattern': spec.artifact_pattern,
                     'source': 'verified_binding_frozen_producer_relocation',
                     'producer_pattern': producer,
+                    'producer_result_basename': specimen.name,
                     'binding_sha256': digest(binding_path),
                     'comparison_protocol_sha256': digest(protocol_path),
                     'specimen_sha256': original['sha256'],
@@ -4967,6 +5281,15 @@ class DerivedResearch:
 
     def _recorded_artifact(self, record: dict[str, Any]) -> Path | None:
         """Use one artifact this exact stage attempt verified, never a later glob hit."""
+        handoff = record.get('explicit_checkpoint_handoff')
+        if handoff:
+            from .checkpoint_handoff import validate as validate_handoff
+            validate_handoff(self.output, handoff)
+            if handoff.get('producer_evidence_ref') != record.get('evidence_ref'):
+                raise ValueError('policy boundary belongs to another training producer')
+            return Path(handoff['selected_path'])
+        if (record.get('artifact_selection') or {}).get('status') == 'native_boundary_review_required':
+            return None
         artifact = record.get("artifact") or {}
         if artifact.get("matched") == 1:
             examples = artifact.get("examples") or []
@@ -5017,6 +5340,18 @@ class DerivedResearch:
         if self._frozen_error:
             return f"could not freeze evaluation protocol: {self._frozen_error}"
         try:
+            from .protocol_revision import effective
+            frozen_path, revision = effective(self.run_root)
+            if (revision or {}).get('id') != (getattr(self,'protocol_revision',None) or {}).get('id'):
+                raise ValueError('protocol revision changed during controller execution; reload controller')
+            if frozen_path.is_symlink() or frozen_path.parent.is_symlink():
+                raise ValueError('unsafe protected protocol path')
+            if frozen_path.exists():
+                if read_json(frozen_path).get('hashes') != (getattr(self, '_frozen_record_hashes', None) or self._frozen):
+                    raise ValueError('protected protocol differs from this controller snapshot')
+            else:
+                immutable_json(frozen_path,{'schema_version':1,'hashes':self._frozen,
+                    'created_at':now(),'freeze_reason':'first requested measurement/execution guard'})
             assert_frozen(self._frozen)
             current = redline_rules.protected_hashes(
                 self.repo, self.red_lines(), exclude_roots=(self.run_root,))
@@ -5029,9 +5364,16 @@ class DerivedResearch:
 
     def _comparison_refusal(self, label: str, settings: dict[str, Any], why: str
                             ) -> dict[str, Any]:
+        from .operation_failure import seal
+        from .runtime_freshness import controller_identity
+        proof = seal(self.output, operation='measurement_protocol_guard',
+            exc=ValueError(why), native_operation_status='not_started',
+            context={'run_id':self.run_id, 'label':label,
+                     'controller_runtime_id':controller_identity(),
+                     'controller_decision_id':self.controller_decision_id})
         failed = {"label": label, "ok": False, "where": "comparison_protocol",
                   "why": why, "settings": dict(settings), "metric_value": None,
-                  "ran": False}
+                  "ran": False, **proof}
         atomic_json(self.run_root / "measurements" / f"{label}.json", failed)
         return failed
 
@@ -5040,7 +5382,8 @@ class DerivedResearch:
         if identity:
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', identity):
                 raise ValueError('invalid reference protocol identity')
-            path = self.run_root/'reference_protocols'/(identity+'.json')
+            from .protocol_revision import reference_path
+            path = reference_path(self.run_root,identity)
             if path.is_symlink() or path.parent.is_symlink():
                 raise ValueError('unsafe reference protocol path')
             return path
@@ -5056,6 +5399,10 @@ class DerivedResearch:
         this is only a partial protocol guarantee, not independent confirmation.
         """
         path = self._active_protocol_path()
+        if freeze:
+            violation = self._protocol_violation()
+            if violation:
+                return violation
         if not freeze and not path.exists():
             return ""
         goal = self.declaration.get("research_goal") or {}
@@ -5115,6 +5462,18 @@ class DerivedResearch:
                       "coverage": "declared_and_generic_keys_only"}
         if getattr(self, "guardrail_specs", []):
             projection["guardrail_metrics"] = self.guardrail_specs
+        rebase_context = getattr(self, '_confirmation_rebase', None)
+        if confirmation and rebase_context:
+            original_root, runtime_root = rebase_context
+            def original_namespace(value):
+                if isinstance(value, str):
+                    return value.replace(runtime_root, original_root)
+                if isinstance(value, list):
+                    return [original_namespace(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: original_namespace(item) for key, item in value.items()}
+                return value
+            projection = original_namespace(projection)
         try:
             local = self.run_root/'comparison_protocol.json'
             if getattr(self, '_reference_protocol_id', '') and local.exists():
@@ -5188,11 +5547,8 @@ class DerivedResearch:
                                     "setting name to the value reserved for confirmation")
             return {}
         extra = goal.get("protocol_keys") or []
-        exact = {"task", "tasks", "suite", "benchmark", "seed", "seeds",
-                 "episodes", "n_episodes", "horizon", "max_episode_steps",
-                 "initial_states", "eval_seed", *extra}
-        outside = sorted(key for key in declared
-                         if key not in exact and not key.startswith(("eval.", "evaluation.")))
+        from .confirmation_reservation import unrecognized_protocol_keys
+        outside = unrecognized_protocol_keys(declared, extra)
         if outside:
             self._held_out_error = (
                 f"research_goal.confirmation reserves {outside}, which the comparison protocol "
@@ -5498,6 +5854,13 @@ class DerivedResearch:
         merely by proposing it. Shape/space validation and red-line audit happen before it is
         exposed as a selectable option; source edits are still rechecked at application time.
         """
+        reproposal_parent = ""
+        if isinstance(candidate, dict) and 'reuse_idea_label' in candidate:
+            from .idea_reproposal import expand_reproposal
+            try:
+                candidate, reproposal_parent = expand_reproposal(candidate, self.library)
+            except (ValueError, TypeError, AttributeError) as exc:
+                return {"status": "invalid", "why": str(exc)[:600]}
         required = {"label", "granularity", "mechanism", "change", "risk", "crosses",
                     "why", "evidence", "touches"}
         if not isinstance(candidate, dict) or set(candidate) != required:
@@ -5539,7 +5902,7 @@ class DerivedResearch:
                 return {"status": "invalid", "why":
                         f"change does not fit the declared action contract: {exc}"[:600]}
 
-        self.library.add(idea)
+        self.library.add(idea, parent=reproposal_parent)
         self._audit_the_batch(self.red_lines())
         held = self.library.get(idea.label)
         if held is None:
@@ -5562,7 +5925,8 @@ class DerivedResearch:
         """
         candidates = [one for one in self.library.usable()
                       if execution_compatibility(
-                          one, stage_parameters=self.backend.parameters.get("train"))[0]]
+                          one, stage_parameters=self.backend.parameters.get("train"),
+                          train_source=self.sources.get('train', ''))[0]]
         # The legacy autonomous loop applies patches through AgentFix, which can
         # repair a stale literal using the actual source. Do not filter away that
         # recovery path here. Main-controller options perform source preflight
@@ -5892,9 +6256,18 @@ class DerivedResearch:
         """
         # Main-agent runs narrate at the Scheduler boundary, not through a second
         # legacy free-form Scheduler summary turn.
-        run_record.generate(self.run_root, client=(None if getattr(
-            self.client, "supports_recorder", False) else self.client), refresh_summary=True,
-                            title=f"{self.benchmark or self.run_id} / derived")
+        try:
+            run_record.generate(self.run_root, client=(None if getattr(
+                self.client, "supports_recorder", False) else self.client), refresh_summary=True,
+                                title=f"{self.benchmark or self.run_id} / derived")
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            # Native receipts/measurements own the result, not optional narration.
+            # Retrying presentation must not buy another training or evaluation.
+            try:
+                self._append_local_event({'at': now(), 'event': 'presentation_failed',
+                    'exception': type(exc).__name__, 'measurement_preserved': True})
+            except (OSError, ValueError, TypeError, RuntimeError):
+                pass  # A full disk is not permission to delete/replay paid work.
 
     def _record_shared_event(self, event: str, *, details: dict[str, Any],
                              phase_state: dict[str, Any],
@@ -6306,9 +6679,16 @@ class DerivedResearch:
             # Existing measurement records without their controller checkpoint may belong to
             # a legacy or interrupted loop. Never assume they are safe to repeat or adopt.
             measurements = self.run_root / "measurements"
-            if yield_after_action and measurements.is_dir() and any(measurements.glob("*.json")):
-                raise ResearchStateError("measurement records exist without a resumable "
-                                         "controller checkpoint; refusing to retrain")
+            if yield_after_action and measurements.is_dir():
+                from .baseline_reference import registered_reference_measurement
+                # Published-reference evaluations have their own frozen protocols and
+                # hash-bound registry history. They are not local baseline/candidate
+                # attempts, and cannot imply a missing local controller checkpoint.
+                if measurements.is_symlink() or any(
+                        not registered_reference_measurement(self.output, self.run_root, path)
+                        for path in measurements.glob('*.json')):
+                    raise ResearchStateError("measurement records exist without a resumable "
+                                             "controller checkpoint; refusing to retrain")
             self._set_research_action("build_rubric_and_baseline")
             self._set_research_action("baseline")
             if yield_after_action and session is None:
@@ -6461,7 +6841,8 @@ class DerivedResearch:
                 eligible = [one for one in self.library.usable()
                             if (kinds_wanted is None or one.granularity in kinds_wanted) and
                             execution_compatibility(
-                                one, stage_parameters=self.backend.parameters.get("train"), repo=self.repo)[0] and
+                                one, stage_parameters=self.backend.parameters.get("train"), repo=self.repo,
+                                train_source=self.sources.get('train', ''))[0] and
                             declared_space_compatibility(one, space=self.space)[0]]
                 if not any(one.label == selected_idea_label for one in eligible):
                     raise ResearchStateError(
@@ -6667,7 +7048,32 @@ class DerivedResearch:
                 "round": index, "phase": "preparing_idea", "idea": idea.as_dict(),
                 "evidence_sha256": object_digest(evidence),
                 "source_transaction_protocol": 1, "updated_at": now()})
-            prepared = self._prepare_idea(idea, evidence=evidence, round_index=index)
+            from .baseline_reference import SourceCitationError
+            try:
+                prepared = self._prepare_idea(idea, evidence=evidence, round_index=index)
+            except SourceCitationError as exc:
+                # Citation validation can fail before code_change creates its write-ahead
+                # manifest. Return control to Main rather than strand a running session.
+                # An existing manifest could own partial writes and must be reconciled.
+                transaction = self.run_root / 'code_changes' / f'round-{index}.json'
+                if (transaction.parent.is_symlink() or transaction.exists()
+                        or transaction.is_symlink()):
+                    raise
+                from .operation_failure import seal
+                refusal = seal(self.output, operation='candidate_source_preflight', exc=exc,
+                    native_operation_status='not_started',
+                    context={'idea_label': idea.label, 'round': index,
+                             'phase': 'preparing_idea', 'source_transaction_protocol': 1})
+                checkpoint_session(status='paused', action='', pending_action=None,
+                    source_preflight_failure={**refusal, 'idea_label': idea.label, 'round': index,
+                                              'why': str(exc)[:1200], 'native_replayed': False})
+                self._set_research_action(f'round_{index}', status='paused',
+                    details={'outcome': 'source_preflight_refused', **refusal})
+                return {'run_id': self.run_id, 'run_status': 'paused',
+                        'stopped_because': 'candidate source evidence needs refresh; no patch or native job launched',
+                        'source_preflight_failure': refusal, 'rounds': history,
+                        'next_round': index,
+                        'baseline': history[0] if history else {}}
             if prepared["refused"]:
                 # The round is spent and the loop goes on. Ending the run here would make one
                 # idea the end of the research. The repair's own answer travels with it,
@@ -6697,12 +7103,8 @@ class DerivedResearch:
             self.snapshots.capture(sorted(self.touched), repo=self.repo,
                                    name=f"round-{index}",
                                    why=f"before measuring {idea.label} ({idea.granularity})")
-            varied = {**base_settings}
-            for key, value in (proposal.get("training") or {}).items():
-                if isinstance(value, dict):
-                    varied.update({f"{key}.{k}": v for k, v in value.items()})
-                else:
-                    varied[key] = value
+            from .candidate_settings import merge_training
+            varied = merge_training(self, base_settings, idea, proposal)
             from .data_versions import resolve as resolve_data_versions
             if candidate_training_settings is not None:
                 from .candidate_settings import apply
@@ -6710,7 +7112,8 @@ class DerivedResearch:
             if candidate_job and candidate_job.get('training_settings') is not None:
                 from .candidate_settings import apply
                 varied=apply(self,varied,candidate_job['training_settings'])
-            varied, selected_data_versions = resolve_data_versions(self.output,self.repo,varied)
+            from .data_consumer_review import resolve_candidate
+            varied, selected_data_versions = resolve_candidate(self, varied, round_index=index)
             if frozen_trial:
                 # Code-only intervention: hold the exact training/data settings, not
                 # the original baseline defaults or an invented new training recipe.

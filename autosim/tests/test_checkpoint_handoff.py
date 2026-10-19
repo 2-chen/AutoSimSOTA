@@ -56,6 +56,25 @@ def test_agent_selects_bundle_not_largest_optimizer_file(tmp_path):
         ch.validate(root, selected)
 
 
+def test_historical_source_block_does_not_keep_recommending_ineffective_inspection(tmp_path,monkeypatch):
+    root,_,_,_=producer(tmp_path)
+    repo=root/'checkout';repo.mkdir()
+    job='b'*32;attempt='c'*32;source='a'*64
+    atomic_json(root/'native_jobs'/job/'request.json',dict(job_id=job,run_id='derived',
+        stage='train',repo=str(repo),source_identity=source))
+    atomic_json(root/'native_jobs'/job/'result.json',dict(job_id=job,status='completed',
+        source_identity_after=source,stage_result=dict(attempt_id=attempt,evidence_ref='evidence/'+attempt+'.json')))
+    atomic_json(root/'research/derived/attempts'/attempt/'receipt.json',dict(stage='train',attempt_id=attempt,
+        controller_decision_id=job,evidence_ref='evidence/'+attempt+'.json'))
+    monkeypatch.setattr('autosim.research.training_progress_audit.revalidate_detached',lambda *a,**kw:None)
+    monkeypatch.setattr('autosim.research.native_jobs.source_matches',lambda *a:False)
+    pending=ch.catalog(root)['pending_producers'][0]
+    assert pending['source_matches'] is False and pending['next_operation'] is None
+    assert 'unchanged inspection' in pending['because']
+    monkeypatch.setattr('autosim.research.native_jobs.source_matches',lambda *a:True)
+    assert ch.catalog(root)['pending_producers'][0]['next_operation']=='inspect_native_job'
+
+
 def test_multiple_native_snapshots_do_not_require_unique_declared_file(tmp_path):
     root, _, bundle, _ = producer(tmp_path)
     document = root/'derivation_attempts/train.json'

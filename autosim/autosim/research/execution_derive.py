@@ -86,13 +86,19 @@ INPUT_VOCABULARY: dict[str, str] = {
                "them (a randomisation mode, a scene variant); a value the benchmark "
                "defines, which the caller selects",
     "dataset": "absolute path to training data, when the stage consumes it",
+    "selected_training_data": "a train-only list of verified selection labels {id, setting, path}; "
+                "empty without registered data. Route ID/slot only through source-proven native "
+                "interfaces, never invent flags. These are labels, not expected hashes or read counts",
     "checkpoint": "absolute path to a policy checkpoint, when the stage consumes one",
     "output": "absolute directory the stage should write into",
     "steps": "explicit optimizer-update budget, as an int; verification supplies its bounded "
              "probe budget, formal research must choose its own learning work. Do not silently "
              "reuse a verification cap or treat native epochs as updates",
-    "episodes": "target number of completed evaluation episodes, as an int; this is a "
-                "count of episodes, not a number of environment steps",
+    "episodes": "caller target count of evaluation episodes or collection episodes, as an int; "
+                "requested collection work is not actual accepted output, nor environment steps",
+    "collection_controls": "sparse map of independently source-reviewed TRAINING acquisition controls, "
+                "collect stage only; empty during verification or without an explicit request. "
+                "Route native names through their actual parser/config/consumer, never evaluation settings",
     "seed": "the seed, as an int",
     "device": "the device this stage should run on, spelled the way the framework does: "
               "`cuda`, `cpu`, `cuda:1`. Not an index -- a benchmark doing "
@@ -122,8 +128,10 @@ def blank_inputs() -> dict[str, Any]:
     """
     inputs: dict[str, Any] = {}
     for key in INPUT_VOCABULARY:
-        if key in ("settings", "extra"):
+        if key in ("settings", "extra", "collection_controls"):
             inputs[key] = {}
+        elif key == "selected_training_data":
+            inputs[key] = []
         elif key in ("steps", "episodes", "seed", "device_index"):
             inputs[key] = 0
         else:
@@ -1347,7 +1355,10 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                 "only through a source-proven native interface; do not invent flags or "
                 "key=value support. They are NOT in the `i` dict "
                 "and must not be read from it; the only keys `i` has are the ones in "
-                "`inputs_available`. Return the argv only.",
+                "`inputs_available`. Return the source/reasoning/shape_was_accepted/"
+                "parameters JSON object specified in the system contract, not a bare "
+                "argv list or a diagnostic report. The executor evaluates source to "
+                "produce the argv.",
     }
         # Only when there is one. A field that is present and empty reads as "the last round
         # established nothing", which is a different statement from "there was no last round".
@@ -1420,7 +1431,8 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
         content, metadata = client.chat_with_metadata(
             sanitize_model_text(ARGV_SYSTEM),
             sanitize_model_text(current), max_tokens=3000,
-            timeout=agent_timeout_seconds, thinking="disabled")
+            timeout=agent_timeout_seconds, thinking="disabled",
+            **({'bounded_generation':True} if getattr(client,'supports_bounded_generation',False) else {}))
         verification_called = False
         outcome = {}
         source, argv, text, revised = None, None, None, None
@@ -1656,7 +1668,11 @@ def generate_argv(client: Any, stage: str, *, entrypoint: str, invocation: str,
                         anchored_evidence_ref = str(outcome.get('native_evidence_ref') or '')
                     # The model is handed the failure and the output, unedited, and decides
                     # what it means. It is the same reader that has to act on the answer.
-                    raise ValueError("the command did not run. The program said:\n"
+                    disposition = ('native execution completed; a verification postcondition failed'
+                        if outcome.get('launch_verified') and
+                        (outcome.get('native_diagnostics') or {}).get('returncode')==0
+                        else 'the command did not run')
+                    raise ValueError(disposition + ". The program said:\n"
                                      + native_failure_feedback(outcome))
                 current_parameters = revised
             log.append({"stage": stage, "attempt": repair + 1, "status": "accepted",
@@ -1748,6 +1764,7 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                   verification_timeout: int = 600,
                   verification_window: Any = None,
                   verification_inputs_guard: Any = None,
+                  invocation_blueprint: dict[str, Any] | None = None,
                   unique_verification_outputs: bool = False,
                   remaining_seconds: Any = None,
                   agent_timeout_seconds: float = 180
@@ -1781,8 +1798,22 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
     verify_output = str(inputs_for_verify.get("output") or "")
     from .stage_verification import resource_context, missing_checkout_paths, run_native, recent_attempts
     resources = resource_context(repo)
+    if invocation_blueprint:
+        resources['main_selected_invocation_blueprint'] = {
+            key: invocation_blueprint.get(key) for key in
+            ('ref', 'authority', 'native_evidence_ref', 'entry')}
+        resources['blueprint_instruction'] = (
+            'Main explicitly selected this historical starting point. Preserve its '
+            'source-backed runtime connections unless current evidence contradicts them; '
+            'adapt the pure builder to CURRENT caller inputs. The old native receipt '
+            'is history, not a current failure or approval. NEW native verification '
+            'and all current budget/protocol/producer/postcondition checks are required.')
     addressed_native_evidence_refs: set[str] = set()
     if verify_output:
+        from .run_successor import preparation_reference
+        predecessor = preparation_reference(Path(verify_output).parent, stage)
+        if predecessor['status'] == 'historical_reference_requires_new_verification':
+            resources['authorized_predecessor_runtime_reference'] = predecessor
         resources['previous_native_verifications'] = [
             attempt for attempt in recent_attempts(Path(verify_output).parent)
             if attempt.get('stage') == stage][:3]
@@ -1798,8 +1829,10 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
         inputs_for_verify['output'] = str(path)
         return dict(inputs_for_verify)
     def local_environment(env: dict[str, str]) -> dict[str, str]:
-        return (run_local_environment(Path(verify_output).parent, env)
-                if verify_output else env)
+        from .data_versions import native_selection_payload
+        supplied = {**env, 'AUTOSIM_TRAIN_SELECTION_JSON': native_selection_payload(inputs_for_verify)}
+        return (run_local_environment(Path(verify_output).parent, supplied)
+                if verify_output else supplied)
     # Held in a dict rather than closed over: a revision replaces the directory and the
     # environment, and the verifier has to see the new ones. A default argument captures its
     # value at definition time, so the closure would keep testing the invocation that had
@@ -1817,6 +1850,8 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                "stdin": invocation_stdin(row)}
     artifact_failures: dict[str, dict[str, Any]] = {}
     native_postconditions: dict[str, Any] = {}
+    from .verification_recheck import ArtifactRecheck
+    artifact_recheck = ArtifactRecheck(stage,repo,Path(verify_output).parent) if verify_output else None
 
     def allowed_timeout(requested: float) -> float:
         if remaining_seconds is None:
@@ -1850,7 +1885,11 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
             except (subprocess.TimeoutExpired, OSError, ValueError, TimeoutError) as exc:
                 return f"{type(exc).__name__}: {exc}"
             if done.returncode != 0:
-                return ((done.stdout or "") + (done.stderr or ""))[-2000:]
+                # A silent nonzero shell is still a failed prerequisite. Returning
+                # an empty string here used to launch its consumer as if setup had
+                # succeeded and send Fix the downstream missing-file error instead.
+                return (f'staging command failed (returncode={done.returncode})\n'
+                        + ((done.stdout or "") + (done.stderr or ""))[-2000:])
         return ""
 
     def verify(argv):
@@ -1875,7 +1914,16 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                                    "staging": invocation_staging(row)})
         if cache_key in artifact_failures:
             return artifact_failures[cache_key]
-        staged = _stage()
+        reused = (artifact_recheck.lookup(argv,row,inputs_for_verify,current['environment'],
+                    current['directory'],current['stdin']) if artifact_recheck else None)
+        identity_before = None
+        if artifact_recheck and stage == 'evaluate' and not reused:
+            try:
+                identity_before = artifact_recheck.identity(argv,row,inputs_for_verify,
+                    current['environment'],current['directory'],current['stdin'])
+            except (OSError,ValueError,KeyError,TypeError):
+                pass
+        staged = '' if reused else _stage()
         if staged and staged.strip():
             return {"ok": False, "error": f"staging did not succeed:\n{staged}"}
         missing = missing_checkout_paths(argv, repo=repo,
@@ -1896,8 +1944,11 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                         'failure_kind':'producer_identity_changed',
                         'error':f'Frozen producer input failed verification: {type(exc).__name__}: {exc}'}
         try:
-            started = time.time()
-            if verification_window is not None and verify_output:
+            started = reused['started'] if reused else time.time()
+            if reused:
+                done = reused['done']
+                inputs_for_verify['output'] = reused['output']
+            elif verification_window is not None and verify_output:
                 done = run_native([str(a) for a in argv], repo=repo,
                     output=Path(verify_output).parent, cwd=Path(current["directory"]),
                     env=current["environment"], stdin=current["stdin"],
@@ -1959,6 +2010,7 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
             verification_output=str(inputs_for_verify.get('output') or ''),
             launch_verified=True,
             native_diagnostics={'returncode':done.returncode,
+                'reused_native_execution': bool(reused),
                 'native_returncode':getattr(done, 'native_returncode', done.returncode),
                 'cleanup':getattr(done, 'native_cleanup', {}),
                 'stderr_tail':str(done.stderr or '')[-4000:],
@@ -2051,6 +2103,9 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                            f"directory; fresh nearby files: {fresh}; correct the artifact "
                            "pattern or the command"}
                 artifact_failures[cache_key] = failure
+                if artifact_recheck and not reused:
+                    artifact_recheck.capture(done,started,argv,row,inputs_for_verify,
+                        current['environment'],current['directory'],current['stdin'],before=identity_before)
                 return failure
             if evidence.get("matched"):
                 evidence_root = (Path(current["directory"]) if
@@ -2265,6 +2320,20 @@ def make_runnable(client: Any, stage: str, row: dict[str, Any], *, repo: Path,
                 hint=hint, require_step_control=require_step_control,
                 require_evaluation_progress=require_evaluation_progress,
                 agent_timeout_seconds=agent_timeout_seconds)
+            # The inner generator preserves corrected values even when a different
+            # postcondition still fails. Carry those proposals into diagnosis and
+            # the next outer round too; otherwise an artifact repair silently
+            # resets unrelated launch corrections to the original declaration.
+            # These remain proposals, not verified inputs or an accepted command.
+            if parameters:
+                pending = {p['name']:dict(p) for p in (row.get('parameters') or [])
+                           if isinstance(p,dict) and 'name' in p}
+                for key, value in parameters.items():
+                    prior = pending.get(key, {})
+                    pending[key] = {**prior, 'name':key, 'value':value,
+                        **({'evidence':'Agent argv proposal retained; native verification still required'}
+                           if prior.get('value') != value else {})}
+                row = {**row, 'parameters':list(pending.values())}
         except Exception as exc:                                       # noqa: BLE001
             from .startup_verification import VerificationWindowBoundary
             if isinstance(exc, VerificationWindowBoundary):
@@ -2734,7 +2803,8 @@ def diagnose(client: Any, stage: str, row: dict[str, Any], *, repo: Path, argv: 
             content, _ = client.chat_with_metadata(
                 sanitize_model_text(DIAGNOSE_SYSTEM),
                 sanitize_model_text(payload, local_roots=(repo,)),
-                max_tokens=2000, timeout=agent_timeout_seconds, thinking="disabled")
+                max_tokens=2000, timeout=agent_timeout_seconds, thinking="disabled",
+                **({'bounded_generation':True} if getattr(client,'supports_bounded_generation',False) else {}))
         except Exception:                                            # noqa: BLE001
             return {}
         try:
@@ -2837,7 +2907,8 @@ def revise_invocation(client: Any, stage: str, row: dict[str, Any], *, repo: Pat
             content, _ = client.chat_with_metadata(
                 sanitize_model_text(REVISE_SYSTEM),
                 sanitize_model_text(payload, local_roots=(repo,)),
-                max_tokens=2000, timeout=agent_timeout_seconds, thinking="disabled")
+                max_tokens=2000, timeout=agent_timeout_seconds, thinking="disabled",
+                **({'bounded_generation':True} if getattr(client,'supports_bounded_generation',False) else {}))
         except Exception:                                            # noqa: BLE001
             # A client that cannot answer is a round that produced nothing. It is not a
             # reason to end the stage: this call sits on the loop's hot path, and the claim

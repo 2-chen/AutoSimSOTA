@@ -139,6 +139,37 @@ def test_zero_request_receipt_releases_hold_without_guessing_from_process_exit(t
     assert ledger.snapshot()['reserved_usd']==0
 
 
+@pytest.mark.parametrize('mode', ['priced', 'inflight', 'wrong_owner', 'live'])
+def test_request_journal_recovers_crash_before_terminal_pricing_only_with_bound_ownership(tmp_path, monkeypatch, mode):
+    ledger, price, reservation = priced_hold(tmp_path, monkeypatch)
+    price.unlink()
+    turn = 'a' * 32
+    gateway = {'unknown': False, 'requests': 1, 'cost_usd': .03, 'bound_valid': True,
+               'held_usd': 0, 'accounting_ceiling_usd': .03}
+    if mode == 'inflight':
+        gateway.update(unknown=True, held_usd=.07, accounting_ceiling_usd=.1)
+    if mode == 'live':
+        monkeypatch.setattr(budget_receipts, 'inspect_process_identity', lambda _: {'status': 'matching_running'})
+    journal = tmp_path / 'agent/gateway_journals' / (turn + '.json')
+    atomic_json(journal, {'schema_version': 1, 'kind': 'request_gateway_journal_v1',
+        'price_card': PRICE_CARD_ID, 'cost_basis': ledger.cost_basis, 'turn_id': turn,
+        'run_id': 'r', 'role': 'init', 'session_id': 's', 'budget_output': str(tmp_path),
+        'budget_reservation_id': 'wrong' if mode == 'wrong_owner' else reservation['reservation_id'],
+        'gateway': gateway})
+    result = ledger.reconcile_receipts(apply=True)['results'][0]
+    if mode == 'priced':
+        assert result['status'] == 'settled_from_receipt'
+        assert ledger.snapshot()['spent_usd'] == pytest.approx(.03)
+        assert ledger.snapshot()['reserved_usd'] == 0
+    elif mode == 'inflight':
+        assert result['status'] == 'unknown_bound_verified'
+        assert ledger.snapshot()['reserved_usd'] == pytest.approx(.1)
+    else:
+        assert result['status'] == 'retained'
+        assert ledger.snapshot()['reserved_usd'] == 3
+    assert not price.exists()  # do not fabricate a terminal pricing receipt
+
+
 def test_interruption_seals_provider_receipt_and_settles_only_observed_usage(tmp_path,monkeypatch):
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -153,6 +184,7 @@ def test_interruption_seals_provider_receipt_and_settles_only_observed_usage(tmp
     snapshot = {'unknown':False,'requests':1,'cost_usd':.03,'bound_valid':True}
     @contextmanager
     def gate(**kwargs):
+        kwargs['checkpoint'](snapshot)
         yield SimpleNamespace(base_url='http://fixture',local_token='fixture',snapshot=lambda:snapshot)
     def interrupted(*args,**kwargs):
         raise KeyboardInterrupt('fixture interrupt')
@@ -166,6 +198,12 @@ def test_interruption_seals_provider_receipt_and_settles_only_observed_usage(tmp
     assert ledger.snapshot()['reserved_usd']==0
     receipts = list((output/'agent/pricing').glob('*.json'))
     assert len(receipts)==1 and read_json(receipts[0])['interrupted']
+    journals = list((output / 'agent/gateway_journals').glob('*.json'))
+    assert len(journals) == 1
+    journal = read_json(journals[0])
+    assert journal['budget_reservation_id'] == read_json(ledger.path)['entries'][0]['reservation_id']
+    assert journal['role'] == 'scheduler' and journal['run_id'] == 'r'
+    assert 'fixture-secret' not in journals[0].read_text()
 
 
 @pytest.mark.parametrize('worker,unknown',[(False,False),(True,False),(False,True)])
@@ -221,6 +259,29 @@ def test_historical_orphan_hold_needs_evidence_even_if_no_process_exists(tmp_pat
     ledger.reserve(session_id='old',role='fix',requested_usd=3)
     assert ledger.reconcile_receipts(apply=True)['results'][0]['status']=='retained'
     assert ledger.snapshot()['reserved_usd']==3
+
+
+def test_per_turn_archive_survives_overwritten_conversation_projection(tmp_path, monkeypatch):
+    ledger, price, _ = priced_hold(tmp_path, monkeypatch)
+    session_path = next((tmp_path / 'agent/sessions').glob('*.json'))
+    old = read_json(session_path)
+    archived = tmp_path / 'agent/turn_sessions' / (old['process_attempt_id'] + '.json')
+    atomic_json(archived, old)
+    # The SAME finalized turn may have two copies, not two owners.
+    assert ledger.reconcile_receipts()['results'][0]['status'] == 'settled_from_receipt'
+    atomic_json(session_path, {**old, 'budget_reservation_id': 'later-turn'})
+    assert ledger.reconcile_receipts(apply=True)['results'][0]['status'] == 'settled_from_receipt'
+    assert ledger.snapshot()['spent_usd'] == pytest.approx(.07)
+    assert ledger.snapshot()['reserved_usd'] == 0
+
+
+def test_conflicting_turn_archive_does_not_release_usage(tmp_path, monkeypatch):
+    ledger, _, _ = priced_hold(tmp_path, monkeypatch)
+    original = read_json(next((tmp_path / 'agent/sessions').glob('*.json')))
+    atomic_json(tmp_path / 'agent/turn_sessions' / (original['process_attempt_id'] + '.json'),
+                {**original, 'role': 'wrong-owner'})
+    assert ledger.reconcile_receipts(apply=True)['results'][0]['status'] == 'retained'
+    assert ledger.snapshot()['reserved_usd'] == 3
 
 
 def test_recorder_cannot_reserve_or_extend_execution_recovery_margin(tmp_path):

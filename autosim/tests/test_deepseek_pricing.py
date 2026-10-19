@@ -16,6 +16,39 @@ PEAK = dt.datetime(2026, 9, 29, 3, 0, tzinfo=dt.timezone.utc)
 OFF_PEAK = dt.datetime(2026, 9, 29, 5, 0, tzinfo=dt.timezone.utc)
 
 
+def test_gate_journals_before_forward_and_after_usage_without_request_payload(tmp_path):
+    from autosim.research.common import atomic_json, read_json
+    path = tmp_path / 'journal.json'
+    gate = TurnCostGate(limit_usd=1, model='deepseek-flash',
+                        checkpoint=lambda value: atomic_json(path, value))
+    zero = read_json(path)
+    assert zero['model'] == 'deepseek-flash'
+    assert zero['unknown'] is False and zero['requests'] == 0
+    request = gate.reserve(model='deepseek-flash', max_tokens=100, at=PEAK, input_bytes=1000)
+    inflight = read_json(path)
+    assert inflight['unknown'] is True and inflight['held_usd'] > 0
+    gate.settle(request, {'input_tokens': 100, 'output_tokens': 10})
+    settled = read_json(path)
+    assert settled['unknown'] is False and settled['cost_usd'] > 0
+    assert settled['held_usd'] == 0 and settled['requests'] == 1
+    assert settled['receipts'][0]['requested_model'] == 'deepseek-flash'
+    assert 'input_bytes' not in path.read_text()  # only accounting, not prompts/keys
+
+
+def test_gate_cannot_forward_after_durable_reservation_write_fails():
+    calls = []
+    def checkpoint(value):
+        calls.append(value)
+        if value['held_usd'] > 0:
+            raise OSError('fixture full disk')
+    gate = TurnCostGate(limit_usd=1, model='deepseek-flash', checkpoint=checkpoint)
+    with pytest.raises(DeepSeekGatewayError, match='durable'):
+        gate.reserve(model='deepseek-flash', max_tokens=100, at=PEAK, input_bytes=1000)
+    assert gate.snapshot()['bound_valid'] is False
+    with pytest.raises(DeepSeekGatewayError):
+        gate.reserve(model='deepseek-flash', max_tokens=100, at=PEAK, input_bytes=1000)
+
+
 def test_local_gate_can_grow_under_persistent_total_and_records_actual_denial(tmp_path):
     from autosim.research.agent_budget import AgentCostLedger
     ledger = AgentCostLedger(tmp_path, run_id="adaptive", limit_usd=.5)
@@ -83,6 +116,31 @@ def test_nested_tool_schema_type_does_not_crash_text_guard():
     assert _has_nontext({"content": [{"type": "image", "source": "x"}]})
 
 
+@pytest.mark.parametrize("model", ["deepseek-v4-pro", "deepseek-pro", "deepseek-reasoner"])
+def test_gateway_never_forwards_cli_model_fallbacks(monkeypatch, model):
+    from autosim.research import deepseek_gateway
+    monkeypatch.setattr(deepseek_gateway.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("paid request must not start"))
+    with DeepSeekTurnGateway(upstream_base_url="https://api.deepseek.com/anthropic",
+                             upstream_key="fixture-key", model="deepseek-flash",
+                             limit_usd=.05) as gateway:
+        url = urlparse(gateway.base_url)
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
+        body = json.dumps({"model": model, "max_tokens": 100,
+                           "messages": [{"role": "user", "content": "hello"}]})
+        conn.request("POST", "/v1/messages", body=body,
+                     headers={"Authorization": "Bearer " + gateway.local_token,
+                              "Content-Type": "application/json"})
+        response = conn.getresponse()
+        assert response.status == 400
+        response.read()
+        conn.close()
+        snapshot = gateway.snapshot()
+        assert snapshot["model"] == "deepseek-flash"
+        assert snapshot["requests"] == 0
+        assert snapshot["accounting_ceiling_usd"] == 0
+
+
 @pytest.mark.parametrize('generation_policy', [None, {'max_output_tokens':64,'thinking':'disabled'}])
 def test_loopback_gateway_forwards_with_upstream_key_and_accounts_usage(monkeypatch,generation_policy):
     from autosim.research import deepseek_gateway
@@ -105,7 +163,8 @@ def test_loopback_gateway_forwards_with_upstream_key_and_accounts_usage(monkeypa
         seen["body"] = json.loads(request.data)
         return FakeResponse(json.dumps({
             "usage": {"input_tokens": 100, "cache_read_input_tokens": 20,
-                      "output_tokens": 10}, "content": [{"type": "text", "text": "ok"}]
+                      "output_tokens": 10}, "stop_reason":"end_turn",
+            "content": [{"type": "text", "text": "ok"}]
         }).encode())
 
     monkeypatch.setattr(deepseek_gateway.urllib.request, "urlopen", fake_upstream)
@@ -139,6 +198,10 @@ def test_loopback_gateway_forwards_with_upstream_key_and_accounts_usage(monkeypa
         snapshot = gateway.gate.snapshot()
         assert snapshot["requests"] == 1 and not snapshot["unknown"]
         assert snapshot["cost_usd"] > 0
+        diagnostics=snapshot['receipts'][0]['diagnostics']
+        assert diagnostics['requested_max_output_tokens']==100
+        assert diagnostics['effective_max_output_tokens']==(64 if generation_policy else 100)
+        assert diagnostics['provider_stop_reason']=='end_turn'
         assert seen['body']['max_tokens']==(64 if generation_policy else 100)
         assert seen['body']['messages']==[{'role':'user','content':'hello'}]
         assert seen['body']['thinking']==({'type':'disabled'} if generation_policy else

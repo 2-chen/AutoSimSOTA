@@ -72,11 +72,26 @@ def run_local_environment(output: Path, base: dict[str, str] | None = None, *,
     return env
 
 
+def source_namespace_alias(repo: Path, output: Path) -> Path:
+    """Short empty owned mountpoint; the checkout itself remains content-addressed."""
+    repo, output = Path(repo).resolve(), Path(output).resolve()
+    if not repo.is_relative_to(output) or repo == output:
+        raise ValueError('source alias requires an isolated run-owned checkout')
+    alias = Path('/tmp') / ('as-c-' + object_digest(str(repo))[:16])
+    alias.mkdir(mode=0o700, exist_ok=True)
+    if (alias.is_symlink() or not alias.is_dir() or alias.stat().st_uid != os.getuid() or
+            alias.stat().st_mode & 0o077 or any(alias.iterdir())):
+        raise ValueError('unsafe source namespace alias mountpoint')
+    return alias
+
+
 def isolated_argv(argv: list[str], *, output: Path, repo: Path,
                   require_pid_namespace: bool = False,
                   read_only_roots: tuple[Path, ...] = (),
                   allow_gpu: bool = True,
                   native_environment: dict[str, str] | None = None,
+                  import_binding_override: dict | None = None,
+                  native_working_directory: Path | None = None,
                   writable_paths: tuple[Path, ...] | None = None) -> list[str]:
     """Run controlled commands in a PID namespace with explicit writable paths.
 
@@ -160,6 +175,36 @@ def isolated_argv(argv: list[str], *, output: Path, repo: Path,
     for binding in bindings_for(repo):
         command.extend(("--ro-bind", binding["source"], binding["source"]))
     command.extend(mount_args(repo))
+    if import_binding_override:
+        binding = import_binding_override
+        source, target, prefix = (Path(binding[key]) for key in ('source', 'target', 'prefix'))
+        if (source.is_symlink() or target.is_symlink() or prefix.is_symlink() or
+                source.parent.resolve() != repo.parent.resolve() or
+                source.name != 'runtime_import_bindings.py' or
+                not prefix.resolve().is_relative_to(output) or
+                not target.resolve().is_relative_to(prefix.resolve()) or
+                target.name != 'autosim_overlay_sources.py' or
+                digest(source) != binding.get('sha256')):
+            raise ValueError('invalid isolated source import binding')
+        command.extend(('--ro-bind', str(prefix), str(prefix),
+                        '--ro-bind', str(source), str(target)))
+        if binding.get('runtime_repo'):
+            alias = source_namespace_alias(repo, output)
+            if binding['runtime_repo'] != str(alias):
+                raise ValueError('source runtime alias identity mismatch')
+            readonly = writable_paths is not None and not any(
+                repo.is_relative_to(Path(p).resolve()) for p in writable if Path(p) != Path('/tmp'))
+            command.extend(('--ro-bind' if readonly else '--bind', str(repo), str(alias)))
+            command.extend(mount_args(repo, mounted_at=alias))
+            # Source-file paths and cwd are namespace aliases of the same bytes.
+            # Cache, policy, output and all protocol inputs keep their owned paths.
+            argv = [str(part).replace(str(repo), str(alias)) for part in argv]
+            for key, value in (native_environment or {}).items():
+                if str(repo) in value:
+                    command.extend(('--setenv', key, value.replace(str(repo), str(alias))))
+            directory = Path(native_working_directory or repo).resolve()
+            if directory.is_relative_to(repo):
+                command.extend(('--chdir', str(alias / directory.relative_to(repo))))
     if native_environment and native_environment.get('HOME'):
         # Native SDKs may derive fixed-width identifiers from absolute cache
         # paths. Use a short namespace alias of the SAME owned home, not a fresh
@@ -478,7 +523,7 @@ _MODEL_EPISODE_ID = re.compile(
     r"episode(?:[_-]?id)?[_-](?!(?:id|ids|index|keys)\b)[\w.-]+|"
     r"episode(?:[_ -]?id)?\s+(?=[\w.-]*\d)[\w.-]+)")
 _MODEL_RESOURCE_ARGUMENT = re.compile(
-    r"(?i)(--?(?:checkpoint|ckpt|model(?:-path)?|policy(?:-path)?|dataset|data|demo|"
+    r"(?i)(?<![\w-])(--?(?:checkpoint|ckpt|model(?:-path)?|policy(?:-path)?|dataset|data|demo|"
     r"trajectory|video|output|asset-path|file)(?:=|\s+))(?P<quote>['\"]?)"
     r"(?P<value>[^\s'\";&|]+)(?P=quote)")
 
@@ -737,10 +782,15 @@ def benchmark_roots(workspace: Path) -> list[Path]:
     roots.extend([workspace, workspace.parent])
     seen, unique = set(), []
     for root in roots:
-        resolved = root.expanduser().resolve()
-        if resolved not in seen and resolved.is_dir():
-            seen.add(resolved)
-            unique.append(resolved)
+        try:
+            resolved = root.expanduser().resolve()
+            if resolved not in seen and resolved.is_dir():
+                seen.add(resolved)
+                unique.append(resolved)
+        except (OSError, RuntimeError):
+            # Optional discovery must not fail on an unrelated private directory
+            # or symlink loop. Explicit repository access retains its own errors.
+            continue
     return unique
 
 
@@ -750,18 +800,27 @@ def find_benchmark(name: str, workspace: Path, *, marker: str, depth: int = 2) -
     Searches each root directly and then one level of subdirectories, so a layout
     that groups benchmarks under a shared directory works as well as one that keeps
     them side by side. Nothing here assumes a particular depth or an ancestor count.
+    Unreadable optional candidates are skipped, not certified absent or runnable.
     """
     for root in benchmark_roots(workspace):
         direct = root / name
-        if (direct / marker).exists():
-            return direct.absolute()
+        try:
+            if (direct / marker).is_file():
+                return direct.absolute()
+        except OSError:
+            pass
         if depth > 1:
             try:
-                children = sorted(child for child in root.iterdir() if child.is_dir())
+                children = sorted(root.iterdir())
             except OSError:
                 continue
             for child in children:
-                nested = child / name
-                if (nested / marker).exists():
-                    return nested.absolute()
+                try:
+                    if not child.is_dir():
+                        continue
+                    nested = child / name
+                    if (nested / marker).is_file():
+                        return nested.absolute()
+                except OSError:
+                    continue
     return None

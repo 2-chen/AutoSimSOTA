@@ -4,6 +4,26 @@ from pathlib import Path
 from .common import atomic_json, digest, exclusive, now, object_digest, read_json
 from .research_state import ResearchStateError
 
+IDLE_ALLOCATION_STATUSES = frozenset({'paused', 'completed', 'finalizing'})
+
+
+def allocation_view(progress,available):
+    """Expose local allocation separately from hard totals; never allocate here."""
+    progress=progress if isinstance(progress,dict) else {}
+    total=progress.get('planned_rounds');cursor=progress.get('next_round')
+    valid=type(total) is int and type(cursor) is int and total>=0 and cursor>=1
+    enabled='extend_research_rounds' in available
+    return {'status':'observed' if valid else 'unknown','is_hard_total_budget':False,
+        'planned_rounds':total if valid else None,
+        'remaining_candidate_rounds':max(0,total-cursor+1) if valid else None,
+        'extension_available':enabled,
+        'extension_expected_rounds':total if valid and enabled else None,
+        'authority':'operation availability and session allocation only; not a budget grant',
+        'guidance':'Main chooses additional_rounds and reason through extend_research_rounds when available, '
+            'even before allocation reaches zero. Few local rounds alone are not a budget-limited boundary. '
+            'Respect hard GPU/model/wall totals and immutable protocols. If a full multi-seed matrix '
+            'cannot fit, assess whether a valid partial experiment can fit; keep unfinished arms incomplete.'}
+
 
 def resume_rounds(root: Path, session: dict, requested: int) -> int:
     """Accept an earlier CLI allocation only through applied extension receipts."""
@@ -88,7 +108,7 @@ def extend(research, *, additional_rounds: int, expected_rounds: int, reason: st
         session, report = read_json(session_path), read_json(report_path)
         if (session.get('schema_version') != 1 or session.get('run_id') != research.run_id
                 or Path(session.get('repository', '')).resolve() != research.repo
-                or session.get('status') not in {'paused', 'completed'}
+                or session.get('status') not in IDLE_ALLOCATION_STATUSES
                 or session.get('pending_action') or session.get('action')
                 or report.get('run_id') != research.run_id
                 or report.get('run_status') != session.get('status')

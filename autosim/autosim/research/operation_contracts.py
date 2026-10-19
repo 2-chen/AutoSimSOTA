@@ -9,8 +9,12 @@ import re
 # Scientific/source validation remains in the native domain validators, not here.
 SOURCE_REFS = {'type':'array','minItems':1,'maxItems':12,'items':{
     'type':'object','required':['ref','quote'],'properties':{
-        'ref':{'type':'string','minLength':1},
-        'quote':{'type':'string','minLength':1}},'additionalProperties':False}}
+        'ref':{'type':'string','minLength':1,'maxLength':1024,
+               'description':'Checkout-relative file[:line[-line]], native-source:ID or checkout-source:ID. '
+                   'Never use [LOCAL_RESOURCE]/[LOCAL_PATH]. For redacted JSON/config sources capture '
+                   'inspect_native_environment.checkout_source_request and copy its exact returned ref/quote.'},
+        'quote':{'type':'string','minLength':1,'maxLength':4000,
+                 'description':'Exact source quote, confined to cited lines; for checkout-source:ID copy the whole returned quote.'}},'additionalProperties':False}}
 ID = {'type':'string','pattern':r'^[A-Za-z0-9_-]{1,64}$'}
 REASON = {'type':'string','minLength':1,'maxLength':1000}
 BASELINE_DIAGNOSIS = {'type':'object','required':['subject_sha256','decision','checks',
@@ -37,11 +41,87 @@ PLAN = {'type':'object','required':['objective','hypotheses','open_questions','n
             'required':['route','why','targets','producer_to_loader','evidence_refs','next_probe'],
             'properties':{'route':_text_shape(400),'why':_text_shape(1500),'next_probe':_text_shape(1500),
                 **{k:PLAN_ITEMS for k in ('targets','producer_to_loader','evidence_refs')}}},
+        'decision_memory':{'type':'object','additionalProperties':False,'maxEncodedBytes':6000,
+            'required':['bottleneck','observations','lessons','failed_directions','next_experiment'],
+            'properties':{'bottleneck':_text_shape(1000),'next_experiment':_text_shape(1500),
+                **{k:PLAN_ITEMS for k in ('observations','lessons','failed_directions')}}},
         'budget_strategy':{'type':'object','additionalProperties':False,'maxEncodedBytes':6000,
             'required':['why','allocations','evidence_refs','revisit_condition','next_action'],
             'properties':{'why':_text_shape(1500),'revisit_condition':_text_shape(1000),
                 'next_action':_text_shape(1000),'allocations':PLAN_ITEMS,'evidence_refs':PLAN_ITEMS}}}}
 NESTED = {
+    '_step_recover_unscored_baseline':{'artifact_revision':{
+        'type':['object','null'],'properties':{'pattern':{'type':'string','minLength':1,'maxLength':500},
+            'reason':REASON,'source_refs':SOURCE_REFS},
+        'required':['pattern','reason','source_refs'],'additionalProperties':False}},
+    '_step_recover_reference_score': {'artifact_revision': {
+        'type':['object','null'],'required':['pattern','reason','source_refs'],
+        'properties':{'pattern':{'type':'string','minLength':1,'maxLength':512},
+                      'reason':{'type':'string','minLength':1,'maxLength':1000},
+                      'source_refs':SOURCE_REFS},'additionalProperties':False,
+        'description':'Optional source-reviewed attempt-owned result locator for the SAME completed '
+            'reference only; independent review and policy/completed-episode/metric checks, no GPU replay '
+            'or protocol/stage mutation. Never choose by the metric value.'}},
+    '_step_correct_policy_handoff': {
+        'artifact_revision': {
+            'type':['object','null'],'required':['pattern','reason','source_refs'],
+            'properties':{'pattern':{'type':'string','minLength':1,'maxLength':512},
+                'reason':REASON,'source_refs':SOURCE_REFS},'additionalProperties':False,
+            'description':'Only for an offered completed_evaluation_missing_locator. Main selects '
+                'a source-backed result locator; independent review plus native load/rollout/metric '
+                'reverification on CPU, no native replay or metric change. Omit checkpoint_ref and job_id.'},
+        'checkpoint_ref': {'type':'string',
+            'description':'Source-backed file or complete bundle inside the ORIGINAL completed training '
+                'producer. Select this to run the frozen evaluation; omit job_id.'},
+        'job_id': {'type':'string',
+            'description':'Only an offered COMPLETED EVALUATE native-job ID from completed_evaluation_links '
+                'to attach an existing evaluation without replay. Not a training attempt/evidence ID. '
+                'Omit checkpoint_ref in this mode.'}},
+    '_step_derive_a_command': {'artifact_revision': {
+        'type':['object','null'], 'required':['pattern','reason','source_refs'],
+        'properties':{'pattern':{'type':'string','minLength':1,'maxLength':512},
+                      'reason':{'type':'string','minLength':1,'maxLength':1000},
+                      'source_refs':SOURCE_REFS}, 'additionalProperties':False}},
+    '_step_record_data_campaign_arm':{'boundary':{
+        'type':['object','null'],'additionalProperties':False,
+        'required':['status','reason','evidence_refs','source_refs'],
+        'properties':{'status':{'type':'string','enum':['unsupported','budget_limited']},
+            'reason':{'type':'string','minLength':1,'maxLength':2000},
+            'source_refs':SOURCE_REFS,
+            'evidence_refs':{'type':'array','minItems':1,'maxItems':8,'uniqueItems':True,
+                'items':{'type':'string','pattern':r'^[0-9a-f]{32}$'},
+                'description':'Sealed native/operation evidence IDs, not job/measurement/decision IDs.'}}}},
+    '_step_build_the_environment': {
+        'reuse_environment_ref':{'type':['string','null'],
+            'pattern':r'^(env|environments/[A-Za-z0-9_-]{1,80})$',
+            'description':'Select a metadata-verified run-owned overlay from environment.prepared_overlays. '
+                'Requires its matching base_environment_id and overlay mode; omitted source_binding_ids '
+                'preserve existing external bindings and installed delta. Native consumers are reverified.'},
+        'base_environment_id':{'type':['string','null'],'minLength':1},
+        'base_environment_mode':{'type':'string','enum':['overlay','clone','reconstruct']},
+        'environment_selection_reason':{'type':'string','maxLength':2000,
+            'description':'Short source/evidence-grounded rationale, <=2000 characters. '
+                'Omit base selection to continue the existing cursor; an omitted binding list '
+                'reasserts the accepted plan, not a new environment. Cite evidence rather than paste logs.'}},
+    '_step_review_confirmation_failure': {'diagnostic_evidence_id': {
+        'type': 'string', 'pattern': r'^[0-9a-f]{32}$',
+        'description': 'CPU repair-probe evidence ID (termination_reason=cpu_native_diagnostic), '
+                       'or the sealed confirm_best_engineering envelope which binds that CPU probe. '
+                       'Not the original held-out failure ID.'}, 'reason': REASON},
+    '_step_inspect_native_job':{'log_query':{'type':['string','null'],'maxLength':128,
+        'description':'Optional literal text from native producer source/logs to inspect in a bounded live snapshot. '
+                      'Empty string offers the bounded tail. Not regex or a terminal-work audit; excludes evaluation/held-out.'}},
+    '_step_submit_native_job':{'evaluation_settings':{
+        'type':['object','null'],'minProperties':1,
+        'properties':{'episodes':{'type':'integer','minimum':1},
+                      'seed':{'type':'integer','minimum':0}},'additionalProperties':False},
+        'collection_settings':{'type':['object','null'],'required':['episodes'],
+            'properties':{'episodes':{'type':'integer','minimum':1},
+                          'seed':{'type':'integer','minimum':0},
+                          'controls':{'type':'object','minProperties':1,'maxProperties':12,
+                              'description':'Native training-side fields only. The verified builder must read '
+                                  'collection_controls; actual observed effect must be checked after the probe.'},
+                          'control_source_refs':SOURCE_REFS},'additionalProperties':False}},
     '_step_update_research_plan':{'plan':PLAN},
     '_step_record_baseline_diagnosis':{'diagnosis':BASELINE_DIAGNOSIS},
     '_step_configure_baseline_reference':{'reference':{
@@ -89,8 +169,24 @@ def schema(handler) -> dict:
     for name in ('evidence_id','job_id'):
         if name in properties:
             properties[name]['pattern'] = r'^(?:[0-9a-f]{32})?$' if properties[name].get('default') == '' else r'^[0-9a-f]{32}$'
-            properties[name]['description'] = 'Opaque 32-hex evidence/job ID, not action_id or receipt sha256.'
-    return {'type':'object','properties':properties,'required':required,'additionalProperties':False}
+            properties[name].setdefault('description',
+                'Opaque 32-hex evidence/job ID, not action_id or receipt sha256.')
+    contract = {'type':'object','properties':properties,'required':required,'additionalProperties':False}
+    if handler.__name__ == '_step_recover_unscored_baseline':
+        contract.update({'if':{'required':['artifact_revision'],
+            'properties':{'artifact_revision':{'type':'object'}}},
+            'then':{'properties':{'checkpoint_ref':{'type':'string','maxLength':0}}}})
+    if handler.__name__ == '_step_correct_policy_handoff':
+        # The same argument contract is used for Main admission AND optional Fix
+        # recommendations. Do not label a mutually exclusive recommendation valid
+        # merely because both individual fields have the right Python type.
+        contract.update({
+            'description':'Two exclusive modes: label + checkpoint_ref runs evaluation of the completed '
+                'training producer; label + offered completed EVALUATE job_id links existing evaluation. '
+                'Never pass a training attempt ID as job_id or combine nonempty checkpoint_ref and job_id.',
+            'if':{'required':['job_id'],'properties':{'job_id':{'type':'string','minLength':1}}},
+            'then':{'properties':{'checkpoint_ref':{'const':''}}}})
+    return contract
 
 
 def validate(contract: dict, arguments: dict) -> None:

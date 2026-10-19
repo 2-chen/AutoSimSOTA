@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "study_id": "fdas_acquisition_equal_data_draft_20261015",
+  "phase": "draft",
+  "track": "equal_accepted_data",
+  "tasks": [
+    {"id": "bell", "repository": "RoboSynChallenge", "native_task": "click_bell", "family": "contact", "role": "development"},
+    {"id": "drawer", "repository": "RoboSynChallenge", "native_task": "drawer_open_place", "family": "articulation_and_placement", "role": "development"},
+    {"id": "assembly", "repository": "RoboSynChallenge", "native_task": "item_assembly", "family": "contact", "role": "task_holdout"},
+    {"id": "rearrange", "repository": "RoboSynChallenge", "native_task": "table_rearrangement", "family": "multi_object_placement", "role": "task_holdout"}
+  ],
+  "methods": ["fixed_official", "fixed_continuation", "random_quality", "rule_targeted", "agent_targeted"],
+  "training_seeds": [0, 1, 2],
+  "agent_replicas": [0],
+  "protocol": {
+    "model_configuration": null,
+    "resource_manifest": null,
+    "native_source_revision": null,
+    "resource_budget": null,
+    "accepted_new_episodes": null,
+    "official_data_identity": null,
+    "expert_identity": null,
+    "legal_training_domain": null,
+    "common_quality_floor": "Expert success, complete episodes, valid action/observation alignment, legal training split and source-family deduplication; identical floor for random, rule and agent acquisition arms. No task-directed Qt selection in this acquisition-only matrix.",
+    "initialization": null,
+    "training_work": null,
+    "data_mixture": null,
+    "development_evaluation": null,
+    "heldout_reservation": null,
+    "metric": "Native task success rate; macro average across the prespecified tasks only after all required cells are available. Development results and final confirmation remain separate.",
+    "cost_accounting": "Equal accepted data is NOT equal compute. Charge failed attempts, conversion, selection and training; disclose shared acquisition costs separately from each training seed. GPU device leases, CPU, wall and LLM USD are distinct.",
+    "exclusion_rules": "Task list is provisional until native capability, resources and measured runtime are audited. Freeze final selection before held-out search. Never drop failed trials post hoc; retain missing cells and explanations. No best-seed selection. fixed_official means independently trained on official data, not multiple seed labels for one published policy; released-checkpoint reproduction is a separate calibration track."
+  },
+  "bindings": {}
+}

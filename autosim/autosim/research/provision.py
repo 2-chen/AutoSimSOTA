@@ -68,6 +68,7 @@ from .common import (atomic_json, bounded_run, isolated_argv, now, object_digest
                      redact, run_local_environment, sanitize_model_payload,
                      sanitize_model_payload_text)
 from .budget import RunBudget
+from .devices import NoCompatibleDevice
 from .survey import survey
 
 
@@ -164,6 +165,65 @@ class EnvironmentPlanError(ValueError):
     def __init__(self, message: str, failure: dict):
         super().__init__(message)
         self.planning_failure = failure
+
+
+def prepared_environment_catalog(output: Path, repo: Path) -> list[dict]:
+    from .environment_overlay import prepared_catalog
+    return prepared_catalog(output, repo)
+
+
+def selection_advice(output: Path, repo: Path, proposal: dict, *, manifests: dict) -> dict:
+    """Validate a Fix suggestion, not deploy it. Main retains the selection right."""
+    from .prepare import Preparation
+    from .operation_contracts import schema, validate
+    from .environment_overlay import prepared_overlay, validate_binding_ids
+    from .environment_pool import catalog
+    if (not isinstance(proposal, dict) or set(proposal) != {'step','arguments'} or
+            proposal['step'] != 'build_the_environment'):
+        raise ValueError('selection proposed_action must name build_the_environment')
+    args = proposal['arguments']
+    validate(schema(Preparation._step_build_the_environment), args)
+    if args.get('repair_proposal') is not None:
+        raise ValueError('selection advice cannot combine an install repair or execute it')
+    chosen = next((r for r in catalog(output,manifests,platform_facts())
+                   if r['id']==args.get('base_environment_id')), None)
+    if not chosen or args.get('base_environment_mode') != 'overlay':
+        raise ValueError('selection advice requires a current overlay base ID')
+    if not str(args.get('environment_selection_reason') or '').strip():
+        raise ValueError('selection advice needs an evidence-grounded reason')
+    ids = args.get('source_binding_ids')
+    if ids is not None:
+        validate_binding_ids(ids,chosen.get('source_binding_options') or [])
+    ref = args.get('reuse_environment_ref')
+    if ref is not None:
+        prepared = prepared_overlay(output,repo,ref)
+        if (prepared['base_prefix'] != chosen['prefix'] or
+                prepared['base_fingerprint'] != chosen['fingerprint'] or prepared['python'] != chosen['python']):
+            raise ValueError('selection advice prepared overlay does not match current base')
+    elif ids is None:
+        raise ValueError('selection advice needs a prepared ref or corrected explicit bindings')
+    return proposal
+
+
+def selection_failure(output: Path, message: str, *, details: dict) -> None:
+    """A bad caller selection cannot be repaired by a planner forced to obey it."""
+    from .common import atomic_text
+    from .evidence_store import capture_attempt_evidence
+    identity = uuid.uuid4().hex
+    failure = {'failure_domain':'framework_plan', 'repair_owner':'main_agent',
+        'native_operation_status':'not_started', 'failure_category':'environment_selection_invalid',
+        'next_operation':'build_the_environment', 'retry_original_arguments':False,
+        'guidance':'Correct the caller selection from the current catalog or select a verified '
+                   'prepared overlay; do not reinstall packages or retry unchanged arguments.',
+        'details':details, 'attempts':[{'attempt':0,'status':'rejected','error':message}]}
+    log = output/f'planning_failures/{identity}.log'
+    ref = f'planning_failures/{identity}.json'
+    atomic_text(log, json.dumps(failure, ensure_ascii=False))
+    failure.update(capture_attempt_evidence(output, attempt_id=identity, log=log, receipt_ref=ref,
+        status='proposal_rejected', returncode=None, termination_reason='environment_selection_invalid'))
+    atomic_json(output/ref, failure)
+    atomic_json(output/'planning_failure_latest.json', failure)
+    raise EnvironmentPlanError(message, failure)
 
 
 def _asset_exists(checkout: Path, target: Path) -> bool:
@@ -616,6 +676,32 @@ def validate_resource_requests(value: dict[str, Any]) -> None:
             raise ValueError("resource request needs an exact planned command, resource and reason")
 
 
+def operation_compute(template: str, *, planned: dict, transcript: list, compute=None):
+    """CPU unless this exact operation explicitly requests accelerator access.
+
+    A selected GPU is a capability, not a grant for every environment probe.
+    Asset checks added by the executor therefore remain CPU-only too.
+    """
+    resource = "cpu"
+    grants = list(planned.get("resource_requests") or [])
+    for row in transcript:
+        grants.extend(row.get("resource_requests") or [])
+    for row in grants:
+        if row.get("command") == template:
+            resource = row["resource"]
+    if resource == "gpu" and (compute is None or not compute.on_gpu):
+        from .compute_decision import ComputeDecision
+        return ComputeDecision("unavailable", -1, why="no selected GPU for explicit request",
+                               evidence={"requested_resource": "gpu"})
+    return compute if resource == "gpu" else None
+
+
+def resource_retryable(result):
+    return (result.get('failure_kind') == 'resource_busy' and result.get('launched') is False
+            and result.get('requested_resource') == 'gpu' and result.get('gpu_access') is False
+            and result.get('retryable') is True)
+
+
 def run(command: str, *, env: dict[str, str], cwd: Path, timeout: int,
         output: Path, read_only_roots: tuple[Path, ...] = (), compute=None,
         rejection: dict[str, Any] | None = None,
@@ -626,7 +712,11 @@ def run(command: str, *, env: dict[str, str], cwd: Path, timeout: int,
     import uuid
     from .evidence_store import capture_attempt_evidence
     attempt_id = uuid.uuid4().hex
-    native_grant = {"resource": "cpu", "gpu_access": False}
+    requested_gpu = compute is not None and (compute.on_gpu or
+        compute.evidence.get("requested_resource") == "gpu")
+    native_grant = {"resource": "gpu" if requested_gpu else "cpu",
+                    "requested_resource": "gpu" if requested_gpu else "cpu",
+                    "gpu_access": False}
 
     def seal(result: dict[str, Any], text: str) -> dict[str, Any]:
         attempt_log = output.parent / "provision_attempts" / f"{attempt_id}.log"
@@ -707,6 +797,14 @@ def run(command: str, *, env: dict[str, str], cwd: Path, timeout: int,
                     "seconds": round(time.monotonic() - started, 1),
                     "failure_kind": "timeout",
                     "excerpt": f"the command did not finish within {timeout}s"}, partial)
+        except NoCompatibleDevice as exc:
+            log.write(f"[{type(exc).__name__}: {exc}]\n")
+            return seal({"command": command, "ok": False, "returncode": None,
+                    "seconds": round(time.monotonic() - started, 1),
+                    "failure_kind": "resource_busy", "failure_category": "resource_busy",
+                    "retryable": True, "retry_when": "fresh selected-device occupancy admits this operation",
+                    "repair_owner": "resource", "launched": False,
+                    "excerpt": f"{type(exc).__name__}: {exc}"}, str(exc))
         except (OSError, ValueError, RuntimeError) as exc:
             log.write(f"[{type(exc).__name__}: {exc}]\n")
             return seal({"command": command, "ok": False, "returncode": None, "seconds": 0.0,
@@ -966,7 +1064,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
           budget: RunBudget | None = None, max_operations: int | None = None,
           compute=None, repair_proposal: dict | None = None,
           base_environment_id: str | None = None, base_environment_mode: str = 'clone',
-          environment_selection_reason: str = '', source_binding_ids: list[str] | None = None) -> dict[str, Any]:
+          environment_selection_reason: str = '', source_binding_ids: list[str] | None = None,
+          reuse_environment_ref: str | None = None) -> dict[str, Any]:
     """Build until every probe passes, recording only what survived.
 
     The loop is: run the next command; if it fails, ask what to change given the failure and
@@ -985,6 +1084,9 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
     explicit_base = None
     selection_path = output / 'environment_selection.json'
     previous_selection = read_json(selection_path) if selection_path.is_file() else {}
+    if reuse_environment_ref is not None and (base_environment_id is None or base_environment_mode != 'overlay'):
+        selection_failure(output, 'reuse_environment_ref requires explicit overlay base selection',
+                          details={'reuse_environment_ref':reuse_environment_ref})
     if source_binding_ids is not None and (base_environment_id is None or base_environment_mode != 'overlay' or
             not isinstance(source_binding_ids, list) or len(source_binding_ids) > 64 or
             any(not isinstance(i, str) for i in source_binding_ids)):
@@ -994,6 +1096,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         if (held_failure.get('verdict') or {}).get('reason') in {'base_clone_failed', 'base_overlay_failed'}:
             return held_failure
     if base_environment_id is not None:
+        if isinstance(environment_selection_reason, str) and len(environment_selection_reason) > 2000:
+            raise ValueError(f'environment_selection_reason has {len(environment_selection_reason)} characters; maximum is 2000')
         if (not isinstance(base_environment_id, str) or base_environment_mode not in {'overlay', 'clone', 'reconstruct'}
                 or not isinstance(environment_selection_reason, str) or not environment_selection_reason.strip()
                 or len(environment_selection_reason) > 2000):
@@ -1003,20 +1107,59 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         capability = {'clone':'cloneable', 'reconstruct':'reconstructable', 'overlay':'overlay_reusable'}[base_environment_mode]
         if explicit_base is None or not explicit_base.get(capability):
             raise ValueError('selected base is unavailable or does not support the requested mode')
+        from .environment_overlay import validate_binding_ids, prepared_overlay
+        if source_binding_ids is not None:
+            try:
+                validate_binding_ids(source_binding_ids, explicit_base.get('source_binding_options') or [])
+            except ValueError as exc:
+                selection_failure(output, str(exc), details={'base_environment_id':base_environment_id,
+                    'source_binding_ids':source_binding_ids})
+        reusable = None
+        candidate_ref = reuse_environment_ref
+        if candidate_ref is None and not previous_selection and python:
+            supplied = Path(python).absolute().parent.parent
+            if supplied.is_relative_to(output.resolve()):
+                candidate_ref = str(supplied.relative_to(output.resolve()))
+        if candidate_ref is not None and base_environment_mode == 'overlay':
+            try:
+                reusable = prepared_overlay(output, repo, candidate_ref)
+                if (reusable['base_prefix'] != explicit_base['prefix'] or
+                        reusable['base_fingerprint'] != explicit_base['fingerprint'] or
+                        reusable['python'] != explicit_base['python']):
+                    raise ValueError('prepared overlay does not match selected base/ABI identity')
+                validate_binding_ids(reusable['source_binding_ids'], explicit_base.get('source_binding_options') or [])
+                if source_binding_ids is not None:
+                    selected_external = sorted(i for i in source_binding_ids if next(
+                        r for r in explicit_base['source_binding_options'] if r['id'] == i)['origin'] != 'checkout')
+                    if selected_external != sorted(reusable['source_binding_ids']):
+                        raise ValueError('prepared overlay binding definition differs; submit a separate binding switch')
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                if reuse_environment_ref is not None:
+                    selection_failure(output, str(exc), details={'reuse_environment_ref':reuse_environment_ref,
+                        'base_environment_id':base_environment_id})
+                reusable = None
+            if reusable is not None and source_binding_ids is None:
+                source_binding_ids = reusable['source_binding_ids']
         selection_path = output / 'environment_selection.json'
         previous_selection = read_json(selection_path) if selection_path.is_file() else {}
         request_identity = object_digest({'id':base_environment_id, 'mode':base_environment_mode,
             'fingerprint':explicit_base['fingerprint'], 'context':manifests})
         # Repeating an accepted selection with a live, matching cursor is a
         # continuation, not a new switch. Check before paying for another plan.
+        saved_cursor = read_json(output/'provision_cursor.json') if (output/'provision_cursor.json').is_file() else {}
         bindings = source_binding_ids
         if bindings is None:
-            bindings = [b['id'] for b in ((previous_selection.get('result') or {}).get(
-                'overlay') or {}).get('bindings', []) if b.get('origin') != 'checkout']
+            # Omission reasserts the accepted plan, not a synthesized binding set.
+            # The planner can explicitly include checkout IDs; create() also adds
+            # implicit checkout modules. Filtering actual bindings to external
+            # roots compared a different list and recreated a healthy prefix.
+            recorded = (saved_cursor.get('planned') or {}).get('source_binding_ids')
+            bindings = recorded if isinstance(recorded, list) else [b['id'] for b in
+                ((previous_selection.get('result') or {}).get('overlay') or {}).get('bindings', [])
+                if b.get('origin') != 'checkout']
         same_definition = object_digest({'id':base_environment_id, 'mode':base_environment_mode,
             'fingerprint':explicit_base['fingerprint'], 'overlay_fingerprint':explicit_base.get('overlay_fingerprint'),
             'context':manifests, 'bindings':sorted(bindings)})
-        saved_cursor = read_json(output/'provision_cursor.json') if (output/'provision_cursor.json').is_file() else {}
         proposed_context = {**((assets or {}).get('research_context') or {}), 'repository_checkout':str(repo)}
         current_identity = object_digest({'manifests':manifests, 'context':proposed_context,
             'entrypoints':source_context_hashes(repo, proposed_context)})
@@ -1037,6 +1180,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                     not (existing/'bin/python').is_file()):
                 raise ValueError('accepted environment continuation has an unsafe prefix')
             prefix, python, explicit_base = existing, str(existing/'bin/python'), None
+        elif reusable is not None:
+            prefix, python = Path(reusable['prefix']), str(Path(reusable['prefix'])/'bin/python')
         else:
             # Never overwrite the old prefix. All prior evidence/artifacts remain available.
             prefix = output.resolve() / 'environments' / uuid.uuid4().hex
@@ -1137,7 +1282,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                                        or not 1 <= max_operations <= 64):
         raise ValueError("max_operations must be an integer in 1..64")
     candidates = (catalog(output, manifests, platform_facts())
-                  if (not python_is_given or cursor.get('base_preparation') == 'preparing')
+                  if (explicit_base is not None or not python_is_given or cursor.get('base_preparation') == 'preparing')
                   and store_for(output) is not None else [])
     if candidates:
         surveyed = {**surveyed, "environment_candidates": short_catalog(candidates)}
@@ -1205,15 +1350,20 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         if (planned.get('base_environment_id') != base_environment_id or
                 planned.get('base_environment_mode', 'clone') != base_environment_mode):
             raise ValueError('planner must honor the explicit environment selection')
-        if source_binding_ids is not None and planned.get('source_binding_ids', []) != source_binding_ids:
+        if source_binding_ids is not None and sorted(planned.get('source_binding_ids', [])) != sorted(source_binding_ids):
             raise ValueError('planner must honor explicitly selected source binding IDs')
         request_identity = object_digest({'id':base_environment_id,'mode':base_environment_mode,
             'fingerprint':explicit_base['fingerprint'],'overlay_fingerprint':explicit_base.get('overlay_fingerprint'),
             'context':manifests,'bindings':sorted(planned.get('source_binding_ids') or [])})
-        if previous_selection.get('request_identity') == request_identity:
+        if (previous_selection.get('request_identity') == request_identity and
+                not (reuse_environment_ref is not None and reusable is not None and
+                     previous_selection.get('prefix') != reusable['prefix'])):
             raise ValueError('same base and binding definition already attempted; continue its cursor or submit changed bindings/evidence')
-        transcript.append({'kind':'reset','why':'explicit isolated base/binding switch',
-            'base_id':base_environment_id,'new_prefix':str(prefix)})
+        transcript.append({'kind':'reset','why':('reuse prepared overlay; consumers require new verification'
+            if reusable is not None else 'explicit isolated base/binding switch'),
+            'base_id':base_environment_id,'new_prefix':str(prefix),
+            **({'prepared_overlay_identity':reusable['identity'], 'reuse_environment_ref':reusable['ref']}
+               if reusable is not None else {})})
         record, survived = [], []
         atomic_json(output/'transcript.json', {'rows':transcript})
     chosen_id = planned.get("base_environment_id")
@@ -1353,18 +1503,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         record = list(cursor.get("record", record))
         survived = [row["command"] for row in record if row.get("kind") != "probe"]
     def requested_compute(template: str, *, probe: bool = False):
-        grants = list(planned.get("resource_requests") or [])
-        for row in transcript:
-            if row.get("resource_requests"):
-                grants += row["resource_requests"]
-        resource = "gpu" if probe and compute is not None and compute.on_gpu else "cpu"
-        for row in grants:
-            if row.get("command") == template:
-                resource = row["resource"]
-        if resource == "gpu" and (compute is None or not compute.on_gpu):
-            from .compute_decision import ComputeDecision
-            return ComputeDecision("unavailable", -1, why="no selected GPU for explicit request")
-        return compute if resource == "gpu" else None
+        return operation_compute(template, planned=planned, transcript=transcript, compute=compute)
 
     def budget_exhausted() -> dict[str, Any]:
         transcript.append({"kind": "budget_exhausted", "at": now(),
@@ -1419,6 +1558,12 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                    "pending_commands": len(pending[index:]), "at": now()}
         partial["repair_rejection"] = next((row for row in reversed(transcript)
             if row.get("kind") == "repair_proposal_rejected"), {})
+        advice = next((row for row in reversed(transcript)
+            if row.get('kind') == 'repair_selection_advice' and
+               row.get('parent_evidence_id') == failed.get('evidence_id')), None)
+        if not new_native_operation and advice:
+            recovery_status = 'selection_proposed'
+            partial['selection_proposal'] = advice
         partial["recovery_status"] = recovery_status
         partial["new_native_operation"] = new_native_operation
         partial["recovery_revision"] = object_digest({"pending": pending[index:], "probes": probes,
@@ -1431,7 +1576,7 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
         # Bind to immutable evidence, not arbitrary model prose or package keywords.
         failed = current_queue_failure(cursor, transcript, head_only=True) if cursor.get('prefix') else next(
             (row for row in reversed(transcript) if "ok" in row and row.get("template") == pending[0]), {})
-        if failed.get("ok") is False and failed.get("evidence_id"):
+        if failed.get("ok") is False and failed.get("evidence_id") and not resource_retryable(failed):
             from .evidence_store import read_attempt_evidence
             read_attempt_evidence(output, failed["evidence_id"], limit=1)
             more, replacement = resume(client, repo, record, failed,
@@ -1464,6 +1609,13 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                 "related_retired_operations": retired_templates,
                 "new_commands": list(more), "probes_changed": bool(replacement)})
             checkpoint()
+    if failed_probe and resource_retryable(failed_probe) and not pending:
+        from .evidence_store import read_attempt_evidence
+        read_attempt_evidence(output, failed_probe['evidence_id'], limit=1)
+        transcript.append({'kind': 'resource_revalidation', 'parent_evidence_id': failed_probe['evidence_id'],
+            'reason': 'explicit Scheduler continuation retries the unchanged pre-start operation; '
+                      'fresh occupancy/lease/budget checks remain required'})
+        failed_probe = {}
     if failed_probe and not pending:
         from .evidence_store import read_attempt_evidence
         read_attempt_evidence(output, failed_probe["evidence_id"], limit=1)
@@ -1545,6 +1697,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                 "verdict": {"passed": False, "reason": "build not yet verified"},
                 "latest_attempt": result,
             })
+            if resource_retryable(result):
+                return checkpoint(recovery_status='resource_wait')
             if result.get("failure_kind") == "integrity_boundary":
                 return _finish(output, repo, python, record, transcript, probes,
                                {"passed": False, "reason": "integrity_boundary"},
@@ -1659,6 +1813,8 @@ def build(repo: Path, *, client: Any, prefix: Path, output: Path, python: str | 
                 if not outcome["ok"]:
                     failed_probe = {**outcome, "kind": "probe", "probe": probe}
                     next_probe = probe_index
+                    if resource_retryable(outcome):
+                        return checkpoint(recovery_status='resource_wait')
                     break
                 if max_operations and operations >= max_operations and probe_index + 1 < len(probes):
                     # Successful capability receipts survive across Scheduler turns.
@@ -1795,6 +1951,7 @@ def plan(client: Any, repo: Path, *, manifests: dict[str, str], assets: dict[str
                     "execution_path_guidance": "Use quoted aliases verbatim in commands. "
                         "They are restored locally; display redaction markers are never executable paths.",
                     "installed_packages": installed_packages,
+                    "prepared_overlays": prepared_environment_catalog(paths.output, repo),
                     "interpreter_already_present": bool(python), **(assets or {}),
                     "explicit_bound_resources": bound_assets}
     prior_output = getattr(client, "output", None)
@@ -1848,13 +2005,11 @@ def plan(client: Any, repo: Path, *, manifests: dict[str, str], assets: dict[str
                 if mode != 'overlay' and bindings:
                     raise ValueError('source_binding_ids apply only to overlay mode')
                 required_bindings = ((assets or {}).get('required_environment_selection') or {}).get('source_binding_ids')
-                if required_bindings is not None and bindings != required_bindings:
+                if required_bindings is not None and (not isinstance(bindings,list) or
+                        sorted(bindings) != sorted(required_bindings)):
                     raise ValueError('honor explicitly selected source_binding_ids')
-                options = {r['id']:r for r in (selected.get('source_binding_options') or [])}
-                if (not isinstance(bindings, list) or len(bindings) > 64 or
-                        any(not isinstance(i, str) or i not in options for i in bindings) or
-                        len({options[i]['module'] for i in bindings}) != len(bindings)):
-                    raise ValueError('select valid source binding IDs, at most one per module')
+                from .environment_overlay import validate_binding_ids
+                validate_binding_ids(bindings, selected.get('source_binding_options') or [])
                 if str(value.get("python")) != str(selected.get("python")):
                     raise ValueError("selected base Python must match planned Python version")
             required_selection = (assets or {}).get('required_environment_selection')
@@ -1875,7 +2030,7 @@ def plan(client: Any, repo: Path, *, manifests: dict[str, str], assets: dict[str
                        "repository_checkout": str(repo)}
             faults = plan_problems(value, context)
             faults += unnecessary_version_installs(
-                value, installed_packages=(installed_packages if not base_id else
+                value, installed_packages=(installed_packages if not base_id or python else
                     [{"name": name, "version": version} for name, version in
                      {**selected.get("core_packages", {}),
                       **(selected.get('declared_package_matches') or {})}.items()]), manifests=manifests)
@@ -1958,6 +2113,7 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
         "declared_dependencies": {k: v[:4000] for k, v in executable_manifests.items()},
         "execution_path_aliases": paths.catalog(),
         "installation_recovery_inventory": resources,
+        "prepared_overlays": prepared_environment_catalog(paths.output, repo),
         "actual_environment_observation": prompt_view(observation,
             json.dumps([executable_manifests, failure, current_probes, pending_commands])),
         "required_existing_probes": [paths.encode_text(item) for item in (current_probes or [])],
@@ -2045,6 +2201,15 @@ def resume(client: Any, repo: Path, record: list[dict[str, Any]], failure: dict[
                         raise ValueError("submitted repair operations must be bounded lists of nonempty strings")
             else:
                 value = _object(content)
+            if value.get('proposed_action') is not None:
+                if value.get('commands') or value.get('probes') or value.get('unbuildable'):
+                    raise ValueError('selection advice must not also install, replace probes or declare a boundary')
+                proposal = selection_advice(paths.output,repo,value['proposed_action'],manifests=manifests)
+                transcript.append({'kind':'repair_selection_advice', 'parent_evidence_id':failure.get('evidence_id'),
+                    'proposed_action':proposal, 'authority':'Fix advice; Main must choose; not executed',
+                    'native_operation_launched':False})
+                finish(paths.output,intent_id,'selection_proposed')
+                return [], None
             paths.operations(value)
             validate_resource_requests(value)
             if str(value.get("unbuildable", "")).strip():

@@ -49,6 +49,22 @@ def test_triage_is_bound_to_actual_evidence_and_never_rewrites_score(tmp_path):
     assert len(list((root/current['diagnosis_ref']).parent.joinpath('history').glob('*.json'))) == 2
 
 
+@pytest.mark.parametrize('changed_source', [False, True])
+def test_triage_resolves_run_owned_source_handles_without_losing_native_context(tmp_path, changed_source):
+    from autosim.research.checkout_source_citations import capture
+    root, repo, measured, diagnosis = fixture(tmp_path)
+    source = capture(root, repo, {'ref':'train.py'})
+    diagnosis['source_refs'] = [{'ref':source['ref'], 'quote':source['quote']}]
+    before = measured.read_bytes()
+    if changed_source:
+        (repo/'train.py').write_text('changed native loader')
+        with pytest.raises(ValueError, match='sealed_source_invalid'):
+            triage.record(root, repo, 'derived', diagnosis)
+    else:
+        assert triage.record(root, repo, 'derived', diagnosis)['status'] == 'triaged_local_only'
+    assert measured.read_bytes() == before
+
+
 @pytest.mark.parametrize('fault',['subject','missing_native','foreign_native','native_bytes','source_quote','shape'])
 def test_unproven_or_stale_triage_cannot_clear_handoff(tmp_path,fault):
     root,repo,measured,diagnosis = fixture(tmp_path)
@@ -73,6 +89,44 @@ def test_changed_measurement_or_diagnosis_reopens_triage(tmp_path):
     triage.record(root,repo,'derived',diagnosis)
     row = read_json(measured);row['settings'] = {'steps':8192};atomic_json(measured,row)
     assert triage.view(root,'derived')['status'] == 'required'
+
+
+def test_prestart_reference_failure_exposes_sealed_evidence(tmp_path,monkeypatch):
+    from autosim.research.operation_failure import seal
+    root=tmp_path/'run';root.mkdir()
+    proof=seal(root,operation='measurement_protocol_guard',exc=ValueError('frozen protocol changed'),
+        native_operation_status='not_started')
+    path=root/'research/derived/measurements/reference_blocked.json'
+    atomic_json(path,{'ok':False,'ran':False,'why':'frozen protocol changed',**proof})
+    monkeypatch.setattr('autosim.research.baseline_reference.view',lambda *a:{
+        'id':'published','status':'evaluation_failed',
+        'measurement_ref':'research/derived/measurements/reference_blocked.json',
+        'record_ref':'baseline_references/published.json'})
+    before=path.read_bytes()
+    current=triage.view(root,'derived')
+    assert current['status']=='required'
+    assert current['subject']['evidence_ids']==[proof['evidence_id']]
+    assert proof['evidence_ref'] in current['subject']['evidence_refs']
+    assert path.read_bytes()==before
+
+
+def test_missing_historical_proof_is_not_an_impossible_diagnosis_action(tmp_path,monkeypatch):
+    from tests.test_prepare import preparation
+    controller=preparation(tmp_path)
+    controller.client.supports_main_agent=True
+    measurement=controller.output/'research/derived/measurements/reference_legacy.json'
+    atomic_json(measurement,{'ok':False,'why':'legacy prestart refusal','evaluate':{'ran':False}})
+    monkeypatch.setattr('autosim.research.baseline_reference.view',lambda *a:{
+        'id':'published','status':'evaluation_failed',
+        'measurement_ref':'research/derived/measurements/reference_legacy.json',
+        'record_ref':'baseline_references/published.json'})
+    before=measurement.read_bytes()
+    current=triage.view(controller.output,'derived')
+    assert current['status']=='required' and current['diagnosis_recordable'] is False
+    assert 'sealed_failure_evidence_missing' in current['subject']['problems']
+    assert 'Do not fabricate' in current['evidence_gap']
+    assert 'record_baseline_diagnosis' not in controller._available_operations()
+    assert measurement.read_bytes()==before
 
 
 def test_zero_reward_is_not_inferred_to_mean_zero_success(tmp_path):

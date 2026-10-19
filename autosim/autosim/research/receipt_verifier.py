@@ -85,6 +85,23 @@ def verify_measurement(root: Path, label: str, *, _policy_lineage: tuple[str,...
     if not isinstance(receipt, dict):
         return {"label": label, "status": "unverifiable", "checks": checks,
                 "issues": issues + ["evaluation receipt is not an object"]}
+    completed_link=measured.get('completed_evaluation_link') is not None
+    if completed_link:
+        try:
+            from .completed_evaluation_recovery import verify_link
+            receipt=verify_link(root,measured,receipt)
+            check('completed_evaluation_link',True,'')
+        except (OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
+            return {'label':label,'attempt_id':attempt,'status':'unverifiable','checks':checks,
+                    'issues':issues+['invalid completed evaluation link: '+str(exc)[:500]]}
+    if measured.get('scoring_recovery') is not None:
+        try:
+            from .reference_score_recovery import scoring_receipt
+            receipt = scoring_receipt(root, measured, receipt)
+            check('scoring_recovery', True, '')
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            return {'label': label, 'attempt_id': attempt, 'status': 'unverifiable',
+                    'checks': checks, 'issues': issues + [f'invalid scoring recovery: {exc}']}
     expected_node = "evaluate"
     graph_run = measured.get("graph_run") or {}
     if graph_run:
@@ -115,8 +132,20 @@ def verify_measurement(root: Path, label: str, *, _policy_lineage: tuple[str,...
           receipt.get("node_id") == expected_node,
           "receipt is not the named evaluate attempt")
     settings = measured.get("settings")
-    check("receipt_settings", isinstance(settings, dict) and
-          receipt.get("settings_digest") == object_digest(settings),
+    if measured.get('protocol_revision_id'):
+        try:
+            from .protocol_revision import effective
+            frozen_path,revision=effective(root)
+            check('protocol_revision',revision is not None and
+                revision['id']==measured['protocol_revision_id']==receipt.get('protocol_revision_id') and
+                receipt.get('frozen_protocol_ref')==frozen_path.relative_to(root).as_posix() and
+                receipt.get('frozen_protocol_sha256')==digest(frozen_path),
+                'prospective protocol version or parent identity changed')
+        except (OSError,ValueError,TypeError,KeyError) as exc:
+            check('protocol_revision',False,str(exc))
+    native_settings=measured.get('evaluation_settings') if completed_link else settings
+    check("receipt_settings", isinstance(settings, dict) and isinstance(native_settings,dict) and
+          receipt.get("settings_digest") == object_digest(native_settings),
           "evaluation receipt is not bound to the measurement settings")
     try:
         protocol_path = root / "comparison_protocol.json"
@@ -181,7 +210,8 @@ def verify_measurement(root: Path, label: str, *, _policy_lineage: tuple[str,...
     if isinstance(consumption, dict) and consumption.get("status") == "verified":
         try:
             log_path = Path(str(receipt.get("log") or "")).resolve(strict=True)
-            policy_path = Path(str(archived_policy.get("path") or "")).resolve(strict=True)
+            policy_path = Path(str(measured.get('consumed_policy_path') if completed_link else
+                                   archived_policy.get("path") or "")).resolve(strict=True)
             proof = verify_policy_consumption(log_path, policy_path)
             check("native_policy_consumption", proof.get("status") == "verified",
                   "native policy loader evidence no longer matches frozen policy bytes")
@@ -271,6 +301,16 @@ def verify_measurement(root: Path, label: str, *, _policy_lineage: tuple[str,...
             check("native_metric_lineage", native_lineage.get("status") == "verified" and
                   (measured.get("metric_lineage") or {}).get("status") == "verified",
                   "native metric did not bind the same completed episodes and policy")
+            if measured.get('scoring_recovery') is not None:
+                from .policy_consumption import verified_episode_count
+                actual_count=verified_episode_count({**measured,'policy_consumption':proof,
+                    'rollout_evidence':native_rollout,'metric_lineage':native_lineage,
+                    'metric_reading':reading,'metric_value':reading.get('value')})
+                expected_count=(protocol.get('settings') or {}).get('episodes')
+                check('recovered_native_episode_scope',type(expected_count) is int and expected_count>0
+                    and actual_count==expected_count and verified_episode_count(measured)==expected_count
+                    and (measured.get('rollout_evidence') or {}).get('episode_ids')==native_rollout.get('episode_ids'),
+                    'recovered score does not bind the complete frozen native episode set')
         except (OSError, ValueError, RuntimeError, TypeError):
             check("native_metric_lineage", False,
                   "native metric lineage could not be independently reread")

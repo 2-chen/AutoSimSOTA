@@ -451,3 +451,19 @@ def test_registry_snapshot_is_paged_without_sending_all_file_lists(tmp_path):
     assert len(first['registered_artifacts'])==2
     last=sr.snapshot(output,registry_offset=2,registry_limit=2)
     assert len(last['registered_artifacts'])==1 and last['registry_next_offset'] is None
+@pytest.mark.parametrize('stage',['collect','prepare_data'])
+def test_data_producer_inventory_is_readonly_and_never_authorizes_gc(tmp_path,stage):
+    from autosim.research.common import digest
+    output,folder,identity=producer(tmp_path,stage=stage)
+    before={path:digest(path) for path in folder.iterdir() if path.is_file()}
+    page=sr.inspect_producer(output,evidence_id=identity,limit=2)
+    assert page['stage']==stage and page['read_only'] is True
+    assert page['data_payload_gc_eligible'] is False and len(page['files'])==2
+    assert page['next_offset']==2
+    sl.configure(output,auto_gc=True)
+    with pytest.raises(ValueError,match='data producers are not eligible'):
+        sl.native_owner(output,identity)
+    with pytest.raises(ValueError,match='data producers are not eligible'):
+        group(output,folder,identity,'middle.pt','intermediate')
+    assert not sl.catalog(output)
+    assert all(path.exists() and digest(path)==sha for path,sha in before.items())

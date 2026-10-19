@@ -58,9 +58,11 @@ def test_checkpoint_rebind_never_waives_other_context(tmp_path, key):
     base = {'checkpoint':'old', 'entrypoint_sha256':'code', 'interpreter':'runtime',
             'task':'frozen', 'row':{'entrypoint':'eval.py'}}
     saved = drafts.save(tmp_path, stage='evaluate', base=base, row={}, reason='native failure')
-    with pytest.raises(ValueError, match='changed'):
+    with pytest.raises(drafts.DraftContextChanged, match='changed') as error:
         drafts.load(tmp_path, saved['ref'], stage='evaluate',
                     base={**base, 'checkpoint':'new', key:'changed'}, rebind_inputs=['checkpoint'])
+    assert error.value.changed_fields==sorted(['checkpoint',key])
+    assert not error.value.checkpoint_only
 
 
 @pytest.mark.parametrize('keys', [['interpreter'], ['checkpoint','checkpoint'], 'checkpoint', [{}]])

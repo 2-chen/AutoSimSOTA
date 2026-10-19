@@ -48,6 +48,71 @@ def test_launcher_preserves_verified_main_baseline_settings_without_requiring_ag
     assert (real.run_root/'controller_session.json').read_bytes()==before
 
 
+@pytest.mark.parametrize('fault', ['', 'constraint', 'session_settings', 'session_hash',
+    'parent_hash', 'parent_action', 'parent_child', 'native_settings', 'native_stage',
+    'evaluation_exposed', 'linked_parent'])
+def test_launcher_can_resume_main_owned_paid_unscored_baseline_without_adoption(tmp_path, fault):
+    from tests.test_derived_research import research
+    from autosim.research.common import atomic_json, object_digest, read_json
+    from autosim.research.action_receipt import ActionReceipt, write_action_receipt
+    real = research(tmp_path)
+    real.require_training_progress = True
+    real.controller_decision_id = 'a'*16
+    real.backend.stages['train']['artifact'] = 'models/**'
+    real.backend.sources['train'] = real.backend.sources['train'].replace(
+        'print("succ: 0.50")', 'print("global_step=17")')
+    settings = {'task':'Lift', 'steps':17, 'episodes':50, 'seed':0}
+    baseline = real.baseline(settings=settings)
+    assert baseline['ok'] is False and baseline['where'] == 'policy_artifact'
+    assert not baseline.get('evaluate')
+    train = baseline['train']
+    attempt = train['attempt_id']
+    relative = f'research/derived/attempts/{attempt}/receipt.json'
+    session_path = _session(real.output, settings=settings, repository=tmp_path)
+    session = read_json(session_path)
+    if fault == 'session_settings':
+        session['base_settings']['steps'] = 1
+    session['input_component_sha256'] = {'settings':object_digest(session['base_settings'])}
+    if fault == 'session_hash':
+        session['input_component_sha256']['settings'] = '0'*64
+    atomic_json(session_path, session)
+    ref, _ = write_action_receipt(real.output, ActionReceipt(
+        action_id='a'*16, decision_id='a'*16, run_id='derived', repository=str(tmp_path),
+        action='derive_a_command' if fault == 'parent_action' else 'run_the_loop',
+        state_revision=1, started_at='2026-10-11T00:00:00+00:00',
+        finished_at='2026-10-11T00:01:00+00:00', status='yielded', reason='Unscored paid baseline',
+        child_attempt_ids=[] if fault == 'parent_child' else [attempt], evidence_refs=[relative]))
+    if fault == 'parent_hash':
+        parent = read_json(real.output/ref)
+        parent['reason'] = 'modified without resealing'
+        atomic_json(real.output/ref, parent)
+    if fault == 'linked_parent':
+        original = real.output/ref
+        original.rename(original.with_name('original.json'))
+        original.symlink_to('original.json')
+    if fault in {'native_settings', 'native_stage'}:
+        receipt = read_json(real.output/relative)
+        if fault == 'native_settings':
+            receipt['settings_digest'] = '0'*64
+        else:
+            receipt['node_id'] = 'evaluate'
+        atomic_json(real.output/relative, receipt)
+    if fault == 'evaluation_exposed':
+        baseline['evaluate'] = {'attempt_id':'f'*32}
+        atomic_json(real.run_root/'measurements/baseline.json', baseline)
+    requested = {'task':'Other' if fault == 'constraint' else 'Lift'}
+    before_session = session_path.read_bytes()
+    before_baseline = (real.run_root/'measurements/baseline.json').read_bytes()
+    if fault:
+        with pytest.raises(ValueError, match='different frozen rounds/settings'):
+            validate_paused_research_resume(real.output, rounds=2, settings=requested, repository=tmp_path)
+    else:
+        assert validate_paused_research_resume(real.output, rounds=2, settings=requested,
+            repository=tmp_path) == 2
+    assert session_path.read_bytes() == before_session
+    assert (real.run_root/'measurements/baseline.json').read_bytes() == before_baseline
+
+
 @pytest.mark.parametrize("rounds,settings", [
     (1, {"task": "PushCube-v1"}),
     (2, {"task": "PushCube-v1", "steps": 2_000_000}),

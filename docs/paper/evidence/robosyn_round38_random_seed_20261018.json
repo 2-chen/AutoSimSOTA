@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "kind": "formal_development_random_data_third_training_seed_not_matched_method_effect",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_38_handoff_correction",
+  "training": {
+    "attempt_id": "ba2af2d2d9a54657b7e166a740f88a16",
+    "returncode": 0,
+    "seconds": 95.7,
+    "completed_updates": 1000,
+    "seed": 20261032,
+    "registered_version": "click_bell_random_quality_20ep_007_v1",
+    "consumption_stage": "training_batch",
+    "witness_events": 41,
+    "reader_streams": 1,
+    "terminal_sample_uses_including_repeats": 8000,
+    "malformed_witness_json_lines": 0,
+    "saved_config_resume": false,
+    "saved_config_policy_pretrained_path_present": false,
+    "saved_config_batch_size": 8
+  },
+  "evaluation": {
+    "attempt_id": "392a99a9e6b94f659f9bc3d35f352800",
+    "returncode": 0,
+    "seconds": 491.6,
+    "development_score": 0.08,
+    "successes": 4,
+    "episodes": 50,
+    "policy_bundle_sha256": "79f8b6c7ef3826880cea39ae951015bb8e024a4d259eca6af7c58dd7aca8e5e0",
+    "data_consumption": "verified",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified"
+  },
+  "recovery": {
+    "fix_attempt_id": "3aeb9b29253e4681",
+    "main_handoff_action": "99528b3a99be273c",
+    "training_reused": true,
+    "original_unscored_measurement_preserved": true
+  },
+  "autonomy": {
+    "host_version": "v72",
+    "exact_prior_idea_reproposal_action": "b4894337f0781bd6",
+    "reproposal_parent": "train_batch_atomic_witness_v21",
+    "new_label": "train_batch_atomic_witness_v22",
+    "native_candidate_settings_training_fix_handoff": "system Main/Fix agents",
+    "operator_during_execution": "read-only monitoring and documentation; no native edits, scientific parameter choice, budget grant or restart",
+    "unassisted_cold_start_claim": false
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "method_gain_claim_supported": false,
+  "matched_acquisition_comparison_complete": false,
+  "limits": [
+    "No new acquisition in this trial.",
+    "8000 is repeated sample use, not unique trajectories; 41 sparse witness events are not 41 updates.",
+    "Three training seeds on one random-data set and one targeted-data set are not three independent acquisition repetitions.",
+    "Frozen common policy warm-start is absent from saved configuration; full matched recipe and semantic data quality remain uncertified.",
+    "Raw observations and arm registration do not establish acquisition method effects.",
+    "No held-out or SOTA claim."
+  ],
+  "source_hashes": {
+    "action_receipts/73da3b43a7adc58a.json": "fb4e700224308a4d839906a283decb1da862096ff43ec4a0e66d3f00537e5869",
+    "data_campaigns/click_bell_random_quality_vs_agent_targeted_v3/random_quality-20261032.json": "9a28987b8887ce1cf32c0627c70e040fe231fc8c3f26fb74cd2a25887655b5ee",
+    "action_receipts/b4894337f0781bd6.json": "f790b57f8eb09d57844e02a06ef6806e1db5cd34092b8533409f9d750d3d6c2b",
+    "action_receipts/f4e4cf33a6a7da7b.json": "bffa1bb84fe43406a48e3e29ef4d328f7acd81a49711569c952f5281bddeb5d6",
+    "action_receipts/99528b3a99be273c.json": "680158ac159fa0f3d2a9ca8e04508762c21cdc6696ae276c48b516213e001ed9",
+    "data_versions/click_bell_random_quality_20ep_007_v1.json": "46560f1f394060b531b24d59919a146858c5614dab67c6736e79ab4fd77f7998",
+    "data_campaigns/click_bell_random_quality_vs_agent_targeted_v3/plan.json": "df8f801721037ebc01ec9a40a961a0a5912438d9521f493d6a2ea5acdba904bb",
+    "research/derived/measurements/round_38.json": "5b3dacff24ce4a174f3eb6eb44b353d3d04efb9169621752bc297293eb18de9c",
+    "research/derived/measurements/round_38_handoff_correction.json": "ec9252ea4ef7a8070f231e67cf2b54f73772528f8a232d0e532cfe0bfa60b0d3",
+    "research/derived/code_changes/round-38.json": "ac53a9fe87f6899b4cb07e4c762c594468ac9c9fdad785feab01eeb3144bcc72",
+    "research/derived/train/native_outputs/ba2af2d2d9a54657b7e166a740f88a16/checkpoints/001000/pretrained_model/train_config.json": "717ad63214eb8b9d14b22fcda10fafb9ea6183f315898110e6ad96ce7abd3157",
+    "training_progress_audits/a102097e6927949ecc7732b22db6dcc780c522a532418bec54d72d25791a49b8.json": "50cf514960a69c09cd5e68123b73920dae1899779f0ced7d905c3e327ff9d106",
+    "verification_checkpoint_handoffs/434d03a57cb6f18f9e4d87239c447fe35ce7e086a5c6d52f0405177251d16ef9.json": "8596eb99ad0ba2f7bb54aa9e28544b0f691951afd18d34fd4aff293abd5d5c72",
+    "research/derived/attempts/ba2af2d2d9a54657b7e166a740f88a16/receipt.json": "e6caeb7f137addbc00b1c6c7e05b4b540e9591ef8877acd3869b456f7a550d8f",
+    "evidence/ba2af2d2d9a54657b7e166a740f88a16.json": "0d577eea7d23909d2b5c34a01e8b7d50fe528f373ad68016a6fb10556c7873bc",
+    "research/derived/train/attempts/ba2af2d2d9a54657b7e166a740f88a16/output.log": "114158c0f276413b9d56d7d0241b76f8ddf57f5462f88f6182a35c1017ee039e",
+    "research/derived/attempts/392a99a9e6b94f659f9bc3d35f352800/receipt.json": "0739298c3698a6126d888da1ca04044572b6a2152b2c8c909d33b6bc8123c8ec",
+    "evidence/392a99a9e6b94f659f9bc3d35f352800.json": "96c3dee7cb0cc1a8b5605b48560bd0ef7d38cbcbb2ea11afc63c9383b93fffc1",
+    "research/derived/evaluate/attempts/392a99a9e6b94f659f9bc3d35f352800/output.log": "260d779f2f5d6c1dc1b06599baaafe8ab0d9af8e78addc7926b429f348c97dea",
+    "research/derived/evaluate/native_outputs/392a99a9e6b94f659f9bc3d35f352800/eval_result/click_bell/act/random/policy/2026-10-18_22-33-36/evaluation_metrics.json": "5f0defdc7f1157984a0ff75ebd5c906854aa494119c558a8f9251153cbb791ef"
+  }
+}

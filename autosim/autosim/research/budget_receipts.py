@@ -1,5 +1,6 @@
 """Reconcile abandoned model holds from executor receipts, never from process death alone."""
 from pathlib import Path
+from copy import deepcopy
 import math
 import re
 
@@ -46,6 +47,7 @@ def reconcile(ledger, *, apply=False):
     root = ledger.output
     with ledger._locked():
         document = ledger._read()
+        before_document = deepcopy(document)
         ledger._totals(document)
         before = object_digest(document)
         pending = {r['reservation_id']:r for r in document['entries']
@@ -54,12 +56,22 @@ def reconcile(ledger, *, apply=False):
         paths = list(root.glob('agent/sessions/*.json'))
         paths += list(root.glob('agent_tasks/*/agent/sessions/*.json'))
         paths += list(root.glob('agent_workers/*/agent/sessions/*.json'))
+        paths += list(root.glob('agent/turn_sessions/*.json'))
+        paths += list(root.glob('agent_tasks/*/agent/turn_sessions/*.json'))
+        paths += list(root.glob('agent_workers/*/agent/turn_sessions/*.json'))
         for path in sorted(paths)[:4000]:
             try:
                 session = _read(root,path)
                 identity = session.get('budget_reservation_id')
                 if identity in pending:
-                    sessions.setdefault(identity,[]).append((path,session))
+                    matches = sessions.setdefault(identity,[])
+                    # A latest projection and its per-turn archive may coexist.
+                    # Collapse only byte-identical records with the SAME owner;
+                    # conflicting ownership or state remains an audit refusal.
+                    if not any(object_digest(prior) == object_digest(session) and
+                               previous.parent.parent.parent == path.parent.parent.parent
+                               for previous, prior in matches):
+                        matches.append((path,session))
             except (OSError,ValueError,TypeError):
                 continue
         results = []
@@ -92,7 +104,18 @@ def reconcile(ledger, *, apply=False):
                 elif process.get('status') != 'not_launched':
                     raise ValueError('missing process identity is not evidence of zero usage')
                 pricing_path = owner/'agent/pricing'/f'{turn}.json'
-                price = _read(root,pricing_path)
+                if pricing_path.is_file() or pricing_path.is_symlink():
+                    price = _read(root,pricing_path)
+                else:
+                    pricing_path = owner/'agent/gateway_journals'/f'{turn}.json'
+                    price = _read(root,pricing_path)
+                    if (price.get('kind') != 'request_gateway_journal_v1' or
+                            price.get('budget_reservation_id') != identity or
+                            price.get('run_id') != ledger.run_id or price.get('role') != entry['role'] or
+                            price.get('session_id') != entry['session_id'] or
+                            Path(price.get('budget_output') or '').resolve() != root.resolve()):
+                        raise ValueError('durable request journal ownership differs')
+                    price = {**price, 'official_estimate_usd': known_gateway_cost(price.get('gateway'))}
                 from .deepseek_pricing import PRICE_CARD_ID
                 if (ledger.cost_basis != 'deepseek_official_estimate_v1' or
                         price.get('cost_basis') != ledger.cost_basis or price.get('turn_id') != turn or
@@ -126,7 +149,8 @@ def reconcile(ledger, *, apply=False):
             results.append(result)
         if apply and changed:
             document['updated_at'] = now()
-            atomic_json(ledger.path,document)
+            from .ledger_history import persist
+            persist(ledger, before_document, document, operation='receipt_reconciliation')
         report = {'schema_version':1,'created_at':now(),'applied':bool(apply),
                   'ledger_before_sha256':before,'ledger_after_sha256':object_digest(document),
                   'results':results,'policy':'receipt-backed only; process death never clears unknown usage'}

@@ -19,7 +19,10 @@ def allocation(research, idea_label: str, training_settings: dict | None = None)
     if idea is None or idea.status != CLEARED:
         raise ValueError('select one exact currently cleared idea')
     if idea.granularity not in {'param', 'algo'}:
-        raise ValueError('detached code candidates need a prepared patch transaction; use the synchronous audited path')
+        raise ValueError('detached code candidates need a prepared patch transaction. '
+            'Use the synchronous audited path for policy trials. For source-only collector/data-preparation '
+            'investment, use apply_workflow_candidate on an exact cleared code idea, then fresh stage '
+            'verification and a separate native job; application alone produces no score')
     if research.execution_graph:
         raise ValueError('graph candidates require graph-node artifact binding; use the existing graph experiment path')
     own = idea.change or {}
@@ -30,7 +33,7 @@ def allocation(research, idea_label: str, training_settings: dict | None = None)
     settings = proposed(research,session['base_settings'],idea)
     violation = research._comparison_protocol_violation(settings, target='evaluate')
     if violation:
-        raise ValueError('candidate changes the frozen evaluation protocol')
+        raise ValueError(f'candidate changes the frozen evaluation protocol: {violation}')
     if training_settings is not None:
         from .candidate_settings import apply
         settings=apply(research,settings,training_settings)

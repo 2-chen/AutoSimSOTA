@@ -35,6 +35,38 @@ def policy(output: Path) -> dict:
     return read_json(path) if path.is_file() else {}
 
 
+def native_review_events(jobs: list[dict], *, epoch: float) -> list[dict]:
+    """Two advisory checkpoints per live window, not heartbeat/model polling.
+
+    Output silence is not proof of a stall. These events only ask the owning Agent
+    to inspect work/remaining totals and decide whether any local change is needed.
+    A deadline adjustment or a new native attempt creates a new review identity.
+    """
+    events = []
+    for job in jobs:
+        if job.get('status') != 'running' or job.get('worker') != 'matching_running':
+            continue
+        deadline, window = job.get('deadline_epoch'), job.get('window_seconds')
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or
+               not math.isfinite(v) for v in (deadline, window)) or window < 60:
+            continue
+        remaining = deadline - epoch
+        if remaining <= 0 or remaining > window / 2:
+            continue
+        phase = ('deadline_near' if remaining <= min(300, window / 4)
+                 else 'window_midpoint')
+        progress = job.get('progress') or {}
+        events.append({'job_id': job['job_id'], 'phase': phase,
+                       'attempt_id': progress.get('attempt_id') or job.get('attempt_id'),
+                       'deadline_epoch': deadline, 'window_seconds': window,
+                       'remaining_seconds': remaining, 'progress': progress,
+                       'job_ref': job.get('job_ref'), 'owner': 'resource',
+                       'instruction': 'Inspect native progress and remaining hard totals; '
+                       'recommend keeping, extending or cancelling this local window. '
+                       'This advisory is not a stall diagnosis or permission to change protocol.'})
+    return events
+
+
 @contextmanager
 def locked(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,6 +138,46 @@ def resource_profile(value: dict | None, *, gpu: bool = False) -> dict:
     return answer
 
 
+def _physical_core(cpu: int) -> tuple[int, int] | None:
+    """Observe Linux topology, never infer sibling relationships from CPU numbers."""
+    if type(cpu) is not int or cpu < 0:
+        return None
+    root=Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+    try:
+        values=[]
+        for name in ('physical_package_id','core_id'):
+            with (root/name).open() as source:
+                raw=source.read(32)
+            if not raw.strip().isdigit():
+                return None
+            values.append(int(raw))
+        return values[0],values[1]
+    except (OSError,ValueError):
+        return None
+
+
+def _available_cpu_ids(allowed: list[int], assigned: set[int]) -> list[int]:
+    """Prefer unused physical cores within the SAME logical-CPU resource grant.
+
+    Keep existing leases untouched. If any relevant topology is unavailable, use
+    the original affinity ordering rather than inventing physical separation.
+    Neither placement nor thread counts certify a throughput improvement.
+    """
+    available=[cpu for cpu in allowed if cpu not in assigned]
+    topology={cpu:_physical_core(cpu) for cpu in set(allowed)|assigned}
+    if any(group is None for group in topology.values()):
+        return available
+    seen={topology[cpu] for cpu in assigned}
+    spread,siblings=[],[]
+    for cpu in available:
+        group=topology[cpu]
+        if group in seen:
+            siblings.append(cpu)
+        else:
+            spread.append(cpu);seen.add(group)
+    return spread+siblings
+
+
 class HostLease:
     """Cross-run CPU/memory admission with strong PID reconciliation."""
     def __init__(self, identity: str, resources: dict, *, directory: Path | None = None,
@@ -167,7 +239,7 @@ class HostLease:
                 run_id="host-admission", attempt_id=self.identity, argv=[])
             assigned = {core for row in rows.values() for core in row.get("cores") or []}
             allowed = facts["cpu"].get("affinity") or list(range(int(facts["cpu"]["effective_cpus"])))
-            self.cores = [core for core in allowed if core not in assigned][:self.resources["cpu"]]
+            self.cores = _available_cpu_ids(allowed,assigned)[:self.resources["cpu"]]
             if len(self.cores) < self.resources["cpu"]:
                 atomic_json(self.path, rows)
                 return False

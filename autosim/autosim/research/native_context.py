@@ -8,6 +8,26 @@ import shlex
 from .common import atomic_json, object_digest, now, read_json
 
 
+def inspection_availability(output: Path):
+    """Published interpreter context is not proof that CLI exposes its tool."""
+    context = Path(output) / 'native_context.json'
+    published = context.is_file() and not context.is_symlink()
+    tool = 'mcp__autosim_exec__inspect_native_environment'
+    path = Path(output) / 'agent/tool_capabilities.json'
+    row = read_json(path) if path.is_file() and not path.is_symlink() and path.stat().st_size <= 32000 else {}
+    if tool in (row.get('advertised_tools') or []):
+        status = 'advertised'
+    elif tool in (row.get('configured_tools') or []):
+        status = 'missing_from_cli'
+    else:
+        status = 'not_observed_for_capable_role'
+    return {'available': published and status == 'advertised', 'context_published': published,
+        'cli_tool_status': status, 'observed_role': row.get('role'),
+        'guidance': 'Context publication is not CLI tool discovery or environment readiness. '
+            'A missing configured tool is a tool-schema/runtime issue, not a reason to reinstall SDK. '
+            'Native execution revalidates context and authorized source bindings.'}
+
+
 def publish_context(output: Path, repo: Path, interpreter: Path, environment: dict):
     output = output.resolve()
     # Keep only run-local path configuration, never arbitrary inherited secrets.
@@ -63,6 +83,38 @@ def load_context(output: Path, workspace: Path):
     if row.get('runtime_library_dirs', []) != runtime_library_dirs(prefix, output, workspace):
         raise ValueError('native loader bindings changed; republish and revalidate consumers')
     return row
+
+
+def publish_interpreter_hint(output: Path, repo: Path, interpreter: Path | None):
+    """A safe run-local hint permits CPU source reading, not environment admission.
+
+    Otherwise a fresh study cannot inspect the known SDK until an environment build,
+    while its protocol survey needs those SDK sources before any native evaluation.
+    External paths are still not grants; CLI constructs the owned overlay first.
+    """
+    output, repo = Path(output).resolve(), Path(repo).resolve()
+    path = output/'native_context.json'
+    if path.exists() or path.is_symlink():
+        return {'status':'existing_context_preserved', 'readiness':'requires_native_consumers'}
+    if interpreter is None:
+        return {'status':'no_hint', 'readiness':'unverified'}
+    python = Path(interpreter).absolute()
+    prefix = python.parent.parent
+    if (not python.is_file() or prefix.is_symlink() or prefix == output
+            or not prefix.resolve().is_relative_to(output)):
+        return {'status':'hint_not_run_owned', 'readiness':'unverified'}
+    from .environment_overlay import readonly_roots
+    try:
+        readonly_roots(prefix, output, repo)
+        record = publish_context(output, repo, python, {})
+        load_context(output, repo)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        return {'status':'hint_context_refused', 'why':str(exc)[:500], 'readiness':'unverified'}
+    result = {'status':'diagnostic_hint_published', 'context_identity':record['identity'],
+              'readiness':'unverified_requires_native_consumers', 'gpu_access':False,
+              'authority':'provided run-owned interpreter for read-only CPU/source inspection only'}
+    atomic_json(output/'native_context_hint.json',result)
+    return result
 
 
 def record_command_configuration(output: Path, command: str, environment: dict):

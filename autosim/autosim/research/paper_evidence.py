@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import itertools
 import statistics
 from pathlib import Path
 
@@ -85,12 +86,18 @@ def build(output: Path, repo: Path, *, run_id='derived'):
             continue
         accepted={}
         for arm in campaign['observations']:
+            if arm.get('status') in {'unsupported','budget_limited'}:
+                issues.append({'campaign':campaign['id'],'arm':arm['arm'],'seed':arm['seed'],
+                               'why':arm.get('reason'),'status':arm['status']})
+                continue
             try:
                 measurement,witness=_measurement(output,run_id,arm['measurement_label'])
                 receipt=verify_measurement(output/'research'/run_id,arm['measurement_label'])
                 if receipt.get('status')!='consistent':
                     raise ValueError('native measurement receipt/identity is not consistently verified')
                 for ident in (arm['acquired_version_id'],arm['training_version_id']):
+                    if ident is None:
+                        continue  # A fixed-data control has no newly acquired version.
                     if ident not in checked:
                         _,bindings=resolve(output,repo,{'data':'data-version:'+ident})
                         checked[ident]=bindings[0]
@@ -105,8 +112,11 @@ def build(output: Path, repo: Path, *, run_id='derived'):
                 accepted[(arm['arm'],arm['seed'])]=measurement
             except (OSError,ValueError,TypeError,KeyError) as exc:
                 issues.append({'campaign':campaign['id'],'arm':arm['arm'],'seed':arm['seed'],'why':str(exc)[:500]})
-        for seed in campaign['comparison']['seeds']:
-            targeted=accepted.get(('targeted',seed));random=accepted.get(('random',seed))
+        pairs = ([('random','targeted')] if campaign.get('schema_version',1) == 1 else
+                 [('random_quality','agent_targeted'), ('rule_targeted','agent_targeted'),
+                  ('targeted_quality','fdas'), ('fixed_continuation','random_quality')])
+        for seed, (left_arm, right_arm) in itertools.product(campaign['comparison']['seeds'], pairs):
+            targeted=accepted.get((right_arm,seed));random=accepted.get((left_arm,seed))
             if not targeted or not random:
                 continue
             tm,rm=targeted.get('metric') or {},random.get('metric') or {}
@@ -122,12 +132,14 @@ def build(output: Path, repo: Path, *, run_id='derived'):
                 continue
             kind='binary' if all(x in (0,1) for x in [*left,*right]) else 'continuous'
             result=compare(left,right,kind=kind,paired=paired is not None).as_dict()
-            comparisons.append({'campaign':campaign['id'],'seed':seed,'random_to_targeted':result,
+            comparisons.append({'campaign':campaign['id'],'seed':seed,
+                'left_method':left_arm,'right_method':right_arm,
+                ('random_to_targeted' if left_arm == 'random' else 'statistics'):result,
                 'paired_by_initial_state_hash':paired is not None,
                 'interpretation':'development episode difference only; not held-out, causal fairness or training-seed uncertainty'})
     seed_summaries=[]
     for campaign in campaigns:
-        for arm in ('targeted','random','unfiltered'):
+        for arm in campaign.get('comparison', {}).get('arms', []):
             selected=[row for row in rows if row['campaign']==campaign['id'] and row['arm']==arm]
             values=[row['metric_value'] for row in selected]
             if values:

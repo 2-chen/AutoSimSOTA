@@ -19,6 +19,100 @@ def file_digest(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def formal_producers(root: Path, *, pending: list | None = None) -> list[dict]:
+    """Expose paid formal training too, not just smoke tests and detached jobs.
+
+    A measurement can be unscored because its *consumer* failed. That does not erase
+    a completed, independently audited producer. This is a read-only inventory;
+    adoption still rechecks the exact settings, source and comparison protocol.
+    """
+    from .training_progress_audit import candidates, sources, validate as validate_progress
+    root = Path(root).resolve()
+    offered, seen = [], set()
+    paths = sorted((root/'research').glob('*/measurements/*.json'))
+    for path in paths[-128:]:
+        try:
+            if path.is_symlink() or not path.resolve().is_relative_to(root) or path.stat().st_size > 2*1024**2:
+                continue
+            measurement = read_json(path)
+            label = str(measurement.get('label') or '')
+            if (measurement.get('confirmation') or label.startswith('confirmation') or
+                    measurement.get('baseline_origin') == 'released_reference' or path.stem != label):
+                continue
+            attempt = str((measurement.get('train') or {}).get('attempt_id') or
+                          (measurement.get('training_outcome') or {}).get('attempt_id') or '')
+            if not re.fullmatch(r'[0-9a-f]{32}', attempt) or attempt in seen:
+                continue
+            run_root = path.parent.parent
+            raw = run_root/'attempts'/attempt/'receipt.json'
+            if raw.is_symlink() or raw.stat().st_size > 2*1024**2:
+                continue
+            receipt = read_json(raw)
+            if (receipt.get('attempt_id') != attempt or receipt.get('run_id') != run_root.name or
+                    receipt.get('stage') != 'train' or receipt.get('status') != 'completed' or
+                    receipt.get('returncode') != 0 or receipt.get('termination_reason') != 'normal_exit'):
+                continue
+            native = read_attempt_evidence(root, attempt, limit=1)
+            if (native.get('status') != 'completed' or native.get('returncode') != 0 or
+                    native.get('receipt_ref') != raw.relative_to(root).as_posix()):
+                continue
+            progress = receipt.get('training_progress') or {}
+            audit = root/str(progress.get('audit_ref') or '')
+            if (progress.get('status') != 'observed' or audit.is_symlink() or
+                    not audit.resolve().is_relative_to(root/'training_progress_audits') or
+                    audit.stat().st_size > 2*1024**2):
+                continue
+            document = read_json(audit)
+            if document.get('native_evidence_ref') != receipt.get('evidence_ref'):
+                continue
+            output = Path(receipt['output_directory']).resolve(strict=True)
+            repo = Path(receipt['working_directory']).resolve(strict=True)
+            if not output.is_dir() or not output.is_relative_to(run_root) or not repo.is_relative_to(root):
+                continue
+            code = sources(repo, root, receipt['argv'])
+            provenance = {'kind':'current_source', 'restore_required':False}
+            if document.get('source_hashes') != [row['sha256'] for row in code]:
+                from .handoff_correction import historical_progress_sources
+                code, provenance = historical_progress_sources(root, run_root, repo,
+                                                               label, receipt['argv'])
+                if document.get('source_hashes') != [row['sha256'] for row in code]:
+                    raise ValueError('historical candidate trace does not match the complete training-time '
+                                     'source audit; retain weights and resolve changed dependencies/source')
+            checked = validate_progress(document['answer'], output=output,
+                docs=candidates(output, float(receipt['started_epoch'])), code=code)
+            artifact = receipt.get('artifact') or {}
+            if not (artifact.get('checked') and artifact.get('freshness_checked') and artifact.get('matched', 0) > 0):
+                continue
+            entries, count = [], 0
+            for item in sorted(output.rglob('*')):
+                if item.is_symlink() or not item.resolve().is_relative_to(output):
+                    continue
+                count += 1
+                if len(entries) < 96:
+                    entries.append({'ref':item.relative_to(root).as_posix(),
+                        'kind':'directory' if item.is_dir() else 'file',
+                        'bytes':item.stat().st_size if item.is_file() else None})
+            seen.add(attempt)
+            offered.append({'status':'available', 'origin':'formal_measurement',
+                'producer_id':attempt, 'training_attempt_id':attempt, 'label':label,
+                'run_id':run_root.name, 'output_ref':output.relative_to(root).as_posix(),
+                'native_evidence_ref':receipt['evidence_ref'], 'progress':checked,
+                'source_provenance':provenance,
+                'entries':entries, 'entry_count':count, 'entries_truncated':count > len(entries),
+                'formal_adoption_ready':False,
+                'formal_adoption_requirements':'same producer, exact original settings, verified original source '
+                    '(restore archived candidate if required), '
+                    'frozen development protocol and native policy-load/rollout/metric witnesses'})
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            if pending is not None:
+                pending.append({'origin':'formal_measurement',
+                    'measurement_ref':path.relative_to(root).as_posix(),
+                    'because':f'{type(exc).__name__}: {exc}'[:600],
+                    'instruction':'Resolve the original source/audit evidence for this completed '
+                        'producer; do not retrain or substitute probe weights to hide the refusal.'})
+    return offered
+
+
 def _verification_catalog(root: Path) -> dict:
     root = Path(root).resolve()
     def unavailable(why):
@@ -100,6 +194,7 @@ def catalog(root: Path) -> dict:
     if verification['status'] == 'available':
         producers.append({**verification, 'origin':'command_verification',
                           'producer_id':Path(verification['native_evidence_ref']).stem})
+    producers.extend(formal_producers(root, pending=pending))
     jobs_root = root/'native_jobs'
     paths = sorted(jobs_root.glob('*/request.json')) if not jobs_root.is_symlink() else []
     for path in paths[:128]:
@@ -138,6 +233,19 @@ def catalog(root: Path) -> dict:
                 raise ValueError('producer checkout is not run-owned')
             reviewed = revalidate_detached(receipt, path=receipt_path, root=root, repo=repo)
             if not reviewed:
+                from .native_jobs import source_matches
+                try:
+                    current=source_matches(root,repo,request)
+                except (OSError,ValueError,TypeError,KeyError):
+                    current=False
+                if not current:
+                    pending.append({'job_id':request['job_id'],'source_matches':False,
+                        'because':'completed historical training has missing/changed source identity; '
+                                  'unchanged inspection cannot perform the current-source progress audit',
+                        'next_operation':None,'native_evidence_ref':receipt.get('evidence_ref'),
+                        'instruction':'retain historical evidence and weights; resolve source provenance '
+                                      'before requesting a new audit, never bypass formal adoption'})
+                    continue
                 raise ValueError('inspect_native_job must independently audit/revalidate training progress')
             output = Path(receipt['output_directory']).resolve(strict=True)
             if not output.is_dir() or not output.is_relative_to(root/'research'/run_id):
@@ -159,6 +267,10 @@ def catalog(root: Path) -> dict:
                 source_current = source_matches(root,repo,request)
             except (OSError,ValueError,TypeError,KeyError):
                 source_current = False
+            # Formal measurements can already reference this detached producer.
+            # One physical output is one producer, not an ambiguous double entry.
+            if any(row['output_ref'] == output.relative_to(root).as_posix() for row in producers):
+                continue
             producers.append({'status':'available','origin':'native_job',
                 'formal_adoption_source_status':'current' if source_current else 'historical_source_requires_resolution',
                 'formal_adoption_ready':False,
@@ -235,3 +347,60 @@ def validate(root: Path, selected: dict) -> None:
         if (path.is_symlink() or not (resolved == base or resolved.is_relative_to(base)) or
                 path.stat().st_size != row['bytes'] or file_digest(path) != row['sha256']):
             raise ValueError('selected producer bytes changed before native loading: '+row['ref'])
+
+
+def bound_handoff(root: Path, measurement: dict, *, producer_evidence_ref: str) -> dict | None:
+    """Recover the measurement's exact selection proof, never infer a bundle path.
+
+    Older baseline recoveries retained the reference under ``recovery`` only;
+    newer compact train records retain it too. Both are identity-bound evidence,
+    not a filename scan or permission to pick a different producer.
+    """
+    refs = set()
+    for row in (measurement.get('train') or {}, measurement.get('recovery') or {},
+                measurement.get('handoff_correction') or {}):
+        if not isinstance(row, dict):
+            raise ValueError('invalid measurement checkpoint handoff container')
+        ref = row.get('checkpoint_handoff_ref')
+        if ref:
+            if not isinstance(ref, str):
+                raise ValueError('invalid measurement checkpoint handoff reference')
+            refs.add(ref)
+    if not refs:
+        return None
+    if len(refs) != 1:
+        raise ValueError('measurement contains conflicting checkpoint handoff references')
+    ref = refs.pop()
+    if not isinstance(ref, str) or not re.fullmatch(r'verification_checkpoint_handoffs/[a-f0-9]{64}\.json', ref):
+        raise ValueError('unsafe measurement checkpoint handoff reference')
+    root = Path(root).resolve(strict=True)
+    path = root/ref
+    if (path.is_symlink() or path.parent.is_symlink() or not path.is_file()
+            or not path.resolve().is_relative_to(root) or path.stat().st_size > 256*1024):
+        raise ValueError('measurement checkpoint handoff proof is missing or unsafe')
+    selected = read_json(path)
+    files = selected.get('files')
+    if not isinstance(files, list) or not 1 <= len(files) <= 256:
+        raise ValueError('invalid checkpoint handoff file manifest')
+    names = []
+    for row in files:
+        if (not isinstance(row, dict) or set(row) != {'ref','sha256','bytes'}
+                or not isinstance(row['ref'], str) or not row['ref']
+                or Path(row['ref']).is_absolute() or '..' in Path(row['ref']).parts
+                or not isinstance(row['sha256'], str) or not re.fullmatch('[a-f0-9]{64}',row['sha256'])
+                or type(row['bytes']) is not int or row['bytes'] < 0):
+            raise ValueError('invalid checkpoint handoff manifest entry')
+        names.append(row['ref'])
+    if len(set(names)) != len(names):
+        raise ValueError('duplicate checkpoint handoff manifest entry')
+    identity = object_digest({'producer':selected.get('producer_evidence_ref'), 'files':files})
+    if (path.stem != identity or selected.get('id') != identity
+            or selected.get('producer_evidence_ref') != producer_evidence_ref):
+        raise ValueError('checkpoint handoff proof identity or producer changed')
+    relative = Path(str(selected.get('checkpoint_ref') or ''))
+    if (not selected.get('checkpoint_ref') or relative.is_absolute() or '..' in relative.parts
+            or (root/relative).resolve(strict=True) != Path(selected.get('selected_path') or '').resolve(strict=True)
+            or str((measurement.get('policy_artifact') or {}).get('source') or '') != selected['selected_path']):
+        raise ValueError('checkpoint handoff does not bind the measurement native input')
+    validate(root, selected)
+    return {**selected, 'evidence_ref':ref}

@@ -29,6 +29,49 @@ def test_readable_closure_panel_separates_paid_training_and_verified_score(tmp_p
     assert 'SOTA' not in text
 
 
+def test_closure_panel_displays_hypothesis_and_exact_verification_gap(tmp_path):
+    held = snapshot(tmp_path)
+    held['experiment_lifecycle'] = {'candidates': [{
+        'label': 'round_1', 'status': 'unverified',
+        'research_note': {'hypothesis': '增加闭环反馈能否改善接触？'},
+        'verification': {'issues': ['实际加载权重与候选不同']},
+        'recovery': {'edge': 'measurement_to_commit'},
+    }]}
+    text = recorder.render(tmp_path, held, {})
+    assert '增加闭环反馈能否改善接触？' in text
+    assert '实际加载权重与候选不同' in text
+    assert '先复核现有回执，不重复训练' in text
+    assert '不是干预已生效' in text
+
+
+@pytest.mark.parametrize('value',[0.0,0.55])
+def test_reference_mismatch_is_not_necessarily_below_reference(tmp_path,value):
+    held=snapshot(tmp_path)
+    held['baseline_reference']={'status':'performance_mismatch','expected_metric':0.37,
+                               'measured_metric':value,'samples':100}
+    text=recorder.render(tmp_path,held,{})
+    assert '实测与参考值不一致' in text and '实测未达到参考值' not in text
+    assert '份开发测量记录' in text
+    assert '恢复记录不代表新增 GPU 试跑' in text
+
+
+def test_legacy_transport_failure_can_display_typed_upstream_payment_refusal(tmp_path):
+    turn='e'*32
+    atomic_json(tmp_path/'agent/runtime_failure.json',{'turn_id':turn,'category':'provider_transport'})
+    atomic_json(tmp_path/f'agent/pricing/{turn}.json',{'gateway':{'receipts':[
+        {'status':'unknown','diagnostics':{'http_status':402,'error_type':'HTTPError'}}]}})
+    view=run_record.build_report_view(tmp_path,'derived',status='infrastructure_blocked')
+    held=recorder.make_snapshot(tmp_path,view,{'actions':[],'plan':{}})
+    text=recorder.render(tmp_path,held,{})
+    assert '上游模型 API 返回 HTTP 402' in text
+    assert '不是本地实验预算耗尽或仿真环境失败' in text
+    assert '未知用量预留保留' in text
+    # A resumed run must not label a historical payment fault as its current blocker.
+    view['status']='running'
+    held=recorder.make_snapshot(tmp_path,view,{'actions':[],'plan':{}})
+    assert held['model_provider_blocker']=={}
+
+
 def test_report_includes_partial_build_facts_and_separate_model_budget(tmp_path):
     atomic_json(tmp_path / "provision_progress.json", {"status": "building", "attempts": [
         {"ok": True, "seconds": 12, "evidence_ref": "evidence/" + "a"*32 + ".json"},
@@ -63,7 +106,7 @@ def test_native_verification_is_displayed_without_claiming_scored_experiment(tmp
     assert '\x1b' not in document
     assert log.read_bytes() == original_bytes
     assert f'evidence/{identity}.json' in document
-    assert '已记录 0 项开发实验' in document
+    assert '已记录 0 份开发测量记录' in document
     assert snapshot['measurements'] == []
 
 
@@ -122,6 +165,77 @@ def measurement(root, label, value, protocol="a" * 64, *, direction="maximize", 
 def snapshot(root):
     return recorder.make_snapshot(root, run_record.build_report_view(root, "derived", status="running"),
                                   {"actions": [{"step": "train", "outcome": "done"}], "plan": {}})
+
+
+def native_record(root, *, stage='evaluate', gpu=True):
+    from autosim.research.evidence_store import capture_attempt_evidence
+    ident=hashlib.sha256(stage.encode()).hexdigest()[:32]
+    log=root/f'derivation_native/{ident}/native.log'
+    log.parent.mkdir(parents=True)
+    log.write_text('native stage completed\n')
+    ref=f'derivation_native/{ident}/receipt.json'
+    sealed=capture_attempt_evidence(root,attempt_id=ident,log=log,receipt_ref=ref,
+        status='completed',returncode=0,termination_reason='normal_exit')
+    atomic_json(root/ref,{**sealed,'id':ident,'stage':stage,'status':'completed',
+                         'gpu_allowed':gpu,'seconds':12})
+
+
+def test_native_receipts_trigger_new_narrative_event_without_new_score_or_action(tmp_path):
+    before=snapshot(tmp_path)
+    native_record(tmp_path,stage='train')
+    native_record(tmp_path)
+    after=snapshot(tmp_path)
+    assert after['event_revision']!=before['event_revision']
+    assert after['actions']==before['actions'] and after['measurements']==[]
+    facts=after['execution_facts']
+    assert facts['stages']['train']['completed']==1
+    assert facts['stages']['evaluate']['gpu_granted']==1
+    assert facts['formal_scored_measurements']==0
+    prose={'event_revision':before['event_revision'],'revision':before['revision'],
+           'sections':{key:{'text':'不实旧叙述：只有CPU导入。'} for key in recorder.FIELDS}}
+    document=recorder.render(tmp_path,after,prose)
+    assert '实际执行与正式计分' in document
+    assert '| evaluate | 1 | 0 | 1 |' in document
+    assert '正式计分测量：0 项' in document
+    assert '不实旧叙述' not in document
+
+
+def test_fact_reviewer_receives_contradiction_guards_even_when_writer_omits_them(tmp_path):
+    native_record(tmp_path,stage='train')
+    held=snapshot(tmp_path)
+    proposed={'sections':{key:{'text':'本轮都是CPU导入。','evidence_ids':['provisioning']}
+              for key in recorder.FIELDS},'demo_requests':[]}
+    class Reviewer:
+        def chat_with_metadata(self,system,user,**kw):
+            packet=json.loads(user)
+            assert packet['evidence']['execution_facts']['stages']['train']['completed']==1
+            assert {'last_completed_action','environment_queue'} <= set(packet['evidence'])
+            return json.dumps({'verdict':'unsupported','issues':[{'section':'finding',
+                'reason':'已完成原生训练，不能概括为仅CPU导入。','evidence_ids':['execution_facts']}]}),{}
+    with pytest.raises(ValueError,match='factual contradiction'):
+        recorder._review_facts(tmp_path,Reviewer(),held,proposed,remaining=10,
+            options={'timeout':10},attempt={},turns=[])
+
+
+def test_provider_blocked_report_refresh_never_calls_model(tmp_path,monkeypatch):
+    held=snapshot(tmp_path);held['status']='infrastructure_blocked'
+    monkeypatch.setattr(recorder,'narration_allowance',lambda root:{'allowed':True})
+    class Client:
+        supports_recorder=True
+        def chat_with_metadata(self,*a,**kw):pytest.fail('blocked provider cannot be retried for prose')
+    recorder.narrate(tmp_path,held,client=Client())
+    assert not (tmp_path/'report/recorder_trigger.json').exists()
+
+
+def test_later_environment_pass_makes_failed_revalidation_historical(tmp_path):
+    held=snapshot(tmp_path)
+    held['environment_queue']={'passed':True}
+    held['recovery_transaction']={'latest_revalidation':{'replayed_step':'build_the_environment',
+        'outcome':'reverification_failed','original_outcome':'checkpoint failure'}}
+    document=recorder.render(tmp_path,held,{})
+    assert '历史复验记录（环境现已通过）' in document
+    assert '当时未通过；后续环境验收已通过' in document
+    assert '原操作复验仍失败' not in document
 
 
 def test_report_current_cursor_and_latest_action_override_stale_working_plan(tmp_path):
@@ -615,11 +729,11 @@ def test_independent_fact_review_corrects_once_or_preserves_previous(tmp_path, m
         assert not result and trigger['status'] == 'failed'
         assert not recorder.pending_requests(tmp_path)
         assert not (tmp_path/'report/narrative.json').exists()
-        assert len(writer.calls) == (5 if mode == 'repeated' else 3)
+        assert len(writer.calls) == (5 if mode == 'repeated' else 4 if mode == 'bad_reference' else 3)
     assert all(0 < options['timeout'] <= 20 for _, options in writer.calls)
     assert all(options['read_only'] and options['resume_session'] is False for _, options in writer.calls)
     recorder.narrate(tmp_path, held, client=writer, timeout=40)
-    assert len(writer.calls) == (5 if mode in {'correctable', 'repeated'} else 3)
+    assert len(writer.calls) == (5 if mode in {'correctable', 'repeated'} else 4 if mode == 'bad_reference' else 3)
 
 
 def test_recorder_corrects_format_once_in_same_time_budget(tmp_path):
@@ -780,7 +894,73 @@ def test_new_research_event_stales_narration_and_generates_a_new_turn(tmp_path):
     second = snapshot(tmp_path)
     assert "上一份叙述已过期" in recorder.render(tmp_path, second, narrative)
     recorder.narrate(tmp_path, second, client=writer)
-    assert len(writer.calls) == 6
+    assert len(writer.calls) == 5  # Same writing purpose reuses its Agent-selected skills.
+    assert writer.calls[-2][0]['phase'] == 'write_report'
+    assert writer.calls[-1][0]['phase'] == 'review_report'
+    assert recorder.read(tmp_path, 'report/narrative.json')['skill_selection_reused']
+
+
+def test_writing_skill_cache_retains_agent_reasons_and_invalidates_changed_body(tmp_path, monkeypatch):
+    from autosim.research import skills
+    packet = {'skill_catalog': skills.skills_catalog(query='RUN.md recorder 中文 图表 视频 可读性'),
+        'phase': 'skill_selection', 'task_outline': {'status': 'running', 'measurement_count': 1,
+            'has_failure': False, 'has_media': False, 'purpose': 'writing'}, 'event_revision': 'first'}
+    writer = Writer()
+    methods, reasons, metadata, reused = recorder._select_writing_methods(tmp_path, writer, packet, {})
+    assert not reused and len(writer.calls) == 1
+    packet['event_revision'] = 'next'  # Fresh prose will use this; method selection need not.
+    packet['task_outline']['measurement_count'] = 2
+    _, later_reasons, _, reused = recorder._select_writing_methods(tmp_path, writer, packet, {})
+    assert reused and later_reasons == reasons and len(writer.calls) == 1
+    original = skills.read_selected_skills
+    def changed(ids):
+        result = original(ids)
+        result['selection'][0]['body_sha256'] = 'changed-body'
+        return result
+    monkeypatch.setattr(skills, 'read_selected_skills', changed)
+    assert not recorder._select_writing_methods(tmp_path, writer, packet, {})[-1]
+    assert len(writer.calls) == 2
+    packet['task_outline'].update(has_failure=True, failure_category='new_failure')
+    assert not recorder._select_writing_methods(tmp_path, writer, packet, {})[-1]
+    assert len(writer.calls) == 3
+    packet['skill_catalog']['unreadable_count'] += 1
+    assert not recorder._select_writing_methods(tmp_path, writer, packet, {})[-1]
+    assert len(writer.calls) == 4
+
+
+def test_presentation_workspace_stays_empty_and_rotates_on_configuration_changes(tmp_path):
+    from autosim.research.agent_client import RoleAwareAgentClient
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    (checkout / 'private_data.txt').write_text('must not be copied')
+    client = RoleAwareAgentClient(workspace=checkout, output=tmp_path, run_id='writing-test',
+        turn_budget_usd=.1, total_budget_usd=2, timeout=90)
+    first = recorder._writing_workspace(tmp_path, client)
+    assert recorder._writing_workspace(tmp_path, client) == first
+    worker, empty = first
+    assert list(empty.iterdir()) == []
+    assert recorder.read(worker, 'worker_parent.json')['read_only'] is True
+    child = client.fork_readonly(output=worker, workspace=empty, role='recorder')
+    assert child.budget_output == tmp_path and child._research_context == {}
+    # Reviewed narratives and old receipts survive a configuration/budget transition.
+    atomic_json(worker / 'agent/pricing/old.json', {'status': 'keep'})
+    client.total_budget_usd = 3
+    second = recorder._writing_workspace(tmp_path, client)
+    assert second != first and recorder.read(worker, 'agent/pricing/old.json') == {'status': 'keep'}
+    atomic_json(second[0] / 'agent/session.json', {'status': 'running'})
+    assert recorder._writing_workspace(tmp_path, client) != second
+
+
+def test_presentation_workspace_rejects_symlink_namespace(tmp_path):
+    from types import SimpleNamespace
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    (tmp_path / 'agent_workers').symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(ValueError, match='unsafe'):
+        recorder._writing_workspace(tmp_path, SimpleNamespace(workspace=checkout))
+    assert list(elsewhere.iterdir()) == []
 
 
 def test_running_action_is_separate_from_old_stop_and_plan(tmp_path):
@@ -793,7 +973,7 @@ def test_running_action_is_separate_from_old_stop_and_plan(tmp_path):
                     'next_actions': ['old environment preparation'],
                     'data_strategy': {'route': 'old deferred collection route'}}
     document = recorder.render(tmp_path, held, {})
-    assert '正在执行：**train**' in document
+    assert '正在执行：**执行训练**' in document
     assert '最近已返回的操作（历史）' in document
     assert '不是当前动作的结果或停止原因' in document
     assert '上次计划中的问题（未复核当前状态）' in document
@@ -825,6 +1005,20 @@ def test_stop_reason_is_historical_after_resume(tmp_path, status):
     assert ('<summary>上次停止说明（历史，当前已续跑）</summary>' in document) == (status == 'running')
 
 
+def test_active_native_derivation_and_historical_success_are_localized(tmp_path):
+    held = snapshot(tmp_path)
+    held.update(status='running', current_action='derive_a_command')
+    held['actions'] = [{'step': 'derive:train', 'outcome': 'done',
+                        'because': 'train runs'}]
+    document = recorder.render(tmp_path, held, {})
+    assert '正在执行：**推导并验收原生命令**' in document
+    assert '当前动作：推导并验收原生命令' in document
+    assert '验收原生入口：执行训练' in document
+    assert '状态：**操作已完成**' in document
+    assert '已核验开发分数：0 项' in document
+    assert recorder.operation_name('future_operation') == 'future_operation'
+
+
 @pytest.mark.parametrize('outcome, label', [
     ('not attempted', '未执行（原因见操作记录）'),
     ('yielded', '本段已返回主控，不代表实验成功'),
@@ -852,7 +1046,7 @@ def test_monitor_fixture_is_shown_as_operator_evidence_not_measurement(tmp_path)
     assert '外部监视诊断（不是原生实验结果）' in document
     assert '不是系统自主发现' in document
     assert '操作者取消了有缺陷的训练' in document
-    assert '已记录 0 项开发实验' in document
+    assert '已记录 0 份开发测量记录' in document
     assert '查看反例' in document
 
 
@@ -921,7 +1115,8 @@ def test_recorder_has_no_tools_or_mcp_and_cannot_execute(tmp_path):
     assert "--allowedTools" not in args
 
 
-def test_scheduler_capture_is_explicit_frozen_and_not_replayed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("development_status", ["paused", "completed"])
+def test_scheduler_capture_is_explicit_frozen_and_not_replayed(tmp_path, monkeypatch, development_status):
     output = tmp_path / "out"
     real = Preparation(repo=tmp_path, output=output, client=Writer(), scouting=tmp_path / "scout")
     path = measurement(output, "baseline", 1)
@@ -936,7 +1131,7 @@ def test_scheduler_capture_is_explicit_frozen_and_not_replayed(tmp_path, monkeyp
             assert not recorder.pending_requests(output)  # capturing persisted before side effects
             return {"status": "captured", "attempt_id": "3" * 32}
 
-    monkeypatch.setattr(real, "state", lambda: {"research_progress": {"status": "paused"}})
+    monkeypatch.setattr(real, "state", lambda: {"research_progress": {"status": development_status}})
     monkeypatch.setattr(real, "_research_controller", lambda: (Research(), {}))
     result = real.do("review_report_demo", request_id=request["id"], decision="capture", reason="预留预算内展示")
     assert result["outcome"] == "captured" and len(calls) == 1

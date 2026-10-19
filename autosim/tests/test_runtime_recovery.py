@@ -277,6 +277,26 @@ def test_repeated_sealed_startup_failure_stops_after_one_recovery_assessment(tmp
     assert result["supervision"]["automatic_relaunches"] == 0
 
 
+@pytest.mark.parametrize('category',['provider_transport','missing_final_response'])
+def test_empty_or_transport_decision_retries_are_bounded_without_paid_monitor(tmp_path,monkeypatch,category):
+    from tests.test_prepare import preparation
+    obj=preparation(tmp_path)
+    class Client:
+        @contextmanager
+        def as_role(self,role):
+            yield
+    obj.client=Client()
+    obj.output.mkdir(exist_ok=True)
+    def unexpected(*a,**kw):
+        raise AssertionError('no Monitor or native experiment for an empty decision')
+    monkeypatch.setattr(obj,'_monitor_failed_action',unexpected)
+    failure={'failure_category':category,'failure_fingerprint':'same-fault',
+             'evidence_id':'d'*32,'evidence_refs':['evidence/'+'d'*32+'.json']}
+    assert [obj._handoff_scheduler_decision_failure(failure=dict(failure)) for _ in range(4)] == [True,True,True,False]
+    assert json.loads((obj.output/'agent/runtime_recovery_gate.json').read_text())['attempts']==3
+    assert json.loads((obj.output/'runtime_blocker.json').read_text())['recovery']['status']=='blocked'
+
+
 def test_scheduler_sees_recovery_receipt_instead_of_stale_startup_failure(tmp_path, monkeypatch):
     from tests.test_prepare import preparation
     controller=preparation(tmp_path)

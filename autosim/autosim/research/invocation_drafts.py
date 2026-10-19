@@ -5,6 +5,17 @@ import re
 from .common import atomic_json, now, object_digest, read_json, redact
 
 
+class DraftContextChanged(ValueError):
+    def __init__(self, previous, current):
+        known=isinstance(previous,dict)
+        previous=previous if known else {}
+        self.changed_fields=sorted(k for k in set(previous)|set(current)
+                                   if previous.get(k)!=current.get(k))
+        self.checkpoint_only=self.changed_fields==['checkpoint'] and known
+        super().__init__('invocation draft belongs to changed source/input/interpreter context; '
+                         'changed_fields='+','.join(self.changed_fields))
+
+
 def save(output: Path, *, stage: str, base: dict, row: dict, reason: str,
          evidence_ref: str = '') -> dict:
     if not reason.strip():
@@ -60,7 +71,7 @@ def load(output: Path, ref: str, *, stage: str, base: dict | None = None,
                 object_digest(previous) != record.get('base_sha256') or
                 {k:v for k,v in previous.items() if k not in rebind_inputs} !=
                 {k:v for k,v in base.items() if k not in rebind_inputs}):
-            raise ValueError('invocation draft belongs to changed source/input/interpreter context')
+            raise DraftContextChanged(previous,base)
         # This transfers an unverified blueprint, never accepted execution/weights.
         # Main still chooses the new producer; caller binding and native postconditions
         # are enforced by make_runnable under the unchanged isolation/protocol.
@@ -83,7 +94,8 @@ def catalog(output: Path, limit: int = 6) -> list[dict]:
                           stage=candidate.get('stage'))
             rows.append({key: record.get(key) for key in ('id', 'ref', 'stage', 'status',
                 'base_sha256', 'row', 'reason', 'native_evidence_ref', 'authority')} |
-                {'rebindable_inputs': ['checkpoint'] if isinstance(record.get('base_context'), dict) else []})
+                {'rebindable_inputs': ['checkpoint'] if isinstance(record.get('base_context'), dict) else [],
+                 'rebind_validation':'potential checkpoint-only blueprint transfer; current source, row, task and interpreter must still match'})
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     return rows

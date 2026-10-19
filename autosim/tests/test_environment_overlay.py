@@ -46,6 +46,22 @@ def make(fixture, *, ids=None):
     return overlay.create(chosen, prefix=output/'env', output=output, repo=repo, source_binding_ids=bindings)
 
 
+def test_overlay_metadata_observation_is_single_read_and_not_stale(fixture,monkeypatch):
+    import importlib.metadata as metadata
+    base,site,_,repo,version=fixture
+    original=metadata.Distribution.metadata.fget
+    reads=[]
+    def observed(distribution):
+        reads.append(str(distribution._path))
+        return original(distribution)
+    monkeypatch.setattr(metadata.Distribution,'metadata',property(observed))
+    first=overlay.inspect(base,version,repo=repo)
+    assert len(reads)==1
+    (site/'task-1.dist-info/METADATA').write_text('Name: task\nVersion: 2\n')
+    second=overlay.inspect(base,version,repo=repo)
+    assert len(reads)==2 and second['fingerprint']!=first['fingerprint']
+
+
 def test_reuse_rebind_and_never_execute_old_hooks(fixture):
     base, site, output, repo, version = fixture
     before = {p.name:p.read_bytes() for p in site.iterdir() if p.is_file()}
@@ -67,6 +83,43 @@ def test_external_source_requires_selection(fixture):
     result = make(fixture, ids=[])
     attempt = subprocess.run([result['interpreter'], '-c', 'import addon'], capture_output=True, text=True)
     assert attempt.returncode != 0 and 'ModuleNotFoundError' in attempt.stderr
+
+
+def test_frozen_checkout_import_rebinding_preserves_original_prefix_and_local_overrides(fixture):
+    from autosim.research.workspace_snapshot import create
+    from autosim.research.common import isolated_argv, digest
+    base, site, output, repo, version = fixture
+    result = make(fixture)
+    prefix = output / 'env'
+    (prefix / 'lib' / f'python{version}' / 'site-packages/dependency.py').write_text('VALUE = 99\n')
+    source = base.parent / 'frozen_source'; (source / 'task').mkdir(parents=True)
+    (source / 'task/__init__.py').write_text("VALUE = 'frozen'\n")
+    fresh = output / 'confirmation_sources/baseline/checkout'
+    create(source, fresh)
+    original = prefix / 'lib' / f'python{version}' / 'site-packages/autosim_overlay_sources.py'
+    before = digest(original)
+    binding = overlay.isolated_source_bindings(Path(result['interpreter']), output=output,
+                                               original_repo=repo, repo=fresh)
+    checked = overlay.verify_isolated_source_bindings(Path(result['interpreter']),
+        output=output, repo=fresh, binding=binding)
+    assert checked['status'] == 'verified' and checked['gpu_access'] is False
+    argv = isolated_argv([result['interpreter'], '-c',
+        'import task,dependency,addon; print(task.VALUE,dependency.VALUE,addon.VALUE)'],
+        repo=fresh, output=output, allow_gpu=False, import_binding_override=binding)
+    text = subprocess.check_output(argv, cwd=fresh, text=True)
+    assert text.strip() == 'frozen 99 19'
+    nested = fresh / 'task'
+    nested_argv = isolated_argv([result['interpreter'], '-c', 'import pathlib; print(pathlib.Path.cwd().name)'],
+        repo=fresh, output=output, allow_gpu=False, import_binding_override=binding,
+        native_working_directory=nested)
+    assert subprocess.check_output(nested_argv, cwd=nested, text=True).strip() == 'task'
+    assert digest(original) == before
+    assert subprocess.check_output([result['interpreter'], '-c', 'import task; print(task.VALUE)'],
+                                  cwd=repo, text=True).strip() == 'current'
+    Path(binding['source']).write_text('# corrupted\n')
+    with pytest.raises(ValueError, match='import binding'):
+        isolated_argv([result['interpreter'], '-c', 'pass'], repo=fresh, output=output,
+                      import_binding_override=binding)
 
 
 def test_unknown_binding_refused_before_creation(fixture):
@@ -348,6 +401,117 @@ def provision_fixture(fixture, monkeypatch, *, bindings=()):
     return row, planned
 
 
+def test_explicit_base_reuses_supplied_prepared_overlay_and_local_delta(fixture, monkeypatch):
+    base, site, output, repo, version = fixture
+    prepared = make(fixture)
+    addon = next(b['id'] for b in overlay.inspect(base, version, repo=repo)['bindings'] if b['module']=='addon')
+    row, planned = provision_fixture(fixture, monkeypatch, bindings=[addon])
+    local = output/'env/lib'/f'python{version}'/'site-packages/local_delta.py'
+    local.write_text('VALUE = 123\n')
+    planned['probes'] = ["{python} -c 'import dependency,task,addon,local_delta; assert local_delta.VALUE == 123'"]
+    result = provision.build(repo,client=None,prefix=output/'env',output=output,
+        python=prepared['interpreter'],manifests={},assets={},max_rounds=1,
+        base_environment_id=row['id'],base_environment_mode='overlay',environment_selection_reason='reuse supplied base')
+    assert result['verdict']['passed'], result
+    assert result['interpreter'] == prepared['interpreter']
+    assert local.read_text() == 'VALUE = 123\n'
+    assert not list((output/'environments').glob('*/bin/python'))
+    assert not (base.parent/'HOOK_RAN').exists()
+
+
+def test_main_can_select_prepared_overlay_after_failed_other_prefix(fixture, monkeypatch):
+    base, site, output, repo, version = fixture
+    prepared = make(fixture)
+    row, planned = provision_fixture(fixture, monkeypatch)
+    kwargs = dict(client=None,prefix=output/'env',output=output,manifests={},assets={},max_rounds=1,
+        base_environment_id=row['id'],base_environment_mode='overlay',environment_selection_reason='source backed choice')
+    first = provision.build(repo,source_binding_ids=[],**kwargs)
+    assert not first['verdict']['passed']
+    addon = next(b['id'] for b in overlay.inspect(base,version,repo=repo)['bindings'] if b['module']=='addon')
+    planned['source_binding_ids'] = [addon]
+    second = provision.build(repo,reuse_environment_ref='env',**kwargs)
+    assert second['verdict']['passed'], second
+    assert second['interpreter'] == prepared['interpreter'] != first['interpreter']
+    assert Path(first['interpreter']).is_file()
+    assert len(list((output/'environments').glob('*/bin/python')))==1
+
+
+def test_invalid_caller_binding_sealed_before_model_or_prefix_change(fixture, monkeypatch):
+    base, site, output, repo, version = fixture
+    row, planned = provision_fixture(fixture,monkeypatch)
+    monkeypatch.setattr(provision,'plan',lambda *a,**kw: pytest.fail('bad caller must not buy a plan'))
+    with pytest.raises(provision.EnvironmentPlanError,match='unknown source_binding_ids: mistaken-id') as caught:
+        provision.build(repo,client=None,prefix=output/'env',output=output,manifests={},assets={},
+            base_environment_id=row['id'],base_environment_mode='overlay',
+            environment_selection_reason='select explicit SDK',source_binding_ids=['mistaken-id'])
+    failure=caught.value.planning_failure
+    assert failure['repair_owner']=='main_agent' and failure['retry_original_arguments'] is False
+    assert failure['native_operation_status']=='not_started'
+    from autosim.research.evidence_store import read_attempt_evidence
+    assert read_attempt_evidence(output,failure['evidence_id'])['status']=='proposal_rejected'
+    assert not list((output/'environments').glob('*'))
+    assert not (output/'environment_selection.json').exists()
+
+
+def test_native_fix_can_return_selection_advice_without_switching_or_installing(fixture, monkeypatch):
+    base,site,output,repo,version=fixture
+    prepared=make(fixture)
+    original_resume=provision.resume
+    row,planned=provision_fixture(fixture,monkeypatch)
+    proposal={'step':'build_the_environment','arguments':{
+        'base_environment_id':row['id'],'base_environment_mode':'overlay',
+        'reuse_environment_ref':'env','environment_selection_reason':'reuse same ABI and preserved local closure'}}
+    class Client:
+        def chat_with_metadata(self,system,user,**kwargs):
+            assert json.loads(user)['prepared_overlays'][0]['ref']=='env'
+            return json.dumps({'proposed_action':proposal,'reasoning':'preserved modules'}),{}
+    client=Client();client.output=output
+    transcript=[]
+    commands,probes=original_resume(client,repo,[],
+        {'evidence_id':'a'*32,'template':'{python} -c "import missing"','ok':False},
+        manifests={},transcript=transcript,values={'python':prepared['interpreter'],'repo':str(repo)},
+        current_probes=['{python} -c "import missing"'])
+    assert commands==[] and probes is None
+    assert transcript[-1]['kind']=='repair_selection_advice'
+    assert transcript[-1]['proposed_action']==proposal
+    assert transcript[-1]['native_operation_launched'] is False
+    assert not (output/'environment_selection.json').exists()
+    assert not list((output/'environments').glob('*'))
+
+
+@pytest.mark.parametrize('fault',['invalid_id','escape','install_mix','missing_reason'])
+def test_fix_selection_advice_rejects_unbounded_or_invalid_choice(fixture,monkeypatch,fault):
+    base,site,output,repo,version=fixture
+    make(fixture);row,_=provision_fixture(fixture,monkeypatch)
+    args={'base_environment_id':row['id'],'base_environment_mode':'overlay',
+          'reuse_environment_ref':'env','environment_selection_reason':'preserved local closure'}
+    if fault=='invalid_id':args['source_binding_ids']=['bad-id']
+    elif fault=='escape':args['reuse_environment_ref']='../other'
+    elif fault=='install_mix':args['repair_proposal']={'failure_evidence_id':'a'*32}
+    else:args['environment_selection_reason']=''
+    with pytest.raises(ValueError):
+        provision.selection_advice(output,repo,{'step':'build_the_environment','arguments':args},manifests={})
+    assert not (output/'environment_selection.json').exists()
+
+
+@pytest.mark.parametrize('change',['startup','base','escape','bindings'])
+def test_prepared_overlay_selection_rejects_changed_identity(fixture, monkeypatch, change):
+    base, site, output, repo, version = fixture
+    make(fixture)
+    row, planned = provision_fixture(fixture,monkeypatch)
+    ref='env'; ids=None
+    if change=='startup':(output/'env/lib'/f'python{version}'/'site-packages/autosim_overlay.pth').write_text('import os\n')
+    elif change=='base':(site/'task-1.dist-info/METADATA').write_text('Name: task\nVersion: 2\n')
+    elif change=='escape':ref='../base'
+    else:ids=[]
+    monkeypatch.setattr(provision,'plan',lambda *a,**kw: pytest.fail('invalid reuse must not buy a plan'))
+    with pytest.raises(provision.EnvironmentPlanError):
+        provision.build(repo,client=None,prefix=output/'env',output=output,manifests={},assets={},
+            base_environment_id=row['id'],base_environment_mode='overlay',
+            environment_selection_reason='reuse verified metadata',reuse_environment_ref=ref,source_binding_ids=ids)
+    assert not (base.parent/'HOOK_RAN').exists()
+
+
 def test_crash_before_first_probe_continues_without_model_or_new_prefix(fixture, monkeypatch):
     from autosim.research import native_context
     base, site, output, repo, version = fixture
@@ -423,6 +587,29 @@ def test_same_base_accepts_corrected_bindings_but_rejects_identical_retry(fixtur
     assert first['interpreter'] != second['interpreter']
     with pytest.raises(ValueError,match='already attempted'):
         provision.build(repo,source_binding_ids=[addon],**kwargs)
+
+
+def test_omitted_bindings_preserve_explicit_checkout_and_external_plan(fixture, monkeypatch):
+    from autosim.research import native_context
+    base,site,output,repo,version=fixture
+    options=overlay.inspect(base,version,repo=repo)['bindings']
+    ids=[b['id'] for b in options if b['module'] in {'task','addon'}]
+    row,planned=provision_fixture(fixture,monkeypatch,bindings=ids)
+    publish=native_context.publish_context
+    monkeypatch.setattr(native_context,'publish_context',lambda *a,**kw: (_ for _ in ()).throw(RuntimeError('crash')))
+    kwargs=dict(client=None,prefix=output/'env',output=output,manifests={},assets={},max_rounds=1,
+                base_environment_id=row['id'],base_environment_mode='overlay',environment_selection_reason='preserve same plan')
+    with pytest.raises(RuntimeError,match='crash'):provision.build(repo,**kwargs)
+    selection=(output/'environment_selection.json').read_bytes()
+    interpreter=json.loads(selection)['prefix']+'/bin/python'
+    retained=Path(interpreter).parent.parent/'retained-local-delta';retained.write_text('keep')
+    monkeypatch.setattr(native_context,'publish_context',publish)
+    monkeypatch.setattr(provision,'plan',lambda *a,**kw: pytest.fail('same definition must not buy a fresh plan'))
+    result=provision.build(repo,**kwargs)
+    assert result['verdict']['passed'] and result['interpreter']==interpreter
+    assert retained.read_text()=='keep'
+    assert (output/'environment_selection.json').read_bytes()==selection
+    assert len(list((output/'environments').glob('*/bin/python')))==1
 
 
 def test_prepare_does_not_report_stale_overlay_as_already_done(fixture, monkeypatch):

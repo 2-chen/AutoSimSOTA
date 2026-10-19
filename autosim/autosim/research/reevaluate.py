@@ -222,26 +222,19 @@ def plan(run_root: Path, label: str) -> dict[str, Any]:
             out["why"] = "source-defined policy measurements require an isolated source snapshot"
             return out
         if source_state:
+            from .workspace_snapshot import audit_frozen_state
             snapshot_name = str(source_state.get("source_snapshot") or "")
             overlay_files = source_state.get("overlay_files")
-            expected_identity = object_digest({
-                "schema_version": 1,
-                "source_tree_fingerprint": workspace.get("source_tree_fingerprint"),
-                "source_snapshot": snapshot_name,
-                "overlay_files": overlay_files,
-                "overlay_modes": source_state.get("overlay_modes") or {},
-                "overlay_directories": source_state.get("overlay_directories") or {},
-                "copy_mode": source_state.get("copy_mode", "full_worktree"),
-                "untracked_assets_omitted": bool(
-                    source_state.get("untracked_assets_omitted")),
-            }) if isinstance(overlay_files, dict) and snapshot_name else ""
-            if (workspace.get("schema_version") != 2 or
-                    source_state.get("source_tree_fingerprint") !=
-                    workspace.get("source_tree_fingerprint") or
-                    source_state.get("identity_sha256") != expected_identity or
+            review = audit_frozen_state(workspace, source_state,
+                                        Snapshots(run_root / "snapshots"), destination=repo)
+            out["source_identity_review"] = review
+            if (review["status"] != "verified" or
                     (source_controller and source_policy.get("identity_sha256") !=
-                     expected_identity)):
-                out["why"] = "the measured source-state identity does not match the workspace base"
+                     review["expected_identity_sha256"])):
+                issues = review.get('issues') or []
+                out["why"] = ("the measured source overlay has a missing or corrupt snapshot blob"
+                    if issues and all(row.get('field') == 'snapshot_blob' for row in issues) else
+                    "the measured source-state identity does not match the workspace base")
                 return out
         else:
             # Older checkpoint measurements used the best-state snapshot convention. They

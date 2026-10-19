@@ -59,7 +59,7 @@ def stage(research, name: str, *, result=None):
 
 @contextmanager
 def track(research, *, label: str, settings: dict, confirmation=False,
-          reference=False, reused_attempt=''):
+          reference=False, reused_attempt='', data_selection=None):
     if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', label):
         raise ValueError('unsafe experiment label')
     previous = getattr(research, '_experiment_journal', None)
@@ -69,6 +69,8 @@ def track(research, *, label: str, settings: dict, confirmation=False,
                'phase': 'planned', 'status': 'running', 'stages': [],
                'reused_training_attempt_id': reused_attempt, 'started_at': now(),
                'authority': 'evidence index only; native receipts/session own execution'}
+    if data_selection is not None:
+        journal['data_selection'] = deepcopy(data_selection)
     research._experiment_journal = journal
     try:
         _save(research, journal)

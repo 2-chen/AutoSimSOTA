@@ -9,7 +9,7 @@ description: 发现原生专家或策略采集能力，验证采集、转换与�
 
 ## 责任与交付
 
-主 Agent 可用 `research_task` 委派 `resource` 调查数据供给，也可自行调查。交付应包含：原生入口及配置来源、动作提供者、所需资产、训练划分、产物格式/位置、转换入口、训练 loader 的实际输入，以及尚未验证的连接。Resource 只读源码和回执，不启动采集；Init 负责接入期的配置与连接，Fix 定位具体失败，Scheduler 通过受控执行器运行原生阶段。研究开始后的源码修复走受审计的新候选。
+主 Agent 可用 `research_task(role="data")` 委派供给、目标与消费调查，Resource核查资产/成本，也可自行调查。交付包含原生入口/配置、动作提供者、训练合法域、产物/转换、真实loader及缺边。Data/Resource只读，不启动采集；Init/Fix接线，Scheduler通过受控执行器运行。研究开始后的源码修复走受审计候选。
 
 把结论写进 `update_research_plan` 的问题、下一步和证据字段，区分：未知、发现入口但条件未满足、试采通过、训练消费已验证。缺少资产或 seed 列表是具体依赖问题，不足以证明仓库没有采集能力。
 
@@ -25,6 +25,8 @@ description: 发现原生专家或策略采集能力，验证采集、转换与�
 在冻结研究声明前，核对原生采集器支持的可变参数与转换/训练输入，登记证据支持的 collection axes。不要猜通用参数名、凭空扩展采集能力，或给所有仓库套同一个流程。
 
 ## 用小试验证这条连接
+
+准备扩大采集前核对seed/场景路由、逐条成功/终止与来源记录。已验证builder忽略seed或control，是接入缺边而非“默认值也一样”；Init/Fix应读原生parser并重新核验，或说明仅能默认小试/后选的边界。一次成功的默认探针不能认证跨批新颖性。输出可读后按需选 `auditing-demonstration-quality`，源示范适配与状态专家分别选 `generating-adapted-demonstrations`、`collecting-expert-corrections`；不用同一reset脚本冒充所有路线。
 
 让主 Agent 请求现有 `derive_a_command` 验证实际 `collect` 阶段，按原生单位选择足够完成一条轨迹的工作量和局部时限。CPU 调查子任务不能代替这次仿真验证。启用新调度的运行可以通过 `submit_native_job` 提交已核验的采集、转换、训练等原生阶段；未启用该调度的历史运行仅支持后台训练。必须核对当前可用动作、真实命令和资源回执，不用旧能力说明替代实际核验。
 
@@ -43,6 +45,8 @@ description: 发现原生专家或策略采集能力，验证采集、转换与�
 使用当前合法的 `propose_research_idea`/`run_the_loop` 接口：collection 设置须来自已声明的轴，候选需说明其数据如何进入训练、预期收益、采集与再训练成本。仅在输出和消费者连接均可验证时选择它。不要发明数据采集专用操作或绕过候选审核。
 
 ### 显式数据版本与实际消费证明
+
+数量/seed和已核验训练控制走 `collection_settings`，controls 映射到专用 `i["collection_controls"]`，需精确原生路由引用、独立审核及小试的实际条件证据。生产者失败后的完整部分、只读worker→Main的manifest ID交接、授权祖先数据复用、真实batch消费与v2对照字段，按需读下方原生数据合同，不用猜路径或参数。Data应在小试/候选结果后持续复核目标与扩量成本。
 
 已经通过原生阶段生成的新训练数据，可用 `register_data_version(version)` 登记：四个基础字段为 `id`、run-relative `dataset_ref`、精确公开源码 `source_refs`、简短 `reason`；可选 `asset` 连接生产回执、类型、父版本与处理配方。需要完整字段或 profile/exposure witness 时按需读取[原生数据合同](../curating-simulation-datasets/references/native-data-contract.md)，不要推测字段。主 Agent 先追踪生产者、训练划分及 loader 的真实参数；独立只读 Supervisor 审核协议许可与 loader 连线，注册数据内容身份，而不是认证其质量。
 

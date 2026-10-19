@@ -66,3 +66,54 @@ def test_evidence_rejects_external_log(tmp_path):
         capture_attempt_evidence(output, attempt_id="c" * 32, log=external,
                                  receipt_ref="receipt.json", status="failed",
                                  returncode=1, termination_reason="nonzero_exit")
+
+
+def test_large_native_log_streams_and_verifies_unpaged_bytes(tmp_path, monkeypatch):
+    from autosim.research.common import read_json
+    output=tmp_path/'run';output.mkdir()
+    log=output/'output.log';size=64*1024*1024+64
+    tail=b'completed native updates before timeout\n'
+    with log.open('wb') as stream:
+        stream.truncate(size)
+        stream.seek(size-len(tail));stream.write(tail)
+    monkeypatch.setattr(Path,'read_bytes',lambda _: pytest.fail('whole-file read forbidden'))
+    row=capture_attempt_evidence(output,attempt_id='d'*32,log=log,
+        receipt_ref='receipt.json',status='timed_out',returncode=None,
+        termination_reason='timeout')
+    assert tail.decode().strip() in row['excerpt']
+    assert read_json(output/row['evidence_ref'])['log_bytes']==size
+    found=read_attempt_evidence(output,'d'*32,offset=size-len(tail),limit=len(tail))
+    assert found['text']==tail.decode() and found['next_offset']==size
+    assert found['status']=='timed_out' and found['termination_reason']=='timeout'
+    with log.open('r+b') as stream:
+        stream.seek(0);stream.write(b'X')
+    with pytest.raises(ValueError,match='changed'):
+        read_attempt_evidence(output,'d'*32,offset=size-len(tail),limit=len(tail))
+
+
+def test_disk_log_bound_is_still_enforced(tmp_path,monkeypatch):
+    import autosim.research.evidence_store as store
+    output=tmp_path/'run';output.mkdir();log=output/'output.log'
+    log.write_bytes(b'x'*65);monkeypatch.setattr(store,'_MAX_LOG',64)
+    with pytest.raises(ValueError,match='store limit'):
+        capture_attempt_evidence(output,attempt_id='e'*32,log=log,
+            receipt_ref='receipt.json',status='failed',returncode=1,
+            termination_reason='nonzero_exit')
+    assert not (output/'evidence').exists()
+
+
+def test_log_mutation_during_hash_refuses_capture(tmp_path,monkeypatch):
+    import autosim.research.evidence_store as store
+    original=store.hashlib.sha256
+    output=tmp_path/'run';output.mkdir();log=output/'output.log';log.write_bytes(b'original')
+    class ChangingHash:
+        def __init__(self):self.inner=original()
+        def update(self,chunk):
+            self.inner.update(chunk);log.write_bytes(b'changed!')
+        def hexdigest(self):return self.inner.hexdigest()
+    monkeypatch.setattr(store.hashlib,'sha256',ChangingHash)
+    with pytest.raises(ValueError,match='changed while reading'):
+        capture_attempt_evidence(output,attempt_id='f'*32,log=log,
+            receipt_ref='receipt.json',status='failed',returncode=1,
+            termination_reason='nonzero_exit')
+    assert not (output/'evidence').exists()

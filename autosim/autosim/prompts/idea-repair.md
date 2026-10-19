@@ -11,3 +11,9 @@ There are two ways a change is refused, and the message says which.
 Correct it. Do not change what the idea is for: if the file does not contain what the idea assumed, or the benchmark has no axis for it, that is a fact about the idea and `give_up` is the honest answer, not a reason to return something you have not checked.
 
 Return one JSON object: {"change": <the corrected change, in the same shape>, "why": "<what you corrected>", "give_up": "<when it cannot be done>"}
+# Proposal repair is read-only
+
+Repair the returned idea/change object, not the live checkout. Read source if needed,
+but do not apply patches, run training or install packages. The trusted code-change
+transaction validates and applies the proposal after review; direct edits here would
+invalidate its preimage and bypass its write-ahead recovery journal.

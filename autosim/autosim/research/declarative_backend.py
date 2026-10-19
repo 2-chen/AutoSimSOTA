@@ -42,10 +42,12 @@ def staging_environment(environment: dict[str, str], inputs: dict[str, Any]) -> 
     """Give explicit staging the same paths as this attempt's native command.
 
     Do not create directories: some consumers require an absent output leaf.
-    These executor-owned values override stale ambient values, without changing
-    the native environment or expanding arbitrary agent expressions.
+    These executor-owned values override stale ambient values, without expanding
+    arbitrary agent expressions. Selected labels are also available to an audited
+    native bridge without rewriting an already-frozen argv builder.
     """
-    return {**environment, **{
+    from .data_versions import native_selection_payload
+    return {**environment, 'AUTOSIM_TRAIN_SELECTION_JSON': native_selection_payload(inputs), **{
         "AUTOSIM_STAGE_" + key.upper(): str(inputs.get(key) or "")
         for key in ("output", "python", "repo")}}
 

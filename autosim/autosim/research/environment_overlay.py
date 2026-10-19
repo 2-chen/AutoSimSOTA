@@ -47,10 +47,11 @@ def nested_bindings(dependency_sites: list[Path], version: str) -> list[dict]:
                         target = extensions[0]
                     if not target.resolve().is_relative_to(site.resolve()):
                         continue
+                    headers = distribution.metadata
                     row = {'module':name, 'path':str(target.resolve()),
                         'origin':'existing_nested_dependency',
                         'metadata_path':str(Path(distribution._path).resolve()),
-                        'distribution':distribution.metadata.get('Name'), 'version':distribution.version}
+                        'distribution':headers.get('Name'), 'version':headers['Version']}
                     result.append({**row, 'id':object_digest(row)[:32]})
     # Some binary prefixes have no distribution metadata. Offer real packages, still
     # requiring explicit selection and native verification, rather than claiming absence.
@@ -119,7 +120,8 @@ def inspect(prefix: Path, version: str, *, repo: Path | None = None) -> dict:
             maps.setdefault(name, location)
         for distribution in metadata.distributions(path=[str(site)]):
             direct = distribution.read_text('direct_url.json')
-            distributions.append((str(site), distribution.metadata.get('Name'), distribution.version, direct))
+            headers = distribution.metadata
+            distributions.append((str(site), headers.get('Name'), headers['Version'], direct))
             try:
                 local = json.loads(direct) if direct else {}
             except (ValueError, TypeError):
@@ -183,6 +185,136 @@ def overlay_identity(prefix: Path):
     row = read_json(manifest)
     return object_digest({k:row.get(k) for k in ('base_prefix','base_fingerprint',
         'dependency_fingerprint','dependency_view','bindings','startup_hashes')})
+
+
+def validate_binding_ids(ids: list[str], options: list[dict]) -> None:
+    """Validate caller input before asking a planner to obey it. Never guess IDs."""
+    if (not isinstance(ids, list) or len(ids) > 64 or
+            any(not isinstance(i, str) for i in ids)):
+        raise ValueError('source_binding_ids must be a bounded list of catalog IDs')
+    known = {r['id']: r for r in options}
+    missing = [i for i in ids if i not in known]
+    if missing:
+        raise ValueError('unknown source_binding_ids: ' + ', '.join(missing) +
+                         '; reread the current catalog and submit corrected caller arguments; '
+                         'do not replay this request or guess a replacement')
+    modules = [known[i]['module'] for i in ids]
+    repeated = sorted({m for m in modules if modules.count(m) > 1})
+    if repeated:
+        raise ValueError('duplicate source binding modules: ' + ', '.join(repeated) +
+                         '; select exactly one current catalog ID per module')
+
+
+def prepared_overlay(output: Path, repo: Path, ref: str) -> dict:
+    """Inspect a bounded run-owned prefix; readiness still needs native consumers."""
+    if not isinstance(ref, str) or not re.fullmatch(r'env|environments/[A-Za-z0-9_-]{1,80}', ref):
+        raise ValueError('reuse_environment_ref must be env or environments/<run-owned-id>')
+    prefix = output.resolve()/ref
+    if (any((output.resolve()/Path(*Path(ref).parts[:i])).is_symlink()
+            for i in range(1,len(Path(ref).parts)+1)) or
+            not prefix.resolve().is_relative_to(output.resolve())):
+        raise ValueError('prepared environment must remain inside this run')
+    if not (prefix/'bin/python').is_file() or not (prefix/'overlay.json').is_file():
+        raise ValueError('prepared environment has no owned interpreter/overlay manifest')
+    readonly_roots(prefix, output, repo)
+    row = read_json(prefix/'overlay.json')
+    creation_path = prefix/'overlay_creation.json'
+    if creation_path.is_symlink() or not creation_path.is_file():
+        raise ValueError('prepared overlay lacks its controller creation transaction')
+    creation = read_json(creation_path)
+    definition = creation.get('definition') or {}
+    if (definition.get('repo') != str(repo.resolve()) or
+            definition.get('prefix') != str(prefix) or
+            creation.get('identity') != object_digest(definition)):
+        raise ValueError('prepared overlay belongs to a different checkout')
+    return {'ref':ref, 'prefix':str(prefix), 'identity':overlay_identity(prefix),
+            'base_prefix':row['base_prefix'], 'base_fingerprint':row['base_fingerprint'],
+            'python':row['python'], 'dependency_fingerprint':row['dependency_fingerprint'],
+            'source_binding_ids':[b['id'] for b in row['bindings'] if b['origin'] != 'checkout'],
+            'modules':[b['module'] for b in row['bindings']],
+            'local_distributions':sorted({d.metadata.get('Name') or '' for d in
+                metadata.distributions(path=[str(prefix/'lib'/('python'+row['python'])/'site-packages')])})[:64],
+            'readiness':'metadata verified only; native consumers must be reverified'}
+
+
+def prepared_catalog(output: Path, repo: Path) -> list[dict]:
+    refs = ['env'] + ['environments/'+p.parent.name for p in
+        sorted((output/'environments').glob('*/overlay.json'))[:15]]
+    result = []
+    for ref in refs:
+        if not (output/ref/'overlay.json').exists():
+            continue
+        try:
+            result.append(prepared_overlay(output, repo, ref))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result.append({'ref':ref, 'readiness':'invalid', 'reason':str(exc)[:300]})
+    return result
+
+
+def isolated_source_bindings(interpreter: Path, *, output: Path, original_repo: Path,
+                             repo: Path) -> dict | None:
+    """Namespace-only finder replacement; preserve all installed dependency overrides."""
+    prefix = Path(interpreter).absolute().parent.parent
+    manifest = prefix / 'overlay.json'
+    if not manifest.exists():
+        return None
+    row = read_json(manifest)
+    readonly_roots(prefix, output, original_repo)
+    from .common import source_namespace_alias
+    runtime_repo = source_namespace_alias(repo, output)
+    mapping = {}
+    for binding in row['bindings']:
+        location = Path(binding['path'])
+        if binding['origin'] == 'checkout':
+            if not location.resolve().is_relative_to(original_repo.resolve()):
+                raise ValueError('confirmation environment source binding identity mismatch')
+            relative = location.resolve().relative_to(original_repo.resolve())
+            location = repo / relative
+            if not location.exists() or not location.resolve().is_relative_to(repo.resolve()):
+                raise ValueError('confirmation import target missing or escaped source')
+            location = runtime_repo / relative
+        mapping[binding['module']] = str(location)
+    target = prefix / 'lib' / f"python{row['python']}" / 'site-packages/autosim_overlay_sources.py'
+    if row['startup_hashes'].get(str(target.relative_to(prefix))) != digest(target):
+        raise ValueError('original overlay finder changed')
+    source = repo.parent / 'runtime_import_bindings.py'
+    atomic_text(source, FINDER.format(mapping=mapping))
+    return {'source': str(source), 'target': str(target), 'sha256': digest(source),
+            'prefix': str(prefix), 'runtime_repo': str(runtime_repo)}
+
+
+def verify_isolated_source_bindings(interpreter: Path, *, output: Path, repo: Path,
+                                    binding: dict | None, timeout: float = 30) -> dict:
+    """CPU check of actual namespace imports and mounted resource identities."""
+    if binding is None:
+        return {'status': 'not_applicable', 'why': 'no controller overlay'}
+    from .common import bounded_run, isolated_argv, run_local_environment
+    from .workspace_resources import bindings_for
+    mapping = ast.literal_eval(next(n.value for n in ast.parse(Path(binding['source']).read_text()).body
+                                    if isinstance(n, ast.Assign) and
+                                    any(isinstance(t, ast.Name) and t.id == 'MAPPING' for t in n.targets)))
+    runtime_repo = Path(binding.get('runtime_repo') or repo)
+    current = {k: v for k, v in mapping.items() if Path(v).is_relative_to(runtime_repo)}
+    resources = bindings_for(repo)
+    code = ('import importlib.util,json,os,pathlib\n'
+            f'mapping={current!r}\nresources={resources!r}\nrepo={str(runtime_repo)!r}\n'
+            'for name,target in mapping.items():\n'
+            ' spec=importlib.util.find_spec(name)\n'
+            ' locations=list(spec.submodule_search_locations or []) if spec else []\n'
+            ' actual=spec.origin if spec and spec.origin else (locations[0] if locations else "")\n'
+            ' assert actual and pathlib.Path(actual).resolve().is_relative_to(pathlib.Path(target).resolve()) '
+            'if pathlib.Path(target).is_dir() else actual == target, "import root mismatch: "+name\n'
+            'for item in resources:\n'
+            ' stat=os.stat(os.path.join(repo,item["target"]))\n'
+            ' assert (stat.st_dev,stat.st_ino)==(item["device"],item["inode"]), "resource mount mismatch"\n'
+            'print(json.dumps({"imports_checked":len(mapping),"resources_checked":len(resources)}))\n')
+    env = run_local_environment(output, {'CUDA_VISIBLE_DEVICES': '', 'PYTHONDONTWRITEBYTECODE': '1'})
+    result = bounded_run(isolated_argv([str(interpreter), '-c', code], output=output, repo=repo,
+        require_pid_namespace=True, allow_gpu=False, import_binding_override=binding),
+        cwd=repo, env=env, timeout=timeout)
+    if result.returncode:
+        raise ValueError('isolated import/resource CPU preflight failed: ' + result.stderr[-1000:])
+    return {'status': 'verified', 'gpu_access': False, **json.loads(result.stdout)}
 
 
 def readonly_roots(prefix: Path, output: Path, repo: Path) -> list[Path]:

@@ -49,9 +49,21 @@ def offered(root):
             score = row.get('metric_utility')
             scale = ('success_rate' if (row.get('metric') or {}).get('name') == 'success_rate'
                      else 'metric:'+str((row.get('metric') or {}).get('name') or ''))
-            if (not re.fullmatch(r'round_[1-9][0-9]*_handoff_correction', label)
+            handoff=bool(re.fullmatch(r'round_[1-9][0-9]*_handoff_correction',label) and
+                         row.get('handoff_correction'))
+            link=row.get('completed_evaluation_link') or {}
+            job=link.get('job_id')
+            completed=bool(re.fullmatch(r'round_[1-9][0-9]*_eval_[0-9a-f]{12}',label) and
+                isinstance(job,str) and re.fullmatch(r'[0-9a-f]{32}',job) and
+                label.endswith('_eval_'+job[:12]) and link.get('native_replayed') is False)
+            recovery=row.get('scoring_recovery') or {}
+            recovered=bool(re.fullmatch(r'score_recovered_[0-9a-f]{16}',label) and
+                re.fullmatch(r'research/[A-Za-z0-9_-]+/measurements/round_[1-9][0-9]*\.json',
+                    str(recovery.get('original_measurement_ref') or '')) and
+                recovery.get('native_replayed') is False)
+            if (not (handoff or completed or recovered)
                     or path.name != label+'.json' or row.get('ok') is not True
-                    or not row.get('handoff_correction') or row.get('confirmation')
+                    or row.get('confirmation')
                     or row.get('metric') != protocol.get('metric')
                     or (row.get('guardrails') or {}).get('status') in {'unknown', 'violated'}
                     or type(score) not in (int, float) or not math.isfinite(score)

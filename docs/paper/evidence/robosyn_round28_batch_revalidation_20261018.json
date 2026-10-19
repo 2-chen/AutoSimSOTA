@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "kind": "registered_data_batch_consumption_revalidation_not_acquisition_effect",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "measurement_label": "round_28_handoff_correction",
+  "training": {
+    "attempt_id": "9b6fd0cea9c5405483dbccd7c5e027c8",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 93.6,
+    "seed": 1000,
+    "completed_optimizer_updates": 1000,
+    "data_version_id": "click_bell_agent_targeted_20ep_v1",
+    "data_identity_sha256": "dbee53ae6efa4463d9f702922ccb301e91f4d0f2984638927c9e33ac8de0d443",
+    "data_asset_kind": "unknown",
+    "data_asset_producer": null,
+    "new_targeted_acquisition_proven": false,
+    "consumption": {
+      "status": "verified",
+      "evidence_id": "9b6fd0cea9c5405483dbccd7c5e027c8",
+      "versions": [
+        "click_bell_agent_targeted_20ep_v1"
+      ],
+      "exposure": [
+        {
+          "data_version_id": "click_bell_agent_targeted_20ep_v1",
+          "setting": "dataset",
+          "status": "basic_read_only",
+          "samples_read": 8000,
+          "consumption_stage": "training_batch",
+          "reader_streams": 1,
+          "witness_events": 1000
+        }
+      ],
+      "authority": "sealed loader witness under independently reviewed source; not a quality/SOTA claim"
+    },
+    "model_file_sha256": "a43b4d6b5e4f81ba34cdda841fd7515b72ec7ee22059565658738c33bedc9d62"
+  },
+  "physical_log_diagnostic": {
+    "valid_training_batch_rows": 1000,
+    "malformed_rows": 0,
+    "reader_streams": 1,
+    "all_sample_increments": 8,
+    "terminal_sample_uses": 8000,
+    "authority": "operator read-only scan of sealed native log; actual training-data certification is the executor consumption result"
+  },
+  "evaluation": {
+    "attempt_id": "7e6f76578ba54d1bb9636a7554fd40c3",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 510.5,
+    "seed": 20261013,
+    "setting": "random",
+    "completed_episodes": 50,
+    "successful_episodes": 1,
+    "metric_value": 0.02,
+    "policy_sha256": "8b39c5d0f2f3aff430b50721c57203dcc2db0b4c97c836e331abc0f90d99817c",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "result_sha256": "9a065ab0e75bf11425ae50d547136cf6e7531735b5dea37ddc2dedf3ecce06ac"
+  },
+  "recovery": {
+    "training_reused": true,
+    "original_measurement_status": "unscored",
+    "successful_handoff_action": "7a923ec9659ceb70",
+    "old_failures_rewritten": false,
+    "baseline_and_incumbent_unchanged": true
+  },
+  "autonomy": {
+    "missing_batch_goal_recognition_and_round_extension": "system Main, 4ea17d46978500c4",
+    "native_source_repair_and_settings": "system Main train_batch_writer_v16, ed81b2627b8c93fe",
+    "native_controlled_validation": "system Main c2725fe06a1b8b71",
+    "handoff_diagnosis": "system automatic Fix",
+    "handoff_execution": "system Main and trusted executor",
+    "operator": "no new host code, budget or restart since v64; read-only observation and paper bookkeeping only; no native candidate/data/parameter edits or manual evaluation/scoring"
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "matched_acquisition_comparison_complete": false,
+  "independent_training_seed_replicate_of_round27": false,
+  "method_gain_claim_supported": false,
+  "limits": [
+    "This verifies an actual-batch-to-policy-score chain on registered 003 data, not a new acquisition producer or data quality.",
+    "Same training seed1000 and evaluation seed20261013 as R27; observer repair revalidation is not an independent-seed replicate.",
+    "Raw trained weight bytes differ from R27 despite decoded train_config values differing only in output_dir; deterministic noninterference is not established and the cause is not diagnosed. Do not claim byte-identical training or ascribe a score change to observation.",
+    "Only 1000 updates; source-backed common frozen-policy warmstart, quality and matched multi-seed acquisition comparison remain unestablished.",
+    "The source/provenance/supervision unknowns of the 003 version are unchanged.",
+    "1/50=2% is a valid negative development result below the unchanged24% incumbent, not SOTA or evidence that targeted acquisition is ineffective."
+  ],
+  "source_hashes": {
+    "action_receipts/ed81b2627b8c93fe.json": "ec9f5f8539ec0c317ba43b8e4a2f84ef831fa2c82bbbc6a29085ed42e2287160",
+    "action_receipts/c2725fe06a1b8b71.json": "78d3adcb18e2b01a6074abe622164f663610e5ac437fa47ed87c5cc99d93e752",
+    "action_receipts/7a923ec9659ceb70.json": "fd850ff2caaf9a4b08567a6eaf407e04b77937d7f205f90aaf9eef926f3e446a",
+    "data_versions/click_bell_agent_targeted_20ep_v1.json": "78e13f5921eda42b411c955af9d40690fe65f6dd99b15bdb37ccc585cd3e3db4",
+    "data_consumer_reviews/click_bell_agent_targeted_20ep_v1/c757d992c4eb383915b29be84c2f6ebc501090930874634209064501e4b413d0.json": "cd578b4fb47d6472bb202ba74af6d6447b106fcb81db2a7338ff7ced62011ae7",
+    "research/derived/measurements/round_28.json": "37ac42c958d0347d12a15963de0bdda55e012e17fcca477c690fd4ace6deb37b",
+    "research/derived/measurements/round_28_handoff_correction.json": "3b0bb6d6d39ad340accfa864f2bac588da3d35a0c210a05bdd2a819ed4446f49",
+    "research/derived/attempts/9b6fd0cea9c5405483dbccd7c5e027c8/receipt.json": "5823e21943e1ed78fe0609c77dbe17b582c44d01f2deb3e6e6b57ba83dbcf057",
+    "research/derived/attempts/7e6f76578ba54d1bb9636a7554fd40c3/receipt.json": "563c8e9657bd302dbf2716c69e8b46e6004189e8a226838c06b9baf0b26a7205",
+    "evidence/9b6fd0cea9c5405483dbccd7c5e027c8.json": "ee24b5e4e3cb9aea2eb0edd5cbbcadbf316b49c4ffeff42c83037b268e82e71f",
+    "evidence/7e6f76578ba54d1bb9636a7554fd40c3.json": "ef34423c8685097a43af0080561a8a6e0dae9d2ec48205287a7d0880d3cb1de7",
+    "research/derived/train/attempts/9b6fd0cea9c5405483dbccd7c5e027c8/output.log": "ed15c554f6b4d5d2fdc2ae13e5e16e5ed1bd82fd1d78e3cd72d0066b8eeee110",
+    "research/derived/evaluate/attempts/7e6f76578ba54d1bb9636a7554fd40c3/output.log": "cdbb9b4cb1ad0e014c6d611322a8cfd12e571af35f6159db7e1e6c57ddeecab9",
+    "research/derived/code_changes/round-28.json": "65fb8012ba0fbc622d43aca7cc5268270e29bc81f6261aa625066fd9fb613272",
+    "research/derived/snapshots/blobs/d0f704e4fd60e91657ca53f86fdb3c6d15a2caee11e7ec2daf9fa945f5497c64": "d0f704e4fd60e91657ca53f86fdb3c6d15a2caee11e7ec2daf9fa945f5497c64",
+    "training_progress_audits/1f874c11320b0768d9d9117a3bce45dcebadb5251e8a62ab3701a04c7c974f1c.json": "18ecaa735d63b2ea93ef4977f4efe370a86b4c507879851de016afe1b0e1a213",
+    "verification_checkpoint_handoffs/dc688677690114115559fed4cd894343a247a99acaec6b755752fe8a1abbc97a.json": "7793c5c59b32040b1cd5fa381ba98dc8bcf28633bb8b5fa09805afe7baa50645",
+    "research/derived/experiments/round_28_handoff_correction/7e6f76578ba54d1bb9636a7554fd40c3/result.json": "9a065ab0e75bf11425ae50d547136cf6e7531735b5dea37ddc2dedf3ecce06ac"
+  }
+}

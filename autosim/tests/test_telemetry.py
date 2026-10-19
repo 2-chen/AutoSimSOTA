@@ -50,6 +50,74 @@ def test_stdout_scalars_are_incremental_idempotent_and_not_the_score(tmp_path):
     assert "official score" in persisted
 
 
+def test_compact_native_counters_scientific_values_and_short_metric_names(tmp_path):
+    writer,log,_ = _writer(tmp_path)
+    log.write_text('INFO 2026-10-17 11:40:03 ts/train.py:232 '
+                   'step:1K smpl:8K ep:108 epch:0.10 loss:2.4 lr:1.0e-05 updt_s:0.08\n'
+                   'step:1.2K loss:2.0 lr:9.5e-06\n')
+    state = writer.poll()
+    series = {r['metric_name']:r for r in state['series']}
+    assert [r['native_step'] for r in series['loss']['samples']] == [1000,1200]
+    assert series['smpl']['samples'][0]['value'] == 8000
+    assert series['lr']['samples'][-1]['value'] == 9.5e-6
+    assert 'info' not in series and 'ts/train.py' not in series
+
+
+def test_identity_tokens_and_configuration_are_not_numeric_training_signals(tmp_path):
+    writer,log,_ = _writer(tmp_path)
+    identity = '87e57cd66aa228b652f1edefcc45b59209bea0deefc33197441c709b916e2534'
+    raw = ('AUTOSIM_TRAIN_DATA_CONSUMPTION '+json.dumps({
+        'identity':identity,'identity_field':'sha256','samples_read':15})+'\n'
+        'INFO 2026-10-17 11:39:46 ts/train.py:159 cfg.steps=80000 (80K)\n'
+        'backbone=resnet18 initialization=imagenet1k checksum='+identity+'\n'
+        'global_step=42 vendor_margin=3 lr=2e-5 loss=0.7\n')
+    log.write_text(raw)
+    state=writer.poll()
+    series={r['metric_name']:r for r in state['series']}
+    assert set(series)=={'vendor_margin','lr','loss'}
+    assert all(s['native_step']==42 for r in series.values() for s in r['samples'])
+    assert log.read_text()==raw
+
+
+def test_json_only_actual_numeric_values_are_observations(tmp_path):
+    writer,log,_ = _writer(tmp_path)
+    log.write_text(json.dumps({'step':12,'loss':0.6,'version':'0.24',
+                              'hash':'123abc','lr':2e-6,'nested':{'fake':400}})+'\n')
+    state=writer.poll()
+    series={r['metric_name']:r for r in state['series']}
+    assert set(series)=={'loss','lr'}
+    assert all(r['samples'][0]['native_step']==12 for r in series.values())
+
+
+def test_parser_upgrade_archives_bad_projection_then_replays_original_evidence(tmp_path):
+    writer,log,output = _writer(tmp_path)
+    raw='step:1K loss:0.5 lr:1e-5\n'
+    log.write_text(raw)
+    old=writer.poll()
+    old.pop('parser_version')
+    old['series'][0]['samples'][0]['native_step']=1
+    writer.state_path.write_text(json.dumps(old))
+    restarted=LiveTelemetryWriter(output=output,run_root=writer.run_root,repo=writer.repo,
+        working_directory=writer.working_directory,stage_directory=writer.stage_directory,
+        log_path=log,stage='train',attempt_id='a'*32,started_epoch=writer.started_epoch)
+    state=restarted.poll()
+    assert state['parser_version']=='autosim-telemetry-v2'
+    assert state['sample_count']==2
+    assert all(s['native_step']==1000 for r in state['series'] for s in r['samples'])
+    history=list((writer.report_dir/'parser_history').glob('*.json'))
+    assert len(history)==1 and json.loads(history[0].read_text())==old
+    assert log.read_text()==raw
+    assert restarted.poll()['sample_count']==2
+
+
+def test_nonfinite_and_oversize_integer_telemetry_does_not_break_observation(tmp_path):
+    writer,log,_ = _writer(tmp_path)
+    log.write_text(json.dumps({'step':2,'loss':float('nan'),'huge':10**400,
+                              'flag':True,'vendor_signal':0.3})+'\n')
+    state=writer.poll()
+    assert [r['metric_name'] for r in state['series']]==['vendor_signal']
+
+
 def test_partial_line_waits_for_delimiter_then_emits_without_duplicate(tmp_path):
     writer, log, _ = _writer(tmp_path)
     with log.open("wb") as stream:

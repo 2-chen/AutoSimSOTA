@@ -64,6 +64,30 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
     return output, workspace
 
 
+def test_all_roles_and_cli_auxiliary_models_share_flash(tmp_path, monkeypatch):
+    from autosim.llm_client import configured_llm_model
+    from autosim.research.agent_runtime import _claude_env
+    from autosim.research.agent_roles import ROLE_PROFILES
+    monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+    monkeypatch.delenv("AUTOSIM_LLM_MODEL", raising=False)
+    # Host settings must not leak into this run's private CLI environment.
+    monkeypatch.setenv("CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro")
+    output, workspace = _fixture(tmp_path)
+    model = configured_llm_model()
+    for profile in ROLE_PROFILES.values():
+        args = _role_cli_args(profile, workspace=workspace, output=output,
+                              python="/usr/bin/python3", model=model, max_budget_usd=None)
+        assert args[args.index("--model") + 1] == "deepseek-flash"
+        assert args[args.index("--setting-sources") + 1] == ""
+    env = _claude_env(output=output, key="fixture-key", base_url="https://api.deepseek.com",
+                      model=model)
+    model_keys = {"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"}
+    assert {env[k] for k in model_keys} == {"deepseek-flash"}
+
+
 def test_network_filter_profile_fails_closed_for_unknown_architecture():
     assert network_deny_filter_bytes("x86_64")
     with pytest.raises(RuntimeError, match="not defined"):
@@ -182,6 +206,37 @@ def test_provider_budget_error_is_resumable_not_misreported_as_repository_failur
     assert status == ("budget_exhausted", "provider_turn_budget", False)
 
 
+@pytest.mark.parametrize('result', [None, '', '   ', '\n\t'])
+def test_exit_zero_empty_final_is_a_failed_turn_not_a_completed_decision(result):
+    attempt = ProcessAttempt(True, 0)
+    assert _turn_status(attempt, {'type':'result','is_error':False,'result':result}, []) == (
+        'failed', 'missing_final_response', False)
+    assert _turn_status(attempt, {'type':'result','result':'{}'}, []) == ('completed',None,True)
+
+
+def test_empty_cli_success_is_persisted_failed_before_session_resume(tmp_path,monkeypatch):
+    from autosim.research import agent_runtime
+    output,workspace=_fixture(tmp_path)
+    monkeypatch.setattr('autosim.llm_client.load_credential_file',
+        lambda **_: {'source':'fixture','model':'fixture-model'})
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fixture-secret')
+    monkeypatch.setenv('DEEPSEEK_MODEL','fixture-model')
+    def fake_stream(command,**kwargs):
+        kwargs['on_stdout_line'](json.dumps({'type':'result','is_error':False,
+            'result':'','total_cost_usd':.01,'usage':{'input_tokens':10}}))
+        return ProcessAttempt(launched=True,returncode=0)
+    monkeypatch.setattr(agent_runtime,'run_process_stream',fake_stream)
+    result=agent_runtime.run_coding_agent(workspace=workspace,output=output,prompt='fixture',
+        run_id='empty-final',max_budget_usd=.05,max_total_budget_usd=.05,
+        cli='/usr/bin/claude',role='resource')
+    assert result['status']=='failed' and result['failure_category']=='missing_final_response'
+    session=json.loads((output/'agent/session.json').read_text())
+    assert session['status']=='failed' and session['failure_category']=='missing_final_response'
+    process=json.loads((output/result['process_ref']).read_text())
+    assert process['status']=='completed' and process['returncode']==0
+    assert result['total_cost_usd']==.01
+
+
 def test_coding_agent_sends_large_prompt_via_stdin(tmp_path, monkeypatch):
     from autosim.research import agent_runtime
 
@@ -287,8 +342,36 @@ def test_decision_only_json_has_no_tools_and_requires_complete_terminal(tmp_path
         assert json.loads(result['execution_text'])['approved'] is True
 
 
-@pytest.mark.parametrize('generation_policy',[None,{'max_output_tokens':1800,'thinking':'disabled'}])
-def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monkeypatch,generation_policy):
+@pytest.mark.parametrize('policy', [
+    {'max_output_tokens':0}, {'max_output_tokens':True},
+    {'thinking':'enabled'}, {'tools':'all'},
+])
+def test_bounded_engineering_policy_rejects_invalid_controls_before_provider(tmp_path, policy):
+    from autosim.research.agent_runtime import run_coding_agent
+    output, workspace = _fixture(tmp_path)
+    with pytest.raises(ValueError):
+        run_coding_agent(workspace=workspace, output=output, prompt='derive',
+            role='init',generation_policy=policy)
+
+
+@pytest.mark.parametrize('role', ['init','scheduler','fix'])
+def test_generation_bound_does_not_grant_decision_only_authority(tmp_path, role):
+    from autosim.research.agent_runtime import run_coding_agent
+    output, workspace = _fixture(tmp_path)
+    with pytest.raises(ValueError, match='decision-only mode is restricted'):
+        run_coding_agent(workspace=workspace, output=output, prompt='derive', role=role,
+            decision_only=True,generation_policy={'max_output_tokens':3000,'thinking':'disabled'})
+
+
+@pytest.mark.parametrize('role,decision_only,generation_policy',[
+    ('resource',False,None),
+    ('supervisor',True,{'max_output_tokens':1800,'thinking':'disabled'}),
+    ('init',False,{'max_output_tokens':3000,'thinking':'disabled'}),
+    ('init_client',False,{'max_output_tokens':3000,'thinking':'disabled'}),
+    ('fix',False,{'max_output_tokens':2000,'thinking':'disabled'}),
+])
+def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monkeypatch,
+                                                               role,decision_only,generation_policy):
     from contextlib import contextmanager
     from autosim.research import agent_runtime
 
@@ -328,11 +411,32 @@ def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monk
 
     monkeypatch.setattr(agent_runtime, "deepseek_turn_gateway", fake_gateway)
     monkeypatch.setattr(agent_runtime, "run_process_stream", fake_stream)
+    if role == 'init_client':
+        # Keep the actual client -> actual runtime -> gateway/CLI contract. Only
+        # external transport/process execution is stubbed; this catches the
+        # cross-layer regression that client-only mocks previously missed.
+        from autosim.research.agent_client import RoleAwareAgentClient
+        real_run = agent_runtime.run_coding_agent
+        monkeypatch.setattr(agent_runtime, 'run_coding_agent',
+            lambda **kw: real_run(cli='/usr/bin/claude', **kw))
+        client = RoleAwareAgentClient(workspace=workspace, output=output,
+            run_id='official-pricing',turn_budget_usd=.05,total_budget_usd=.50)
+        with client.as_role('init'):
+            text, metadata = client.chat_with_metadata('derive native argv','source context',
+                bounded_generation=True,max_tokens=3000,thinking='disabled')
+        assert text == 'done' and metadata['status'] == 'completed'
+        assert metadata['generation_policy'] == generation_policy
+        assert captured['gateway_args']['generation_policy'] == generation_policy
+        assert captured['environment']['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] == '3000'
+        index = captured['command'].index('--tools')
+        assert captured['command'][index+1]
+        assert metadata['run_budget']['spent_usd'] == pytest.approx(.002)
+        return
     result = agent_runtime.run_coding_agent(
         workspace=workspace, output=output, prompt="hello", run_id="official-pricing",
         max_budget_usd=.05, max_total_budget_usd=.50,
-        cli="/usr/bin/claude", role="supervisor" if generation_policy else "resource",
-        decision_only=bool(generation_policy),generation_policy=generation_policy)
+        cli="/usr/bin/claude", role=role,
+        decision_only=decision_only,generation_policy=generation_policy)
     assert result["status"] == "completed"
     assert result["total_cost_usd"] == pytest.approx(.002)
     assert result["cli_estimate_usd"] == pytest.approx(.20)
@@ -343,7 +447,17 @@ def test_deepseek_turn_uses_gateway_usage_not_claude_cli_estimate(tmp_path, monk
     assert captured["environment"]["ANTHROPIC_AUTH_TOKEN"] == FakeGateway.local_token
     assert captured["gateway_args"]["upstream_key"] == "fixture-secret"
     assert captured['gateway_args']['generation_policy']==generation_policy
+    if generation_policy:
+        assert captured['environment']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']==str(generation_policy['max_output_tokens'])
+    else:
+        assert 'CLAUDE_CODE_MAX_OUTPUT_TOKENS' not in captured['environment']
     assert json.loads((output/'agent/session.json').read_text())['generation_policy']==generation_policy
+    assert json.loads((output/'agent/session.json').read_text())['role']==role
+    if generation_policy and not decision_only:
+        # A bounded engineering turn still has its normal tools, not a forced
+        # no-tool review session. The real runtime/gateway path is exercised.
+        index=captured['command'].index('--tools')
+        assert captured['command'][index+1]
     receipt = json.loads((output / result["pricing_ref"]).read_text())
     assert receipt["official_estimate_usd"] == pytest.approx(.002)
     assert receipt["cli_estimate_usd"] == pytest.approx(.20)

@@ -20,19 +20,60 @@ from autosim.research.process_executor import (capture_process_identity,
                                                terminate_recorded_process)
 
 
-def test_live_process_window_can_extend_without_restarting(tmp_path):
+@pytest.mark.parametrize('runner', [run_process, run_process_stream])
+def test_live_process_window_can_extend_without_restarting(tmp_path, runner):
     control = {"deadline_epoch": time.time() + 0.2, "cancelled": False}
     def extend():
         time.sleep(0.08)
         control["deadline_epoch"] = time.time() + 1.0
     thread = threading.Thread(target=extend)
     thread.start()
-    result = run_process([sys.executable, "-c", "import time; time.sleep(.35); print('done')"],
+    result = runner([sys.executable, "-c", "import time; time.sleep(.35); print('done')"],
                          cwd=tmp_path, env=os.environ.copy(), timeout=2,
                          live_control=lambda: dict(control))
     thread.join()
     assert result.returncode == 0 and not result.timed_out
     assert result.stdout.strip() == "done"
+
+
+@pytest.mark.parametrize('runner', [run_process, run_process_stream])
+def test_live_window_extension_cannot_raise_the_hard_timeout(tmp_path, runner):
+    started = time.monotonic()
+    result = runner([sys.executable, '-c', 'import time; time.sleep(2)'],
+        cwd=tmp_path, env=os.environ.copy(), timeout=.15,
+        live_control=lambda: {'deadline_epoch': time.time()+100, 'cancelled': False})
+    assert result.timed_out and result.returncode != 0
+    assert time.monotonic()-started < 1.5
+
+
+@pytest.mark.parametrize('runner', [run_process, run_process_stream])
+def test_live_window_can_still_shorten_before_hard_timeout(tmp_path, runner):
+    deadline = time.time()+.05
+    result = runner([sys.executable, '-c', 'import time; time.sleep(2)'],
+        cwd=tmp_path, env=os.environ.copy(), timeout=2,
+        live_control=lambda: {'deadline_epoch': deadline, 'cancelled': False})
+    assert result.timed_out and result.returncode != 0
+
+
+@pytest.mark.parametrize('decouple_callbacks', [False, True])
+@pytest.mark.parametrize('cancel', [False, True])
+def test_stream_live_control_survives_launcher_exit(tmp_path, decouple_callbacks, cancel):
+    # A native shell may exit while a worker still owns its stdout/stderr pipes.
+    # The soft window and cancellation govern the job, not just the launcher PID.
+    started = time.monotonic()
+    wall_started = time.time()
+    command = [sys.executable, '-c',
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.5)']); "
+        "print('launcher-exited', flush=True)"]
+    result = run_process_stream(command, cwd=tmp_path, env=os.environ.copy(),
+        timeout=3, decouple_callbacks=decouple_callbacks,
+        live_control=lambda: {'deadline_epoch': wall_started + (3 if cancel else .3),
+                              'cancelled': cancel and time.time() >= wall_started + .3})
+    assert 'launcher-exited' in result.stdout
+    assert result.cancelled if cancel else result.timed_out
+    assert time.monotonic() - started < 1.4
+    assert not result.cleanup_diagnostics.get('remaining_pids')
 
 
 def test_namespace_cleanup_allows_transient_teardown_without_signalling(monkeypatch):
@@ -154,6 +195,53 @@ def test_incomplete_exited_launcher_is_not_perpetually_live():
         process.terminate()
         process.wait()
     assert inspect_process_identity(partial)['status'] == 'not_running'
+
+
+@pytest.mark.parametrize('ticks,group,members,expected',[
+    (200,888,[],'not_running'),
+    (100,888,[],'identity_mismatch'),
+    (50,888,[],'identity_mismatch'),
+    (200,123,[],'identity_mismatch'),
+    (200,888,[456],'identity_mismatch'),
+])
+def test_reused_pid_requires_later_birth_and_absent_original_group(
+        monkeypatch,ticks,group,members,expected):
+    import autosim.research.process_executor as module
+    identity={'pid':123,'pgid':123,'start_ticks':100,
+        'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'command_sha256':'old'}
+    monkeypatch.setattr(module,'_proc_identity',lambda pid:{
+        'pid':pid,'pgid':group,'start_ticks':ticks,'command_sha256':'new'})
+    monkeypatch.setattr(module,'_live_group_members',lambda pgid,**kwargs:members)
+    monkeypatch.setattr(module.os,'killpg',lambda *a:pytest.fail('never signal a replacement PID/group'))
+    assert inspect_process_identity(identity)['status']==expected
+    assert terminate_recorded_process(identity)['status']==expected
+
+
+def test_reused_pid_group_inspection_error_remains_unverifiable(monkeypatch):
+    import autosim.research.process_executor as module
+    identity={'pid':123,'pgid':123,'start_ticks':100,
+        'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'command_sha256':'old'}
+    monkeypatch.setattr(module,'_proc_identity',lambda pid:{
+        'pid':pid,'pgid':888,'start_ticks':200,'command_sha256':'new'})
+    def denied(pgid,**kwargs):raise PermissionError('fixture')
+    monkeypatch.setattr(module,'_live_group_members',denied)
+    assert inspect_process_identity(identity)['status']=='unverifiable'
+
+
+def test_strict_group_absence_does_not_swallow_permission_errors(tmp_path,monkeypatch):
+    import autosim.research.process_executor as module
+    proc=tmp_path/'proc';(proc/'123').mkdir(parents=True)
+    target=proc/'123/stat';target.write_text('fixture')
+    original=Path.read_text
+    def read(path,*args,**kwargs):
+        if path==target:raise PermissionError('fixture group may be invisible')
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(module,'Path',lambda value:proc if value=='/proc' else Path(value))
+    monkeypatch.setattr(Path,'read_text',read)
+    assert module._live_group_members(999)==[]
+    with pytest.raises(PermissionError):module._live_group_members(999,strict=True)
 
 
 def test_incomplete_launcher_with_surviving_group_stays_unverifiable(monkeypatch):

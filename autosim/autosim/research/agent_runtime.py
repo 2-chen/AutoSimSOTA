@@ -27,8 +27,8 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .common import (atomic_json, atomic_text, inspection_mountpoint,
-                     sanitize_model_text)
+from .common import (atomic_json, atomic_text, inspection_mountpoint, now as utc_now,
+                     read_json, sanitize_model_text)
 from .agent_roles import role_profile
 from .agent_budget import AgentCostBudgetError, AgentCostLedger
 from .deepseek_gateway import deepseek_turn_gateway
@@ -228,7 +228,9 @@ def _validate_agent_workspace(workspace: Path, *, max_entries: int = 100000) -> 
 
 def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
                   cwd: Path, native: dict | None = None,
-                  diagnostic_policy: dict | None = None) -> tuple[list[str], Any]:
+                  diagnostic_policy: dict | None = None,
+                  diagnostic_data: dict | None = None,
+                  native_source_workspace: Path | None = None) -> tuple[list[str], Any]:
     bubblewrap = shutil.which("bwrap")
     if not bubblewrap:
         raise AgentRuntimeError("bubblewrap is unavailable; refusing host command execution")
@@ -267,6 +269,11 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
         # bindings cover only the inspection alias; mirror the exact validated,
         # read-only bindings at this second checkout mount as well.
         command.extend(mount_args(workspace))
+        if native_source_workspace is not None:
+            # The parent source is not a grant: expose only this immutable reader
+            # snapshot at its path so borrowed .pth/import mappings cannot read live
+            # parent files. Source scopes still determine which modules exist here.
+            command.extend(('--ro-bind', str(workspace), str(native_source_workspace)))
         for key, value in native["paths"].items():
             path = Path(value)
             if path.exists():
@@ -285,6 +292,10 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
         # An ephemeral tmpfs alias, not a model-controlled path in persistent scratch.
         alias = '/tmp/autosim_policy' if policy.is_dir() else '/tmp/autosim_policy/model'
         command.extend(('--dir', '/tmp/autosim_policy', '--ro-bind', str(policy), alias))
+    if diagnostic_data is not None:
+        if native is None:
+            raise AgentRuntimeError('data diagnostic grant requires the selected native context')
+        command.extend(('--dir','/tmp/autosim_data','--ro-bind',diagnostic_data['path'],'/tmp/autosim_data'))
     command.extend(("--dir", "/tmp/home", "--dir", "/tmp/cache",
                     "--unshare-pid", "--die-with-parent", "--proc", "/proc",
                     "--dev", "/dev", "--cap-drop", "ALL", "--clearenv",
@@ -303,6 +314,8 @@ def _sandbox_argv(argv: list[str], *, output: Path, workspace: Path,
     if native:
         if diagnostic_policy is not None:
             command.extend(('--setenv', 'AUTOSIM_DIAGNOSTIC_POLICY', alias))
+        if diagnostic_data is not None:
+            command.extend(('--setenv','AUTOSIM_DIAGNOSTIC_DATA','/tmp/autosim_data'))
         for key, value in native["paths"].items():
             command.extend(("--setenv", key, value))
         if native.get('runtime_library_dirs'):
@@ -342,6 +355,29 @@ def _missing_resume_session(attempt: ProcessAttempt, session_id: str,
                         for line in str(attempt.stderr or "").splitlines()))
 
 
+def blocked_provider_category(gateway_snapshot: dict | None,
+                              final_result: dict | None) -> str:
+    """Typed terminal HTTP refusals, not text guesses or local budget failures.
+
+    Classification does not settle unknown usage at zero. A valid completed
+    response is handled by the caller; unavailable payment/access cannot be
+    repaired by asking another role through the same unavailable endpoint.
+    """
+    statuses = []
+    if isinstance(gateway_snapshot, dict):
+        for row in gateway_snapshot.get('receipts') or []:
+            if isinstance(row, dict) and isinstance(row.get('diagnostics'), dict):
+                statuses.append(row['diagnostics'].get('http_status'))
+    if isinstance(final_result, dict) and final_result.get('is_error') is True:
+        statuses.append(final_result.get('api_error_status'))
+    statuses = [value for value in statuses if isinstance(value, int) and not isinstance(value, bool)]
+    if 402 in statuses:
+        return 'provider_payment_required'
+    if any(value in {401, 403} for value in statuses):
+        return 'provider_access_blocked'
+    return ''
+
+
 def _turn_status(attempt: ProcessAttempt, final_result: dict[str, Any] | None,
                  protocol_errors: list[str]) -> tuple[str, str | None, bool]:
     """Distinguish a completed turn from resumable budget exhaustion and real failures."""
@@ -349,6 +385,12 @@ def _turn_status(attempt: ProcessAttempt, final_result: dict[str, Any] | None,
                      attempt.returncode == 0 and final_result is not None and
                      not final_result.get("is_error") and not protocol_errors)
     if completed:
+        # CLI success only describes its process. A truncated upstream stream can
+        # still produce an empty success result with exit 0 and unknown usage.
+        # Classify before session persistence so transport diagnostics, recovery
+        # and context rotation receive the failure instead of resuming it forever.
+        if not str(final_result.get("result") or "").strip():
+            return "failed", "missing_final_response", False
         return "completed", None, True
     if final_result and str(final_result.get("subtype") or "").startswith(
             "error_max_budget_usd"):
@@ -481,7 +523,8 @@ def _project_claude_event(event: dict[str, Any],
     if kind == "system" and event.get("subtype") == "init":
         rows.append({"type": "session_started", "summary": "coding agent session initialized",
                      "session_id": _text(event.get("session_id"), 80),
-                     "model": _text(event.get("model"), 100)})
+                     "model": _text(event.get("model"), 100),
+                     "advertised_tools": _advertised_tools(event)})
     elif kind == "assistant":
         message = event.get("message") or {}
         contents = message.get("content") if isinstance(message, dict) else []
@@ -672,7 +715,8 @@ def refresh_agent_document(output: Path) -> Path:
 
 class _McpExecutor:
     def __init__(self, *, workspace: Path, output: Path,
-                 allow_commands: bool = True, allow_native: bool | None = None):
+                 allow_commands: bool = True, allow_native: bool | None = None,
+                 native_source_only: bool = False):
         self.workspace = Path(workspace).resolve(strict=True)
         self.output = Path(output).resolve(strict=True)
         if not _workspace_marker(self.output, self.workspace):
@@ -680,6 +724,9 @@ class _McpExecutor:
         _validate_agent_workspace(self.workspace)
         self.allow_commands = allow_commands
         self.allow_native = allow_commands if allow_native is None else allow_native
+        self.native_source_only = native_source_only
+        if native_source_only and (allow_commands or not self.allow_native):
+            raise ValueError('source-only native access requires read-only commands and native source access')
         self.started = time.monotonic()
         self.calls = 0
         self.tool_seconds = 0.0
@@ -708,6 +755,10 @@ class _McpExecutor:
             return read_review_evidence(_worker_evidence_root(self.output),
                 arguments.get('evidence_id'),offset=arguments.get('offset',0),
                 limit=arguments.get('limit',8000))
+        if str(arguments.get('evidence_id') or '').startswith('workflow-patch:'):
+            from .workflow_patch import read_evidence
+            return read_evidence(_worker_evidence_root(self.output),arguments.get('evidence_id'),
+                offset=arguments.get('offset',0),limit=arguments.get('limit',8000))
         return read_attempt_evidence(
             _worker_evidence_root(self.output), arguments.get("evidence_id"),
             offset=arguments.get("offset", 0), limit=arguments.get("limit", 8000))
@@ -722,9 +773,32 @@ class _McpExecutor:
         return inspect(_worker_evidence_root(self.output), **arguments)
 
     def native_probe(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if set(arguments) - {"code", "purpose", "timeout_seconds", 'policy_request', 'source_request'}:
-            raise ValueError("native diagnostic accepts code, purpose, timeout and optional policy_request only")
-        code, purpose = arguments.get("code", 'pass' if 'source_request' in arguments else None), arguments.get("purpose")
+        if self.native_source_only and (
+                set(arguments) - {'purpose', 'timeout_seconds', 'source_catalog',
+                                  'source_request', 'checkout_source_request', 'framework_source_request'} or
+                len(set(arguments) & {'source_catalog', 'source_request', 'checkout_source_request', 'framework_source_request'}) != 1):
+            raise ValueError('this role has source-only native access: select one catalog/source capture; '
+                             'no code, policy or data diagnostic grants')
+        if set(arguments) - {"code", "purpose", "timeout_seconds", 'policy_request', 'source_request', 'source_catalog', 'checkout_source_request', 'data_profile_request', 'framework_source_request'}:
+            raise ValueError("native diagnostic accepts bounded code or explicit source/catalog requests")
+        profile_request = arguments.get("data_profile_request")
+        if 'data_profile_request' in arguments:
+            if set(arguments) - {'purpose', 'timeout_seconds', 'data_profile_request'}:
+                raise ValueError('data profile cannot combine code or extra resource/source grants')
+            from .data_health import native_profile_code
+            arguments = {**arguments, 'code': native_profile_code(profile_request, workspace=self.workspace)}
+        checkout_request = 'checkout_source_request' in arguments
+        framework_request = 'framework_source_request' in arguments
+        if framework_request and set(arguments)-{'purpose','timeout_seconds','framework_source_request'}:
+            raise ValueError('framework source read cannot combine with code, native grants or other reads')
+        if checkout_request and set(arguments) - {'purpose', 'checkout_source_request', 'timeout_seconds'}:
+            raise ValueError('checkout source capture cannot execute code or request policy/dependency access')
+        catalog = arguments.get('source_catalog')
+        if 'source_catalog' in arguments and catalog is not True:
+            raise ValueError('source_catalog must be true')
+        if catalog and set(arguments) - {'purpose', 'source_catalog', 'timeout_seconds'}:
+            raise ValueError('source catalog cannot execute code or request policy/source bytes')
+        code, purpose = arguments.get("code", 'pass' if 'source_request' in arguments or catalog or checkout_request or framework_request else None), arguments.get("purpose")
         if (not isinstance(code, str) or not 1 <= len(code) <= 16000 or
                 not isinstance(purpose, str) or not 1 <= len(purpose) <= 1000):
             raise ValueError("native diagnostic needs bounded code and purpose")
@@ -736,33 +810,109 @@ class _McpExecutor:
         self.calls += 1
         started = time.monotonic()
         try:
+            if framework_request:
+                from .harness_repair import read_source
+                return read_source(_worker_evidence_root(self.output), arguments['framework_source_request'])
+            if checkout_request:
+                from .checkout_source_citations import capture
+                owner, owner_repo = self._research_owner_workspace()
+                if owner != self.output:
+                    from .harness_repair import native_source_access
+                    if native_source_access(owner, self.output):
+                        # capture() still confines source to the isolated owner
+                        # and rejects resources, secrets and non-source bytes.
+                        return capture(owner, owner_repo, arguments['checkout_source_request'])
+                    if 'producer_evidence_id' in arguments['checkout_source_request']:
+                        raise ValueError('historical producer source requires published owner source access; '
+                                         'no private-run filesystem grant is inferred')
+                    from .baseline_reference import checkout_source
+                    local, _, canonical, local_sha = checkout_source(
+                        self.workspace, arguments['checkout_source_request']['ref'])
+                    reader = read_json(self.output / 'workspace_snapshot.json')
+                    if local.relative_to(self.workspace).as_posix() not in (reader.get('reader_source_files') or []):
+                        raise ValueError('source capture must stay in the delegated reader source inventory')
+                    _, _, _, parent_sha = checkout_source(owner_repo, canonical)
+                    if local_sha != parent_sha:
+                        raise ValueError('delegated source no longer matches current owner; request a fresh snapshot')
+                return capture(owner, owner_repo, arguments['checkout_source_request'])
+            if catalog:
+                from .native_source_citations import catalog as source_catalog
+                owner, owner_repo, _ = self._native_context_owner()
+                return source_catalog(owner, owner_repo)
             if 'source_request' in arguments and 'code' not in arguments:
                 if 'policy_request' in arguments:
                     raise ValueError('source-only capture cannot request policy access')
                 from .native_source_citations import capture
-                return capture(self.output,self.workspace,arguments['source_request'])
+                owner, owner_repo, _ = self._native_context_owner()
+                return capture(owner, owner_repo, arguments['source_request'])
             return self._native_probe_bound(arguments, code, purpose,
                 min(timeout, _MAX_TOOL_SECONDS-self.tool_seconds), started)
         finally:
             # Context/archive validation, execution and post-validation all cost time.
             self.tool_seconds += time.monotonic() - started
 
+    def _research_owner_workspace(self):
+        """Resolve only the existing owner workspace marker; no model path grants."""
+        owner = _worker_evidence_root(self.output)
+        owner_repo = self.workspace
+        if owner != self.output:
+            path = owner / 'workspace_snapshot.json'
+            key = 'destination'
+            if not path.exists() and not path.is_symlink():
+                path, key = owner / 'agent_fixture.json', 'workspace'
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 512 * 1024:
+                raise ValueError('research owner has no safe workspace marker')
+            owner_repo = Path(read_json(path).get(key) or '').resolve(strict=True)
+            if owner_repo == owner or not owner_repo.is_relative_to(owner) or not _workspace_marker(owner, owner_repo):
+                raise ValueError('native context owner checkout is not an isolated run workspace')
+        return owner, owner_repo
+
+    def _native_context_owner(self):
+        """Borrow only an executor-published read-only context, not model host paths.
+
+        Reader snapshots do not copy an environment. Public source captures use
+        the authoritative owner context; CPU diagnostics mount only that validated
+        interpreter/dependencies plus the delegated snapshot, never the live source.
+        """
+        from .native_context import load_context
+        owner, owner_repo = self._research_owner_workspace()
+        return owner, owner_repo, load_context(owner, owner_repo)
+
     def _native_probe_bound(self, arguments, code, purpose, timeout, started):
         from .native_context import load_context
         from .common import atomic_text
         from .evidence_store import capture_attempt_evidence
-        # Read-only worker snapshots do not gain access to the parent's live environment.
-        native = load_context(self.output, self.workspace)
+        # An explicitly prepared worker environment remains authoritative. Otherwise
+        # borrow only the owner's validated interpreter/dependencies read-only. Map
+        # the delegated source snapshot at the native checkout address for source-owned
+        # import paths; do not mount the actual parent checkout or the whole run.
+        local_context = self.output / 'native_context.json'
+        if local_context.exists() or local_context.is_symlink():
+            context_owner, context_repo = self.output, self.workspace
+            native = load_context(self.output, self.workspace)
+        else:
+            context_owner, context_repo, native = self._native_context_owner()
         from .diagnostic_source_identity import source_identity
         source_before = source_identity(self.workspace)
         from .diagnostic_artifacts import policy_binding, binding_unchanged
-        binding = policy_binding(self.output, arguments['policy_request']) if 'policy_request' in arguments else None
+        binding = policy_binding(_worker_evidence_root(self.output), arguments['policy_request']) if 'policy_request' in arguments else None
+        data_grant = None
+        producer_request = (arguments.get('data_profile_request') or {}).get('producer')
+        inspector = None
+        if (arguments.get('data_profile_request') or {}).get('format') == 'source_manifest':
+            from .data_health import inspector_source
+            inspector = inspector_source(self.workspace, arguments['data_profile_request']['inspector_ref'])
+        if producer_request is not None:
+            from .diagnostic_artifacts import data_binding
+            data_grant = data_binding(_worker_evidence_root(self.output), producer_request)
         remaining = timeout - (time.monotonic()-started)
         if remaining <= 0:
             raise AgentRuntimeError('diagnostic validation exhausted the original tool window')
         command, stream = _sandbox_argv([native["interpreter"], "-c", code],
             output=self.output, workspace=self.workspace, cwd=self.workspace, native=native,
-            **({'diagnostic_policy': binding} if binding is not None else {}))
+            **({'native_source_workspace': context_repo} if context_owner != self.output else {}),
+            **({'diagnostic_policy': binding} if binding is not None else {}),
+            **({'diagnostic_data':data_grant} if data_grant is not None else {}))
         try:
             attempt = run_process(command, cwd=self.workspace, env={"PATH": "/usr/bin:/bin"},
                                   timeout=max(.001, timeout-(time.monotonic()-started)),
@@ -774,20 +924,97 @@ class _McpExecutor:
         log = self.output / "native_diagnostics" / (identity + ".log")
         atomic_text(log, sanitize_model_text(f"Purpose: {purpose}\n{result['stdout']}\n{result['stderr']}"))
         ref = f"native_diagnostics/{identity}.json"
+        try:
+            context_stable = load_context(context_owner, context_repo)['identity'] == native['identity']
+        except (OSError, ValueError, TypeError, KeyError):
+            context_stable = False
         receipt = {**result, "context_identity": native["identity"], "purpose": purpose,
+                   'native_context_stable': context_stable,
                    'repository_source_identity': source_before,
                    'repository_source_stable': source_before is not None and source_before == source_identity(self.workspace),
                    "capability": "cpu_diagnostic_not_simulation_readiness", "gpu_access": False}
+        if 'data_profile_request' in arguments:
+            receipt['data_profile_request'] = arguments['data_profile_request']
+            from .data_health import LEROBOT_PROFILE_GENERATOR
+            receipt['data_profile_generator'] = LEROBOT_PROFILE_GENERATOR
+            if inspector is not None:
+                receipt['data_profile_generator'] = 'autosim_native_source_manifest_v1'
+                receipt['data_profile_inspector'] = inspector
+            if result.get('returncode') == 0:
+                try:
+                    receipt['data_profile'] = json.loads(result.get('stdout') or '')
+                    if not isinstance(receipt['data_profile'], dict):
+                        raise ValueError('native data profile must be a JSON object')
+                    if 'selection' in arguments['data_profile_request']:
+                        from .data_quality import selection
+                        receipt['data_selection'] = selection(
+                            receipt['data_profile']['episode_manifest'],
+                            **arguments['data_profile_request']['selection'])
+                    manifest = receipt['data_profile'].get('episode_manifest')
+                    if manifest is None and (inspector is not None or
+                            arguments['data_profile_request'].get('include_manifest') is True or
+                            any(k in arguments['data_profile_request'] for k in ('selection', 'coverage_reference'))):
+                        raise ValueError('requested native episode manifest is missing')
+                    if manifest is not None:
+                        from .data_quality import validate_manifest
+                        validate_manifest(manifest)
+                    if 'coverage_reference' in arguments['data_profile_request']:
+                        from .data_quality import sealed_coverage_change
+                        receipt['data_coverage_change'] = sealed_coverage_change(
+                            _worker_evidence_root(self.output), manifest,
+                            arguments['data_profile_request']['coverage_reference'])
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    receipt['data_profile_status'] = 'unreadable_or_truncated; inspect sealed evidence'
         if binding is not None:
             receipt['diagnostic_policy_binding'] = {k:v for k,v in binding.items() if k != 'path'}
-            receipt['diagnostic_policy_binding_stable'] = binding_unchanged(self.output, binding)
-        receipt.update(capture_attempt_evidence(self.output, attempt_id=identity, log=log,
-            receipt_ref=ref, status=result["status"], returncode=result["returncode"],
+            receipt['diagnostic_policy_binding_stable'] = binding_unchanged(_worker_evidence_root(self.output), binding)
+        if data_grant is not None:
+            from .diagnostic_artifacts import data_binding_unchanged
+            receipt['diagnostic_data_binding'] = {k:v for k,v in data_grant.items() if k != 'path'}
+            receipt['diagnostic_data_binding_stable'] = data_binding_unchanged(_worker_evidence_root(self.output),data_grant)
+        # A read-only Data/Fix worker owns its probe files, while stable evidence IDs
+        # are shared with Scheduler. Otherwise the worker cannot even read its own
+        # returned ID through read_evidence, and Main cannot bind it to a data version.
+        evidence_root = _worker_evidence_root(self.output)
+        global_ref = (self.output/ref).relative_to(evidence_root).as_posix()
+        receipt.update(capture_attempt_evidence(evidence_root, attempt_id=identity, log=log,
+            receipt_ref=global_ref, status=result["status"], returncode=result["returncode"],
             termination_reason="cpu_native_diagnostic"))
         atomic_json(self.output / ref, receipt)
         if 'source_request' in arguments:
             from .native_source_citations import capture
-            receipt['source_citation'] = capture(self.output,self.workspace,arguments['source_request'])
+            owner, owner_repo, _ = self._native_context_owner()
+            receipt['source_citation'] = capture(owner,owner_repo,arguments['source_request'])
+        if 'data_profile_request' in arguments:
+            # Keep the complete manifest/selection sealed, not duplicated as stdout
+            # and parsed JSON in every model context. Stable ID pages remain available.
+            public = {**receipt, 'stdout': '', 'stderr': receipt.get('stderr', '')[-4000:],
+                      'excerpt': 'Native data manifest is sealed; read_evidence by evidence_id for bounded pages.'}
+            observed = receipt.get('data_profile') or {}
+            if not isinstance(observed, dict) or receipt.get('data_profile_status'):
+                public['data_profile'] = {}
+                return {**public, 'stdout':receipt.get('stdout','')[-4000:],
+                        'data_profile_inspector':{k:v for k,v in (inspector or {}).items() if k != 'code'}}
+            manifest = observed.get('episode_manifest')
+            public['data_profile'] = {k:v for k,v in observed.items() if k != 'episode_manifest'}
+            if manifest is not None:
+                from .common import object_digest
+                rows = manifest['episodes']
+                public['data_profile']['episode_manifest_summary'] = {
+                    'scope': manifest['scope'], 'sha256': object_digest(manifest),
+                    'episodes': len(rows), 'identity_field': manifest['identity_field'], 'identity': manifest['identity'],
+                    'committed': sum(r['committed'] for r in rows),
+                    'format_valid': sum(r['format_valid'] is True for r in rows),
+                    'unknown_source_families': sum(r['source_family'] is None for r in rows),
+                    'unknown_supervision': sum(r['supervision'] is None for r in rows)}
+            if receipt.get('data_selection'):
+                chosen = receipt['data_selection']
+                public['data_selection'] = {k:v for k,v in chosen.items() if k != 'selected_episode_ids'}
+                public['data_selection']['selected_ids_preview'] = chosen['selected_episode_ids'][:16]
+                public['data_selection']['selection_sealed_in_receipt'] = global_ref
+            if inspector is not None:
+                public['data_profile_inspector'] = {k:v for k,v in inspector.items() if k != 'code'}
+            return public
         return receipt
 
     def public_source(self, name, arguments):
@@ -837,16 +1064,18 @@ def _evidence_tool_schema() -> dict[str, Any]:
     return {"name": _EVIDENCE_TOOL_NAME,
             "description": ("Read a verified slice of run-owned evidence by stable ID. "
                             "Native IDs are 32 hex. For a sealed candidate_execution_reviews/<64hex>.json "
-                            "reference use execution-review:<64hex>. Inspect the original error before a fix."),
+                            "reference use execution-review:<64hex>. For a source-only workflow "
+                            "transaction use workflow-patch:<32hex>; it is not native or score evidence. "
+                            "Inspect the original error before a fix."),
             "inputSchema": {"type": "object", "properties": {
-                "evidence_id": {"type": "string", "pattern": "^([0-9a-f]{32}|execution-review:[0-9a-f]{64})$"},
+                "evidence_id": {"type": "string", "pattern": "^([0-9a-f]{32}|execution-review:[0-9a-f]{64}|workflow-patch:[0-9a-f]{32})$"},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 12000}},
                 "required": ["evidence_id"], "additionalProperties": False}}
 
 
-def _native_tool_schema() -> dict[str, Any]:
-    return {"name": _NATIVE_TOOL_NAME, "description":
+def _native_tool_schema(*, source_only: bool = False) -> dict[str, Any]:
+    schema = {"name": _NATIVE_TOOL_NAME, "description":
             "Inspect the actual selected native interpreter and run configuration. "
             "CPU only, no network, checkout/environment/config read-only. "
             "Optionally request a scored local policy via policy_request={label,measurement_sha256}; "
@@ -857,18 +1086,99 @@ def _native_tool_schema() -> dict[str, Any]:
                 "code": {"type": "string", "maxLength": 16000},
                 "purpose": {"type": "string", "maxLength": 1000},
                 "timeout_seconds": {"type": "number", "minimum": .1, "maximum": 900},
+                'data_profile_request': {'type':'object', 'required':['format','root'],
+                    'properties': {'format': {'type':'string', 'enum':['lerobot_v2.1','source_manifest']},
+                        'inspector_ref': {'type':'string','maxLength':512,
+                            'description':'For source_manifest: bounded checkout-relative native reader/checker .py. '
+                                'It reads AUTOSIM_DATA_ROOT and prints one JSON profile with a full '
+                                'episode_manifest, native format/counts/issues/scope/video_decode_scope. '
+                                'Source code is sealed; independent registration review must verify observations. '
+                                'This is not arbitrary host-path access or automatic expert certification.'},
+                        'root': {'type':'string','minLength':1,'maxLength':512},
+                        'max_episodes': {'type':'integer','minimum':1,'maximum':10000},
+                        'decode_videos': {'type':'boolean'},
+                        'include_manifest': {'type':'boolean'},
+                        'manifest_fields': {'type':'object',
+                            'description':'Map native episode metadata fields to source_family/source_instance/'
+                                'split/supervision and observed conditions. No constant provenance values.'},
+                        'selection': {'type':'object',
+                            'description':'Reversible complete-episode selection over observed metadata only: '
+                                'target={field,op,value,unit}, limit, deduplicate (bytes/source_instance/none), '
+                                'require_split, require_supervision. Unknown fields are not fabricated.'},
+                        'coverage_reference': {'type':'object', 'required':['evidence_id','target'],
+                            'properties':{'evidence_id':{'type':'string','pattern':'^[0-9a-f]{32}$'},
+                                'target':{'type':'object'}}, 'additionalProperties':False,
+                            'description':'Compare actual condition coverage to one prior sealed read-only '
+                                'manifest. Missing observations stay unknown; no change is not evidence '
+                                'that a control worked. Includes manifest automatically.'},
+                        'producer':{'type':'object','required':['evidence_id','artifact_index'],
+                            'properties':{'evidence_id':{'type':'string','pattern':'^[0-9a-f]{32}$'},
+                                'artifact_index':{'type':'integer','minimum':0,'maximum':4095},
+                                'relative_path':{'type':'string','maxLength':512},
+                                'dataset_root_relative':{'type':'string','minLength':1,'maxLength':512,
+                                    'description':'Only when the selected producer artifact is a marker FILE: '
+                                        'explicit dataset DIRECTORY relative to that attempt output, containing '
+                                        'the marker. Not the producer/run root; cannot combine relative_path. '
+                                        'Read-only full-tree identity is rechecked; does not certify training scope.'},
+                                'scope':{'type':'string','enum':['this_run','budget_parent']}},'additionalProperties':False,
+                            'description':'For a newly produced artifact outside this read-only worker snapshot, '
+                                'select a sealed collect/prepare_data candidate. Set root=@producer; '
+                                'only that dataset is mounted read-only, not the parent source/run.'}}, 'additionalProperties':False,
+                    'description':'Explicit format-level health check of a checkout/resource-relative dataset. '
+                        'CPU/read-only; bounded scans label full vs sampled. Not expert-label, provenance, '
+                        'loader consumption or policy-value certification; never grants host paths.'},
+                'source_catalog': {'type': 'boolean', 'enum': [True],
+                    'description': 'Discover bounded public source entries under the current native dependency roots. '
+                        'Returns numeric root indexes and relative names; no host-path guessing or code execution.'},
                 'source_request': {'type':'object','required':['root_index','path'],
                     'properties':{'root_index':{'type':'integer','minimum':0},
                         'path':{'type':'string','minLength':1,'maxLength':512}},'additionalProperties':False,
                     'description':'Capture exact installed public source under root 0=native interpreter prefix, '
                         '1..N=published read-only dependency_roots. Returns native-source:ID for protocol/reference citations. '
                         'No arbitrary host paths; code is optional for source-only reads.'},
+                'checkout_source_request': {'type': 'object', 'required': ['ref'],
+                    'properties': {'ref': {'type': 'string', 'minLength': 1, 'maxLength': 1024},
+                        'producer_evidence_id': {'type':'string','pattern':'^[0-9a-f]{32}$'},
+                        'view': {'type':'string','enum':['source','patch']}},
+                    'additionalProperties': False,
+                    'description': 'Capture an exact checkout source/config slice: '
+                        '{ref:"relative/file.json:101-109"}. Returns checkout-source:ID and exact quote '
+                        'that survive privacy projection. Source-only: no code, GPU, network, or resource access. '
+                        'Use the returned ref/quote pair in source_refs, never a redacted path. '
+                        'For this-run archived candidate code add producer_evidence_id=sealed TRAIN id. '
+                        'view=patch selects its complete recorded delta for ref=relative/file.py; '
+                        'view=source reads its recorded postimage ref=file.py:line-line. '
+                        'Historical reads return producer-source:ID, NOT checkout-source:ID; no restoration, '
+                        'current-installation claim or current-protocol approval. No arbitrary run paths.'},
+                'framework_source_request': {'type':'object', 'required':['path'],
+                    'properties':{'path':{'type':'string','minLength':1,'maxLength':512},
+                        'offset':{'type':'integer','minimum':0},
+                        'limit':{'type':'integer','minimum':1,'maximum':240},
+                        'query':{'type':'string','minLength':1,'maxLength':128}},'additionalProperties':False,
+                    'description':'Read a bounded line page of an exact source_ref in harness_repair.source_catalog. '
+                        'No host paths, directory scan, imports, code execution or live edits. '
+                        'Optional literal query locates a function/error within this ONE file instead of offset. '
+                        'Use this to diagnose framework guards/routing instead of scanning installed packages.'},
                 'policy_request': {'type':'object', 'properties': {
                     'label': {'type':'string','pattern':'^[A-Za-z0-9_-]{1,80}$'},
                     'measurement_sha256': {'type':'string','pattern':'^[0-9a-f]{64}$'}},
                     'required':['label','measurement_sha256'],'additionalProperties':False}},
-                "required": ["purpose"], "anyOf":[{'required':['code']},{'required':['source_request']}],
+                # Anthropic/Claude Code drops tools with top-level anyOf/oneOf.
+                # Keep the transport schema a plain object; native_probe enforces
+                # the code/source/catalog alternatives before granting anything.
+                "required": ["purpose"],
                 "additionalProperties": False}}
+    if source_only:
+        schema['description'] = ('Read exact public source from the current run-owned native dependency '
+            'catalog or delegated checkout. Source-only: no code execution, GPU, data/policy grants or writes. '
+            'Returns owner-sealed source IDs usable by Scheduler for independent review.')
+        props = schema['inputSchema']['properties']
+        schema['inputSchema']['properties'] = {k: props[k] for k in
+            ('purpose', 'timeout_seconds', 'source_catalog', 'source_request', 'checkout_source_request', 'framework_source_request')}
+        schema['inputSchema']['properties']['source_request'] = {
+            **props['source_request'], 'description': 'Capture exact public dependency source by published root index '
+            'and relative path. No code execution; use returned native-source:ID and verbatim quote.'}
+    return schema
 
 
 def _resource_tool_schema() -> dict[str, Any]:
@@ -909,7 +1219,7 @@ def handle_mcp_message(message: dict[str, Any], executor: _McpExecutor) -> dict[
         result = {}
     elif method == "tools/list":
         result = {"tools": ([_tool_schema()] if executor.allow_commands else []) +
-                  ([_native_tool_schema()] if executor.allow_native else []) +
+                  ([_native_tool_schema(source_only=executor.native_source_only)] if executor.allow_native else []) +
                   [_evidence_tool_schema(), _resource_tool_schema(), *_public_tool_schemas()]}
     elif method == "tools/call":
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -929,6 +1239,9 @@ def handle_mcp_message(message: dict[str, Any], executor: _McpExecutor) -> dict[
                 value = executor.inspect_resources(params.get("arguments") or {})
             else:
                 value = executor.read_evidence(params.get("arguments") or {})
+            if params.get('name') != _EVIDENCE_TOOL_NAME and isinstance(value, dict):
+                from .token_context import project_tool_result
+                value = project_tool_result(value, _worker_evidence_root(executor.output))
             result = {"content": [{"type": "text", "text": json.dumps(
                 value, ensure_ascii=False, sort_keys=True)}], "isError": False}
         except (AgentRuntimeError, OSError, ValueError, TypeError) as exc:
@@ -957,9 +1270,11 @@ def handle_mcp_message(message: dict[str, Any], executor: _McpExecutor) -> dict[
 
 
 def mcp_stdio(*, workspace: Path, output: Path,
-              allow_commands: bool = True, allow_native: bool | None = None) -> int:
+              allow_commands: bool = True, allow_native: bool | None = None,
+              native_source_only: bool = False) -> int:
     executor = _McpExecutor(workspace=workspace, output=output,
-                            allow_commands=allow_commands, allow_native=allow_native)
+                            allow_commands=allow_commands, allow_native=allow_native,
+                            native_source_only=native_source_only)
     for raw in sys.stdin.buffer:
         try:
             message = json.loads(raw)
@@ -978,16 +1293,34 @@ def mcp_stdio(*, workspace: Path, output: Path,
 
 def _claude_configuration(*, workspace: Path, output: Path,
                           python: str, include_executor: bool = True,
-                          native_readonly: bool = False) -> dict[str, Any]:
+                          native_readonly: bool = False,
+                          native_source_only: bool = False) -> dict[str, Any]:
     package_root = Path(__file__).resolve().parents[2]
     command = ["-i", "PATH=/usr/bin:/bin", f"PYTHONPATH={package_root}",
                f"HOME={output / 'mcp-home'}", f"TMPDIR={output / 'mcp-tmp'}",
                python, "-m", "autosim.research.agent_runtime", "mcp-stdio",
                "--workspace", str(workspace), "--output", str(output),
                *( [] if include_executor else ["--read-only"]),
-               *(["--native-readonly"] if native_readonly else [])]
+               *(["--native-readonly"] if native_readonly else []),
+               *(["--native-source-only"] if native_source_only else [])]
     return {"mcpServers": {_MCP_SERVER_NAME: {"command": "/usr/bin/env",
                                                 "args": command}}}
+
+
+def _advertised_tools(event):
+    value = event.get('tools')
+    if not isinstance(value, list):
+        return None
+    return sorted({name for name in value if isinstance(name, str) and
+                   re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}', name)})[:128]
+
+
+def capability_identity(profile):
+    from .common import object_digest
+    return object_digest({'role': profile.name, 'builtin_tools': profile.builtin_tools,
+        'mcp_tools': profile.mcp_tools, 'native_schema': _native_tool_schema(source_only=profile.native_source_only)
+            if profile.can_inspect_native else None,
+        'can_execute': profile.can_execute_diagnostics, 'can_edit': profile.can_edit_checkout})
 
 
 def _role_cli_args(profile: Any, *, workspace: Path, output: Path,
@@ -996,7 +1329,8 @@ def _role_cli_args(profile: Any, *, workspace: Path, output: Path,
     """Translate one role's capability profile into the actual CLI/MCP allowlist."""
     config = _claude_configuration(workspace=workspace, output=output, python=python,
                                    include_executor=profile.can_execute_diagnostics,
-                                   native_readonly=profile.can_inspect_native)
+                                   native_readonly=profile.can_inspect_native,
+                                   native_source_only=profile.native_source_only)
     authorized_tools = [*profile.builtin_tools, *profile.mcp_tools]
     if profile.name == "recorder" or decision_only:
         config = {"mcpServers": {}}
@@ -1044,6 +1378,8 @@ def _claude_env(*, output: Path, key: str, base_url: str, model: str) -> dict[st
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
             "CLAUDE_CODE_DISABLE_NON_ESSENTIAL_TRAFFIC": "1"}
 
 
@@ -1112,6 +1448,18 @@ def _persist_agent_session(output: Path, session: dict[str, Any]) -> None:
             raise AgentRuntimeError("agent session directory is a symlink")
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_json(sessions / f"{key}.json", session)
+    # Conversation projections are reused and overwritten on resume. Budget
+    # reconciliation needs each reservation's own final turn, not the last
+    # turn of a long conversation. Preserve the original owner/pricing route.
+    turn = str(session.get("process_attempt_id") or "")
+    if turn:
+        if not re.fullmatch(r"[0-9a-f]{32}", turn):
+            raise AgentRuntimeError("agent turn identity cannot be archived safely")
+        turns = root / "turn_sessions"
+        if turns.is_symlink():
+            raise AgentRuntimeError("agent turn-session directory is a symlink")
+        turns.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_json(turns / f"{turn}.json", session)
     atomic_json(roles / f"{role}.json", {"schema_version": _SESSION_SCHEMA,
                                            "role": role, "session_key": key,
                                            "run_id": session.get("run_id"),
@@ -1284,7 +1632,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
                            generation_policy: dict | None = None
                            ) -> dict[str, Any]:
     """Run one real, streamed Claude Code turn against the configured DeepSeek endpoint."""
-    from ..llm_client import PROJECT_ROOT, load_credential_file
+    from ..llm_client import PROJECT_ROOT, configured_llm_model, load_credential_file
 
     workspace = Path(workspace).expanduser().resolve(strict=True)
     output = Path(output).expanduser().resolve(strict=True)
@@ -1299,8 +1647,11 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         resume = False
         auto_skills = False
     if generation_policy:
-        if not decision_only:
-            raise ValueError("generation policy requires a fresh decision-only review")
+        # Bounded generation controls output/thinking, not tool authority. Init
+        # argv derivation explicitly requests a bound while retaining its tools;
+        # conflating that request with review-only mode fails before the provider.
+        # Role capability, decision-only restrictions and gateway validation are
+        # independent guards and remain in force for both kinds of turn.
         from .deepseek_gateway import validate_generation_policy
         generation_policy = validate_generation_policy(generation_policy)
     if decision_attempt_id is not None and not re.fullmatch(
@@ -1320,8 +1671,7 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         raise AgentRuntimeError("no DeepSeek API credential is configured")
     base_url = os.environ.get("DEEPSEEK_BASE_URL") or os.environ.get(
         "AUTOSIM_LLM_BASE_URL", "https://api.deepseek.com")
-    model = os.environ.get("DEEPSEEK_MODEL") or os.environ.get(
-        "AUTOSIM_LLM_MODEL", credential.get("model") or "deepseek-flash")
+    model = configured_llm_model()
     official_pricing = model == "deepseek-flash"
     if model.startswith("deepseek") and not official_pricing:
         raise AgentRuntimeError(
@@ -1401,10 +1751,13 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         prompt = prompt.rstrip() + "\n\n" + skill_context
     prompt = sanitize_model_text(prompt, local_roots=(workspace,))
     _validate_agent_prompt(prompt)
+    from .runtime_freshness import controller_identity
     session = {"schema_version": _SESSION_SCHEMA, "run_id": run_id,
+               "controller_runtime_id": controller_identity(),
                "agent_session_key": session_key,
                "session_id": session_id, "workspace_identity": str(workspace),
                "role": profile.name, "read_only": read_only,
+               "capability_identity": capability_identity(profile),
                "model": model, "status": "running",
                "started_at": time.time(),
                "skill_selection": skill_manifest,
@@ -1443,6 +1796,10 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     refresh_agent_document(output)
 
     environment = _claude_env(output=output, key=key, base_url=base_url, model=model)
+    if generation_policy and generation_policy.get('max_output_tokens') is not None:
+        # Align the CLI's declared ceiling with the effective proxy ceiling. A
+        # 900-token upstream truncation must not masquerade as a 32000-token one.
+        environment['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=str(generation_policy['max_output_tokens'])
     reservation = None
     turn_budget_usd = float(max_budget_usd)
     if ledger is not None:
@@ -1579,6 +1936,15 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
             candidate_id = event.get("session_id")
             if isinstance(candidate_id, str) and candidate_id:
                 seen_session = candidate_id
+            advertised = _advertised_tools(event)
+            if advertised is not None:
+                atomic_json(output / 'agent/tool_capabilities.json', {
+                    'role': profile.name, 'session_id': seen_session,
+                    'capability_identity': capability_identity(profile),
+                    'configured_tools': [*profile.builtin_tools, *profile.mcp_tools],
+                    'advertised_tools': advertised,
+                    'missing_configured_tools': sorted(set(profile.mcp_tools) - set(advertised)),
+                    'authority': 'CLI discovery, not a model claim or permission escalation', 'at': utc_now()})
         if event.get("type") == "result":
             final_result = event
         for row in _project_claude_event(event, tool_names):
@@ -1658,10 +2024,21 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
     startup_failure = None
     startup_phase = "deepseek_gateway_start"
     try:
+        def checkpoint_gateway(snapshot):
+            journal = output / 'agent' / 'gateway_journals' / (process_attempt_id + '.json')
+            if any(path.is_symlink() for path in (output, output/'agent', journal.parent, journal)):
+                raise AgentRuntimeError('unsafe gateway journal path')
+            atomic_json(journal, {'schema_version': 1, 'kind': 'request_gateway_journal_v1',
+                'price_card': PRICE_CARD_ID, 'cost_basis': cost_basis,
+                'turn_id': process_attempt_id, 'run_id': run_id, 'role': profile.name,
+                'session_id': session_id, 'budget_output': str(budget_root),
+                'budget_reservation_id': reservation['reservation_id'] if reservation else None,
+                'gateway': snapshot})
         gateway_context = (deepseek_turn_gateway(
             upstream_base_url=_anthropic_endpoint(base_url), upstream_key=key,
             model=model, limit_usd=turn_budget_usd,
             generation_policy=generation_policy,
+            checkpoint=checkpoint_gateway,
             extend_budget=(lambda required: ledger.extend(
                 reservation["reservation_id"], required)) if ledger is not None else None
             ) if official_pricing else nullcontext(None))
@@ -1816,7 +2193,10 @@ def _run_coding_agent_turn(*, workspace: Path, output: Path, prompt: str,
         status, failure_category = "infrastructure_blocked", "runtime_startup"
     elif not attempt.launched and isinstance(attempt.error, (PermissionError, FileNotFoundError)):
         status, failure_category = "infrastructure_blocked", "cli_launch_permission_or_missing"
-    if (official_pricing and gateway_snapshot is not None and
+    terminal_provider = blocked_provider_category(gateway_snapshot, final_result)
+    if terminal_provider and not completed:
+        status, failure_category = 'infrastructure_blocked', terminal_provider
+    elif (official_pricing and gateway_snapshot is not None and
             gateway_snapshot.get("denied_count", 0) and not completed):
         denials = gateway_snapshot.get("denials", [])
         if any(row.get("category") == "run_model_budget" for row in denials):
@@ -1986,12 +2366,14 @@ def _main(argv: list[str] | None = None) -> int:
     mcp.add_argument("--output", type=Path, required=True)
     mcp.add_argument("--read-only", action="store_true")
     mcp.add_argument("--native-readonly", action="store_true")
+    mcp.add_argument("--native-source-only", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "mcp-stdio":
         try:
             return mcp_stdio(workspace=args.workspace, output=args.output,
                              allow_commands=not args.read_only,
-                             allow_native=not args.read_only or args.native_readonly)
+                             allow_native=not args.read_only or args.native_readonly,
+                             native_source_only=args.native_source_only)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"autosim MCP server refused startup: {type(exc).__name__}", file=sys.stderr)
             return 2

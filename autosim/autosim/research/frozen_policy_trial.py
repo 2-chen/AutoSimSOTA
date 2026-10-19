@@ -153,6 +153,10 @@ def load(research, request):
             raise ValueError('frozen policy selection differs from native artifact inventory')
     trained={**receipt,'artifact':dict(artifact),
              'artifact_selection':dict(train.get('artifact_selection') or {})}
+    from .checkpoint_handoff import bound_handoff
+    handoff = bound_handoff(research.output, parent, producer_evidence_ref=receipt['evidence_ref'])
+    if handoff is not None:
+        trained['explicit_checkpoint_handoff'] = handoff
     produced=research._recorded_artifact(trained)
     if produced is None:
         raise ValueError('frozen policy original artifact selection is unverifiable')

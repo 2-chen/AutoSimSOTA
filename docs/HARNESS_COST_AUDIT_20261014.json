@@ -1,0 +1,678 @@
+{
+  "observed_on": "2026-10-14",
+  "read_only": true,
+  "optimization_paid_ab_performed": false,
+  "reports": {
+    "robosyn_required_data_20261013_v1": {
+      "schema_version": 2,
+      "basis": "stored_gateway_receipts_only_no_repricing",
+      "unknown_usage_is_not_zero_cost": true,
+      "roles": {
+        "supervisor": {
+          "turns": 31,
+          "requests_total": 103,
+          "requests_with_usage": 103,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 3017600,
+          "input_miss_tokens": 1191124,
+          "output_tokens": 140517,
+          "known_cost_usd": 0.38113097399999996,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.7169869062452182,
+          "output_token_share": 0.0499503755955995,
+          "known_cost_share": 0.06165232436003121,
+          "input_tokens_per_request": {
+            "mean": 40861.398058252424,
+            "max": 134858,
+            "p95": 122396
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 103,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "scheduler": {
+          "turns": 92,
+          "requests_total": 302,
+          "requests_with_usage": 300,
+          "requests_without_usage": 2,
+          "input_hit_tokens": 22235264,
+          "input_miss_tokens": 7694143,
+          "output_tokens": 1704205,
+          "known_cost_usd": 3.0309593579999987,
+          "unknown_reserved_usd": 0.11462661000000002,
+          "requests_without_cost": 2,
+          "cache_hit_ratio": 0.7429236402846204,
+          "output_token_share": 0.6058034247948549,
+          "known_cost_share": 0.4902925823643184,
+          "input_tokens_per_request": {
+            "mean": 99764.69,
+            "max": 163082,
+            "p95": 147012
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 302,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "fix": {
+          "turns": 12,
+          "requests_total": 135,
+          "requests_with_usage": 135,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 9594624,
+          "input_miss_tokens": 1178224,
+          "output_tokens": 290113,
+          "known_cost_usd": 0.5754309479999999,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8906302214604718,
+          "output_token_share": 0.10312811485561289,
+          "known_cost_share": 0.09308258282071886,
+          "input_tokens_per_request": {
+            "mean": 79798.87407407408,
+            "max": 164248,
+            "p95": 145384
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 135,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "objective": {
+          "turns": 10,
+          "requests_total": 88,
+          "requests_with_usage": 88,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 7331712,
+          "input_miss_tokens": 869750,
+          "output_tokens": 142587,
+          "known_cost_usd": 0.436920276,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8939518344412253,
+          "output_token_share": 0.05068621024537775,
+          "known_cost_share": 0.0706768864590532,
+          "input_tokens_per_request": {
+            "mean": 93198.43181818182,
+            "max": 159708,
+            "p95": 152946
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 88,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "monitor": {
+          "turns": 6,
+          "requests_total": 18,
+          "requests_with_usage": 18,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 801280,
+          "input_miss_tokens": 448712,
+          "output_tokens": 47417,
+          "known_cost_usd": 0.136092186,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.6410281025798565,
+          "output_token_share": 0.016855590139389122,
+          "known_cost_share": 0.022014478398540496,
+          "input_tokens_per_request": {
+            "mean": 69444,
+            "max": 127816,
+            "p95": 127816
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 18,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "init": {
+          "turns": 22,
+          "requests_total": 104,
+          "requests_with_usage": 104,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 7064320,
+          "input_miss_tokens": 1709941,
+          "output_tokens": 373148,
+          "known_cost_usd": 0.8851991099999998,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8051185165337571,
+          "output_token_share": 0.13264503763065508,
+          "known_cost_share": 0.14319115048605557,
+          "input_tokens_per_request": {
+            "mean": 84367.89423076923,
+            "max": 156490,
+            "p95": 149344
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 104,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "resource": {
+          "turns": 2,
+          "requests_total": 13,
+          "requests_with_usage": 13,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 1403776,
+          "input_miss_tokens": 178722,
+          "output_tokens": 27731,
+          "known_cost_usd": 0.095316456,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8870633643770798,
+          "output_token_share": 0.009857695977295057,
+          "known_cost_share": 0.015418534475134636,
+          "input_tokens_per_request": {
+            "mean": 121730.61538461539,
+            "max": 154567,
+            "p95": 154567
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 13,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "recorder": {
+          "turns": 89,
+          "requests_total": 176,
+          "requests_with_usage": 176,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 0,
+          "input_miss_tokens": 3206521,
+          "output_tokens": 48773,
+          "known_cost_usd": 0.58707075,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0,
+          "output_token_share": 0.017337615156345312,
+          "known_cost_share": 0.09496545484462984,
+          "input_tokens_per_request": {
+            "mean": 18218.86931818182,
+            "max": 30845,
+            "p95": 27294
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 176,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "data": {
+          "turns": 3,
+          "requests_total": 21,
+          "requests_with_usage": 21,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 2023552,
+          "input_miss_tokens": 163765,
+          "output_tokens": 38641,
+          "known_cost_usd": 0.053820006,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.9251297365676763,
+          "output_token_share": 0.013735935604870301,
+          "known_cost_share": 0.008706005791517816,
+          "input_tokens_per_request": {
+            "mean": 104157.95238095238,
+            "max": 160910,
+            "p95": 153417
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 21,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        }
+      },
+      "skipped_records": 0,
+      "totals": {
+        "turns": 267,
+        "requests_total": 960,
+        "requests_with_usage": 958,
+        "requests_without_usage": 2,
+        "input_hit_tokens": 53472128,
+        "input_miss_tokens": 16640902,
+        "output_tokens": 2813132,
+        "known_cost_usd": 6.181940063999998,
+        "unknown_reserved_usd": 0.11462661000000002,
+        "requests_without_cost": 2,
+        "cache_hit_ratio": 0.7626560712038832,
+        "output_token_share": 1,
+        "known_cost_share": 1,
+        "input_tokens_per_request": {
+          "mean": 73186.87891440501,
+          "max": 164248,
+          "p95": 143867
+        },
+        "request_profiles": {
+          "observed_requests": 0,
+          "missing_requests": 960,
+          "not_provider_cache_measurement": true,
+          "distinct_hashes": {
+            "envelope_sha256": 0,
+            "system_sha256": 0,
+            "tools_sha256": 0,
+            "first_message_sha256": 0
+          }
+        }
+      },
+      "worker_roots_included": 56,
+      "not_full_inherited_ledger_or_provider_invoice": true
+    },
+    "robosyn_data_closure_20261012_v2": {
+      "schema_version": 2,
+      "basis": "stored_gateway_receipts_only_no_repricing",
+      "unknown_usage_is_not_zero_cost": true,
+      "roles": {
+        "scheduler": {
+          "turns": 169,
+          "requests_total": 494,
+          "requests_with_usage": 493,
+          "requests_without_usage": 1,
+          "input_hit_tokens": 33095424,
+          "input_miss_tokens": 18314756,
+          "output_tokens": 3288093,
+          "known_cost_usd": 5.270918111999999,
+          "unknown_reserved_usd": 0.19570666499999997,
+          "requests_without_cost": 1,
+          "cache_hit_ratio": 0.6437523463251831,
+          "output_token_share": 0.5543625819887161,
+          "known_cost_share": 0.4593016941784213,
+          "input_tokens_per_request": {
+            "mean": 104280.28397565923,
+            "max": 166283,
+            "p95": 149923
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 494,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "supervisor": {
+          "turns": 77,
+          "requests_total": 187,
+          "requests_with_usage": 181,
+          "requests_without_usage": 6,
+          "input_hit_tokens": 1602944,
+          "input_miss_tokens": 3601388,
+          "output_tokens": 90090,
+          "known_cost_usd": 0.6573692819999999,
+          "unknown_reserved_usd": 0.36220432499999994,
+          "requests_without_cost": 6,
+          "cache_hit_ratio": 0.30800187228639525,
+          "output_token_share": 0.015188902811253647,
+          "known_cost_share": 0.05728239720440043,
+          "input_tokens_per_request": {
+            "mean": 28753.21546961326,
+            "max": 122066,
+            "p95": 71308
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 187,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "init": {
+          "turns": 47,
+          "requests_total": 306,
+          "requests_with_usage": 306,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 23659136,
+          "input_miss_tokens": 4182729,
+          "output_tokens": 1215502,
+          "known_cost_usd": 1.4276879579999981,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8497683614226273,
+          "output_token_share": 0.20492997829819548,
+          "known_cost_share": 0.12440707366988785,
+          "input_tokens_per_request": {
+            "mean": 90986.48692810457,
+            "max": 166186,
+            "p95": 159221
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 306,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "fix": {
+          "turns": 13,
+          "requests_total": 134,
+          "requests_with_usage": 134,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 10089600,
+          "input_miss_tokens": 1836894,
+          "output_tokens": 421440,
+          "known_cost_usd": 0.6399987119999999,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8459820631276886,
+          "output_token_share": 0.07105351538211496,
+          "known_cost_share": 0.05576874587073979,
+          "input_tokens_per_request": {
+            "mean": 89003.68656716419,
+            "max": 159098,
+            "p95": 138225
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 134,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "monitor": {
+          "turns": 20,
+          "requests_total": 46,
+          "requests_with_usage": 46,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 2663040,
+          "input_miss_tokens": 1694785,
+          "output_tokens": 336759,
+          "known_cost_usd": 0.5946144600000002,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.6110938369484777,
+          "output_token_share": 0.05677655368869982,
+          "known_cost_share": 0.05181401476134093,
+          "input_tokens_per_request": {
+            "mean": 94735.32608695653,
+            "max": 140300,
+            "p95": 135774
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 46,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "objective": {
+          "turns": 12,
+          "requests_total": 88,
+          "requests_with_usage": 88,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 6627584,
+          "input_miss_tokens": 1028033,
+          "output_tokens": 209861,
+          "known_cost_usd": 0.30000430200000006,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8657151997023884,
+          "output_token_share": 0.035381932876817644,
+          "known_cost_share": 0.02614202710827749,
+          "input_tokens_per_request": {
+            "mean": 86995.64772727272,
+            "max": 157335,
+            "p95": 147126
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 88,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "data": {
+          "turns": 7,
+          "requests_total": 37,
+          "requests_with_usage": 37,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 3123456,
+          "input_miss_tokens": 414884,
+          "output_tokens": 96396,
+          "known_cost_usd": 0.15872131799999997,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8827461464980754,
+          "output_token_share": 0.01625207542894446,
+          "known_cost_share": 0.01383079165917271,
+          "input_tokens_per_request": {
+            "mean": 95630.81081081081,
+            "max": 161055,
+            "p95": 159755
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 37,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "ideator": {
+          "turns": 1,
+          "requests_total": 23,
+          "requests_with_usage": 23,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 1766528,
+          "input_miss_tokens": 270362,
+          "output_tokens": 63125,
+          "known_cost_usd": 0.08372888399999999,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8672672554728041,
+          "output_token_share": 0.01064268498124527,
+          "known_cost_share": 0.007296037892396026,
+          "input_tokens_per_request": {
+            "mean": 88560.43478260869,
+            "max": 161600,
+            "p95": 160300
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 23,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "resource": {
+          "turns": 3,
+          "requests_total": 15,
+          "requests_with_usage": 15,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 1259392,
+          "input_miss_tokens": 239317,
+          "output_tokens": 40777,
+          "known_cost_usd": 0.064141926,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0.8403179002728348,
+          "output_token_share": 0.006874879453152291,
+          "known_cost_share": 0.005589253077674628,
+          "input_tokens_per_request": {
+            "mean": 99913.93333333333,
+            "max": 120479,
+            "p95": 120479
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 15,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        },
+        "recorder": {
+          "turns": 277,
+          "requests_total": 550,
+          "requests_with_usage": 550,
+          "requests_without_usage": 0,
+          "input_hit_tokens": 0,
+          "input_miss_tokens": 12778883,
+          "output_tokens": 169261,
+          "known_cost_usd": 2.2787538000000005,
+          "unknown_reserved_usd": 0,
+          "requests_without_cost": 0,
+          "cache_hit_ratio": 0,
+          "output_token_share": 0.02853689509086029,
+          "known_cost_share": 0.1985679645776891,
+          "input_tokens_per_request": {
+            "mean": 23234.332727272726,
+            "max": 41899,
+            "p95": 39227
+          },
+          "request_profiles": {
+            "observed_requests": 0,
+            "missing_requests": 550,
+            "not_provider_cache_measurement": true,
+            "distinct_hashes": {
+              "envelope_sha256": 0,
+              "system_sha256": 0,
+              "tools_sha256": 0,
+              "first_message_sha256": 0
+            }
+          }
+        }
+      },
+      "skipped_records": 0,
+      "totals": {
+        "turns": 626,
+        "requests_total": 1880,
+        "requests_with_usage": 1873,
+        "requests_without_usage": 7,
+        "input_hit_tokens": 83887104,
+        "input_miss_tokens": 44362031,
+        "output_tokens": 5931304,
+        "known_cost_usd": 11.475938753999994,
+        "unknown_reserved_usd": 0.5579109899999999,
+        "requests_without_cost": 7,
+        "cache_hit_ratio": 0.6540948911663225,
+        "output_token_share": 1,
+        "known_cost_share": 1,
+        "input_tokens_per_request": {
+          "mean": 68472.57608115322,
+          "max": 166283,
+          "p95": 144852
+        },
+        "request_profiles": {
+          "observed_requests": 0,
+          "missing_requests": 1880,
+          "not_provider_cache_measurement": true,
+          "distinct_hashes": {
+            "envelope_sha256": 0,
+            "system_sha256": 0,
+            "tools_sha256": 0,
+            "first_message_sha256": 0
+          }
+        }
+      },
+      "worker_roots_included": 209,
+      "not_full_inherited_ledger_or_provider_invoice": true
+    }
+  }
+}

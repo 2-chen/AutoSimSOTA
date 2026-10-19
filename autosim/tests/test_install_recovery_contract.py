@@ -8,6 +8,50 @@ from autosim.research.execution_paths import ExecutionPaths
 from autosim.research.common import sanitize_model_payload
 
 
+def test_selector_fault_is_handed_to_main_and_not_replayed(tmp_path, monkeypatch):
+    from autosim.research.prepare import Preparation
+    class Client: model='fixture'
+    repo=tmp_path/'checkout';repo.mkdir()
+    obj=Preparation(repo=repo,output=tmp_path/'out',client=Client(),scouting=tmp_path/'scouting')
+    def fail(*,source_binding_ids=None):
+        pv.selection_failure(obj.output,'unknown source_binding_ids: caller-typo',
+            details={'source_binding_ids':source_binding_ids})
+    monkeypatch.setattr(obj,'_step_build_the_environment',fail)
+    result=obj.do('build_the_environment',source_binding_ids=['caller-typo'])
+    assert result['repair_owner']=='main_agent'
+    assert result['failure_category']=='environment_selection_invalid'
+    assert result['retry_original_arguments'] is False
+    assert result['selection_fault']['source_binding_ids']==['caller-typo']
+    assert result['evidence_id']
+    view=recovery_contract.view([{**result,'step':'build_the_environment','receipt_ref':'selector'}],{})
+    assert view['pending'] is None
+    assert view['unresolved_failure']['next_action']=='build_the_environment'
+    assert view['unresolved_failure']['retry_original_arguments'] is False
+    target={'original':{**result,'step':'build_the_environment'}}
+    monkeypatch.setattr(obj,'_pending_repair',lambda:target)
+    assert obj._repair_retry_available() is False
+    assert obj._step_retry_failed_action()['outcome']=='not attempted'
+
+
+def test_fix_selection_proposal_returns_to_main_without_claiming_recovery(tmp_path,monkeypatch):
+    from autosim.research.prepare import Preparation
+    class Client: model='fixture'
+    repo=tmp_path/'checkout';repo.mkdir()
+    obj=Preparation(repo=repo,output=tmp_path/'out',client=Client(),scouting=tmp_path/'scouting')
+    obj.declaration={'benchmark':'fixture'}
+    monkeypatch.setattr(obj,'state',lambda:{'workspace_resources':{}})
+    monkeypatch.setattr(obj,'_surveyed_runnable_stages',lambda:{'evaluate':{'entrypoint':'eval.py'}})
+    monkeypatch.setattr(obj,'_select_execution_path',lambda **kw:{'stages':['evaluate'],'asset_keys':[],'why':'fixture'})
+    proposal={'step':'build_the_environment','arguments':{'reuse_environment_ref':'env'}}
+    monkeypatch.setattr(pv,'build',lambda *a,**kw:{'status':'yielded','new_native_operation':False,
+        'recovery_status':'selection_proposed','selection_proposal':{
+            'parent_evidence_id':'a'*32,'proposed_action':proposal}})
+    result=obj._step_build_the_environment()
+    assert result['outcome']=='selection proposed'
+    assert result['repair_owner']=='main_agent' and result['proposed_action']==proposal
+    assert result['native_operation_launched'] is False
+
+
 def test_parent_dependency_paths_survive_model_redaction_without_host_paths(tmp_path):
     output = tmp_path / "run"; repo = output / "checkout"; repo.mkdir(parents=True)
     paths = ExecutionPaths(repo, output)

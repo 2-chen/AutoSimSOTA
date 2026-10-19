@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "kind": "native_policy_correction_acquisition_pending_quality_and_learning",
+  "run_ref": "autoresearch_runs/robosyn_required_data_20261013_v1",
+  "producer": {
+    "attempt_id": "1b7917f95c9741429fd9ec77e5d991a8",
+    "native_job_id": "3553a6b331b446a4b4c6db9da8e53055",
+    "main_action": "7809eaca345ab835",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 406.5,
+    "mode": "policy_correction",
+    "requested_episodes": 20,
+    "reported_saved_episodes": 20,
+    "count_authority": "sealed native save-gate progress and finalization log; not independent semantic quality certification",
+    "dataset_ref": "lerobot_dataset/click_bell/cobotmagic_Sim_click_the_bell_008",
+    "artifact_scope": "directory",
+    "requested_parent_train_attempt": "9b6fd0cea9c5405483dbccd7c5e027c8",
+    "requested_parent_model_ref": "research/derived/train/native_outputs/9b6fd0cea9c5405483dbccd7c5e027c8/checkpoints/001000/pretrained_model",
+    "parent_development_score": 0.02,
+    "collector_parent_weight_loading_independently_certified": false,
+    "explicit_native_collection_seed": false,
+    "receipt_requested_seed_not_an_observed_collection_seed": 0
+  },
+  "review": {
+    "scope": "explicit_controls_and_required_dependencies_not_entire_declared_space",
+    "allowed_training_controls": true,
+    "routing_supported": true,
+    "label_supply_supported": true,
+    "effect_status_before_execution": "needs_native_observation"
+  },
+  "autonomy": {
+    "research_settings_and_source_selection": "system Main",
+    "independent_review": "system Supervisor",
+    "execution": "trusted native executor",
+    "operator": "host-only repairs, finite wall continuation, read-only monitoring and paper bookkeeping; no native candidate/data/parameter edits or manual native collection/training/evaluation/scoring"
+  },
+  "incumbent_development_score_unchanged": 0.24,
+  "quality_audit_complete": false,
+  "registered_and_consumed": true,
+  "new_data_policy_score": 0,
+  "matched_acquisition_comparison_complete": false,
+  "method_gain_claim_supported": false,
+  "limits": [
+    "New acquisition on October18, distinct from historical003/October15 and random007/October17. Do not relabel prior data or measurements.",
+    "Directory production, full structural inspection, immutable registration, actual batch consumption, policy loading, native rollout and metric lineage are now connected. This does not establish semantic quality or a causal data benefit.",
+    "No explicit collection_manifest was selected. Per-attempt seeds, failures, source-family mapping, parent-load identity and supervision/targeting quality are not certified here.",
+    "The receipt requested_seed=0 is an unconsumed generic caller input, not an observed native collection seed; native defaults are not a sealed seed witness.",
+    "Requested policy_correction and successful native saves do not alone establish high-quality/useful data, failure-stratum coverage or a DAgger/MimicGen method result.",
+    "Formal0/50=0% is a valid negative development result, below unchanged24% incumbent. R29 has1000updates on20new correction episodes; strong shared initialization, mixture, equal complete cost and matched multi-seed acquisition comparison remain unestablished. No method gain, held-out or SOTA claim."
+  ],
+  "source_hashes": {
+    "action_receipts/7809eaca345ab835.json": "2a9cc6638487746e8fd0e5bb793b1555b2dc05bad0d366c13233759bcdc5ef15",
+    "native_jobs/3553a6b331b446a4b4c6db9da8e53055/request.json": "b24b6a0457f1a0a2ea1f9fd0d16ad583c3791bfb67c014b98e34c7e9bc3bd95d",
+    "native_jobs/3553a6b331b446a4b4c6db9da8e53055/result.json": "a43d08b915b2f35a4e252477e47429f5aa219d31453692c647e04489e8c6aa97",
+    "research/derived/attempts/1b7917f95c9741429fd9ec77e5d991a8/receipt.json": "6e05aff91b9ac7bfa0f36f3ee2bf0dfeb1dfb8e9a2e8f52bb4eb3f2b470d6e8b",
+    "evidence/1b7917f95c9741429fd9ec77e5d991a8.json": "6417a8db9449596b7de29c0862afec90d0a3555a5049e1f84679adef74e976c7",
+    "research/derived/collect/attempts/1b7917f95c9741429fd9ec77e5d991a8/output.log": "222bb6dce85f6303ab5e83bd11a8e0eaecb0a152b97ec479b51a3a335ec3c409",
+    "research/derived/attempts/9b6fd0cea9c5405483dbccd7c5e027c8/receipt.json": "5823e21943e1ed78fe0609c77dbe17b582c44d01f2deb3e6e6b57ba83dbcf057",
+    "research/derived/measurements/round_28_handoff_correction.json": "3b0bb6d6d39ad340accfa864f2bac588da3d35a0c210a05bdd2a819ed4446f49",
+    "evidence/f5921c966047433fab92aa41a7feb49b.json": "09b4554b278af58a8892d8112f132c30419303f6d27a5914f81a7d67d4ff0f1f",
+    "native_diagnostics/f5921c966047433fab92aa41a7feb49b.json": "9e67371c61b8d8a497962ead1ea86694ef493b0e88463e5a81cb08ab7e0b4028",
+    "native_diagnostics/f5921c966047433fab92aa41a7feb49b.log": "3f7daddd165660e37700983bfc58cf1078dd1dc8e839a249a52af072e63c41ed",
+    "data_versions/click_bell_agent_targeted_20ep_008_v1.json": "36a4afd6acbc98e2717da9f5840f80cbd820b3275b20c9be3f0591be0164ff10",
+    "action_receipts/0a689cc3c8ac9163.json": "928b7df5214d6a66ab9ed8ae375c256436f7fb143f982ca1fd38f85f02575bca",
+    "action_receipts/6913006e1010181d.json": "ca30117158b1ef31634e51ad68eac77a0e07e1c689fba69306afa8b87fc52f6f",
+    "research/derived/attempts/a470b62514d244828ade18766b23c857/receipt.json": "2ad3e953916f836df7eeacc2b53ac0dd09edfda250e3f2b81744fd302de9adab",
+    "evidence/a470b62514d244828ade18766b23c857.json": "be7d2a87c78af2d94b3c31d877d1ad3b9f27368e55f02b58190c6677659c35dc",
+    "research/derived/train/attempts/a470b62514d244828ade18766b23c857/output.log": "0729a003d49900a59ad58def6a4e62c00db9211730432eadb1ad7a290f419d8f",
+    "research/derived/measurements/round_29.json": "91981c2715acd39e76fcc9982bd4db2e5d5ff3c79e5ac588cd25dced555b518d",
+    "action_receipts/193c881b00699813.json": "4427802b16f812342649122172ee9628c4a44ff11be0e815d5075a5435e1f4c8",
+    "research/derived/train/native_outputs/a470b62514d244828ade18766b23c857/checkpoints/001000/training_state/training_step.json": "82222f802c6ef162b11a2593ba087082bfb6d1595b8e4183233e4e4a82b139f5",
+    "research/derived/code_changes/round-29.json": "01de58b548eede6ef1a83ff6544ab7a3b698d0e9df5e495dd5d3aad9f5bec56a",
+    "action_receipts/dc3f1b9076e33f46.json": "9920f3f500fea792d87eaaf396cd8c512e0b26d36bc5f840a521f08b59de295c",
+    "research/derived/measurements/round_29_handoff_correction.json": "0019b9687bd9ee2b4481314eeb504a543fa456c59ce6651f223d8b7707fcc350",
+    "research/derived/attempts/d7713666e8ad4adcb87018ecd3feda69/receipt.json": "1f11fbf26226301af3faecf752af62e9021d2c6ce89603c428ba7ca2de3b3b24",
+    "evidence/d7713666e8ad4adcb87018ecd3feda69.json": "b4c436f90597440c0f6c9a06b54f6cb60a5d57f230cbd1dc3716f255e9a43832",
+    "research/derived/evaluate/attempts/d7713666e8ad4adcb87018ecd3feda69/output.log": "16847679e03f7e2864e8f55ce88b8c5712986a44f213609ecd4fbd3b07e1580e",
+    "research/derived/experiments/round_29_handoff_correction/d7713666e8ad4adcb87018ecd3feda69/result.json": "10750d5ccf383333ccad14c8375bf64e3d4041d4f7d8bbefa9eefd23fe0e5441"
+  },
+  "structural_audit": {
+    "evidence_id": "f5921c966047433fab92aa41a7feb49b",
+    "status": "completed",
+    "scope": "full",
+    "counts": {
+      "episodes_checked": 20,
+      "parquet_frames": 1480,
+      "videos_present": 60,
+      "videos_decoded": 60
+    },
+    "issues": [],
+    "video_decode_scope": "full",
+    "unique_exact_action_sequences": 20,
+    "unknown_source_family_episodes": 20,
+    "unknown_supervision_episodes": 20,
+    "unchecked": [
+      "expert labels and success",
+      "action units/frame",
+      "source-family independence",
+      "target coverage",
+      "native loader consumption",
+      "policy improvement"
+    ],
+    "dataset_identity_sha256": "05ddb4d51a42f64e512155d973de4b3a0128c0d563d56fd330b975009ffa97fa"
+  },
+  "registration": {
+    "action": "0a689cc3c8ac9163",
+    "data_version_id": "click_bell_agent_targeted_20ep_008_v1",
+    "status": "reviewed_not_consumed",
+    "asset_kind": "collected",
+    "producer_evidence_id": "1b7917f95c9741429fd9ec77e5d991a8",
+    "identity_sha256": "05ddb4d51a42f64e512155d973de4b3a0128c0d563d56fd330b975009ffa97fa",
+    "profile_scope": "full",
+    "counts": {
+      "transitions": 1480,
+      "episodes": 20,
+      "invalid_episodes": 0
+    },
+    "review": {
+      "allowed_training_data": true,
+      "loader_connection_supported": true,
+      "sources_supported": true,
+      "manifest_observations_supported": false,
+      "why": "allowed_training_data=true: the reviewed artifact is a collector-produced LeRobot v2.1 training dataset at lerobot_dataset/click_bell/cobotmagic_Sim_click_the_bell_008, produced by native collect evidence 1b7917f95c9741429fd9ec77e5d991a8 (returncode 0; log command '... --max_episodes 20 --headless --collection_mode policy_correction --correction_checkpoint ...'), not by the evaluation entrypoint. The correction branch saves an episode only when the scripted expert plan is valid and env.get_wrapper_attr('is_task_success')() holds (review-source-3), and the card's training_scope is training review only. Registration does not certify quality, successful collection or performance. loader_connection_supported=true: --dataset-root is required and --data-version-id is documented as the label for the consumption witness whose identity is recomputed from loaded bytes (review-source-1). In the checkout, main resolves the root into DatasetConfig.root (train.py:1059-1064,1135-1144); the patched make_dataset sets part_cfg.dataset.root and repo_id and calls LeRobot's original make_dataset (train.py:755-777), then wraps the result in _AliasedLeRobotDataset(dataset_root=root) whose __getitem__ reads the base dataset sample before emitting the consumption marker (train.py:227-229). The marker's identity is dataset_bytes_identity(root), a sha256 over the sorted relative-path/file-sha256 manifest of the actual root (train.py:68-88,210-211), not an argv or config constant; samples_read increments per real read (train.py:212-225). For mixtures, an exposure audit counts samples yielded by the DataLoader after collation and before policy.update (train.py:592-685,843-863). Caveats: TRAIN_DATA_SETTING is the module constant 'random'; no training run has consumed this dataset yet, so there is no batch-level exposure measurement for it; and the trainer's all-files identity recipe should be confirmed to equal the registered identity 05ddb4d51a42f64e512155d973de4b3a0128c0d563d56fd330b975009ffa97fa on first read. sources_supported=true: producer evidence 1b7917f95c9741429fd9ec77e5d991a8 is a sealed rc=0 native collect log that found the dataset beside the command; profile evidence f5921c966047433fab92aa41a7feb49b is a CPU native diagnostic with scope full, 20/20 episodes checked, 1480 parquet frames, 60 videos present and 60 decoded, no issues, and a 20-entry per-episode manifest with parquet/mp4 sha256 and content_sha256; its identity matches the card. Count units, scope and episode file grouping are therefore observed. However, all 20 episodes carry source_family=null, source_instance=null, split=null, supervision=null and conditions={}; known_source_families is 0; parents is empty; the description's round_28 parent-policy provenance is model-declared with a redacted checkpoint path; and recipe is empty. manifest_observations_supported=false: the format/count/video-decode/scope observations are genuine, but the full source checks do not pass. There is no per-episode supervision or success certificate (the profile's own unchecked list includes expert labels and success), so the is_task_success save gate in review-source-3 is a source-level possible gate, not a per-episode runtime certificate. Parent grouping is absent, training-only status is only a path-level property (split null; training_scope requires_independent_registration_review), and no reversible recipe is supplied. This dataset is reviewed_not_consumed, so no actual training-batch exposure counter exists yet; a future consumption witness at the real DataLoader read is required before claiming exposure or benefit. profile_witness has no inspector field, so there is no inspector code to inspect.",
+      "citations": [
+        {
+          "ref": "checkout-source:681987bfabde4eb9b751e4068e6cf044",
+          "quote": "    parser.add_argument(\"--dataset-root\", required=True)\n    parser.add_argument(\n        \"--data-version-id\",\n        default=None,\n        help=\"Registered data-version id bound to --dataset-root. It only labels \"\n             \"the data-consumption witness; the dataset identity is recomputed \"\n             \"from the loaded bytes. Mixture manifests declare one per entry.\",\n    )\n    parser.add_argument(\"--observation-contract\", default=None,\n                        help=\"JSON camera/state/action contract; limits learned inputs explicitly.\")\n",
+          "sha256": "0824adc67799468ef4d8d4b61e830aaab4c9e3bf22d54d4cbed986b04b2f81e1"
+        },
+        {
+          "ref": "checkout-source:9c763b0f597a4dc78fee278a3b3592db",
+          "quote": "RUN_CMD=(\n    \"$PYTHON_BIN\" -m scripts.run_env\n    --gym_config \"$GYM_CONFIG\"\n    --action_config \"$ACTION_CONFIG\"\n    --num_envs 1\n)\n\nRUN_CMD+=(\"${EXTRA_ARGS[@]}\")\n\necho \"Running command:\"\n",
+          "sha256": "8eadfe5fa2c44555a82a5330437dbdba5992729642224f0affa3b7bd5cb04af2"
+        },
+        {
+          "ref": "checkout-source:2562437c7a6140a7a209b38e12d913d6",
+          "quote": "        if not valid and args.correction_safe_return_steps > 0:\n            used_safe_return = True\n            _execute_safe_return(\n                env, reset_policy_state, args.correction_safe_return_steps\n            )\n            valid = generate_and_execute_action_list(\n                env, 0, getattr(args, \"debug_mode\", False), regenerate=True\n            )\n        before = _get_saved_episode_count(env)\n        _reset_env(\n            env,\n            seed_stream,\n            options={\"save_data\": bool(valid and env.get_wrapper_attr(\"is_task_success\")())},\n            reason=\"save_policy_induced_expert_correction\",\n        )\n        saved_episodes = _get_saved_episode_count(env)\n        saved = bool(saved_episodes > before)\n        seed_stream.record_attempt(\n            episode_seed,\n            saved=saved,\n            reason=(\n                \"saved_policy_induced_expert_correction\"\n                if saved\n                else \"expert_correction_failed\"\n            ),\n            policy_prefix_steps=prefix_steps,\n            requested_prefix_steps=prefix_target,\n            expert_plan_valid=bool(valid),\n            safe_return_used=used_safe_return,\n            safe_return_steps=(\n                args.correction_safe_return_steps if used_safe_return else 0\n",
+          "sha256": "fa0ec938d8a41da0a2b303784c363895f33cc5bb58d1e12a5bd6b07dd4f3325c"
+        }
+      ]
+    },
+    "initial_failure_preserved": "d789452474034f8bb2b95e5fd950ffd2"
+  },
+  "training": {
+    "attempt_id": "a470b62514d244828ade18766b23c857",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 93.4,
+    "seed": 1000,
+    "completed_optimizer_updates": 1000,
+    "data_consumption": {
+      "status": "verified",
+      "evidence_id": "a470b62514d244828ade18766b23c857",
+      "versions": [
+        "click_bell_agent_targeted_20ep_008_v1"
+      ],
+      "exposure": [
+        {
+          "data_version_id": "click_bell_agent_targeted_20ep_008_v1",
+          "setting": "dataset",
+          "status": "basic_read_only",
+          "samples_read": 8000,
+          "consumption_stage": "training_batch",
+          "reader_streams": 1,
+          "witness_events": 9064
+        }
+      ],
+      "authority": "sealed loader witness under independently reviewed source; not a quality/SOTA claim"
+    },
+    "terminal_model_file_sha256": "19a808d4dce604c70e6fcfa359803523236ca769dea1cd4d29dde397a32ca80e",
+    "original_measurement_label": "round_29",
+    "original_measurement_status": "unscored",
+    "unscored_stage": "policy_artifact",
+    "collection_parent_as_training_initialization": "not established; collection policy and learning initialization are separate"
+  },
+  "training_physical_log_diagnostic": {
+    "training_batch_events": 1000,
+    "other_events": 8064,
+    "malformed_rows": 0,
+    "batch_reader_streams": 1,
+    "terminal_sample_uses": 8000,
+    "authority": "operator read-only count of sealed log; scientific admission remains executor consumption"
+  },
+  "evaluation": {
+    "attempt_id": "d7713666e8ad4adcb87018ecd3feda69",
+    "status": "completed",
+    "returncode": 0,
+    "native_seconds": 509.2,
+    "seed": 20261013,
+    "setting": "random",
+    "completed_episodes": 50,
+    "successful_episodes": 0,
+    "metric_value": 0,
+    "policy_sha256": "e44d644c79f4fbeb734be66aa06419060738a0b17db97fbd2467dc30a667b0d9",
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "result_sha256": "10750d5ccf383333ccad14c8375bf64e3d4041d4f7d8bbefa9eefd23fe0e5441"
+  },
+  "acquisition_to_policy_score_chain_complete": true,
+  "recovery": {
+    "training_reused": true,
+    "successful_handoff_action": "dc3f1b9076e33f46",
+    "original_round29_unscored_record_preserved": true,
+    "operator_selected_handoff": false
+  }
+}

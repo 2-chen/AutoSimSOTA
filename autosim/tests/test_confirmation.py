@@ -17,6 +17,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from autosim.research.derived_research import _load_confirmation
 from autosim.research.declarative_backend import DeclarativeBackend
 from autosim.research.experiment_bundle import freeze_artifact
@@ -157,13 +159,15 @@ def test_confirmation_refuses_to_compare_different_source_states_in_one_checkout
     assert result["where"] == "baseline_source_identity"
 
 
-def _isolated_source_controller(tmp_path):
+def _isolated_source_controller(tmp_path, *, resources=None, protected=False, absolute_paths=False):
     source = tmp_path / "source-base"
     source.mkdir()
     (source / "controller.py").write_text("baseline\n", encoding="utf-8")
+    if protected:
+        (source / 'evaluate.py').write_text('# protected evaluator; success predicate unchanged\n')
     output = tmp_path / "out"
     checkout = output / "checkout"
-    workspace = create(source, checkout)
+    workspace = create(source, checkout, resources=resources)
     code = (
         "from pathlib import Path; text=Path('controller.py').read_text(); "
         "print('success_rate: 0.75' if text.strip() == 'candidate' else "
@@ -173,6 +177,9 @@ def _isolated_source_controller(tmp_path):
     answer = {"stages": {"evaluate": {"available": True, "entrypoint": "score.py",
                                         "invocation": "python score.py", "artifact": "",
                                         "working_directory": "{repo}"}}}
+    if absolute_paths:
+        answer['stages']['evaluate']['entrypoint'] = str(checkout / 'score.py')
+        answer['stages']['evaluate']['working_directory'] = str(checkout)
     declaration = {"task_contract": {"policy_representation": "source"},
                    "research_goal": {"primary_metric": {"name": "success_rate",
                                                          "direction": "maximize"},
@@ -232,6 +239,62 @@ def test_source_controller_confirmation_restores_baseline_and_candidate_separate
         "fresh_copy_from_verified_base_and_overlay"
     assert (checkout / "controller.py").read_text() == "candidate\n"
     assert result["confirmation_comparison"]["verdict"] == "not_established"
+
+
+def test_resource_bound_source_identity_is_valid_for_confirmation_and_reevaluation(tmp_path):
+    from autosim.research.reevaluate import plan as inspect_measurement
+
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    real, checkout = _isolated_source_controller(
+        tmp_path, resources=[{"target": "assets", "source": str(assets)}])
+    baseline = real.measure(settings={"seed": 0}, label="baseline")
+    assert baseline["ok"]
+    real._advance_best("baseline", score=.25, scale="success_rate", why="baseline")
+    (checkout / "controller.py").write_text("candidate\n", encoding="utf-8")
+    candidate = real.measure(settings={"seed": 0}, label="round_1")
+    assert candidate["ok"]
+    real._advance_best("round-1", score=.75, scale="success_rate", why="candidate")
+    inspected = inspect_measurement(real.run_root, "round_1")
+    assert inspected["status"] == "ready", inspected
+    result = real.confirm()
+    assert result["ok"], result
+    assert result["baseline_metric_value"] == .25 and result["metric_value"] == .75
+
+
+@pytest.mark.parametrize('tamper', [False, True])
+def test_confirmation_guard_checks_actual_fresh_source_and_preserves_original_protocol(tmp_path, tamper):
+    from autosim.research.common import read_json
+    real, checkout = _isolated_source_controller(tmp_path, protected=True, absolute_paths=True)
+    baseline = real.measure(settings={'seed': 0}, label='baseline')
+    assert baseline['ok']
+    real._advance_best('baseline', score=.25, scale='success_rate', why='fixture')
+    original_frozen = dict(real._frozen)
+    assert str(checkout / 'evaluate.py') in original_frozen
+    protocol_bytes = (real.run_root / 'protocol_frozen.json').read_bytes()
+    (checkout / 'controller.py').write_text('candidate\n')
+    assert real.measure(settings={'seed': 0}, label='round_1')['ok']
+    real._advance_best('round-1', score=.75, scale='success_rate', why='fixture')
+    run_stage = real.run_stage
+    observed = []
+    def guarded(stage, **kwargs):
+        assert real.repo != checkout
+        assert all(Path(path).is_relative_to(real.repo) for path in real._frozen)
+        observed.append(real.repo)
+        if tamper:
+            (real.repo / 'evaluate.py').write_text('# changed protected evaluator\n')
+        return run_stage(stage, **kwargs)
+    real.run_stage = guarded
+    result = real.confirm()
+    assert observed
+    assert bool(result['ok']) is (not tamper), result
+    if not tamper:
+        assert len(observed) == 2 and observed[0] != observed[1]
+        assert result['baseline_metric_value'] == .25 and result['metric_value'] == .75
+    assert real._frozen == original_frozen
+    assert real.repo == checkout
+    assert (real.run_root / 'protocol_frozen.json').read_bytes() == protocol_bytes
+    assert (checkout / 'evaluate.py').read_text() == '# protected evaluator; success predicate unchanged\n'
 
 
 def test_confirmation_keeps_paired_statistics_separate_from_an_l4_claim(tmp_path):
@@ -496,7 +559,7 @@ def test_a_failed_confirmation_is_distinct_from_never_having_tried(tmp_path):
     real.backend.answer["stages"]["evaluate"]["available"] = False
     real.confirm()
     state = real.confirmation_state()
-    assert state["status"] == "attempted_and_failed"
+    assert state["status"] == "admission_refused"
     assert state["retryable"] is True
     assert state["why"]
 
@@ -510,8 +573,8 @@ def test_the_document_separates_a_failed_confirmation_from_an_untried_one(tmp_pa
     real.backend.answer["stages"]["evaluate"]["available"] = False
     real.run(rounds=0, confirm=True)
     document = run_record.generate(real.run_root).read_text(encoding="utf-8")
-    assert "未参与搜索的确认测量失败了" in document
-    assert "评测尚未启动，修复启动条件后可重试" in document
+    assert "确认评测在启动前被拒绝" in document
+    assert "没有执行留出 rollout" in document
 
 
 def test_a_failed_confirmation_can_be_tried_again(tmp_path):

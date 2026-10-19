@@ -8,11 +8,11 @@ controller still validates every decision and trusted executors still own benchm
 from __future__ import annotations
 
 import json
-import os
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
 
+from ..llm_client import configured_llm_model
 from .common import atomic_json, now, sanitize_model_payload
 from .deepseek_pricing import PRICE_CARD_ID
 
@@ -58,6 +58,7 @@ class RoleAwareAgentClient:
     supports_recorder = True
     supports_native_progress_audit = True
     supports_candidate_execution_review = True
+    supports_bounded_generation = True
 
     def __init__(self, *, workspace: Path, output: Path, run_id: str,
                  turn_budget_usd: float, total_budget_usd: float,
@@ -75,8 +76,7 @@ class RoleAwareAgentClient:
         self.turn_budget_usd = float(turn_budget_usd)
         self.total_budget_usd = float(total_budget_usd)
         self.timeout = float(timeout)
-        self.model = (os.environ.get("DEEPSEEK_MODEL") or
-                      os.environ.get("AUTOSIM_LLM_MODEL") or "deepseek-flash")
+        self.model = configured_llm_model()
         self._role = "scheduler"
         self._research_context: dict[str, Any] = {}
         self._freeze_runtime_spec()
@@ -147,7 +147,7 @@ class RoleAwareAgentClient:
         finally:
             self._role = previous
 
-    def _resume_role(self, role: str) -> bool:
+    def _resume_role(self, role: str, *, read_only: bool = False) -> bool:
         root = self.output / "agent"
         roles = root / "roles"
         pointer = roles / f"{role}.json"
@@ -165,7 +165,7 @@ class RoleAwareAgentClient:
         # historical tool output. Old sessions and their receipts remain available.
         from .agent_runtime import _safe_session
         session = _safe_session(self.output, session_key=held.get("session_key"))
-        if session.get("failure_category") in {"stream_protocol", "missing_result_or_nonzero_exit", "provider_transport", "process_executor", "missing_resume_session", "provider_or_tool_error"}:
+        if session.get("failure_category") in {"stream_protocol", "missing_result_or_nonzero_exit", "missing_final_response", "provider_transport", "process_executor", "missing_resume_session", "provider_or_tool_error"}:
             atomic_json(root / "context_rotation.json", {
                 "role": role, "previous_session_key": held.get("session_key"),
                 "reason": "rehydrate after failed protocol/transport/tool or missing CLI session; preserve original evidence and charges",
@@ -178,41 +178,78 @@ class RoleAwareAgentClient:
                     path.resolve().is_relative_to(self.output) and path.stat().st_size < 1024*1024):
                 pricing = json.loads(path.read_text(encoding="utf-8"))
                 receipts = (pricing.get("gateway") or {}).get("receipts") or []
-                usage = receipts[-1].get("usage") or {} if receipts else {}
-                size = int(usage.get("input_miss_tokens") or 0) + int(usage.get("input_hit_tokens") or 0)
-                if size >= 120_000:
+                from .context_pressure import rotation_decision
+                decision = rotation_decision(receipts[-1] if receipts else {})
+                if decision['rotate']:
                     atomic_json(root / "context_rotation.json", {
                         "role": role, "previous_session_key": held.get("session_key"),
-                        "input_tokens": size, "reason": "rehydrate from current evidence",
+                        **decision,
                         "at": now()})
                     return False
+        from .agent_runtime import capability_identity
+        from .agent_roles import role_profile
+        expected = capability_identity(role_profile(role, read_only=read_only))
+        if session and session.get('capability_identity') != expected:
+            atomic_json(root / 'context_rotation.json', {'role': role,
+                'previous_session_key': held.get('session_key'),
+                'reason': 'capability/schema changed; rehydrate instead of resuming stale tool assumptions',
+                'expected_capability_identity': expected, 'at': now()})
+            return False
+        from .runtime_freshness import controller_identity
+        current_runtime = controller_identity()
+        if session.get('controller_runtime_id') != current_runtime:
+            atomic_json(root / 'context_rotation.json', {'role': role,
+                'previous_session_key': held.get('session_key'),
+                'reason':'controller runtime changed or unversioned; rehydrate current facts '
+                    'instead of resuming obsolete operation assumptions',
+                'previous_controller_runtime_id':session.get('controller_runtime_id'),
+                'current_controller_runtime_id':current_runtime, 'at':now()})
+            return False
         return True
 
     def chat_with_metadata(self, system: str, user: str, **kwargs: Any
                            ) -> tuple[str, dict[str, Any]]:
         """Run one real coding-agent turn and return its final text and safe usage metadata."""
         from .agent_runtime import run_coding_agent, _worker_evidence_root
-        from .token_context import compact_json, project_context
+        from .token_context import compact_json, project_context, project_request
 
         role = self._role
-        prompt = str(system).strip()
+        read_only = kwargs.get('read_only') is True or self.budget_output != self.output
+        from .agent_roles import role_profile
+        profile = role_profile(role, read_only=read_only)
+        prompt = "## AutoSim role execution contract"
+        tools = [] if kwargs.get('decision_only') else [*profile.builtin_tools, *profile.mcp_tools]
+        prompt += ('\n\n## Current role capability contract\n' + json.dumps({'role': role,
+            'configured_tools': tools, 'can_edit_checkout': profile.can_edit_checkout,
+            'native_inspection_is_cpu_readonly': profile.can_inspect_native}, sort_keys=True) +
+            '\nThese are the current configured tools, not old role-session recollections. '
+            'For installed SDK source use inspect_native_environment with source_catalog=true, '
+            'then source_request={root_index,path}; no editable-mode or external file grant is needed. '
+            'Distinguish CLI discovery/tool rejection evidence from merely not attempting a tool. '
+            'Do not declare an access boundary solely from remembered tool availability.')
         prompt += ("\n\n## Execution path safety\n"
                    "Display placeholders such as {repo}, {output}, and [LOCAL_PATH] are not "
                    "literal filesystem paths. Resolve the actual working directory through "
                    "tools and use repository-relative paths. Use the bound native interpreter "
                    "or the execution environment's PATH; do not create external interpreter "
                    "symlinks inside the source checkout. Such links block every Agent role.")
+        prompt += "\n\n## Task instructions\n" + str(system).strip()
         # Stable instructions precede changing requests to preserve provider prefix reuse.
         request = str(user).strip()
         try:
             request = compact_json(json.loads(request))
         except (ValueError, TypeError):
             pass
-        prompt += "\n\n## Current request and evidence\n" + request
+        # Paging requires an actually configured read tool, not merely a role label.
+        pageable = (kwargs.get("decision_only") is not True and
+                    "mcp__autosim_exec__read_evidence" in profile.mcp_tools)
+        evidence_root = _worker_evidence_root(self.output)
+        projected_request, request_metrics = project_request(request, evidence_root, pageable=pageable)
+        prompt += "\n\n## Current request and evidence\n" + projected_request
         context_metrics = {}
         if self._research_context and kwargs.get("include_research_context", True):
             context, context_metrics = project_context(self._research_context, request,
-                _worker_evidence_root(self.output), pageable=role != "recorder")
+                evidence_root, pageable=pageable)
             prompt += ("\n\n## Shared research context (latest controller snapshot)\n" +
                        "Prior role-session recollections do not override this snapshot or "
                        "native evidence. Working plans and handoffs are model claims.\n" +
@@ -225,13 +262,13 @@ class RoleAwareAgentClient:
                                                 float(kwargs.get("timeout", self.timeout))),
                 max_budget_usd=self.turn_budget_usd,
                 max_total_budget_usd=self.total_budget_usd,
-                resume=(self._resume_role(role) if kwargs.get("resume_session", True) else False), role=role,
-                read_only=kwargs.get("read_only") is True or self.budget_output != self.output,
+                resume=(self._resume_role(role, read_only=read_only) if kwargs.get("resume_session", True) else False), role=role,
+                read_only=read_only,
                 auto_skills=kwargs.get("auto_skills", True) is True,
                 decision_only=kwargs.get("decision_only") is True,
                 generation_policy=({"max_output_tokens": kwargs.get("max_tokens"),
                                     "thinking": kwargs.get("thinking")}
-                    if kwargs.get("decision_only") is True and
+                    if (kwargs.get("decision_only") is True or kwargs.get("bounded_generation") is True) and
                        (kwargs.get("max_tokens") is not None or kwargs.get("thinking") is not None)
                     else None),
                 output_format=str(kwargs.get("output_format") or "stream-json"),
@@ -272,7 +309,7 @@ class RoleAwareAgentClient:
             "run_budget": result.get("run_budget") or {},
             "returncode": result.get("returncode"),
             "failure_category": result.get("failure_category"),
-            "prompt_efficiency": {**context_metrics,
+            "prompt_efficiency": {**context_metrics, **request_metrics,
                                   "prompt_bytes": len(prompt.encode("utf-8"))},
         }
         if status != "completed":
@@ -291,8 +328,18 @@ class RoleAwareAgentClient:
                 turn_id=metadata["turn_id"], process_ref=metadata["process_ref"],
                 event_count=metadata["event_count"], runtime_failure=fault)
         if not content:
+            from .runtime_recovery import seal_turn_failure
+            from .agent_runtime import _worker_evidence_root
+            fault = seal_turn_failure(_worker_evidence_root(self.output), self.workspace,
+                {**result, "status": "failed", "failure_category": "missing_final_response"},
+                role=role, timeout=min(self.timeout, float(kwargs.get("timeout", self.timeout))))
             raise AgentRuntimeClientError(
-                f"{role} coding-agent turn completed without a final response")
+                f"{role} coding-agent turn completed without a final response",
+                status="failed", failure_category="missing_final_response",
+                run_budget=metadata["run_budget"],
+                decision_attempt_id=metadata["decision_attempt_id"],
+                turn_id=metadata["turn_id"], process_ref=metadata["process_ref"],
+                event_count=metadata["event_count"], runtime_failure=fault)
         return content, metadata
 
 

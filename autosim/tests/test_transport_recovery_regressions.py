@@ -35,7 +35,7 @@ def test_broken_stream_keeps_full_request_bound_then_next_request_succeeds(monke
         def __enter__(self): return self
         def __exit__(self, *_): self.close()
     initial = b'data:{"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":0}}}\n\n'
-    endings = [b"", b'data: {"type":"message_delta","usage":{"output_tokens":10}}\n\ndata: {"type":"message_stop"}\n\n']
+    endings = [b"", b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":100}}\n\ndata: {"type":"message_stop"}\n\n']
     monkeypatch.setattr(deepseek_gateway.urllib.request, "urlopen",
         lambda *_a, **_kw: Response(initial + endings.pop(0)))
     with deepseek_gateway.DeepSeekTurnGateway(upstream_base_url="https://api.deepseek.com/anthropic",
@@ -54,6 +54,8 @@ def test_broken_stream_keeps_full_request_bound_then_next_request_succeeds(monke
     assert result["requests"] == 2 and result["unknown"]
     assert result["receipts"][0]["diagnostics"]["error_type"] == "IncompleteStream"
     assert result["receipts"][1]["status"] == "priced"
+    assert result['receipts'][1]['diagnostics']['provider_stop_reason']=='max_tokens'
+    assert result['receipts'][1]['diagnostics']['effective_max_output_tokens']==100
 
 
 def test_request_bound_releases_only_unforwarded_allowance(tmp_path):
@@ -117,3 +119,28 @@ def test_transport_decision_retry_does_not_call_other_roles(tmp_path):
     assert controller._handoff_scheduler_decision_failure(failure=failure)
     assert not controller._handoff_scheduler_decision_failure(failure=failure)
     assert failure["recovery"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize('category',['provider_payment_required','provider_access_blocked'])
+def test_terminal_provider_refusal_does_not_retry_or_ask_another_role(tmp_path,category):
+    from autosim.research.prepare import Preparation
+    class Client:
+        supports_main_agent=True
+        model='fixture'
+        def as_role(self,role):raise AssertionError('blocked endpoint must not be retried')
+    repo=tmp_path/'checkout';repo.mkdir()
+    controller=Preparation(repo=repo,output=tmp_path,client=Client(),scouting=tmp_path/'scouting')
+    failure={'failure_category':category,'failure_fingerprint':'terminal'}
+    assert not controller._handoff_scheduler_decision_failure(failure=failure)
+    assert failure['recovery']['status']=='external_action_required'
+    assert not (tmp_path/'agent/runtime_recovery_gate.json').exists()
+
+
+@pytest.mark.parametrize('status,expected',[(402,'provider_payment_required'),
+    (401,'provider_access_blocked'),(403,'provider_access_blocked'),(429,''),(503,''),('402',''),(True,'')])
+def test_provider_http_status_classification_is_typed_not_text(status,expected):
+    from autosim.research.agent_runtime import blocked_provider_category
+    assert blocked_provider_category({'receipts':[{'diagnostics':{'http_status':status}}]},None)==expected
+    assert blocked_provider_category(None,{'is_error':True,'api_error_status':status})==expected
+    assert blocked_provider_category(None,{'is_error':False,'api_error_status':status})==''
+    assert blocked_provider_category(None,{'is_error':True,'result':'API Error: 402'})==''

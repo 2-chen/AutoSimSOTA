@@ -10,11 +10,11 @@ from .storage_lifecycle import catalog, policy, safe
 
 
 def inspect_producer(output,*,evidence_id,offset=0,limit=24):
-    from .storage_lifecycle import native_owner
+    from .storage_lifecycle import inspection_owner
     if (isinstance(offset,bool) or not isinstance(offset,int) or offset<0 or
             isinstance(limit,bool) or not isinstance(limit,int) or not 1<=limit<=64):
         raise ValueError('producer inspection requires nonnegative offset and limit 1..64')
-    owner,_=native_owner(output,evidence_id)
+    owner,native=inspection_owner(output,evidence_id)
     files=[]
     for path in owner.rglob('*'):
         if path.is_file() and not path.is_symlink():
@@ -25,7 +25,9 @@ def inspect_producer(output,*,evidence_id,offset=0,limit=24):
         if len(files)>32768:
             raise ValueError('producer inventory exceeds explicit scan budget; no complete-set claim')
     files.sort(key=lambda row:row['ref'])
+    stage=(native.get('receipt_facts') or {}).get('stage') or (native.get('receipt_facts') or {}).get('node_id')
     return {'evidence_id':evidence_id,'output_ref':owner.relative_to(output).as_posix(),
+            'stage':stage,'read_only':True,'data_payload_gc_eligible':False if stage in {'collect','prepare_data'} else None,
             'total_files':len(files),'offset':offset,'files':files[offset:offset+limit],
             'next_offset':offset+limit if offset+limit<len(files) else None,
             'instruction':'Discovery only. Read native save/resume source before classifying exact complete groups.'}

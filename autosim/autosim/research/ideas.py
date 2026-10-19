@@ -79,6 +79,14 @@ def validate_main_proposal(candidate: Any, *, repo: Path | None = None) -> None:
         raise ValueError("granularity must be param, code, or algo")
     if candidate['risk'] not in RISKS:
         raise ValueError("risk must be low, medium, or high")
+    crosses = candidate['crosses']
+    if (not isinstance(crosses,str) or
+            (crosses.strip().upper() not in {'NONE','NO'} and
+             re.fullmatch(r'R[1-9][0-9]*',crosses.strip().upper()) is None)):
+        raise ValueError('crosses must be the exact string "none" or one red-line ID '
+                         '(e.g. "R1"), not a list, invented category or prose; '
+                         'put explanations in why. Repair this field yourself; '
+                         'no scientific/red-line audit or source change has run')
     for key in ('mechanism', 'why'):
         if not isinstance(candidate[key], str) or not candidate[key].strip():
             raise ValueError(f"{key} must be non-empty text")
@@ -152,7 +160,8 @@ class Idea:
                 "outcome_event_ids": list(self.outcome_event_ids)}
 
 
-def execution_compatibility(idea: Any, *, stage_parameters: Any, repo: Any = None
+def execution_compatibility(idea: Any, *, stage_parameters: Any, repo: Any = None,
+                            train_source: str = ''
                             ) -> tuple[bool, str]:
     """Check a candidate against the selected run's verified stage interface."""
     granularity = str(getattr(idea, "granularity", "") or "")
@@ -198,6 +207,13 @@ def execution_compatibility(idea: Any, *, stage_parameters: Any, repo: Any = Non
             allowed.add(re.sub(r"[-\s]+", "_", name).lower())
     if not allowed:
         return True, "selected stage has no parameter contract; compatibility is unknown"
+
+    # Executor-owned steps is an explicit input outside the free-form native
+    # parameter map. Use the same source-backed contract as job admission; the
+    # separate declared-space check still decides whether this axis may vary.
+    from .training_work import consumes_steps
+    if consumes_steps(train_source):
+        allowed.add('steps')
 
     names: set[str] = set()
 
@@ -729,7 +745,7 @@ def repair(client: Any, idea: "Idea", problems: list[str], *, repo: Path,
     for _ in range(attempts):
         try:
             content, _ = client.chat_with_metadata(REPAIR_SYSTEM, payload, max_tokens=4000,
-                                                   timeout=300, thinking="disabled")
+                                                   timeout=300, thinking="disabled", read_only=True)
             from .execution_derive import _object
             row = _object(content)
             if str(row.get("give_up") or "").strip():

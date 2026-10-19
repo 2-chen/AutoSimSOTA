@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "kind": "native_training_batch_policy_rollout_development_closure",
+  "observed_on": "2026-10-17",
+  "run": "robosyn_required_data_20261013_v1",
+  "task": "click_bell",
+  "source_label": "round_14",
+  "measurement_label": "round_14_handoff_correction",
+  "idea_label": "train_atomic_batch_witness_v13",
+  "data_version_id": "click_bell_random_quality_20ep_v1",
+  "data_population_quality_or_new_acquisition": "not_established_by_version_name_or_this_training",
+  "canonical_input": "dataset",
+  "dataset_sha256": "8548a3812a1b2208a7fdefd3fb4036df52af387d667adc0a7612879139018b79",
+  "training_steps": 1000,
+  "training_seed": 1000,
+  "evaluation_settings": {"episodes": 50, "seed": 20261013, "setting": "random"},
+  "result": {"successes": 3, "episodes": 50, "value": 0.06},
+  "training_attempt_id": "e31193ca73194c3da4f12e70f941fa2c",
+  "training_seconds": 92.1,
+  "evaluation_attempt_id": "24fcc8937cb743e5be1837eebcf0cfa3",
+  "evaluation_seconds": 500.8,
+  "policy_sha256": "9249868e7fee60622d990b2e4bf20925d72206f296b48c2130de25ed5648c7cb",
+  "model_file_sha256": "bebbfe7d6659cb4bf4a7b5ab166c52c63dc39b93bb8e301f3dd4550b4d71d1d8",
+  "training_data": {
+    "status": "verified",
+    "consumption_stage": "training_batch",
+    "recorded_samples_read": 8000,
+    "native_reported_batches_read": 1000,
+    "reader_streams": 1,
+    "witness_events": 5,
+    "malformed_complete_marker_lines": 0,
+    "scope": "aggregate batch reading, not unique samples, source distribution, quality or causal benefit"
+  },
+  "verification": {
+    "native_training_progress": "observed_terminal_completed_1000",
+    "native_policy_consumption": "verified",
+    "native_rollout_identity": "verified_50_distinct_episode_ids",
+    "metric_lineage": "verified",
+    "independent_receipt_verification": "consistent_no_issues",
+    "original_failed_measurement_preserved": true,
+    "incumbent_unchanged": 0.24
+  },
+  "data_selection_ref": "research/derived/data_selections/0bc6472e403af383ad49ebdbd04f914bc51bec4d396e9d4ad9219af576f4c1c2.json",
+  "data_selection_sha256": "f3b92579a35f84cc892b554a9890413663b8b95d31d7d62fa11548bc2dc690fe",
+  "autonomous_actions": {
+    "proposal": "11b2b713dc864e48",
+    "first_preexecution_uncertainty": "fc835a44987e9126",
+    "new_native_source_probe": "7920bf872bfb414a9831b04408e05c44",
+    "training": "89d9f579ada1ec70",
+    "correct_policy_handoff": "89d9a04bb2368824"
+  },
+  "operator_interventions": "Framework and bounded budget changes disclosed in OPERATOR_INTERVENTIONS.md. Main generated the native patch and selected inputs/steps/seed; Fix proposed the bundle, Main executed correction. Operator only observed and independently verified this native trial.",
+  "file_sha256": {
+    "research/derived/measurements/round_14_handoff_correction.json": "334707b9db759157424050e072061dcf8bb840cc94cf1f111821ad31618c9048",
+    "research/derived/measurements/round_14.json": "98112716664b2bad42948d8578efef995005dc22d1d166606323ebee00be3e34",
+    "research/derived/attempts/e31193ca73194c3da4f12e70f941fa2c/receipt.json": "bdb0ba50311be94115e671383bf9d7e3a5d71dcc6c8625a0ec7ca29c5a0a4fb0",
+    "research/derived/attempts/24fcc8937cb743e5be1837eebcf0cfa3/receipt.json": "01dad7491c0f471f454cf2cacf186ca6716af267cffb7074574e143a0fc3479f",
+    "evidence/e31193ca73194c3da4f12e70f941fa2c.json": "f4f201f27b0bf355446becc567deeba77c537c27d5c7804ddf940b1fe4f7d4f0",
+    "evidence/24fcc8937cb743e5be1837eebcf0cfa3.json": "50cb2fd634dfab3e7d14458c4bb4b0f2474aa84fbd274d6f33870ebe598c6b9a",
+    "research/derived/comparison_protocol.json": "bd65c957005f7c06cfe449cd22e05d01aaf40909a8744fd4f4ea16c7d42d06c0"
+  },
+  "limits": [
+    "Below the 24% incumbent and 12% original local baseline; not an improvement or public SOTA.",
+    "The registered data card has no certified new acquisition producer/quality; no completed campaign arm is established by this result.",
+    "One training seed and one development evaluation; not a matched-origin, matched-recipe causal data comparison or held-out confirmation.",
+    "Input seeds alone do not prove physically paired simulator initial states.",
+    "The earlier 4% diagnostic used a different training producer and learned tensor bytes; no instrumentation-induced improvement claim.",
+    "The old R13 malformed log, earlier failures, original baseline and all usage remain preserved."
+  ]
+}

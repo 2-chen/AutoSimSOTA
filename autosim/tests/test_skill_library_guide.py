@@ -13,6 +13,9 @@ from autosim.research.skills import (GUIDE, discover, read_selected_skills,
 
 
 NEW_SIMULATION_METHODS = (
+    "generating-adapted-demonstrations",
+    "collecting-expert-corrections",
+    "auditing-demonstration-quality",
     "curating-simulation-datasets",
     "preserving-research-data",
     "accelerating-policy-experiments",
@@ -146,7 +149,7 @@ def test_data_methods_load_bounded_advice_not_a_platform_or_long_survey(
     method = read_selected_skills([identity], benchmark="UnseenArmRepository")["skills"][0]
     assert capability in method["capabilities"]
     assert method["scope"] == "general"
-    assert method["version"] == "1.1.0"
+    assert method["version"] == ("1.2.0" if name == "curating-simulation-datasets" else "1.1.0")
     assert method["preconditions"] and method["invalid_when"]
     assert all("Advisory only" in item for item in method["permissions"])
     assert len(method["method"]) < 6000

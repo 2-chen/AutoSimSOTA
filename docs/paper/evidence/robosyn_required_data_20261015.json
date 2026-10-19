@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "observed_on": "2026-10-15",
+  "run": "robosyn_required_data_20261013_v1",
+  "phase": "development",
+  "rows": [
+    {
+      "label": "baseline",
+      "measurement_sha256": "4afafbe8cfd39451820f051d023466637ea2826c7264f8b165220a3c95f0fc0a",
+      "metric": {
+        "name": "click_bell_random_task_success_rate",
+        "unit": "ratio",
+        "direction": "maximize",
+        "aggregation": "mean"
+      },
+      "metric_value": 0.12,
+      "successes": 6,
+      "episodes": 50,
+      "settings": {
+        "episodes": 50,
+        "seed": 20261013,
+        "steps": 1000,
+        "task": "click_bell"
+      },
+      "train_attempt_id": "e82302daae974d2abb48763ce503e4db",
+      "evaluate_attempt_id": "e8c171e895d5438795caf77908d53d5b",
+      "evaluate_seconds": 458.5,
+      "loaded_policy_sha256": "539fe1e42bdf2adfe5661763a4912bf833fb7e094459ada0440ee9e69aa52862",
+      "data_consumption_status": "unknown",
+      "receipt_verifier_status": "consistent",
+      "receipt_verifier_issues": [],
+      "paired_initial_states_verified": false,
+      "formal_paper_eligible": false
+    },
+    {
+      "label": "round_1_handoff_correction",
+      "measurement_sha256": "fdf4daaa5db02b1aecc0f8bdc7db20642736218c4475f43f2647f7927d8ed3c4",
+      "metric": {
+        "name": "click_bell_random_task_success_rate",
+        "unit": "ratio",
+        "direction": "maximize",
+        "aggregation": "mean"
+      },
+      "metric_value": 0.18,
+      "successes": 9,
+      "episodes": 50,
+      "settings": {
+        "episodes": 50,
+        "seed": 20261013,
+        "steps": 1000,
+        "task": "click_bell"
+      },
+      "train_attempt_id": "57b2fd99223a452f8a7dc317956b3bb8",
+      "evaluate_attempt_id": "6b6ac17cee1541019a460888438c42a5",
+      "evaluate_seconds": 445.6,
+      "loaded_policy_sha256": "6864bb44905de9dfdc0e9073bd738d578143c26f6c33630bd2b20e1515ecd66d",
+      "data_consumption_status": "unknown",
+      "receipt_verifier_status": "consistent",
+      "receipt_verifier_issues": [],
+      "paired_initial_states_verified": false,
+      "formal_paper_eligible": false
+    }
+  ],
+  "new_training_performed_for_recovery": false,
+  "not_a_data_acquisition_effect": true,
+  "not_significance_or_heldout_or_sota": true,
+  "operator_maintenance": "audited +10 USD/wall extension and service PATH correction; Main selected handoff/evaluation",
+  "original_failed_label_preserved": "round_1"
+}

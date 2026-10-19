@@ -1,11 +1,13 @@
 """Local, per-turn DeepSeek gate for Claude Code's Anthropic-compatible requests.
 
 The CLI's dollar estimate is not used to authorize spend. A random local token protects the
-loopback listener; only this proxy holds the upstream API key. Every text request reserves
+loopback listener; only this proxy holds the upstream API key. Every admitted request reserves
 its maximum priced cost before forwarding. Missing usage remains held, never priced as zero.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import http.server
 import json
@@ -29,7 +31,8 @@ class DeepSeekGatewayError(RuntimeError):
 class TurnCostGate:
     MAX_REQUESTS = 256
 
-    def __init__(self, *, limit_usd: float, model: str, extend_budget: Any = None):
+    def __init__(self, *, limit_usd: float, model: str, extend_budget: Any = None,
+                 checkpoint: Any = None):
         if limit_usd <= 0:
             raise ValueError("turn cost limit must be positive")
         self.limit_usd = float(limit_usd)
@@ -38,14 +41,25 @@ class TurnCostGate:
         self.denials: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._holds: dict[str, tuple[float, dt.datetime]] = {}
+        self._request_profiles: dict[str, dict] = {}
         self.spent_usd = 0.0
         self.unknown = False
         self.unsafe_bound = False
         self.denied_count = 0
         self.receipts: list[dict[str, Any]] = []
+        self.checkpoint = checkpoint
+        self._checkpoint_unlocked()
+
+    def _checkpoint_unlocked(self):
+        if self.checkpoint is not None:
+            try:
+                self.checkpoint(self._snapshot_unlocked())
+            except Exception as exc:
+                self.unsafe_bound = True
+                raise DeepSeekGatewayError('durable request accounting unavailable; do not forward') from exc
 
     def reserve(self, *, model: str, max_tokens: int, at: dt.datetime,
-                input_bytes: int | None = None) -> str:
+                input_bytes: int | None = None, request_profile: dict | None = None) -> str:
         ceiling = request_cost_ceiling_usd(model, max_tokens, at=at,
                                            input_bytes=input_bytes)
         with self._lock:
@@ -74,6 +88,10 @@ class TurnCostGate:
                 raise DeepSeekGatewayError("turn DeepSeek budget cannot reserve this request")
             identity = uuid.uuid4().hex
             self._holds[identity] = (ceiling, at)
+            if request_profile is not None:
+                self._request_profiles[identity] = request_profile
+            # Must be durable BEFORE the caller may forward a paid request.
+            self._checkpoint_unlocked()
             return identity
 
     def settle(self, identity: str, usage: dict[str, Any] | None,
@@ -82,6 +100,8 @@ class TurnCostGate:
             if identity not in self._holds:
                 raise DeepSeekGatewayError("request reservation was not found")
             ceiling, at = self._holds.pop(identity)
+            profile = self._request_profiles.pop(identity, None)
+            profile_metadata = {"request_profile": profile} if profile is not None else {}
             try:
                 if usage is None:
                     raise ValueError("provider usage is missing")
@@ -92,28 +112,39 @@ class TurnCostGate:
             except (ValueError, TypeError) as exc:
                 self.unknown = True
                 self.receipts.append({"status": "unknown", "reserved_usd": ceiling,
+                                      "requested_model": self.model,
                                       "price_card": PRICE_CARD_ID,
                                       "reason": str(exc)[:180],
                                       "diagnostics": diagnostics or {},
+                                      **profile_metadata,
                                       "at": at.isoformat()})
+                self._checkpoint_unlocked()
                 return
             self.spent_usd += cost
             self.receipts.append({"status": "priced", "cost_usd": cost,
+                                  "requested_model": self.model,
                                   "usage": counts, "tier": tier,
+                                  "diagnostics":dict(diagnostics or {}),
+                                  **profile_metadata,
                                   "price_card": PRICE_CARD_ID, "at": at.isoformat()})
+            self._checkpoint_unlocked()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            unknown_hold = sum(row["reserved_usd"] for row in self.receipts
-                               if row["status"] == "unknown")
-            inflight = sum(row[0] for row in self._holds.values())
-            return {"cost_usd": self.spent_usd, "unknown": self.unknown or bool(self._holds),
-                    "requests": len(self.receipts), "receipts": list(self.receipts),
-                    "denied_count": self.denied_count,
-                    "denials": list(self.denials), "limit_usd": self.limit_usd,
-                    "held_usd": inflight, "unknown_reserved_usd": unknown_hold,
-                    "accounting_ceiling_usd": self.spent_usd + unknown_hold + inflight,
-                    "bound_valid": not self.unsafe_bound}
+            return self._snapshot_unlocked()
+
+    def _snapshot_unlocked(self) -> dict[str, Any]:
+        unknown_hold = sum(row["reserved_usd"] for row in self.receipts
+                           if row["status"] == "unknown")
+        inflight = sum(row[0] for row in self._holds.values())
+        return {"model": self.model,
+                "cost_usd": self.spent_usd, "unknown": self.unknown or bool(self._holds),
+                "requests": len(self.receipts), "receipts": list(self.receipts),
+                "denied_count": self.denied_count,
+                "denials": list(self.denials), "limit_usd": self.limit_usd,
+                "held_usd": inflight, "unknown_reserved_usd": unknown_hold,
+                "accounting_ceiling_usd": self.spent_usd + unknown_hold + inflight,
+                "bound_valid": not self.unsafe_bound}
 
 
 def _has_nontext(value: Any) -> bool:
@@ -124,6 +155,34 @@ def _has_nontext(value: Any) -> bool:
         return any(_has_nontext(item) for item in value.values())
     if isinstance(value, list):
         return any(_has_nontext(item) for item in value)
+    return False
+
+
+def _has_unsupported_media(value: Any, *, allow_images: bool) -> bool:
+    """Admit opt-in inline images; reserve full input context for image requests.
+
+    Compressed image bytes are not a token bound. Flash vision support and input
+    token billing were verified in the official guide on 2026-10-16.
+    """
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str) and kind in {"image", "document", "audio", "video"}:
+            if kind != "image" or not allow_images:
+                return True
+            source = value.get("source")
+            if (not isinstance(source, dict) or source.get("type") != "base64"
+                    or source.get("media_type") not in {
+                        "image/png", "image/jpeg", "image/gif", "image/webp"}
+                    or not isinstance(source.get("data"), str) or not source["data"]):
+                return True
+            try:
+                if not base64.b64decode(source["data"], validate=True):
+                    return True
+            except (ValueError, binascii.Error):
+                return True
+        return any(_has_unsupported_media(item, allow_images=allow_images) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_unsupported_media(item, allow_images=allow_images) for item in value)
     return False
 
 
@@ -174,7 +233,8 @@ def apply_generation_policy(request: dict, policy: dict) -> dict:
 class DeepSeekTurnGateway:
     def __init__(self, *, upstream_base_url: str, upstream_key: str,
                  model: str, limit_usd: float, extend_budget: Any = None,
-                 generation_policy: dict | None = None):
+                 generation_policy: dict | None = None, checkpoint: Any = None,
+                 allow_images: bool = False):
         base = upstream_base_url.rstrip("/")
         if not base.startswith("https://") or not base.endswith("/anthropic"):
             raise ValueError("DeepSeek upstream must be an HTTPS Anthropic-compatible endpoint")
@@ -185,10 +245,11 @@ class DeepSeekTurnGateway:
                                  input_bytes=1)
         self.upstream_base_url = base
         self.generation_policy = validate_generation_policy(generation_policy)
+        self.allow_images = bool(allow_images)
         self._upstream_key = upstream_key
         self.local_token = secrets.token_urlsafe(32)
         self.gate = TurnCostGate(limit_usd=limit_usd, model=model,
-                                 extend_budget=extend_budget)
+                                 extend_budget=extend_budget, checkpoint=checkpoint)
         self._incoming: list[dict[str, str]] = []
         self._rejections: list[str] = []
         self._incoming_lock = threading.Lock()
@@ -204,6 +265,7 @@ class DeepSeekTurnGateway:
     def snapshot(self) -> dict[str, Any]:
         result = self.gate.snapshot()
         result["generation_policy"] = dict(self.generation_policy)
+        result["allow_images"] = self.allow_images
         with self._incoming_lock:
             result["incoming"] = list(self._incoming)
             result["rejections"] = list(self._rejections)
@@ -260,16 +322,22 @@ class DeepSeekTurnGateway:
                         raise ValueError("request body size is unsupported")
                     raw = self.rfile.read(length)
                     request = json.loads(raw)
-                    if not isinstance(request, dict) or _has_nontext(request):
-                        raise ValueError("only priced text requests are supported")
+                    if (not isinstance(request, dict)
+                            or _has_unsupported_media(request, allow_images=gateway.allow_images)):
+                        raise ValueError("only priced text and explicitly enabled inline images are supported")
+                    has_images = _has_nontext(request)
+                    requested_maximum=request.get('max_tokens')
                     if gateway.generation_policy:
                         request = apply_generation_policy(request, gateway.generation_policy)
                         raw = json.dumps(request, ensure_ascii=False).encode("utf-8")
                     model = request.get("model")
                     maximum = request.get("max_tokens")
                     at = dt.datetime.now(dt.timezone.utc)
+                    from .request_fingerprint import request_fingerprint
                     identity = gateway.gate.reserve(model=model, max_tokens=maximum, at=at,
-                                                    input_bytes=len(raw))
+                        input_bytes=None if has_images else len(raw),
+                        request_profile={**request_fingerprint(request, body_bytes=len(raw)),
+                                         "input_modality": "image_and_text" if has_images else "text"})
                 except (ValueError, TypeError, DeepSeekGatewayError) as exc:
                     gateway._note_rejection(type(exc).__name__ + ":" + str(exc)[:80])
                     # Local deterministic refusal is not a provider rate limit. Do not
@@ -279,7 +347,9 @@ class DeepSeekTurnGateway:
                     return
 
                 usage: dict[str, Any] = {}
-                diagnostics: dict[str, Any] = {"phase": "upstream_connect"}
+                diagnostics: dict[str, Any] = {"phase": "upstream_connect",
+                    "requested_max_output_tokens":requested_maximum,
+                    "effective_max_output_tokens":maximum}
                 stream_complete = False
                 settled = False
                 upstream = urllib.request.Request(
@@ -311,6 +381,11 @@ class DeepSeekTurnGateway:
                                 if line.startswith(b"data:"):
                                     try:
                                         event = json.loads(line[5:].lstrip())
+                                        reason=(event.get('delta') or {}).get('stop_reason')
+                                        if reason is None:
+                                            reason=(event.get('message') or {}).get('stop_reason')
+                                        if isinstance(reason,str):
+                                            diagnostics['provider_stop_reason']=reason[:80]
                                         if event.get("type") == "message_stop":
                                             stream_complete = True
                                         _merge_usage(usage, event.get("usage") or {})
@@ -338,6 +413,8 @@ class DeepSeekTurnGateway:
                             if len(body) > 16 * 1024 * 1024:
                                 raise ValueError("provider response exceeded gateway bound")
                             result = json.loads(body)
+                            if isinstance(result.get('stop_reason'),str):
+                                diagnostics['provider_stop_reason']=result['stop_reason'][:80]
                             _merge_usage(usage, result.get("usage") or {})
                             gateway.gate.settle(identity, usage or None, diagnostics=diagnostics)
                             settled = True
@@ -386,9 +463,12 @@ class DeepSeekTurnGateway:
 def deepseek_turn_gateway(*, upstream_base_url: str, upstream_key: str,
                           model: str, limit_usd: float,
                           extend_budget: Any = None,
-                          generation_policy: dict | None = None) -> Iterator[DeepSeekTurnGateway]:
+                          generation_policy: dict | None = None,
+                          checkpoint: Any = None,
+                          allow_images: bool = False) -> Iterator[DeepSeekTurnGateway]:
     with DeepSeekTurnGateway(upstream_base_url=upstream_base_url,
                              upstream_key=upstream_key, model=model,
                              limit_usd=limit_usd, extend_budget=extend_budget,
-                             generation_policy=generation_policy) as gateway:
+                             generation_policy=generation_policy, checkpoint=checkpoint,
+                             allow_images=allow_images) as gateway:
         yield gateway

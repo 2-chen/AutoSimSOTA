@@ -7,32 +7,187 @@ from urllib.parse import urlparse
 from .common import atomic_json, digest, now, object_digest, read_json
 
 
+def _sealed_unstarted_reference(output: Path, measurement: dict) -> bool:
+    """Legacy pre-launch failures may predate the released-reference origin stamp.
+
+    A registry hash alone is not evidence that no learning ran. Require the original
+    host-sealed protocol-guard receipt and its unchanged log, with the same label.
+    This classifies history only; it never supplies or certifies a score.
+    """
+    if (measurement.get('ok') is not False or measurement.get('ran') is not False
+            or measurement.get('native_operation_status') != 'not_started'
+            or measurement.get('failure_domain') != 'operation_contract'
+            or measurement.get('where') != 'comparison_protocol'
+            or any(measurement.get(k) is not None for k in
+                   ('train', 'evaluate', 'metric_value', 'success_rate', 'samples'))):
+        return False
+    identity = measurement.get('evidence_id')
+    if not isinstance(identity, str) or not re.fullmatch(r'[0-9a-f]{32}', identity):
+        return False
+    receipt_ref = f'agent/operation_failures/{identity}.json'
+    log_ref = f'agent/operation_failures/{identity}.log'
+    if measurement.get('receipt_ref') != receipt_ref or measurement.get('log_ref') != log_ref:
+        return False
+    for ref in (receipt_ref, log_ref):
+        path = output / ref
+        if (not path.is_file() or path.stat().st_size > 2 * 1024**2
+                or not path.resolve().is_relative_to(output.resolve())
+                or any(p.is_symlink() for p in (path, *path.parents)
+                       if p.is_relative_to(output))):
+            return False
+    receipt = read_json(output / receipt_ref)
+    log = read_json(output / log_ref)
+    return (receipt.get('operation') == log.get('operation') == 'measurement_protocol_guard'
+            and receipt.get('native_operation_status') == log.get('native_operation_status') == 'not_started'
+            and receipt.get('evidence_id') == identity
+            and receipt.get('log_ref') == log_ref
+            and receipt.get('log_sha256') == measurement.get('log_sha256') == digest(output / log_ref)
+            and receipt.get('context') == log.get('context')
+            and (receipt.get('context') or {}).get('label') == measurement.get('label'))
+
+
+def registered_reference_measurement(output: Path, run_root: Path, path: Path) -> bool:
+    """Identify a hash-registered evaluation-only reference, never certify its score.
+
+    Reference measurements are independent of the local baseline/candidate controller.
+    A label or self-declared origin alone must not bypass interrupted-study protection.
+    Both unsuccessful original and recovered reference records remain immutable history.
+    """
+    try:
+        output, run_root, path = Path(output), Path(run_root), Path(path)
+        if (path.parent != run_root / 'measurements' or path.name == 'baseline.json'
+                or not path.is_file() or path.stat().st_size > 64 * 1024**2
+                or not path.resolve().is_relative_to(output.resolve())
+                or any(p.is_symlink() for p in (path, *path.parents)
+                       if p.is_relative_to(output))):
+            return False
+        measurement = read_json(path)
+        if not isinstance(measurement, dict):
+            return False
+        origin = measurement.get('baseline_origin')
+        if origin != 'released_reference' and not (
+                origin is None and _sealed_unstarted_reference(output, measurement)):
+            return False
+        train = measurement.get('train') or {}
+        if (not isinstance(train, dict) or any(train.get(k) is not None
+                for k in ('attempt_id', 'evidence_id', 'artifact', 'returncode'))
+                or train.get('reused') is True):
+            return False
+        ref = measurement.get('reference_protocol_ref')
+        match = re.fullmatch(r'reference_protocols/([A-Za-z0-9_-]{1,64})\.json', str(ref))
+        if not match:
+            return False
+        identity = match[1]
+        protocol = run_root / ref
+        registry = output / 'baseline_references' / (identity + '.json')
+        for record, maximum in ((protocol, 2 * 1024**2), (registry, 2 * 1024**2)):
+            if (not record.is_file() or record.stat().st_size > maximum
+                    or not record.resolve().is_relative_to(output.resolve())
+                    or any(p.is_symlink() for p in (record, *record.parents)
+                           if p.is_relative_to(output))):
+                return False
+        row = read_json(registry)
+        if (row.get('id') != identity or
+                (row.get('reference') or {}).get('kind') != 'released_checkpoint'
+                or not all((row.get('review') or {}).get(k) is True for k in
+                           ('sources_supported', 'protocol_matches',
+                            'tolerance_supported', 'release_identity_supported'))):
+            return False
+        history = row.get('evaluations') or []
+        if not isinstance(history, list) or len(history) > 4096:
+            return False
+        history = [*history, row.get('evaluation')]
+        relative = path.relative_to(output).as_posix()
+        # Registry complete()/view() use canonical object identity, not file-format bytes.
+        sha256 = object_digest(measurement)
+        return any(isinstance(item, dict) and item.get('measurement_ref') == relative
+                   and item.get('measurement_sha256') == sha256 for item in history)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+class SourceCitationError(ValueError):
+    """A source transport/input failure, not a negative scientific review."""
+    def __init__(self, code, *, index, ref, detail):
+        self.details = {'code': code, 'citation_index': index + 1,
+                        'source_ref': ref if isinstance(ref, str) else '', 'detail': detail}
+        super().__init__(f'reference source citation {index + 1} [{code}]: {detail}')
+
+
+def checkout_source(repo, ref, *, index=0):
+    """Resolve file[:line[-line]] without weakening confinement or exact quoting."""
+    def fail(code, detail):
+        raise SourceCitationError(code, index=index, ref=ref, detail=detail)
+    if not isinstance(ref, str) or not ref or len(ref) > 1024:
+        fail('invalid_reference', 'use a checkout-relative file or an executor-issued source ID')
+    if '[LOCAL_' in ref or '[OUTSIDE_' in ref:
+        fail('display_placeholder', 'display placeholders are not executable references; '
+             'capture checkout_source_request={ref: actual_relative_file[:line[-line]]} and cite its returned ID')
+    match = re.fullmatch(r'(.+):([1-9][0-9]{0,8})(?:-([1-9][0-9]{0,8}))?', ref)
+    name = match[1] if match else ref
+    if ':' in name or '\\' in name:
+        fail('invalid_reference', 'accepted syntax is relative/file[:positive_line[-end_line]]')
+    rel = Path(name)
+    root = Path(repo).resolve()
+    path = root / rel
+    if (rel.is_absolute() or '..' in rel.parts or
+            any(p.startswith('.env') or p in {'.git', '.aws', '.ssh'} for p in rel.parts) or
+            path.suffix.lower() in {'.pem', '.key', '.p12', '.pfx'} or
+            any(x in path.name.lower() for x in ('credential', 'secret', 'id_rsa', 'id_ed25519')) or
+            any(p.is_symlink() for p in [path, *path.parents] if p != root and p.is_relative_to(root)) or
+            not path.resolve().is_relative_to(root)):
+        fail('unsafe_source', 'source must be a non-secret, non-symlink file confined to this checkout')
+    if not path.is_file():
+        fail('source_missing', 'the cited checkout file does not exist; inspect its actual relative name')
+    if path.stat().st_size > 2 * 1024**2:
+        fail('source_too_large', 'source exceeds the 2 MiB file bound')
+    before = digest(path)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except UnicodeError:
+        fail('source_not_text', 'cite UTF-8 source/configuration, not a binary artifact')
+    if before != digest(path):
+        fail('source_changed', 'source changed while reading; recapture current bytes')
+    selected, canonical = text, rel.as_posix()
+    if match:
+        start, end = int(match[2]), int(match[3] or match[2])
+        lines = text.splitlines(keepends=True)
+        if end < start or end > len(lines):
+            fail('invalid_line_range', 'line range is reversed or outside the actual source file')
+        selected = ''.join(lines[start-1:end])
+        canonical += f':{start}' + (f'-{end}' if end != start else '')
+    return path, selected, canonical, before
+
+
 def source_evidence(repo: Path, refs: list, *, output: Path | None = None) -> list[dict]:
     if not isinstance(refs, list) or not 1 <= len(refs) <= 12:
-        raise ValueError('reference requires 1..12 exact source citations')
+        raise SourceCitationError('invalid_sources', index=0, ref=None,
+            detail='reference requires 1..12 exact source citations')
     repo = Path(repo).resolve()
     result = []
-    for row in refs:
+    for index, row in enumerate(refs):
         if not isinstance(row, dict):
-            raise ValueError('source citations must be objects')
-        if isinstance(row.get('ref'),str) and row['ref'].startswith('native-source:'):
+            raise SourceCitationError('invalid_source_item', index=index, ref=None,
+                detail='source citations must be objects with ref and quote')
+        if isinstance(row.get('ref'),str) and row['ref'].startswith(('native-source:', 'checkout-source:')):
             if output is None:
                 raise ValueError('installed source citations require a run-owned native source context')
-            from .native_source_citations import resolve
-            result.append(resolve(output,repo,row['ref'],row.get('quote')))
+            if row['ref'].startswith('native-source:'):
+                from .native_source_citations import resolve
+            else:
+                from .checkout_source_citations import resolve
+            try:
+                result.append(resolve(output,repo,row['ref'],row.get('quote')))
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                raise SourceCitationError('sealed_source_invalid', index=index, ref=row['ref'],
+                    detail=str(exc)) from exc
             continue
-        rel = Path(row.get('ref') or '')
-        path = repo/rel
+        path, text, canonical, sha = checkout_source(repo, row.get('ref'), index=index)
         quote = row.get('quote')
-        if (rel.is_absolute() or '..' in rel.parts or not path.is_file() or path.is_symlink()
-                or not path.resolve().is_relative_to(repo) or path.stat().st_size > 2*1024**2
-                or any(p.startswith('.env') or p in {'.git', '.aws', '.ssh'} for p in rel.parts)
-                or path.suffix.lower() in {'.pem', '.key', '.p12', '.pfx'}
-                or any(x in path.name.lower() for x in ('credential', 'secret', 'id_rsa', 'id_ed25519'))
-                or not isinstance(quote, str) or not quote or len(quote) > 4000
-                or quote not in path.read_text(encoding='utf-8')):
-            raise ValueError('reference source citation is missing, unsafe or not exact')
-        result.append({'ref': rel.as_posix(), 'quote': quote, 'sha256': digest(path)})
+        if not isinstance(quote, str) or not quote or len(quote) > 4000 or quote not in text:
+            raise SourceCitationError('quote_not_exact', index=index, ref=row.get('ref'),
+                detail='quote must occur verbatim in the cited file/line range; capture the exact source rather than guess')
+        result.append({'ref': canonical, 'quote': quote, 'sha256': sha})
     return result
 
 
@@ -268,9 +423,11 @@ def complete(output: Path, reference_id: str, measurement: dict, measurement_ref
              and loaded.resolve().is_relative_to(output.resolve())
              and artifact_identity(loaded) == (field, identity)) if policy.get('path') else False
     value = measurement.get('metric_value')
+    from .policy_consumption import verified_episode_count
+    episode_count=verified_episode_count(measurement)
     valid = (bound and measurement.get('ok') is True and isinstance(value, (int, float))
              and not isinstance(value, bool) and math.isfinite(value)
-             and (measurement.get('metric_reading') or {}).get('samples') == row['reference']['episodes']
+             and episode_count == row['reference']['episodes']
              and all((measurement.get(k) or {}).get('status') == 'verified'
                      for k in ['policy_consumption', 'rollout_evidence', 'metric_lineage']))
     if valid:
@@ -278,7 +435,7 @@ def complete(output: Path, reference_id: str, measurement: dict, measurement_ref
         valid = verify_measurement(measured.parent.parent, measured.stem).get('status') == 'consistent'
     matches = valid and abs(value-row['reference']['expected_metric']) <= row['reference']['tolerance']
     row.update(status='reproduced' if matches else 'performance_mismatch' if valid else 'evaluation_failed',
-               evaluation={'metric_value': value, 'samples': (measurement.get('metric_reading')or{}).get('samples'),
+               evaluation={'metric_value': value, 'samples': episode_count,
                            'measurement_ref': measurement_ref, 'measurement_sha256': object_digest(measurement),
                            'valid': valid, 'at': now()})
     row.setdefault('evaluations', []).append(dict(row['evaluation']))

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "development_training_volume_and_autonomous_recovery_observation",
+  "observed_on": "2026-10-17",
+  "run": "robosyn_required_data_20261013_v1",
+  "task": "click_bell",
+  "label": "round_5_handoff_correction",
+  "original_label": "round_5",
+  "settings": {"episodes": 50, "seed": 20261013, "steps": 80000, "task": "click_bell"},
+  "result": {"successes": 12, "episodes": 50, "value": 0.24},
+  "comparators": {
+    "local_baseline": {"successes": 6, "episodes": 50, "value": 0.12, "training_steps": 1000},
+    "previous_adopted_development": {"successes": 9, "episodes": 50, "value": 0.18},
+    "separate_released_policy_reference": {"successes": 24, "episodes": 50, "value": 0.48}
+  },
+  "training_attempt_id": "6768221922dd40e9907beb746b1ae83e",
+  "evaluation_attempt_id": "ea04c212c3604060a788065e59cbb4db",
+  "training_seconds": 6153.1,
+  "evaluation_seconds": 413.3,
+  "native_completed_optimizer_updates": 80000,
+  "training_progress_audit_ref": "training_progress_audits/8cb36228cf011ff858c3c08a5505847b1d2136bf8d6528469924017aa813f156.json",
+  "training_reused_for_handoff_correction": true,
+  "policy_sha256": "9751da6941837d8eb6ed3ccf2dd2a29d8108a8cd81ac712fe7ec35dfe9b858cb",
+  "failure_stage_counts": {"contact_insufficient_press": 38},
+  "autonomous_decisions": {
+    "training": "c43dd06f3adb7239",
+    "fix_observation": "6ec996f4f16844d7",
+    "handoff_correction": "0d14b31d2e4998b4"
+  },
+  "adoption_status_at_maintenance_stop": "not_yet_adopted; incumbent pointer remains 0.18",
+  "subsequent_autonomous_adoption": {
+    "finished_at_utc": "2026-10-17T08:40:06.083976+00:00",
+    "controller_decision_id": "5f1f56e19f248ea3",
+    "action_receipt_ref": "action_receipts/5f1f56e19f248ea3.json",
+    "action_receipt_sha256": "e9215e32f48a4b1c516134a117c5a4396293de5a7e05db7f8fa018651c1479e1",
+    "adoption_record_ref": "research/derived/measurement_adoptions/78fe2c9689b27a9fec5365d24441ffac75fb3635ac2d88c6372da32a9f7c19ce.json",
+    "adoption_record_sha256": "3884256bcc410601fa55ddde19beaeff64597b5be44ac27fc7f404fe54933f32",
+    "status": "applied",
+    "best_snapshot": "round-5_handoff_correction",
+    "best_value": 0.24,
+    "authority": "Main explicitly adopted the same receipt-verified development measurement; no retraining or new evaluation"
+  },
+  "verification": {
+    "receipt_verifier": "consistent",
+    "issues": [],
+    "policy_consumption": "verified",
+    "rollout_evidence": "verified",
+    "metric_lineage": "verified",
+    "data_consumption": "unknown"
+  },
+  "source_file_sha256": {
+    "comparison_protocol": "bd65c957005f7c06cfe449cd22e05d01aaf40909a8744fd4f4ea16c7d42d06c0",
+    "original_unscored_measurement": "08a695dface9e9f99c8ead10932fbf9423bce061d67a9e8ef45a18de1c63410e",
+    "corrected_measurement": "5dfee217e2cd623f190f84281f578b451db1dd03a5bbcc5cbddd5729519fe521",
+    "training_receipt": "76c3ceea21be940ca7ca3f8ac35858c122f63278f9bad7e0c8c5bd590eb7a9c4",
+    "evaluation_receipt": "c5eadcc0ef4365ee963cfe6f0bd4141ec469bb7ca3d5f82b5e77245a62446788"
+  },
+  "limits": [
+    "Single training seed and development evaluation; physical initial-state pairing and significance are not established.",
+    "Learning work increases from 1000 to 80000 updates; this is not a matched-resource method comparison.",
+    "The original failed handoff and completed producer are preserved; no retraining was used for correction.",
+    "No new data intervention or reviewed training-data consumption is established by this observation.",
+    "Below the separately evaluated released-policy reference; not held-out confirmation or public SOTA.",
+    "Framework-maintained development study, not a frozen zero-intervention systems trial.",
+    "Operator repaired framework contracts and refreshed derived plots, but did not select this candidate, training work, seed, policy bundle or score."
+  ]
+}

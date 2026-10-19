@@ -121,8 +121,23 @@ def candidates(output, since):
     return sorted(result, key=lambda row: row['path'])
 
 
-def sources(repo, root, argv, *, cwd=None):
+def sources(repo, root, argv, *, cwd=None, source_overrides=None):
     """Trace static Python imports only within the checkout/registered dependency roots."""
+    # Historical candidate inspection must not change a live checkout merely to
+    # read its old source. Overrides are verified run-owned snapshot blobs, not
+    # arbitrary external source or a substitute for comparing the full audit trace.
+    overrides = {}
+    for original, blob in (source_overrides or {}).items():
+        original, blob = Path(original), Path(blob)
+        if (not original.is_absolute() or not original.resolve().is_relative_to(repo.resolve())
+                or original.is_symlink() or blob.is_symlink()
+                or not blob.resolve(strict=True).is_relative_to((root/'research').resolve())
+                or not blob.is_file() or blob.stat().st_size > 65536
+                or blob.name != digest(blob)):
+            raise ValueError('historical source override is not a verified owned snapshot blob')
+        overrides[original.resolve()] = blob
+    if len(overrides) > 128:
+        raise ValueError('historical source override budget exceeded')
     if (root/'native_context.json').is_file():
         from .native_context import load_context
         context = load_context(root, repo)
@@ -133,10 +148,19 @@ def sources(repo, root, argv, *, cwd=None):
     pending = [Path(p) if Path(p).is_absolute() else working / p
                for p in argv if str(p).endswith('.py')]
     seen, result = set(), []
+    order = {}
+    repo_root = repo.resolve()
+    def native_first(candidate):
+        # Sorting is advisory priority, not ownership verification. Resolve each
+        # static import once rather than stat thousands of repeated queue entries.
+        # Preserve the exact stable ordering/source IDs of older audit traces.
+        if candidate not in order:
+            order[candidate] = not candidate.resolve().is_relative_to(repo_root)
+        return order[candidate]
     while pending and len(result) < 24:
         # Native orchestration/update semantics come before transitive utility
         # dependencies; large SDK imports must not exhaust the bounded trace.
-        pending.sort(key=lambda candidate: not candidate.resolve().is_relative_to(repo.resolve()))
+        pending.sort(key=native_first)
         path = pending.pop(0)
         if path in seen:
             continue
@@ -145,9 +169,10 @@ def sources(repo, root, argv, *, cwd=None):
                 or not any(path.resolve().is_relative_to(base.resolve()) for base in roots)
                 or path.stat().st_size > 65536):
             continue
-        content = path.read_text(encoding='utf-8')
-        entry = {'id':'source-'+str(len(result)), 'path':path,
-                 'sha256':digest(path), 'content':content,
+        source_path = overrides.get(path.resolve(), path)
+        content = source_path.read_text(encoding='utf-8')
+        entry = {'id':'source-'+str(len(result)), 'path':source_path,
+                 'sha256':digest(source_path), 'content':content,
                  'excerpt':content if len(content) <= 16000 else content[:10000]+'\n…\n'+content[-6000:]}
         result.append(entry)
         try:
